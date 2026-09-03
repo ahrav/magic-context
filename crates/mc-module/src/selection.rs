@@ -1,5 +1,9 @@
+//! Deterministic block-reduction selection for compacted provider context.
 //!
-//! Each block maps 1:1 to [`SelItem`].
+//! Each block maps 1:1 to [`SelItem`]. Selection performs no I/O and reads no clock or
+//! ambient state. Callers supply pressure, protection, and frozen-reduction state through
+//! [`SelectionContext`]. Returned decisions are ordered by target ID.
+//!
 //! Selectors emit identical decisions for identical `(items, frozen_keys, ctx, cfg)`.
 //!
 //!
@@ -495,6 +499,8 @@ pub(crate) fn reasoning_ineligible_arc_ids(items: &[SelItem]) -> HashSet<String>
 }
 
 #[doc(hidden)]
+/// Decision order is preserved while tool arcs that would retain only reasoning are removed.
+/// Blocks without an arc remain unchanged.
 pub fn filter_reasoning_ineligible_decisions(
     items: &[SelItem],
     decisions: Vec<ReductionDecision>,
@@ -1020,6 +1026,9 @@ pub struct SelectionOutcome {
     pub applied_supersession_count: Option<usize>,
 }
 
+/// Frozen, protected, provider-executed, media, opaque, and signed-reasoning blocks are not
+/// targeted. [`PassClass::Defer`] returns no new decisions. Output contains at most one
+/// decision per target and is ordered lexicographically by target ID.
 pub fn select_reductions(
     items: &[SelItem],
     frozen_keys: &HashSet<String>,
@@ -1030,6 +1039,8 @@ pub fn select_reductions(
 }
 
 #[doc(hidden)]
+/// Count fields are `None` when supersession was not evaluated. They distinguish eligible,
+/// protection-withheld, and finally applied arcs after precedence and safety filtering.
 pub fn select_reductions_with_outcome(
     items: &[SelItem],
     frozen_keys: &HashSet<String>,

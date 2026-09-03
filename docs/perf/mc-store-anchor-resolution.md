@@ -1,6 +1,6 @@
-# mc-store anchor-resolution benchmarks
+# mc-kernel anchor-resolution benchmarks
 
-`crates/mc-store/benches/anchor_resolution.rs` measures the applicability
+`crates/mc-kernel/benches/anchor_resolution.rs` measures the applicability
 kernel's two public entry points against gix-built fixture repositories:
 `snapshot_checkout` (checkout snapshot + dirty scan) and the
 `ResolutionLadder` (`new` + `evaluate`) over one `GitCondition`. This doc is
@@ -77,10 +77,10 @@ few minutes of wall time.
 ## Running
 
 ```bash
-cargo test -p mc-store                                    # wiring stays green
-cargo bench -p mc-store --bench anchor_resolution         # full suite
-cargo bench -p mc-store --bench anchor_resolution -- 'evaluate'
-cargo bench -p mc-store --bench anchor_resolution -- 'patch_id'
+cargo test -p mc-kernel                                   # wiring stays green
+cargo bench -p mc-kernel --bench anchor_resolution         # full suite
+cargo bench -p mc-kernel --bench anchor_resolution -- 'evaluate'
+cargo bench -p mc-kernel --bench anchor_resolution -- 'patch_id'
 ```
 
 ## Comparing a change
@@ -89,9 +89,9 @@ Criterion samples within one process are subsamples, not independent runs:
 they cannot capture process-, build-, or host-level variation. For a
 before/after decision:
 
-1. `cargo bench -p mc-store --bench anchor_resolution -- --save-baseline before`
+1. `cargo bench -p mc-kernel --bench anchor_resolution -- --save-baseline before`
 2. Apply the change.
-3. `cargo bench -p mc-store --bench anchor_resolution -- --baseline before`
+3. `cargo bench -p mc-kernel --bench anchor_resolution -- --baseline before`
 4. Repeat the pair across ≥3 fresh process invocations before believing
    effects under ~5%. Run an A/A first (steps 1+3 with no change): treat any
    A/A delta as the floor below which differences are noise for that host.

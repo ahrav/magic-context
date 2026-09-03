@@ -52,8 +52,21 @@ interface EligibleMessage {
     text: string;
 }
 
+/** Transform seeds drive a 32-bit PRNG state, so the archive and the runner share this bound. */
+export const MAX_TRANSFORM_SEED = 0xffff_ffff;
+
+/** The id a derivative scenario is given, which is how a scored entry is bound to its pair. */
+export function derivativeScenarioId(pair: {
+    scenarioId: string;
+    transformId: string;
+    transformVersion: number;
+    seed: number;
+}): string {
+    return `${pair.scenarioId}-d-${pair.transformId}-v${pair.transformVersion}-s${pair.seed}`;
+}
+
 function normalizedSeed(seed: number): number {
-    if (!Number.isSafeInteger(seed) || seed < 0 || seed > 0xffff_ffff) {
+    if (!Number.isSafeInteger(seed) || seed < 0 || seed > MAX_TRANSFORM_SEED) {
         throw new Error("transform seed must be an unsigned 32-bit integer");
     }
     return seed >>> 0;
@@ -208,7 +221,7 @@ function derivative(
     try {
         scenario = parseScenario({
             ...base,
-            id: `${base.id}-d-${transform.id}-v${transform.version}-s${seed}`,
+            id: derivativeScenarioId({ scenarioId: base.id, transformId: transform.id, transformVersion: transform.version, seed }),
             transcript: { turns, epilogueStartIndex },
             gold: remapGold(base.gold, turnMap),
         });

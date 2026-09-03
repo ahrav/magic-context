@@ -1,3 +1,10 @@
+//! Untrusted shared-memory descriptor types and validation.
+//!
+//! Validation binds each frame to an expected incarnation, lane, and sequence before
+//! exposing spans. Lengths are bytes. Checked arithmetic rejects overflow and arena
+//! wrap metadata must describe one contiguous logical body split across at most two
+//! physical spans.
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -13,12 +20,15 @@ pub const WIRE_V2_HEADER_BYTES: usize = 21;
 /// A complete-frame descriptor contains at most two shared spans.
 pub const MAX_SPANS: usize = 2;
 
-/// Validated opaque hardware-profile identifier.
+/// Opaque hardware-profile identifier containing 1 to 64 safe ASCII characters.
+///
+/// Accepted characters are alphanumeric, `-`, `_`, and `.`. Debug output is redacted.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HardwareProfileId(String);
 
 impl HardwareProfileId {
+    /// Validates and stores a hardware-profile identifier.
     pub fn new(value: impl Into<String>) -> Result<Self, DescriptorError> {
         let value = value.into();
         if value.is_empty()
@@ -32,6 +42,7 @@ impl HardwareProfileId {
         Ok(Self(value))
     }
 
+    /// Tests exact equality with a hardware-profile identifier.
     pub fn matches(&self, value: &str) -> bool {
         self.0 == value
     }
@@ -43,7 +54,9 @@ impl fmt::Debug for HardwareProfileId {
     }
 }
 
-/// Fixed ring profile identity carried by an authenticated grant.
+/// Fixed schema and hardware profile carried by an authenticated transport grant.
+///
+/// Debug output redacts the profile identifier.
 #[derive(Clone, PartialEq, Eq)]
 pub struct TransportDescriptor {
     schema_version: u16,
@@ -76,22 +89,28 @@ impl fmt::Debug for TransportDescriptor {
     }
 }
 
-/// Each candidate receives a fresh 128-bit identity.
+/// 128-bit identity separating transport incarnations.
+///
+/// Random construction uses operating-system entropy. Debug output is redacted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Incarnation([u8; 16]);
 
 impl Incarnation {
+    /// Uses operating-system entropy and reports failure as `RandomSourceUnavailable`.
     pub fn random() -> Result<Self, DescriptorError> {
         let mut bytes = [0u8; 16];
         getrandom::getrandom(&mut bytes).map_err(|_| DescriptorError::RandomSourceUnavailable)?;
         Ok(Self(bytes))
     }
 
+    /// Restores an incarnation from its setup-channel bytes.
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
 
-    /// Diagnostics must not include the setup-channel representation.
+    /// Returns the incarnation as bytes.
+    ///
+    /// Diagnostics must not include this setup-channel representation.
     pub const fn into_bytes(self) -> [u8; 16] {
         self.0
     }
@@ -103,7 +122,10 @@ impl fmt::Debug for Incarnation {
     }
 }
 
-/// ReleaseIdentity qualifies a completion by incarnation, lane, and sequence.
+/// Completion identity qualified by incarnation, lane, and sequence.
+///
+/// Exact equality across all fields is required before a descriptor can release or
+/// reuse transport state. Debug output is redacted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ReleaseIdentity {
     incarnation: Incarnation,
@@ -112,6 +134,7 @@ pub struct ReleaseIdentity {
 }
 
 impl ReleaseIdentity {
+    /// Constructs an identity from its exact completion-matching fields.
     pub const fn new(incarnation: Incarnation, lane: u32, sequence: u64) -> Self {
         Self {
             incarnation,
@@ -125,10 +148,12 @@ impl ReleaseIdentity {
         self.incarnation
     }
 
+    /// Returns the lane number.
     pub const fn lane(self) -> u32 {
         self.lane
     }
 
+    /// Returns the raw sequence number without validation, so it is zero when `new` received zero; [`FrameDescriptor::validate`] is what rejects a zero sequence.
     pub const fn sequence(self) -> u64 {
         self.sequence
     }
@@ -140,7 +165,10 @@ impl fmt::Debug for ReleaseIdentity {
     }
 }
 
-/// FrameDescriptor stores a complete metadata snapshot received from an untrusted source.
+/// Complete frame metadata snapshot received from an untrusted source.
+///
+/// Construction performs no validation. Call [`FrameDescriptor::validate`] before
+/// using any offset or length. Debug output is redacted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FrameDescriptor {
     schema_version: u16,
@@ -154,6 +182,7 @@ pub struct FrameDescriptor {
 }
 
 impl FrameDescriptor {
+    /// Copies untrusted descriptor fields without validating them.
     #[allow(
         clippy::too_many_arguments,
         reason = "models fixed shared descriptor fields"
@@ -180,6 +209,12 @@ impl FrameDescriptor {
         }
     }
 
+    /// Validates identity, byte lengths, arena spans, and frozen wire-v2 header fields.
+    ///
+    /// `arena_bytes` is the physical ring size in bytes. A valid logical body occupies
+    /// one span or wraps exactly once into a second span. The allocation may exceed the
+    /// body length but cannot exceed the arena. All additions are checked. This method
+    /// returns a specific [`DescriptorError`] and does not panic.
     pub fn validate(
         self,
         expected: ReleaseIdentity,
@@ -290,6 +325,9 @@ impl fmt::Debug for FrameDescriptor {
     }
 }
 
+/// Frame descriptor whose identity, lengths, spans, and wire header were validated.
+///
+/// Accessors return the exact snapshot checked by [`FrameDescriptor::validate`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ValidatedFrame {
     wire_header: [u8; WIRE_V2_HEADER_BYTES],
@@ -302,30 +340,41 @@ pub struct ValidatedFrame {
 }
 
 impl ValidatedFrame {
+    /// Returns the validated wire-v2 header.
     pub const fn wire_header(self) -> [u8; WIRE_V2_HEADER_BYTES] {
         self.wire_header
     }
 
+    /// Returns the validated release identity.
     pub const fn identity(self) -> ReleaseIdentity {
         self.identity
     }
 
+    /// Returns the declared body length in bytes.
     pub const fn body_len(self) -> u64 {
         self.body_len
     }
 
+    /// Returns the logical allocation start in bytes.
     pub const fn allocation_start(self) -> u64 {
         self.allocation_start
     }
 
+    /// Returns the allocation capacity in bytes.
     pub const fn allocation_len(self) -> u64 {
         self.allocation_len
     }
 
+    /// Returns the number of physical spans.
     pub const fn span_count(self) -> u8 {
         self.span_count
     }
 
+    /// Returns a validated span by index.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` is [`MAX_SPANS`] or greater because `self.spans[index]` is evaluated before `then_some`.
     pub fn span(self, index: usize) -> Option<ArenaSpan> {
         (index < usize::from(self.span_count)).then_some(self.spans[index])
     }
@@ -337,20 +386,29 @@ impl fmt::Debug for ValidatedFrame {
     }
 }
 
-/// Descriptor-state snapshot.
+/// Counts for mutually exclusive descriptor lifecycle states.
+///
+/// A consistent snapshot conserves configured ring depth across all fields.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DescriptorCounts {
     /// Reusable descriptors.
     pub free: u64,
+    /// Descriptors reserved by producers.
     pub producer_reserved: u64,
+    /// Descriptors visible to receivers.
     pub published: u64,
+    /// Descriptors claimed by receivers before lease creation.
     pub receiver_held: u64,
+    /// Descriptors exposed through receive leases.
     pub receiver_leased: u64,
+    /// Descriptors waiting for release processing.
     pub release_pending: u64,
+    /// Descriptors excluded from reuse.
     pub quarantined: u64,
 }
 
 impl DescriptorCounts {
+    /// Uses checked addition so corrupt counters cannot wrap into apparent conservation.
     pub fn conserves(self, depth: u64) -> bool {
         [
             self.free,
@@ -367,24 +425,53 @@ impl DescriptorCounts {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Reports rejected descriptor fields or descriptor construction failures.
+#[derive(thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum DescriptorError {
+    /// Operating-system entropy was unavailable.
+    #[error("operating-system random source unavailable")]
     RandomSourceUnavailable,
+    /// Hardware-profile identifier is empty, too long, or contains unsupported bytes.
+    #[error("hardware profile identifier is invalid")]
     InvalidHardwareProfile,
+    /// Serialized fixed fields are incomplete.
+    #[error("fixed structure is truncated")]
     Truncated,
+    /// Descriptor schema does not match [`DESCRIPTOR_SCHEMA_VERSION`].
+    #[error("descriptor schema is unsupported")]
     UnsupportedSchema,
+    /// Release identity belongs to another transport incarnation.
+    #[error("release identity does not match incarnation")]
     WrongIncarnation,
+    /// Release identity names another lane.
+    #[error("release identity does not match lane")]
     WrongLane,
     /// Sequence is zero or does not match the expected sequence.
+    #[error("release sequence is invalid")]
     InvalidSequence,
-    /// body_len exceeds MAX_FRAME_BYTES.
+    /// Body length exceeds [`MAX_FRAME_BYTES`].
+    #[error("frame exceeds protocol maximum")]
     FrameTooLarge,
+    /// Allocation length or capacity is inconsistent with the arena or body.
+    #[error("arena allocation is invalid")]
     InvalidAllocation,
+    /// Span count is outside `1..=MAX_SPANS`.
+    #[error("descriptor span count is invalid")]
     InvalidSpanCount,
+    /// A span extends outside the arena.
+    #[error("descriptor span is outside arena")]
     OutOfBounds,
+    /// Checked descriptor arithmetic overflowed.
+    #[error("descriptor arithmetic overflow")]
     Overflow,
+    /// Declared lengths disagree.
+    #[error("descriptor lengths disagree")]
     LengthMismatch,
+    /// Physical spans do not describe the declared logical wrap.
+    #[error("descriptor wrap metadata is invalid")]
     InvalidWrapMetadata,
+    /// Wire header version or length disagrees with the descriptor.
+    #[error("wire header disagrees with descriptor")]
     WireHeaderMismatch,
 }
 
@@ -393,27 +480,3 @@ impl fmt::Debug for DescriptorError {
         fmt::Display::fmt(self, formatter)
     }
 }
-
-impl fmt::Display for DescriptorError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::RandomSourceUnavailable => "operating-system random source unavailable",
-            Self::InvalidHardwareProfile => "hardware profile identifier is invalid",
-            Self::Truncated => "fixed structure is truncated",
-            Self::UnsupportedSchema => "descriptor schema is unsupported",
-            Self::WrongIncarnation => "release identity does not match incarnation",
-            Self::WrongLane => "release identity does not match lane",
-            Self::InvalidSequence => "release sequence is invalid",
-            Self::FrameTooLarge => "frame exceeds protocol maximum",
-            Self::InvalidAllocation => "arena allocation is invalid",
-            Self::InvalidSpanCount => "descriptor span count is invalid",
-            Self::OutOfBounds => "descriptor span is outside arena",
-            Self::Overflow => "descriptor arithmetic overflow",
-            Self::LengthMismatch => "descriptor lengths disagree",
-            Self::InvalidWrapMetadata => "descriptor wrap metadata is invalid",
-            Self::WireHeaderMismatch => "wire header disagrees with descriptor",
-        })
-    }
-}
-
-impl std::error::Error for DescriptorError {}

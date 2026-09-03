@@ -15,6 +15,7 @@ import { compareInvariants, compareScoreInvariants } from "./invariants";
 import { admitPair, pairKey } from "./pairs";
 import {
     buildMetamorphicReport,
+    requireRepresentableRunOptions,
     type InjectionCanaryHit,
     type MetamorphicReport,
     type MetamorphicReportEntry,
@@ -111,6 +112,7 @@ export function runDeterministicMetamorphicEval(
     if (scenarios.length === 0) throw new Error("deterministic metamorphic eval needs at least one scenario");
     const transforms = options.transforms ?? TRANSFORMS;
     const seeds = options.seeds ?? DETERMINISTIC_SEEDS;
+    requireRepresentableRunOptions(scenarios, transforms, seeds);
     const output = options.buildOutput ?? buildScriptedOutput;
     const score = options.scoreOutput ?? scoreRawOutputWithInjectedClaims;
     const entries: MetamorphicReportEntry[] = [];

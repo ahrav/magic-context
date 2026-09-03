@@ -10,6 +10,7 @@ pub const M0_EMPTY_BODY: &str = "<session-history></session-history>";
 /// `M1_PLACEHOLDER` keeps the m1 delta block non-empty when it has no new content.
 /// The m1 block remains non-empty to preserve the provider prompt-cache breakpoint.
 pub const M1_PLACEHOLDER: &str = "(no new content since last materialization)";
+/// Default pre-pressure token budget for rendered session history.
 pub const DEFAULT_HISTORY_BUDGET_TOKENS: f64 = 60_000.0;
 
 fn escape_xml_attr(s: &str) -> String {
@@ -64,47 +65,20 @@ pub struct MirroredClaimMemory {
     pub provenance_label: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum MirroredClaimMemoryError {
-    Inactive {
-        public_claim_id: String,
-    },
-    MissingCategory {
-        public_claim_id: String,
-    },
+    #[error("mirrored claim {public_claim_id} is inactive")]
+    Inactive { public_claim_id: String },
+    #[error("mirrored claim {public_claim_id} has no category")]
+    MissingCategory { public_claim_id: String },
+    #[error("mirrored claim {public_claim_id} has non-positive category {category}")]
     NonPositiveCategory {
         public_claim_id: String,
         category: String,
     },
-    MissingImportance {
-        public_claim_id: String,
-    },
+    #[error("mirrored claim {public_claim_id} has no importance")]
+    MissingImportance { public_claim_id: String },
 }
-
-impl std::fmt::Display for MirroredClaimMemoryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Inactive { public_claim_id } => {
-                write!(f, "mirrored claim {public_claim_id} is inactive")
-            }
-            Self::MissingCategory { public_claim_id } => {
-                write!(f, "mirrored claim {public_claim_id} has no category")
-            }
-            Self::NonPositiveCategory {
-                public_claim_id,
-                category,
-            } => write!(
-                f,
-                "mirrored claim {public_claim_id} has non-positive category {category}"
-            ),
-            Self::MissingImportance { public_claim_id } => {
-                write!(f, "mirrored claim {public_claim_id} has no importance")
-            }
-        }
-    }
-}
-
-impl std::error::Error for MirroredClaimMemoryError {}
 
 impl TryFrom<&CommittedClaimMirrorRow> for MirroredClaimMemory {
     type Error = MirroredClaimMemoryError;
@@ -170,6 +144,8 @@ fn claim_render_order(left: &MirroredClaimMemory, right: &MirroredClaimMemory) -
     }
 }
 
+/// Renders one claim line, escaping XML content and truncating content to at
+/// most 64 KiB without splitting a UTF-8 code point.
 pub fn render_claim_memory_line(claim: &MirroredClaimMemory) -> String {
     let source = claim
         .provenance_label
@@ -186,7 +162,12 @@ pub fn render_claim_memory_line(claim: &MirroredClaimMemory) -> String {
     format!("{}{source}: {content}", claim.public_claim_id)
 }
 
-/// Native surfaces filter non-positive categories because callers can construct `MirroredClaimMemory` directly and native surfaces lack a warning renderer.
+/// Renders positive claims grouped in deterministic category and claim-ID order.
+///
+/// Native surfaces filter non-positive categories because callers can construct
+/// [`MirroredClaimMemory`] directly and native surfaces lack a warning renderer.
+/// Category names are escaped for XML attributes, while `wrapper` is interpolated as written, so callers must pass a valid element name.
+/// Claim content is escaped by [`render_claim_memory_line`].
 pub fn render_claim_memory_block(claims: &[MirroredClaimMemory], wrapper: &str) -> String {
     let mut ordered = claims
         .iter()
@@ -293,6 +274,9 @@ pub fn render_m0(inputs: &M0Inputs, estimate_tokens: impl Fn(&str) -> usize) -> 
     sections.join("\n\n").trim().to_string()
 }
 
+/// Wraps non-empty delta blocks in `<session-history-since>` in argument order.
+///
+/// Returns `placeholder` unchanged when every delta block is empty.
 pub fn assemble_m1(
     memory_updates: &str,
     new_compartments: &str,
@@ -320,7 +304,9 @@ pub fn assemble_m1(
     )
 }
 
-/// block.
+/// Renders non-empty compartment input at tier 1 inside `<new-compartments>`.
+///
+/// Returns an empty string when `compartments` is empty and preserves input order.
 pub fn render_new_compartments(
     compartments: &[&crate::decay_render::DecayRenderCompartment],
 ) -> String {

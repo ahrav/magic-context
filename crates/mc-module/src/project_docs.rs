@@ -1,6 +1,8 @@
+//! Reads optional project documents into canonical hash and escaped XML forms.
 //!
-//! The second metadata check immediately precedes reading to narrow the path-swap window.
-//!
+//! Documents are processed in fixed `ARCHITECTURE.md`, then `STRUCTURE.md`
+//! order. Each file is limited to 256 KiB. Metadata checks reject symlinks and
+//! narrow, but do not eliminate, the path-swap window before reading.
 
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -58,6 +60,13 @@ fn read_safe_canonical(path: &Path) -> Option<String> {
     Some(canonicalize_doc_content(&raw))
 }
 
+/// Reads configured project documents and returns their deterministic rendering.
+///
+/// Missing, non-regular, unreadable, and non-UTF-8 files are skipped, as are files over 256 KiB at either metadata check.
+/// A file replaced or grown after the second check is read in full, so the size cap does not hold against a concurrent writer.
+/// The hash covers canonical unescaped content in fixed filename order, while
+/// `rendered_block` XML-escapes file names and content. This function does not
+/// panic for filesystem or decoding failures.
 pub fn read_project_docs_canonical(project_directory: &str) -> ProjectDocs {
     let dir = Path::new(project_directory);
     let mut hash_pieces: Vec<String> = Vec::new();

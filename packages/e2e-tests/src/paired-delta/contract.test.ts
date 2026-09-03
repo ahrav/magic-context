@@ -84,7 +84,7 @@ describe("paired-delta scenario contract", () => {
                 ...base.turnScript.slice(1),
             ],
         });
-        /** Under `exact` the verifier rejects a differently-cased answer, so miscased evidence is not gold. commentlint: allow(JUDGE) */
+        /** Under `exact` the verifier rejects a differently-cased answer, so miscased evidence is not gold. */
         expect(() =>
             parseScenarioDeclaration(scenario({ answerMatch: "exact", ...miscased() })),
         ).toThrow(/evidenceTurnId: answer-absent/);
@@ -94,7 +94,7 @@ describe("paired-delta scenario contract", () => {
     });
 
     it("rejects an answer revealed only by the composed search prompt", () => {
-        /** Present in neither the fixed prefix nor a claim id alone, but in their join. commentlint: allow(JUDGE) */
+        /** Present in neither the fixed prefix nor a claim id alone, but in their join. */
         expect(() =>
             parseScenarioDeclaration(scenario({ expectedAnswer: "evidence: mcm" })),
         ).toThrow(/expectedAnswer: revealed-by-search-prompt/);
@@ -157,11 +157,11 @@ describe("paired-delta scenario contract", () => {
                 r2: { memories: [{ claim, evidence: "Remember ID alpha-17." }] },
             },
         });
-        /** Past MAX_RENDER_FIELD_BYTES: R1 would receive a truncated claim while R3 gets it whole. commentlint: allow(JUDGE) */
+        /** Past MAX_RENDER_FIELD_BYTES: R1 would receive a truncated claim while R3 gets it whole. */
         expect(() =>
             parseScenarioDeclaration(scenario(withClaim(`alpha-17 ${"filler ".repeat(200)}`))),
         ).toThrow(/claim: exceeds-render-bound/);
-        /** A lone surrogate freezes but can never be seeded. commentlint: allow(JUDGE) */
+        /** A lone surrogate freezes but can never be seeded. */
         expect(() =>
             parseScenarioDeclaration(scenario(withClaim("alpha-17 \ud800"))),
         ).toThrow(/claim: unicode-ill-formed/);
@@ -169,7 +169,7 @@ describe("paired-delta scenario contract", () => {
 
     it("detects an answer leak across canonically equivalent spellings", () => {
         const base = scenario();
-        /** Composed gold, decomposed in a post-insertion turn: identical to a reader. commentlint: allow(JUDGE) */
+        /** Composed gold, decomposed in a post-insertion turn: identical to a reader. */
         expect(() =>
             parseScenarioDeclaration(scenario({
                 expectedAnswer: "caf\u00e9",
@@ -214,7 +214,7 @@ describe("paired-delta scenario contract", () => {
 
     it("requires the gold answer as a complete value, not a substring", () => {
         const base = scenario();
-        /** `alpha-17` inside `alpha-170` must not count as gold. commentlint: allow(JUDGE) */
+        /** `alpha-17` inside `alpha-170` must not count as gold. */
         expect(() =>
             parseScenarioDeclaration(scenario({
                 turnScript: [
@@ -223,7 +223,7 @@ describe("paired-delta scenario contract", () => {
                 ],
             })),
         ).toThrow(/evidenceTurnId: answer-absent/);
-        /** A trailing sentence period is not a value character, so it still matches. commentlint: allow(JUDGE) */
+        /** A trailing sentence period is not a value character, so it still matches. */
         expect(() =>
             parseScenarioDeclaration(scenario({
                 turnScript: [
@@ -256,7 +256,7 @@ describe("paired-delta scenario contract", () => {
 
     it("requires the evidence turn to precede the R1 insertion point", () => {
         const base = scenario();
-        /** Answer-free turns so the ordering rule is what fires, not the post-insertion leak scan. commentlint: allow(JUDGE) */
+        /** Answer-free turns so the ordering rule is what fires, not the post-insertion leak scan. */
         const turnScript: ScenarioDeclaration["turnScript"] = [
             { id: "turn-lead", role: "user", content: "Start the task." },
             { id: "turn-evidence", role: "user", content: "Consult the memo." },
@@ -582,7 +582,7 @@ describe("paired-delta manifest contract", () => {
         expect(() =>
             parsePairedDeltaManifest({ schema: PAIRED_DELTA_MANIFEST_SCHEMA, scenarios: [] }),
         ).toThrow(/manifest\.scenarios: empty/);
-        /** Release-only entries leave calibration and weekly with no measurements. commentlint: allow(JUDGE) */
+        /** Release-only entries leave calibration and weekly with no measurements. */
         expect(() =>
             parsePairedDeltaManifest({
                 schema: PAIRED_DELTA_MANIFEST_SCHEMA,

@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
-import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { canonicalFingerprint, canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { publishJsonAtomically } from "../atomic-publish";
 import { compareCodeUnits } from "../code-unit-order";
-import { makeContractPrimitives } from "../contract-primitives";
+import { HEX64_RE, makeContractPrimitives, vocabulary } from "../contract-primitives";
 import type { PairedCaseFact } from "../prospective-holdout/comparison";
 import { parsePolicyOwnerDocument } from "../prospective-holdout/contract";
 import { pairedFactsFingerprint } from "../prospective-holdout/report";
@@ -15,20 +15,27 @@ import {
     type ReasonCode,
 } from "./contract";
 import type {
+    DeltaEndpoint,
+    DeltaResolution,
     EndpointEstimate,
     FamilyDeltaAnalysis,
     FamilyEstimate,
     FamilyNoiseFloor,
     Interval,
+    NoiseComparison,
     RawRegretRecord,
+    RegretEndpoint,
 } from "./estimator";
-import { PRIMARY_ENDPOINTS, REGRET_ENDPOINTS } from "./estimator";
+import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_RESAMPLES, MAX_BOOTSTRAP_SEED, MAX_BOOTSTRAP_WORK, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS, endpointInterval, endpointResolution, estimateRegretEndpoint, includesZero, mean, noiseLabel } from "./estimator";
 import { validSuccess } from "./scoring";
 import { tupleKey } from "./tuple-key";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
 
 export const PAIRED_DELTA_REPORT_SCHEMA = "paired-delta-report/v1";
 export const PAIRED_DELTA_CALIBRATION_SCHEMA = "paired-delta-calibration/v1";
+
+/** The regret rungs in the order the runner climbs them, stopping at the first failure. */
+const REGRET_LADDER = ["retrieval", "formation", "representation"] as const;
 
 const ARM_ID_SET: ReadonlySet<string> = new Set(ARM_IDS);
 const REASON_CODE_SET: ReadonlySet<string> = new Set(REASON_CODES);
@@ -102,12 +109,16 @@ function requireHex64(value: string, label: string): void {
     }
 }
 
-function sortedMetrics(metrics: ArmMetrics): ArmMetrics {
+function sortedMetrics(metrics: ArmMetrics, shape: { integer?: boolean } = {}): ArmMetrics {
     for (const [armId, value] of Object.entries(metrics)) {
         if (!ARM_ID_SET.has(armId)) {
             throw new Error(`paired-delta-report: metric-arm-invalid-${armId}`);
         }
         if (value === undefined || !Number.isFinite(value) || value < 0) {
+            throw new Error("paired-delta-report: metric-invalid");
+        }
+        // Token and turn totals sum per-rollout counters the runner admits only as safe integers.
+        if (shape.integer && !Number.isSafeInteger(value)) {
             throw new Error("paired-delta-report: metric-invalid");
         }
     }
@@ -205,6 +216,44 @@ export function buildPairedDeltaReport(input: {
         throw new Error("paired-delta-report: analysis-paired-facts-mismatch");
     }
     requirePolicyBoundEstimatorSettings(policy.policy, input.analysis);
+    // `calibrationNoiseFloors` is the only floor producer: it names the endpoint and writes `{ lower: 0,
+    // upper: value }` for a value under 2, and the parser admits no other floor shape.
+    // A calibration fingerprint requires every analyzed family to have a noise floor.
+    for (const endpoint of input.analysis.endpoints) {
+        for (const family of endpoint.families) {
+            const floor = family.noise.floor;
+            if (floor === null) {
+                if (input.runSummary.calibrationFingerprint !== null) {
+                    throw new Error(`paired-delta-report: noise-floor-required-${family.familyId}`);
+                }
+                continue;
+            }
+            if (floor.endpoint === undefined) {
+                throw new Error(`paired-delta-report: noise-floor-endpoint-missing-${family.familyId}`);
+            }
+            if (floor.endpoint !== endpoint.endpoint || floor.familyId !== family.familyId) {
+                throw new Error(`paired-delta-report: noise-floor-owner-mismatch-${family.familyId}`);
+            }
+            if (floor.value < 0 || floor.value > 2 || floor.interval.lower !== 0 || floor.interval.upper !== floor.value) {
+                throw new Error(`paired-delta-report: noise-floor-shape-invalid-${family.familyId}`);
+            }
+        }
+    }
+    // A usage-unmeasured run stored the estimated-cost failure that produced the status.
+    if (input.runSummary.status === "usage-unmeasured" && input.runSummary.estimatedCostRollouts === 0) {
+        throw new Error("paired-delta-report: status-evidence-required");
+    }
+    // Rungs run in order and stop at the first failure, so a later regret delta exists only with every earlier one.
+    const rungsByCoordinate = new Map<string, Set<string>>();
+    for (const record of input.analysis.rawRegretRecords) {
+        rungsByCoordinate.set(record.coordinateId, (rungsByCoordinate.get(record.coordinateId) ?? new Set()).add(record.endpoint));
+    }
+    for (const [coordinateId, rungs] of rungsByCoordinate) {
+        const deepest = Math.max(...REGRET_LADDER.map((endpoint, depth) => (rungs.has(endpoint) ? depth : -1)));
+        for (let depth = 0; depth <= deepest; depth += 1) {
+            if (!rungs.has(REGRET_LADDER[depth]!)) throw new Error(`paired-delta-report: ladder-prefix-missing-${coordinateId}`);
+        }
+    }
     const exclusions = [...input.exclusions].sort((left, right) => compareCodeUnits(
         `${left.armId}:${left.reasonCode}`,
         `${right.armId}:${right.reasonCode}`,
@@ -238,13 +287,16 @@ export function buildPairedDeltaReport(input: {
         Object.values(input.runSummary.refusedRegretLadders).some((count) =>
             !Number.isSafeInteger(count) || count < 1) ||
         !Number.isSafeInteger(input.runSummary.plannedCoordinates) ||
-        input.runSummary.plannedCoordinates < 0 ||
+        input.runSummary.plannedCoordinates < 1 ||
         !Number.isSafeInteger(input.runSummary.healthyCoordinates) ||
         input.runSummary.healthyCoordinates < 0 ||
         input.runSummary.healthyCoordinates > input.runSummary.plannedCoordinates
     ) {
         throw new Error("paired-delta-report: run-summary-invalid");
     }
+    // The parser rejects any rollout accounting these rules reject.
+    const accounting = rolloutAccountingViolation(input.runSummary, exclusions, input.analysis);
+    if (accounting !== null) throw new Error(`paired-delta-report: ${accounting.code} (${accounting.path})`);
     if (input.limitations.some((line) => line.trim().length === 0)) {
         throw new Error("paired-delta-report: limitation-invalid");
     }
@@ -259,11 +311,11 @@ export function buildPairedDeltaReport(input: {
         secondaryMetrics: {
             invalidSuccessRateByArm: sortedMetrics(input.secondaryMetrics.invalidSuccessRateByArm),
             finalAttemptTokensByArm:
-                sortedMetrics(input.secondaryMetrics.finalAttemptTokensByArm),
+                sortedMetrics(input.secondaryMetrics.finalAttemptTokensByArm, { integer: true }),
             finalAttemptWallClockMsByArm:
                 sortedMetrics(input.secondaryMetrics.finalAttemptWallClockMsByArm),
             finalAttemptTurnsByArm:
-                sortedMetrics(input.secondaryMetrics.finalAttemptTurnsByArm),
+                sortedMetrics(input.secondaryMetrics.finalAttemptTurnsByArm, { integer: true }),
         },
         regret: {
             live: input.analysis.liveRegret,
@@ -272,6 +324,32 @@ export function buildPairedDeltaReport(input: {
         },
         runSummary: input.runSummary,
     };
+    // The parser admits a calibration fingerprint only as a lowercase 64-character digest.
+    if (body.runSummary.calibrationFingerprint !== null && !HEX64_RE.test(body.runSummary.calibrationFingerprint)) {
+        throw new Error("paired-delta-report: calibration-fingerprint-invalid");
+    }
+    // The parser admits only the refusal reasons the runner records.
+    for (const reason of Object.keys(body.runSummary.refusedRegretLadders)) {
+        if (!(REFUSED_REGRET_REASONS as readonly string[]).includes(reason)) {
+            throw new Error(`paired-delta-report: refusal-reason-invalid-${reason}`);
+        }
+    }
+    // Outside calibration, completeness is the estimator's sufficiency over a fully healthy matrix. Calibration
+    // completeness needs the calibration record's variance, but never holds over an incomplete or unhealthy run.
+    const fullyHealthy = body.runSummary.healthyCoordinates >= body.runSummary.plannedCoordinates;
+    if (body.runSummary.calibrationFingerprint !== null
+        ? body.runSummary.evidenceComplete !== (body.analysis.evidenceSufficient && fullyHealthy)
+        : body.runSummary.evidenceComplete && (body.runSummary.status !== "completed" || !fullyHealthy)) {
+        throw new Error("paired-delta-report: evidence-complete-mismatch");
+    }
+    // A healthy coordinate completed every primary arm, so each metric map carries a value for each of them.
+    if (body.runSummary.healthyCoordinates > 0) {
+        for (const [field, metrics] of Object.entries(body.secondaryMetrics)) {
+            for (const armId of PRIMARY_ARM_IDS) {
+                if (!(armId in metrics)) throw new Error(`paired-delta-report: metric-arm-missing-${field}-${armId}`);
+            }
+        }
+    }
     return {
         schema: PAIRED_DELTA_REPORT_SCHEMA,
         body,
@@ -279,78 +357,191 @@ export function buildPairedDeltaReport(input: {
     };
 }
 
-const RUN_STATUSES = [
-    "completed",
-    "cost-cap-reached",
-    "deadline-reached",
-    "invalid-stored-records",
-    "harness-unreclaimed",
-    "usage-unmeasured",
-] as const satisfies readonly PairedDeltaRunResult["status"][];
-const DELTA_ENDPOINTS = [...PRIMARY_ENDPOINTS, ...REGRET_ENDPOINTS] as const;
+const RUN_STATUSES = vocabulary<PairedDeltaRunResult["status"]>({
+    completed: true,
+    "cost-cap-reached": true,
+    "deadline-reached": true,
+    "invalid-stored-records": true,
+    "harness-unreclaimed": true,
+    "usage-unmeasured": true,
+});
 
 const p = makeContractPrimitives(PairedDeltaContractError);
 
-function finiteNumber(value: unknown, label: string): number {
-    if (typeof value !== "number" || !Number.isFinite(value)) p.fail(`${label}: number-invalid`);
-    return value as number;
-}
-
-function boolean(value: unknown, label: string): boolean {
-    if (typeof value !== "boolean") p.fail(`${label}: boolean-invalid`);
-    return value as boolean;
-}
+// Every primary delta is a difference of two binary outcomes and every regret delta a difference of two
+// fractions, so estimates, bounds, and raw deltas all lie in [-1, 1].
+const deltaNumber = (value: unknown, label: string): number => p.number(value, label, { minimum: -1, maximum: 1 });
+const nonNegativeNumber = (value: unknown, label: string): number => p.number(value, label, { minimum: 0 });
 
 function parseInterval(raw: unknown, label: string): Interval {
     const value = p.record(raw, label);
     p.exact(value, ["lower", "upper"], label);
-    return { lower: finiteNumber(value.lower, `${label}.lower`), upper: finiteNumber(value.upper, `${label}.upper`) };
+    const lower = deltaNumber(value.lower, `${label}.lower`);
+    const upper = deltaNumber(value.upper, `${label}.upper`);
+    // `bootstrapInterval` reads both bounds from one sorted sample, so it cannot invert them. An inverted
+    // interval would also read as excluding zero and let a resolution check pass.
+    if (lower > upper) p.fail(`${label}: interval-invalid`);
+    return { lower, upper };
 }
 
-function parseNoiseFloor(raw: unknown, label: string): FamilyNoiseFloor {
+function parseNoiseFloor(raw: unknown, label: string, owner: { familyId: string; endpoint: DeltaEndpoint }): FamilyNoiseFloor {
     const value = p.record(raw, label);
-    const hasEndpoint = Object.hasOwn(value, "endpoint");
-    p.exact(value, hasEndpoint ? ["endpoint", "familyId", "value", "interval"] : ["familyId", "value", "interval"], label);
-    return {
-        ...(hasEndpoint ? { endpoint: p.enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`) } : {}),
-        familyId: p.string(value.familyId, `${label}.familyId`),
-        value: finiteNumber(value.value, `${label}.value`),
-        interval: parseInterval(value.interval, `${label}.interval`),
+    // `calibrationNoiseFloors` copies `endpoint` from a calibration row, where the field is required.
+    p.exact(value, ["endpoint", "familyId", "value", "interval"], label);
+    // A floor is 1.96 * sqrt(variance / n) over deltas in {-1, 0, 1}, whose sample variance is at most 2, so
+    // no calibration yields a floor of 2 or more.
+    const floorValue = p.number(value.value, `${label}.value`, { minimum: 0, maximum: 2 });
+    // `calibrationNoiseFloors` is the only producer and always writes `{ lower: 0, upper: value }`.
+    const rawInterval = p.record(value.interval, `${label}.interval`);
+    p.exact(rawInterval, ["lower", "upper"], `${label}.interval`);
+    const interval = {
+        lower: p.number(rawInterval.lower, `${label}.interval.lower`),
+        upper: p.number(rawInterval.upper, `${label}.interval.upper`),
     };
+    if (interval.lower !== 0 || interval.upper !== floorValue) p.fail(`${label}.interval: derived-mismatch`);
+    const familyId = p.string(value.familyId, `${label}.familyId`);
+    // `familyId` and `endpoint` must identify the series this floor applies to.
+    if (familyId !== owner.familyId) p.fail(`${label}.familyId: floor-owner-mismatch`);
+    const endpoint = p.enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`);
+    if (endpoint !== owner.endpoint) p.fail(`${label}.endpoint: floor-owner-mismatch`);
+    return { endpoint, familyId, value: floorValue, interval };
 }
 
-function parseFamilyEstimate(raw: unknown, label: string): FamilyEstimate {
+function parseFamilyEstimate(
+    raw: unknown,
+    label: string,
+    endpoint: DeltaEndpoint,
+    minimumAnalyzableFamilyCount: number,
+    endpointFamilyCount: number,
+): FamilyEstimate {
     const value = p.record(raw, label);
     p.exact(value, ["familyId", "pointEstimate", "interval", "resolution", "noise"], label);
     const noise = p.record(value.noise, `${label}.noise`);
     p.exact(noise, ["label", "floor"], `${label}.noise`);
-    return {
-        familyId: p.string(value.familyId, `${label}.familyId`),
-        pointEstimate: finiteNumber(value.pointEstimate, `${label}.pointEstimate`),
-        interval: parseInterval(value.interval, `${label}.interval`),
-        resolution: p.enumeration(value.resolution, ["resolved", "unresolved"] as const, `${label}.resolution`),
-        noise: {
-            label: p.enumeration(noise.label, ["no-noise-floor", "inside-floor", "outside-floor"] as const, `${label}.noise.label`),
-            floor: noise.floor === null ? null : parseNoiseFloor(noise.floor, `${label}.noise.floor`),
-        },
-    };
+    const familyId = p.string(value.familyId, `${label}.familyId`);
+    const pointEstimate = deltaNumber(value.pointEstimate, `${label}.pointEstimate`);
+    const isPrimary = (PRIMARY_ENDPOINTS as readonly DeltaEndpoint[]).includes(endpoint);
+    // `noise.floor` is allowed only for primary endpoints.
+    if (!isPrimary && noise.floor !== null) p.fail(`${label}.noise.floor: floor-owner-mismatch`);
+    const floor = noise.floor === null ? null : parseNoiseFloor(noise.floor, `${label}.noise.floor`, { familyId, endpoint });
+    const noiseLabelValue = p.enumeration(noise.label, NOISE_COMPARISONS, `${label}.noise.label`);
+    if (noiseLabelValue !== noiseLabel(pointEstimate, floor)) p.fail(`${label}.noise.label: derived-mismatch`);
+    const interval = parseInterval(value.interval, `${label}.interval`);
+    const resolution = p.enumeration(value.resolution, DELTA_RESOLUTIONS, `${label}.resolution`);
+    // Zero-crossing intervals, inside-floor noise, and insufficient endpoint families each require
+    // `unresolved`. The unpublished per-family observation count only blocks proving the converse.
+    if (
+        resolution === "resolved" &&
+        (includesZero(interval) || noiseLabelValue === "inside-floor" || endpointFamilyCount < minimumAnalyzableFamilyCount)
+    ) {
+        p.fail(`${label}.resolution: derived-mismatch`);
+    }
+    return { familyId, pointEstimate, interval, resolution, noise: { label: noiseLabelValue, floor } };
 }
 
-function parseEndpointEstimates(raw: unknown, label: string): EndpointEstimate[] {
-    return p.array(raw, label).map((entry, index) => {
+// `allowed` is the estimator's bucket for this array: primary, live-regret, or provider-mixed-regret endpoints only.
+function parseEndpointEstimates(
+    raw: unknown,
+    label: string,
+    allowed: readonly DeltaEndpoint[],
+    settings: { minimumAnalyzableFamilyCount: number; bootstrapResamples: number; bootstrapSeed: number },
+): EndpointEstimate[] {
+    const { minimumAnalyzableFamilyCount } = settings;
+    const estimates = p.array(raw, label).map((entry, index) => {
         const itemLabel = `${label}[${index}]`;
         const value = p.record(entry, itemLabel);
         p.exact(value, ["endpoint", "pointEstimate", "interval", "familyCount", "resolution", "families"], itemLabel);
+        const endpoint = p.enumeration(value.endpoint, allowed, `${itemLabel}.endpoint`);
+        const rawFamilies = p.array(value.families, `${itemLabel}.families`);
+        const families = rawFamilies.map((family, familyIndex) =>
+            parseFamilyEstimate(
+                family,
+                `${itemLabel}.families[${familyIndex}]`,
+                endpoint,
+                minimumAnalyzableFamilyCount,
+                rawFamilies.length,
+            ));
+        // `estimateEndpoint` runs only for an endpoint present in the observations, so a row it emits has at
+        // least one family, and one row per distinct family.
+        if (families.length === 0) p.fail(`${itemLabel}.families: families-required`);
+        p.unique(families.map(({ familyId }) => familyId), `${itemLabel}.families`);
+        p.sorted(families, ({ familyId }) => familyId, `${itemLabel}.families`);
+        const familyCount = p.integer(value.familyCount, `${itemLabel}.familyCount`);
+        if (familyCount !== families.length) p.fail(`${itemLabel}.familyCount: derived-mismatch`);
+        const pointEstimate = deltaNumber(value.pointEstimate, `${itemLabel}.pointEstimate`);
+        const interval = parseInterval(value.interval, `${itemLabel}.interval`);
+        const resolution = p.enumeration(value.resolution, DELTA_RESOLUTIONS, `${itemLabel}.resolution`);
+        const familyMeans = families.map((family) => family.pointEstimate);
+        // The aggregate interval is a bootstrap over the published family means with the published settings, so
+        // the work that replay performs is bounded before anything is recomputed.
+        if (familyMeans.length * settings.bootstrapResamples > MAX_BOOTSTRAP_WORK) {
+            p.fail(`${itemLabel}.families: bootstrap-work-too-large`);
+        }
+        // Using the estimator's `mean` prevents last-bit drift during recomputation.
+        if (pointEstimate !== mean(familyMeans)) {
+            p.fail(`${itemLabel}.pointEstimate: derived-mismatch`);
+        }
+        if (canonicalJson(interval) !== canonicalJson(endpointInterval(endpoint, familyMeans, settings))) {
+            p.fail(`${itemLabel}.interval: derived-mismatch`);
+        }
+        // The endpoint rule is recomputable because each term is published. The per-family rule is not:
+        // the report does not carry the per-family observation count.
+        if (resolution !== endpointResolution(families, interval, minimumAnalyzableFamilyCount)) {
+            p.fail(`${itemLabel}.resolution: derived-mismatch`);
+        }
         return {
-            endpoint: p.enumeration(value.endpoint, DELTA_ENDPOINTS, `${itemLabel}.endpoint`),
-            pointEstimate: finiteNumber(value.pointEstimate, `${itemLabel}.pointEstimate`),
-            interval: parseInterval(value.interval, `${itemLabel}.interval`),
-            familyCount: p.integer(value.familyCount, `${itemLabel}.familyCount`),
-            resolution: p.enumeration(value.resolution, ["resolved", "unresolved"] as const, `${itemLabel}.resolution`),
-            families: p.array(value.families, `${itemLabel}.families`)
-                .map((family, familyIndex) => parseFamilyEstimate(family, `${itemLabel}.families[${familyIndex}]`)),
+            endpoint,
+            pointEstimate,
+            interval,
+            familyCount,
+            resolution,
+            families,
         };
     });
+    // `estimateFamilyDeltas` builds one estimate per endpoint name, so a repeat also makes a later lookup
+    // depend on row order.
+    p.unique(estimates.map(({ endpoint }) => endpoint), label);
+    p.sorted(estimates, ({ endpoint }) => endpoint, label);
+    return estimates;
+}
+
+function parseRawRegretRecords(raw: unknown, label: string): FamilyDeltaAnalysis["rawRegretRecords"] {
+    const records = p.array(raw, label).map((entry, index) => {
+        const itemLabel = `${label}[${index}]`;
+        const item = p.record(entry, itemLabel);
+        p.exact(item, ["coordinateId", "familyId", "endpoint", "delta", "inferential"], itemLabel);
+        if (item.inferential !== false) p.fail(`${itemLabel}.inferential: literal-invalid`);
+        return {
+            coordinateId: p.string(item.coordinateId, `${itemLabel}.coordinateId`),
+            familyId: p.string(item.familyId, `${itemLabel}.familyId`),
+            endpoint: p.enumeration(item.endpoint, REGRET_ENDPOINTS, `${itemLabel}.endpoint`),
+            delta: deltaNumber(item.delta, `${itemLabel}.delta`),
+            inferential: false as const,
+        };
+    });
+    // The estimator rejects a repeated endpoint-coordinate pair, and one coordinate under two families would
+    // join two bootstrap clusters, so its family assignment is fixed.
+    p.unique(records.map(({ endpoint, coordinateId }) => tupleKey(endpoint, coordinateId)), label);
+    // `estimateFamilyDeltas` emits raw records in its observation order: endpoint, then family, then coordinate.
+    p.sorted(records, ({ endpoint, familyId, coordinateId }) => [endpoint, familyId, coordinateId], label);
+    const familyByCoordinate = new Map<string, string>();
+    const endpointsByCoordinate = new Map<string, Set<string>>();
+    for (const [index, record] of records.entries()) {
+        const seen = familyByCoordinate.get(record.coordinateId);
+        if (seen === undefined) familyByCoordinate.set(record.coordinateId, record.familyId);
+        else if (seen !== record.familyId) p.fail(`${label}[${index}].familyId: family-conflict`);
+        const endpoints = endpointsByCoordinate.get(record.coordinateId) ?? new Set<string>();
+        endpoints.add(record.endpoint);
+        endpointsByCoordinate.set(record.coordinateId, endpoints);
+    }
+    // Rungs run in order and stop at the first failure, so a later delta exists only with every earlier one.
+    for (const [coordinateId, endpoints] of endpointsByCoordinate) {
+        const deepest = Math.max(...REGRET_LADDER.map((endpoint, depth) => (endpoints.has(endpoint) ? depth : -1)));
+        for (let depth = 0; depth <= deepest; depth += 1) {
+            if (!endpoints.has(REGRET_LADDER[depth]!)) p.fail(`${label}: ladder-prefix-missing-${coordinateId}`);
+        }
+    }
+    return records;
 }
 
 function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
@@ -360,53 +551,162 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
         "bootstrapSeed", "bootstrapResamples", "minimumAnalyzableFamilyCount", "analyzableFamilyCount",
         "evidenceSufficient", "endpoints", "liveRegret", "providerMixedRegret", "rawRegretRecords",
     ], label);
+    const minimumAnalyzableFamilyCount = p.integer(value.minimumAnalyzableFamilyCount, `${label}.minimumAnalyzableFamilyCount`, 1);
+    const analyzableFamilyCount = p.integer(value.analyzableFamilyCount, `${label}.analyzableFamilyCount`);
+    const evidenceSufficient = p.boolean(value.evidenceSufficient, `${label}.evidenceSufficient`);
+    if (evidenceSufficient !== analyzableFamilyCount >= minimumAnalyzableFamilyCount) p.fail(`${label}.evidenceSufficient: derived-mismatch`);
+    const settings = {
+        minimumAnalyzableFamilyCount,
+        bootstrapSeed: p.boundedInteger(value.bootstrapSeed, `${label}.bootstrapSeed`, 0, MAX_BOOTSTRAP_SEED),
+        // Bounded above as well: the regret estimates are replayed with this count before the fingerprint is read.
+        bootstrapResamples: p.boundedInteger(value.bootstrapResamples, `${label}.bootstrapResamples`, MIN_BOOTSTRAP_RESAMPLES, MAX_BOOTSTRAP_RESAMPLES),
+    };
+    const endpoints = parseEndpointEstimates(value.endpoints, `${label}.endpoints`, PRIMARY_ENDPOINTS, settings);
+    if (endpoints.length > 0) {
+        if (endpoints.length !== PRIMARY_ENDPOINTS.length) p.fail(`${label}.endpoints: paired-endpoints-required`);
+        // Family ids are free-form here, so a separator-joined key could be forged by embedding the
+        // separator. Canonical JSON of the sorted ids escapes instead of concatenating.
+        const familyKeys = endpoints.map(({ families }) =>
+            canonicalJson(families.map(({ familyId }) => familyId).sort(compareCodeUnits)));
+        if (new Set(familyKeys).size !== 1) p.fail(`${label}.endpoints: family-set-mismatch`);
+    }
+    const rawRegret = parseRawRegretRecords(value.rawRegretRecords, `${label}.rawRegretRecords`);
+    // `estimateFamilyDeltas` counts the distinct families observed on paired coordinates at the primary
+    // endpoints, and every such family appears under at least one of them, so the union reproduces it.
+    const observedFamilies = new Set(endpoints.flatMap(({ families }) => families.map(({ familyId }) => familyId)));
+    if (analyzableFamilyCount !== observedFamilies.size) p.fail(`${label}.analyzableFamilyCount: derived-mismatch`);
     return {
         poolManifestFingerprint: p.hex64(value.poolManifestFingerprint, `${label}.poolManifestFingerprint`),
         pinnedSnapshotId: p.string(value.pinnedSnapshotId, `${label}.pinnedSnapshotId`),
         policyFingerprint: p.hex64(value.policyFingerprint, `${label}.policyFingerprint`),
         pairedFactsFingerprint: p.hex64(value.pairedFactsFingerprint, `${label}.pairedFactsFingerprint`),
-        bootstrapSeed: p.integer(value.bootstrapSeed, `${label}.bootstrapSeed`),
-        bootstrapResamples: p.integer(value.bootstrapResamples, `${label}.bootstrapResamples`, 1),
-        minimumAnalyzableFamilyCount: p.integer(value.minimumAnalyzableFamilyCount, `${label}.minimumAnalyzableFamilyCount`, 1),
-        analyzableFamilyCount: p.integer(value.analyzableFamilyCount, `${label}.analyzableFamilyCount`),
-        evidenceSufficient: boolean(value.evidenceSufficient, `${label}.evidenceSufficient`),
-        endpoints: parseEndpointEstimates(value.endpoints, `${label}.endpoints`),
-        liveRegret: parseEndpointEstimates(value.liveRegret, `${label}.liveRegret`),
-        providerMixedRegret: parseEndpointEstimates(value.providerMixedRegret, `${label}.providerMixedRegret`),
-        rawRegretRecords: p.array(value.rawRegretRecords, `${label}.rawRegretRecords`).map((entry, index) => {
-            const itemLabel = `${label}.rawRegretRecords[${index}]`;
-            const item = p.record(entry, itemLabel);
-            p.exact(item, ["coordinateId", "familyId", "endpoint", "delta", "inferential"], itemLabel);
-            if (item.inferential !== false) p.fail(`${itemLabel}.inferential: literal-invalid`);
-            return {
-                coordinateId: p.string(item.coordinateId, `${itemLabel}.coordinateId`),
-                familyId: p.string(item.familyId, `${itemLabel}.familyId`),
-                endpoint: p.enumeration(item.endpoint, REGRET_ENDPOINTS, `${itemLabel}.endpoint`),
-                delta: finiteNumber(item.delta, `${itemLabel}.delta`),
-                inferential: false,
-            };
-        }),
+        bootstrapSeed: settings.bootstrapSeed,
+        bootstrapResamples: settings.bootstrapResamples,
+        minimumAnalyzableFamilyCount,
+        analyzableFamilyCount,
+        evidenceSufficient,
+        endpoints,
+        liveRegret: parseEndpointEstimates(value.liveRegret, `${label}.liveRegret`, LIVE_REGRET_ENDPOINTS, settings),
+        providerMixedRegret: parseEndpointEstimates(value.providerMixedRegret, `${label}.providerMixedRegret`, PROVIDER_MIXED_REGRET_ENDPOINTS, settings),
+        rawRegretRecords: rawRegret,
     };
 }
 
-function parseArmMetrics(raw: unknown, label: string): ArmMetrics {
+function parseArmMetrics(
+    raw: unknown,
+    label: string,
+    shape: { maximum?: number; integer?: boolean } = {},
+): ArmMetrics {
     const value = p.record(raw, label);
     const metrics: ArmMetrics = {};
     for (const [armId, metric] of Object.entries(value)) {
         const arm = p.enumeration(armId, ARM_IDS, `${label}.${armId}`);
-        metrics[arm] = finiteNumber(metric, `${label}.${armId}`);
+        // Token and turn totals sum per-rollout counters the runner admits only as safe integers.
+        metrics[arm] = shape.integer
+            ? p.integer(metric, `${label}.${armId}`)
+            : p.number(metric, `${label}.${armId}`, { minimum: 0, maximum: shape.maximum });
     }
     return metrics;
 }
 
-function parseCountRecord(raw: unknown, label: string): Record<string, number> {
-    const value = p.record(raw, label);
-    return Object.fromEntries(
-        Object.entries(value).map(([key, count]) => [key, p.integer(count, `${label}.${key}`, 1)]),
-    );
+
+function mirroredEstimates(raw: unknown, label: string, parsed: EndpointEstimate[]): EndpointEstimate[] {
+    if (canonicalFingerprint(raw) !== canonicalFingerprint(parsed)) p.fail(`${label}: analysis-mismatch`);
+    return parsed;
+}
+
+const NOISE_COMPARISONS = vocabulary<NoiseComparison>({ "no-noise-floor": true, "inside-floor": true, "outside-floor": true });
+const DELTA_RESOLUTIONS = vocabulary<DeltaResolution>({ resolved: true, unresolved: true });
+
+const REFUSED_REGRET_REASONS = vocabulary<NonNullable<PairedDeltaRunResult["coordinates"][number]["regret"]>["refusedReason"] & string>({
+    "base-fingerprint-mismatch": true,
+    "intervention-mismatch": true,
+});
+
+function parseRefusedRegretLadders(raw: unknown, label: string): Record<string, number> {
+    const record = p.countRecord(raw, label);
+    for (const key of Object.keys(record)) p.enumeration(key, REFUSED_REGRET_REASONS, `${label}.${key}`);
+    return record;
 }
 
 /** Strict consumer parser: rejects unknown fields at every level and a `reportFingerprint` that does not match the body. */
+/**
+ * Relates the run summary's rollout counters, exclusions, and the analyzed family count to each other.
+ *
+ * The two cost counters partition the final record array, which holds at most one record per arm per planned
+ * coordinate; exclusions count the non-completed records of that same array; and a healthy coordinate is one
+ * whose every primary arm completed with observed usage. Returns the first rule the inputs break, or null.
+ */
+function rolloutAccountingViolation(
+    summary: PairedDeltaReportBody["runSummary"],
+    exclusions: readonly ExclusionCount[],
+    analysis: FamilyDeltaAnalysis,
+): { path: string; code: string } | null {
+    const { plannedCoordinates, healthyCoordinates, observedCostRollouts, estimatedCostRollouts, status } = summary;
+    const unhealthy = plannedCoordinates - healthyCoordinates;
+    // Each coordinate carries one family, analyzed only when every primary arm completed.
+    if (analysis.analyzableFamilyCount > healthyCoordinates) {
+        return { path: "analysis.analyzableFamilyCount", code: "healthy-coordinate-shortfall" };
+    }
+    const exclusionsByArm = new Map<string, number>();
+    for (const { armId, count } of exclusions) exclusionsByArm.set(armId, (exclusionsByArm.get(armId) ?? 0) + count);
+    for (const [armId, total] of exclusionsByArm) {
+        // A completed cell carries no exclusion, so a primary arm's exclusions fit in the unhealthy remainder.
+        const ceiling = (PRIMARY_ARM_IDS as readonly string[]).includes(armId) ? unhealthy : plannedCoordinates;
+        if (total > ceiling) return { path: "exclusions", code: `${armId}-exceeds-plan` };
+    }
+    const rollouts = observedCostRollouts + estimatedCostRollouts;
+    // A run ends `completed` only if every planned coordinate stored every primary arm.
+    if (status === "completed" && rollouts < plannedCoordinates * PRIMARY_ARM_IDS.length) {
+        return { path: "runSummary.observedCostRollouts", code: "completed-run-shortfall" };
+    }
+    if (rollouts > plannedCoordinates * ARM_IDS.length) {
+        return { path: "runSummary.observedCostRollouts", code: "exceeds-plan" };
+    }
+    // Each raw regret record is a rung whose regret arm completed, and a completed cell is always observed.
+    // Regret arms are never primary arms, so these records add to every primary-arm floor.
+    const rungRecords = new Set(analysis.rawRegretRecords.map(({ coordinateId, endpoint }) => `${coordinateId}\u0000${endpoint}`)).size;
+    // The runner refuses a completed cell priced as an estimate.
+    if (observedCostRollouts < PRIMARY_ARM_IDS.length * healthyCoordinates + rungRecords) {
+        return { path: "runSummary.observedCostRollouts", code: "healthy-coordinate-shortfall" };
+    }
+    // An excluded record is never one of a healthy coordinate's primary records or a completed regret rung.
+    const excludedRecords = exclusions.reduce((sum, { count }) => sum + count, 0);
+    if (rollouts < PRIMARY_ARM_IDS.length * healthyCoordinates + rungRecords + excludedRecords) {
+        return { path: "runSummary.observedCostRollouts", code: "exclusion-shortfall" };
+    }
+    // An estimated cost means no usage came back, which leaves the cell non-completed and therefore excluded.
+    if (estimatedCostRollouts > excludedRecords) {
+        return { path: "runSummary.estimatedCostRollouts", code: "exclusion-shortfall" };
+    }
+    // On a completed run every unhealthy coordinate has a non-completed primary cell, so each contributes an exclusion.
+    if (status === "completed" && excludedRecords < unhealthy) {
+        return { path: "exclusions", code: "unhealthy-coordinate-shortfall" };
+    }
+    // A refusal is counted at most once per planned coordinate, and a coordinate either refused its ladder or
+    // produced raw regret records, never both.
+    const refusedTotal = Object.values(summary.refusedRegretLadders).reduce((sum, count) => sum + count, 0);
+    if (refusedTotal > plannedCoordinates) {
+        return { path: "runSummary.refusedRegretLadders", code: "exceeds-plan" };
+    }
+    const rawCoordinates = new Set(analysis.rawRegretRecords.map(({ coordinateId }) => coordinateId));
+    if (rawCoordinates.size + refusedTotal > plannedCoordinates) {
+        return { path: "analysis.rawRegretRecords", code: "exceeds-plan" };
+    }
+    // The ladder fires only after a completed, observed mc-on cell, so every refused or raw regret coordinate
+    // implies one observed rollout beyond its rungs. It may also be a healthy coordinate, so this floor and
+    // the healthy floor do not add.
+    if (observedCostRollouts < rawCoordinates.size + refusedTotal + rungRecords) {
+        return { path: "runSummary.observedCostRollouts", code: "regret-coordinate-shortfall" };
+    }
+    // A healthy coordinate contributes both primary observations, so healthy evidence implies the paired
+    // endpoint set and at least one family.
+    if (healthyCoordinates > 0 && (analysis.endpoints.length === 0 || analysis.analyzableFamilyCount === 0)) {
+        return { path: "analysis.endpoints", code: "paired-endpoints-required" };
+    }
+    return null;
+}
+
 export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     const root = p.record(raw, "report");
     p.exact(root, ["schema", "body", "reportFingerprint"], "report");
@@ -425,14 +725,14 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
         "status", "spentUsd", "observedCostRollouts", "estimatedCostRollouts", "refusedRegretLadders",
         "plannedCoordinates", "healthyCoordinates", "evidenceComplete", "calibrationFingerprint",
     ], "report.body.runSummary");
+    const analysis = parseAnalysis(value.analysis, "report.body.analysis");
     const body: PairedDeltaReportBody = {
-        limitations: p.array(value.limitations, "report.body.limitations")
-            .map((line, index) => p.string(line, `report.body.limitations[${index}]`)),
+        limitations: p.stringArray(value.limitations, "report.body.limitations"),
         poolManifestFingerprint: p.hex64(value.poolManifestFingerprint, "report.body.poolManifestFingerprint"),
         pinnedSnapshotId: p.string(value.pinnedSnapshotId, "report.body.pinnedSnapshotId"),
         policyFingerprint: p.hex64(value.policyFingerprint, "report.body.policyFingerprint"),
         implementationDigest: p.string(value.implementationDigest, "report.body.implementationDigest"),
-        analysis: parseAnalysis(value.analysis, "report.body.analysis"),
+        analysis,
         exclusions: p.array(value.exclusions, "report.body.exclusions").map((entry, index) => {
             const label = `report.body.exclusions[${index}]`;
             const item = p.record(entry, label);
@@ -444,21 +744,23 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
             };
         }),
         secondaryMetrics: {
-            invalidSuccessRateByArm: parseArmMetrics(secondary.invalidSuccessRateByArm, "report.body.secondaryMetrics.invalidSuccessRateByArm"),
-            finalAttemptTokensByArm: parseArmMetrics(secondary.finalAttemptTokensByArm, "report.body.secondaryMetrics.finalAttemptTokensByArm"),
+            invalidSuccessRateByArm: parseArmMetrics(secondary.invalidSuccessRateByArm, "report.body.secondaryMetrics.invalidSuccessRateByArm", { maximum: 1 }),
+            finalAttemptTokensByArm: parseArmMetrics(secondary.finalAttemptTokensByArm, "report.body.secondaryMetrics.finalAttemptTokensByArm", { integer: true }),
             finalAttemptWallClockMsByArm: parseArmMetrics(secondary.finalAttemptWallClockMsByArm, "report.body.secondaryMetrics.finalAttemptWallClockMsByArm"),
-            finalAttemptTurnsByArm: parseArmMetrics(secondary.finalAttemptTurnsByArm, "report.body.secondaryMetrics.finalAttemptTurnsByArm"),
+            finalAttemptTurnsByArm: parseArmMetrics(secondary.finalAttemptTurnsByArm, "report.body.secondaryMetrics.finalAttemptTurnsByArm", { integer: true }),
         },
         regret: {
-            live: parseEndpointEstimates(regret.live, "report.body.regret.live"),
-            providerMixed: parseEndpointEstimates(regret.providerMixed, "report.body.regret.providerMixed"),
+            // The builder publishes the analysis arrays here verbatim, so the raw views are compared against the
+            // parsed analysis rather than parsed a second time.
+            live: mirroredEstimates(regret.live, "report.body.regret.live", analysis.liveRegret),
+            providerMixed: mirroredEstimates(regret.providerMixed, "report.body.regret.providerMixed", analysis.providerMixedRegret),
             raw: p.array(regret.raw, "report.body.regret.raw").map((entry, index) => {
                 const label = `report.body.regret.raw[${index}]`;
                 const item = p.record(entry, label);
                 p.exact(item, ["coordinateId", "familyId", "retrieval", "formation", "representation", "label"], label);
                 if (item.label !== "raw-non-inferential") p.fail(`${label}.label: literal-invalid`);
                 const rung = (field: "retrieval" | "formation" | "representation"): number | null =>
-                    item[field] === null ? null : finiteNumber(item[field], `${label}.${field}`);
+                    item[field] === null ? null : deltaNumber(item[field], `${label}.${field}`);
                 return {
                     coordinateId: p.string(item.coordinateId, `${label}.coordinateId`),
                     familyId: p.string(item.familyId, `${label}.familyId`),
@@ -471,18 +773,103 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
         },
         runSummary: {
             status: p.enumeration(summary.status, RUN_STATUSES, "report.body.runSummary.status"),
-            spentUsd: finiteNumber(summary.spentUsd, "report.body.runSummary.spentUsd"),
+            spentUsd: nonNegativeNumber(summary.spentUsd, "report.body.runSummary.spentUsd"),
             observedCostRollouts: p.integer(summary.observedCostRollouts, "report.body.runSummary.observedCostRollouts"),
             estimatedCostRollouts: p.integer(summary.estimatedCostRollouts, "report.body.runSummary.estimatedCostRollouts"),
-            refusedRegretLadders: parseCountRecord(summary.refusedRegretLadders, "report.body.runSummary.refusedRegretLadders"),
-            plannedCoordinates: p.integer(summary.plannedCoordinates, "report.body.runSummary.plannedCoordinates"),
+            refusedRegretLadders: parseRefusedRegretLadders(summary.refusedRegretLadders, "report.body.runSummary.refusedRegretLadders"),
+            // A dispatch plans a non-empty selection at a positive replicate depth.
+            plannedCoordinates: p.integer(summary.plannedCoordinates, "report.body.runSummary.plannedCoordinates", 1),
             healthyCoordinates: p.integer(summary.healthyCoordinates, "report.body.runSummary.healthyCoordinates"),
-            evidenceComplete: boolean(summary.evidenceComplete, "report.body.runSummary.evidenceComplete"),
+            evidenceComplete: p.boolean(summary.evidenceComplete, "report.body.runSummary.evidenceComplete"),
             calibrationFingerprint: summary.calibrationFingerprint === null
                 ? null
                 : p.hex64(summary.calibrationFingerprint, "report.body.runSummary.calibrationFingerprint"),
         },
     };
+    // The fingerprint is an unkeyed digest over the same bytes, so it detects corruption but not a rewritten body.
+    if (
+        body.analysis.poolManifestFingerprint !== body.poolManifestFingerprint ||
+        body.analysis.pinnedSnapshotId !== body.pinnedSnapshotId ||
+        body.analysis.policyFingerprint !== body.policyFingerprint
+    ) {
+        p.fail("report.body.analysis: lane-binding-mismatch");
+    }
+    p.unique(body.exclusions.map(({ armId, reasonCode }) => `${armId}:${reasonCode}`), "report.body.exclusions");
+    // The builder sorts both arrays by the same keys.
+    p.sorted(body.exclusions, ({ armId, reasonCode }) => `${armId}:${reasonCode}`, "report.body.exclusions");
+    p.sorted(body.limitations, (line) => line, "report.body.limitations");
+    if (body.runSummary.healthyCoordinates > body.runSummary.plannedCoordinates) {
+        p.fail("report.body.runSummary.healthyCoordinates: integer-invalid");
+    }
+    // Outside calibration, completeness is the estimator's sufficiency over a fully healthy matrix.
+    if (body.runSummary.calibrationFingerprint !== null) {
+        const derived = body.analysis.evidenceSufficient && body.runSummary.healthyCoordinates >= body.runSummary.plannedCoordinates;
+        if (body.runSummary.evidenceComplete !== derived) p.fail("report.body.runSummary.evidenceComplete: derived-mismatch");
+    } else if (body.runSummary.evidenceComplete) {
+        // Calibration completeness is `validForPoolSizing`, which requires a completed run and full replicate
+        // depth counted over complete-primary coordinates. Variance validity is not recoverable here.
+        if (body.runSummary.status !== "completed" || body.runSummary.healthyCoordinates !== body.runSummary.plannedCoordinates) {
+            p.fail("report.body.runSummary.evidenceComplete: derived-mismatch");
+        }
+    }
+    // The estimator emits an aggregate for every endpoint present in the observations.
+    const aggregateEndpoints = new Set([...body.analysis.liveRegret, ...body.analysis.providerMixedRegret].map(({ endpoint }) => endpoint));
+    const rawEndpoints = new Set<string>(body.analysis.rawRegretRecords.map(({ endpoint }) => endpoint));
+    for (const [index, record] of body.analysis.rawRegretRecords.entries()) {
+        if (!aggregateEndpoints.has(record.endpoint)) {
+            p.fail(`report.body.analysis.rawRegretRecords[${index}].endpoint: aggregate-required`);
+        }
+    }
+    // And only for those endpoints: an aggregate with no observation behind it is unsupported.
+    for (const endpoint of aggregateEndpoints) {
+        if (!rawEndpoints.has(endpoint)) p.fail(`report.body.analysis: aggregate-without-raw-${endpoint}`);
+    }
+    // The replay below samples every archived regret record `bootstrapResamples` times, so the two archive-
+    // supplied sizes are bounded together before any of that work starts.
+    if (body.analysis.rawRegretRecords.length * body.analysis.bootstrapResamples > MAX_BOOTSTRAP_WORK) {
+        p.fail("report.body.analysis.rawRegretRecords: bootstrap-work-too-large");
+    }
+    const accounting = rolloutAccountingViolation(body.runSummary, body.exclusions, body.analysis);
+    if (accounting !== null) p.fail(`report.body.${accounting.path}: ${accounting.code}`);
+    // Every regret observation is archived with the bootstrap settings, so each regret estimate is recomputed
+    // whole: families, means, intervals, and resolutions.
+    for (const [view, estimates] of [["liveRegret", body.analysis.liveRegret], ["providerMixedRegret", body.analysis.providerMixedRegret]] as const) {
+        for (const [index, estimate] of estimates.entries()) {
+            const recomputed = estimateRegretEndpoint(
+                estimate.endpoint as RegretEndpoint,
+                body.analysis.rawRegretRecords,
+                body.analysis,
+            );
+            if (canonicalJson(recomputed) !== canonicalJson(estimate)) {
+                p.fail(`report.body.analysis.${view}[${index}]: derived-mismatch`);
+            }
+        }
+    }
+    // A usage-unmeasured run stored the estimated-cost failure that produced the status.
+    if (body.runSummary.status === "usage-unmeasured" && body.runSummary.estimatedCostRollouts === 0) {
+        p.fail("report.body.runSummary.estimatedCostRollouts: status-evidence-required");
+    }
+    // A healthy coordinate completed every primary arm, so each metric map carries a value for each of them.
+    if (body.runSummary.healthyCoordinates > 0) {
+        for (const [field, metrics] of Object.entries(body.secondaryMetrics)) {
+            for (const armId of PRIMARY_ARM_IDS) {
+                if (!(armId in metrics)) p.fail(`report.body.secondaryMetrics.${field}.${armId}: arm-required`);
+            }
+        }
+    }
+    // Every primary family in a run that consumed a calibration has a calibrated floor.
+    if (body.runSummary.calibrationFingerprint !== null) {
+        for (const [index, endpoint] of body.analysis.endpoints.entries()) {
+            for (const [familyIndex, family] of endpoint.families.entries()) {
+                if (family.noise.floor === null) {
+                    p.fail(`report.body.analysis.endpoints[${index}].families[${familyIndex}].noise.floor: floor-required`);
+                }
+            }
+        }
+    }
+    if (canonicalFingerprint(body.regret.raw) !== canonicalFingerprint(rawRegretLadder(body.analysis.rawRegretRecords))) {
+        p.fail("report.body.regret.raw: analysis-mismatch");
+    }
     const reportFingerprint = p.hex64(root.reportFingerprint, "report.reportFingerprint");
     if (canonicalFingerprint(body) !== reportFingerprint) p.fail("report.reportFingerprint: fingerprint-mismatch");
     return { schema: PAIRED_DELTA_REPORT_SCHEMA, body, reportFingerprint };
@@ -786,7 +1173,7 @@ export function publishCalibrationRecord(
 /**
  * Whether a noise row could have come from real observations.
  *
- * A primary endpoint delta is one of `{-1, 0, 1}`, so `n` observations are a count triple over those three values, and the row's spread fixes which values occur: 0 means one value, 1 means two adjacent values, 2 means both endpoints. The sample variance of every such triple is enumerated and the row must match one. A floor alone still admits values between reachable ones — three observations spanning 2 produce only 1 or 4/3, and a claimed 1.01 would clear a floor of 1 and derive a smaller pool than the genuine 4/3 pilot. The relationship is checked rather than the discrete observations retained, since the record is a summary by design. commentlint: allow(JUDGE)
+ * A primary endpoint delta is one of `{-1, 0, 1}`, so `n` observations are a count triple over those three values, and the row's spread fixes which values occur: 0 means one value, 1 means two adjacent values, 2 means both endpoints. The sample variance of every such triple is enumerated and the row must match one. A floor alone still admits values between reachable ones — three observations spanning 2 produce only 1 or 4/3, and a claimed 1.01 would clear a floor of 1 and derive a smaller pool than the genuine 4/3 pilot. The relationship is checked rather than the discrete observations retained, since the record is a summary by design.
  */
 function arithmeticallyReachable(noise: CalibrationFamilyNoise): boolean {
     const n = noise.observationCount;
@@ -833,7 +1220,7 @@ const MAX_ENDPOINT_SPREAD = 2;
 /** Observations per series a reader will enumerate over. At `replicateCount: 3` a family of five scenarios yields 15; the weekly cost budget cannot reach a small fraction of this. */
 const MAX_CALIBRATION_OBSERVATIONS = 1_024;
 
-/** Relative slack for the writer's floating-point variance — it sums squared deviations from a rounded mean and can land one ulp off the closed form — and far below the gap between any two reachable variances, which is at least `1/(n(n-1))`. commentlint: allow(JUDGE) */
+/** Relative slack for the writer's floating-point variance — it sums squared deviations from a rounded mean and can land one ulp off the closed form — and far below the gap between any two reachable variances, which is at least `1/(n(n-1))`. */
 const VARIANCE_TOLERANCE = 1e-9;
 
 export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecord {
@@ -896,7 +1283,7 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
         !Number.isSafeInteger(noise.observationCount) || noise.observationCount > maxObservations)) {
         throw new Error("paired-delta-calibration: observation-count-exceeds-depth");
     }
-    /** The depth sum is the record's own claim, so it bounds nothing on its own; a fixed ceiling does. `reachableVariances` visits `n²/2` count pairs, and at the ceiling that is about half a million, well inside a preflight's budget and two orders of magnitude above any pilot this lane can afford. commentlint: allow(JUDGE) */
+    /** The depth sum is the record's own claim, so it bounds nothing on its own; a fixed ceiling does. `reachableVariances` visits `n²/2` count pairs, and at the ceiling that is about half a million, well inside a preflight's budget and two orders of magnitude above any pilot this lane can afford. */
     if (measured.some((noise) => noise.observationCount > MAX_CALIBRATION_OBSERVATIONS)) {
         throw new Error("paired-delta-calibration: observation-count-exceeds-ceiling");
     }
@@ -927,11 +1314,11 @@ export function readCalibrationRecord(path: string): PairedDeltaCalibrationRecor
             record.decisions.familyCount,
         )
         : null;
-    /** The declared depth exactly: `buildCalibrationRecord` records `replicateCount` per scenario, and the decisions check above already refused a count below 1, so a floor here would reject a record the writer built correctly at depth 1. commentlint: allow(JUDGE) */
+    /** The declared depth exactly: `buildCalibrationRecord` records `replicateCount` per scenario, and the decisions check above already refused a count below 1, so a floor here would reject a record the writer built correctly at depth 1. */
     const depth = record.decisions.replicateCount;
     /** Per scenario, not per family: a family with two scenarios is satisfied by one of them at full depth if only the aggregate is checked. */
     const perScenario = record.scenarioDepth as Record<string, number> | null | undefined;
-    /** Exactly the declared depth, not at least it: the rollout matrix holds `replicateCount` coordinates per scenario and the store keeps one record per coordinate, so a larger depth describes observations the writer cannot have made, and inflating every depth and `observationCount` together clears the family-sum cross-check while the larger `n` admits a smaller variance. commentlint: allow(JUDGE) */
+    /** Exactly the declared depth, not at least it: the rollout matrix holds `replicateCount` coordinates per scenario and the store keeps one record per coordinate, so a larger depth describes observations the writer cannot have made, and inflating every depth and `observationCount` together clears the family-sum cross-check while the larger `n` admits a smaller variance. */
     const depthPerScenario = perScenario !== null && perScenario !== undefined &&
         typeof perScenario === "object" &&
         Object.keys(perScenario).length > 0 &&

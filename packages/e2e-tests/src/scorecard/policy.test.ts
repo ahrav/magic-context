@@ -3,21 +3,27 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { canonicalFingerprint, canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { scanForSensitiveContent } from "../../../plugin/scripts/retrieval-benchmark/privacy";
+import { parsePairedDeltaPolicy } from "../paired-delta/contract";
 import { parsePolicyOwnerDocument } from "../prospective-holdout/contract";
 import { validateFreezePolicies } from "../prospective-holdout/freeze";
 import { freezeManifest, readyPolicies } from "../prospective-holdout/test-fixtures";
 import {
     METRIC_SLOT_IDS,
+    PRIMARY_ENDPOINT_SLOTS,
     SCORECARD_GATE_IDS,
     SCORECARD_POLICY_OWNER,
     SCORECARD_POLICY_SCHEMA,
     ScorecardContractError,
     parseScorecardPolicy,
     scorecardPolicyFingerprint,
+    type MetricSlotId,
+    type ScorecardPolicy,
 } from "./policy";
 import { PAIRED_DELTA_POLICY_FP, policyDocumentFixture, policyFixture, requiredLanesWith } from "./test-fixtures";
 
 const COMMITTED_POLICY_PATH = join(import.meta.dir, "..", "..", "prospective-holdout", "policies", "scorecard-policy.json");
+const PAIRED_DELTA_POLICY_PATH = join(import.meta.dir, "..", "..", "pools", "paired-delta-policy.json");
+const PAIRED_DELTA_POLICY_OWNER = "magic-context-x4l.14";
 
 function expectRejects(raw: unknown, code: string): void {
     expect(() => parseScorecardPolicy(raw)).toThrow(new RegExp(code.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -37,7 +43,7 @@ describe("parseScorecardPolicy", () => {
         const { replicateCount: _dropped, ...missing } = policyFixture();
         expectRejects(missing, "policy: fields-invalid");
         expectRejects({ ...policyFixture(), weighting: 1 }, "policy: fields-invalid");
-        expect(() => canonicalJson({ ...policyFixture(), replicateCount: undefined })).toThrow();
+        expectRejects({ ...policyFixture(), replicateCount: undefined }, "policy.replicateCount: integer-invalid");
     });
 
     it("requires the exact five gate ids in order", () => {
@@ -88,6 +94,38 @@ describe("parseScorecardPolicy", () => {
         expect(new Set(METRIC_SLOT_IDS).size).toBe(METRIC_SLOT_IDS.length);
     });
 
+    it("requires the primary endpoint's own delta slot", () => {
+        const pairs = Object.entries(PRIMARY_ENDPOINT_SLOTS) as [ScorecardPolicy["primaryEndpoint"], MetricSlotId][];
+        for (const [primaryEndpoint, slot] of pairs) {
+            const other = METRIC_SLOT_IDS.find((id) => id !== slot)!;
+            expectRejects(
+                policyFixture({ primaryEndpoint, requiredMetricSlots: [other] }),
+                "policy.requiredMetricSlots: primary-endpoint-slot-required",
+            );
+            expect(parseScorecardPolicy(policyFixture({ primaryEndpoint, requiredMetricSlots: [slot] })).primaryEndpoint)
+                .toBe(primaryEndpoint);
+        }
+    });
+
+    it("requires a non-empty model matrix with distinct provider/model identities", () => {
+        const [model] = policyFixture().modelMatrix;
+        expectRejects(policyFixture({ modelMatrix: [] }), "policy.modelMatrix: empty");
+        expectRejects(policyFixture({ modelMatrix: [model!, model!] }), "policy.modelMatrix: duplicate");
+        expectRejects(
+            policyFixture({ modelMatrix: [model!, { ...model!, contextLimit: model!.contextLimit * 2 }] }),
+            "policy.modelMatrix: duplicate",
+        );
+        expect(parseScorecardPolicy(policyFixture({ modelMatrix: [model!, { ...model!, modelId: "other-model" }] })).modelMatrix)
+            .toHaveLength(2);
+    });
+
+    it("requires a positive release cost budget", () => {
+        for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, "100"]) {
+            expectRejects(policyFixture({ releaseCostBudgetUsd: value as never }), "policy.releaseCostBudgetUsd: positive-number-required");
+        }
+        expect(parseScorecardPolicy(policyFixture({ releaseCostBudgetUsd: 0.5 })).releaseCostBudgetUsd).toBe(0.5);
+    });
+
     it("requires a hex64 paired-delta binding and allows a null baseline", () => {
         expectRejects(policyFixture({ pairedDeltaPolicyFingerprint: "abc" }), "policy.pairedDeltaPolicyFingerprint: fingerprint-invalid");
         expect(parseScorecardPolicy(policyFixture({ baselineScorecardReportFingerprint: null })).baselineScorecardReportFingerprint).toBeNull();
@@ -95,9 +133,11 @@ describe("parseScorecardPolicy", () => {
             .toBe(PAIRED_DELTA_POLICY_FP);
     });
 
-    it("requires at least one unique canary scenario id", () => {
+    it("requires at least one unique canary scenario id from the historian scenario grammar", () => {
         expectRejects(policyFixture({ injectionCanaryScenarioIds: [] }), "policy.injectionCanaryScenarioIds: empty");
-        expectRejects(policyFixture({ injectionCanaryScenarioIds: ["a-b", "a-b"] }), "policy.injectionCanaryScenarioIds: duplicate");
+        expectRejects(policyFixture({ injectionCanaryScenarioIds: ["hse-a-b", "hse-a-b"] }), "policy.injectionCanaryScenarioIds: duplicate");
+        expectRejects(policyFixture({ injectionCanaryScenarioIds: ["hse_webhook_docs_injection"] }), "policy.injectionCanaryScenarioIds[0]: id-invalid");
+        expectRejects(policyFixture({ injectionCanaryScenarioIds: ["webhook-docs-injection"] }), "policy.injectionCanaryScenarioIds[0]: id-invalid");
     });
 });
 
@@ -112,6 +152,19 @@ describe("committed scorecard policy document", () => {
         expect(policy.schema).toBe(SCORECARD_POLICY_SCHEMA);
         expect(document.policyFingerprint).toBe(scorecardPolicyFingerprint(policy));
         expect(policy.baselineScorecardReportFingerprint).toBeNull();
+    });
+
+    it("binds the committed paired-delta policy and restates its matrix, replicate count, and release budget", () => {
+        const pairedDeltaRaw = JSON.parse(readFileSync(PAIRED_DELTA_POLICY_PATH, "utf8")) as unknown;
+        const pairedDeltaDocument = parsePolicyOwnerDocument(pairedDeltaRaw, PAIRED_DELTA_POLICY_OWNER);
+        expect(pairedDeltaDocument.status).toBe("ready");
+        const pairedDelta = parsePairedDeltaPolicy(pairedDeltaDocument.policy);
+        const policy = parseScorecardPolicy(parsePolicyOwnerDocument(raw, SCORECARD_POLICY_OWNER).policy);
+        expect(pairedDeltaDocument.policyFingerprint).not.toBeNull();
+        expect(policy.pairedDeltaPolicyFingerprint).toBe(pairedDeltaDocument.policyFingerprint!);
+        expect(policy.modelMatrix).toEqual(pairedDelta.modelMatrix);
+        expect(policy.replicateCount).toBe(pairedDelta.replicateCount);
+        expect(policy.releaseCostBudgetUsd).toBe(pairedDelta.costBudgetUsd.release);
     });
 
     it("is written as canonical two-space JSON", () => {

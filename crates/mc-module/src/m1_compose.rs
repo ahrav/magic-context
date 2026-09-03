@@ -12,22 +12,14 @@ use crate::memory_render::{
     assemble_m1, render_new_compartments, render_user_profile_block, M1_PLACEHOLDER,
 };
 
-#[derive(Debug)]
+/// Failure to read composition state, or a compartment range that overlaps or fails to advance.
+#[derive(thiserror::Error, Debug)]
 pub enum M1ComposeError {
+    #[error("store: {0}")]
     Store(McStoreError),
+    #[error("{0}")]
     CoverageGap(CoverageGap),
 }
-
-impl std::fmt::Display for M1ComposeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Store(error) => write!(f, "store: {error}"),
-            Self::CoverageGap(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for M1ComposeError {}
 
 impl From<McStoreError> for M1ComposeError {
     fn from(error: McStoreError) -> Self {
@@ -48,12 +40,23 @@ pub struct M1RevisionSignal {
     pub user_profile_version: u64,
 }
 
+/// Wall-clock read timings in milliseconds.
+///
+/// `notes_ms` remains available to callers but this module currently records
+/// revision snapshot reads in `memories_ms` only.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct M1RevisionReadTimings {
     pub memories_ms: f64,
     pub notes_ms: f64,
 }
 
+/// Computes nonzero in-session and external revision hashes.
+///
+/// The in-session hash covers the canonical snapshot vector when memory is
+/// enabled, maximum compartment sequence, note status version, and user profile
+/// version. The external hash covers only the optional canonical vector. Store
+/// and vector-canonicalization failures return [`McStoreError`]. Elapsed read
+/// time, when requested, is accumulated in milliseconds.
 #[allow(clippy::too_many_arguments)]
 pub fn m1_revision_signal_parts_for_claims_timed(
     store: &McStore,
@@ -95,6 +98,7 @@ pub fn m1_revision_signal_parts_for_claims_timed(
     })
 }
 
+/// Rendered M1 body plus state that the caller must publish after delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct M1Composition {
     pub body: String,
@@ -105,6 +109,10 @@ pub struct M1Composition {
     pub notes_block: String,
 }
 
+/// Atomically claims eligible notes and renders them in delivery order.
+///
+/// Returns store errors from note claiming. An empty claim renders as an empty
+/// string and produces no delivery records.
 pub fn claim_and_render_notes(
     store: &McStore,
     project_path: &str,
@@ -153,6 +161,10 @@ fn render_note_delta(notes: &[StoredNote]) -> String {
     lines.join("\n")
 }
 
+/// Composes new compartments, a changed user profile, and newly claimed notes.
+///
+/// Compartment order follows the store result. A compartment whose `start_message` does not advance past the previous `end_message` returns [`M1ComposeError::CoverageGap`], while sparse ordinal gaps are permitted; store reads and note claims return [`M1ComposeError::Store`].
+/// User profile budget units are tokens. Profile trimming receives 25 percent of that budget, clamped to at least one token.
 #[allow(clippy::too_many_arguments)]
 pub fn compose_m1_from_claim_mirror(
     store: &McStore,

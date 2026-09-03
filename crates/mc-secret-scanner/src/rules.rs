@@ -1,3 +1,9 @@
+//! Embedded secret-rule loading, validation, preselection, and semantic hashing.
+//!
+//! Construction verifies source digests before parsing. Rules are ordered by
+//! source and name, then indexed by a fixed 256-bit mask. Preselection is
+//! allocation-free after construction and preserves rule-vector order.
+
 use std::collections::BTreeSet;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
@@ -5,10 +11,15 @@ use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{ConstructionError, RuleSource, ScanLimits, ScanProfile};
+use crate::{
+    ConstructionError, RuleSource, ScanLimits, ScanProfile, MAX_LOCAL_CONTEXT_BYTES,
+    MAX_RULE_RADIUS,
+};
 
+/// Expected SHA-256 digest of the embedded upstream rule document.
 pub const UPSTREAM_CORPUS_SHA256: &str =
     "2f1292b50148d38afe3ebdb7c489449d103b75b7df464e06da0d5d7c89ac2820";
+/// Expected SHA-256 digest of the embedded conservative overlay document.
 pub const CONSERVATIVE_OVERLAY_SHA256: &str =
     "973181a0af049fb4c0ae06160cd022b1beae3660b87ac9fa4d498864912b3487";
 
@@ -59,6 +70,9 @@ struct RuleDocument {
     rules: Vec<RuleDeclaration>,
 }
 
+/// Parsed rule policy retained verbatim for semantic hashing.
+///
+/// Unknown document fields are rejected during deserialization.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuleDeclaration {
@@ -173,12 +187,16 @@ pub(crate) enum OfflineValidationKind {
     SlackToken,
 }
 
+/// Compiled declaration and its prepared candidate filters.
 pub(crate) struct Rule {
     pub source: RuleSource,
     pub declaration: RuleDeclaration,
     pub regex: Regex,
+    pub keyword_matcher: Option<AhoCorasick>,
+    pub suppressor_matcher: Option<AhoCorasick>,
 }
 
+/// Verified rule collection with anchor and safelist indexes.
 pub(crate) struct RuleSet {
     rules: Vec<Rule>,
     anchors: AhoCorasick,
@@ -233,6 +251,13 @@ impl RuleMask {
 }
 
 impl RuleSet {
+    /// Loads embedded upstream and overlay documents after digest verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConstructionError`] for digest mismatch, malformed YAML,
+    /// duplicate or invalid policy, excess rule count, or regex construction
+    /// failure.
     pub fn from_embedded() -> Result<Self, ConstructionError> {
         Self::from_sources(
             UPSTREAM_BYTES,
@@ -293,6 +318,10 @@ impl RuleSet {
         })
     }
 
+    /// Iterates active rules in canonical source-and-name order.
+    ///
+    /// Comprehensive scans include both sources. Conservative scans include only
+    /// overlay rules.
     pub fn active(&self, profile: ScanProfile) -> impl Iterator<Item = &Rule> {
         self.rules.iter().filter(move |rule| {
             profile == ScanProfile::Comprehensive || rule.source == RuleSource::ConservativeOverlay
@@ -318,14 +347,25 @@ impl RuleSet {
         selected.iter().map(|index| &self.rules[index])
     }
 
+    /// Tests candidate context bytes against context suppressors.
     pub fn context_is_safelisted(&self, bytes: &[u8]) -> bool {
         self.context_safelist.is_match(bytes)
     }
 
+    /// Tests candidate value bytes against value-only suppressors.
     pub fn value_is_safelisted(&self, bytes: &[u8]) -> bool {
         self.value_safelist.is_match(bytes)
     }
 
+    /// Hashes all finding-affecting rule, profile, limit, and evaluator inputs.
+    ///
+    /// Integer limits use little-endian 64-bit encoding. Rules are sorted before
+    /// encoding, so storage order does not affect the digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConstructionError::InvalidRulePolicy`] if a validated declaration
+    /// cannot be serialized.
     pub fn semantic_digest(
         &self,
         profile: ScanProfile,
@@ -451,11 +491,32 @@ fn compile_rule(
     {
         return Err(ConstructionError::InvalidRulePattern);
     }
+    let keyword_matcher = declaration
+        .keywords_any
+        .as_deref()
+        .map(build_case_insensitive_matcher)
+        .transpose()?;
+    let suppressor_matcher = declaration
+        .value_suppressors_any
+        .as_deref()
+        .map(build_case_insensitive_matcher)
+        .transpose()?;
     Ok(Rule {
         source,
         declaration,
         regex,
+        keyword_matcher,
+        suppressor_matcher,
     })
+}
+
+fn build_case_insensitive_matcher(patterns: &[String]) -> Result<AhoCorasick, ConstructionError> {
+    AhoCorasickBuilder::new()
+        // The evaluator probes these matchers with `find_overlapping_iter`, which panics for every match kind except `Standard`.
+        .match_kind(MatchKind::Standard)
+        .ascii_case_insensitive(true)
+        .build(patterns)
+        .map_err(|_| ConstructionError::InvalidRulePattern)
 }
 
 fn validate_policy(rule: &RuleDeclaration) -> Result<(), ConstructionError> {
@@ -490,14 +551,16 @@ fn validate_policy(rule: &RuleDeclaration) -> Result<(), ConstructionError> {
         .char_class
         .as_ref()
         .is_some_and(|spec| spec.max_lower_pct > 100 || spec.min_window_len < 16)
+        || rule.radius > MAX_RULE_RADIUS
         || rule.two_phase.as_ref().is_some_and(|spec| {
             spec.seed_radius > spec.full_radius
+                || spec.full_radius > MAX_RULE_RADIUS
                 || spec.confirm_any.is_empty()
                 || spec.confirm_any.iter().any(String::is_empty)
         })
         || rule.local_context.as_ref().is_some_and(|spec| {
-            spec.lookbehind > 1024
-                || spec.lookahead > 1024
+            spec.lookbehind > MAX_LOCAL_CONTEXT_BYTES
+                || spec.lookahead > MAX_LOCAL_CONTEXT_BYTES
                 || spec
                     .key_names_any
                     .as_ref()
@@ -570,6 +633,9 @@ fn encode_rule(hash: &mut Sha256, rule: &Rule) -> Result<(), ConstructionError> 
 mod tests {
     use super::*;
 
+    /// Pattern count above which `AhoCorasickKind::Auto` stops building a DFA and falls back to a contiguous NFA.
+    const AUTO_DFA_PATTERN_LIMIT: usize = 100;
+
     /// A matching rule must be preselected because unselected rules are not
     /// evaluated.
     #[test]
@@ -617,6 +683,49 @@ mod tests {
     fn embedded_sources_match_expected_digests() {
         assert_eq!(digest_hex(UPSTREAM_BYTES), UPSTREAM_CORPUS_SHA256);
         assert_eq!(digest_hex(OVERLAY_BYTES), CONSERVATIVE_OVERLAY_SHA256);
+    }
+
+    // The evaluator probes keyword and suppressor matchers with `find_overlapping_iter`, which panics for every match kind except `Standard`.
+    // `AhoCorasickKind::Auto` builds a DFA for an unanchored automaton holding at most 100 patterns, so the kind assertion below holds without pinning the kind and forfeiting the contiguous-NFA fallback that keeps a larger list from failing construction.
+    #[test]
+    fn every_prepared_matcher_supports_overlapping_search() {
+        let rules = RuleSet::from_embedded().unwrap();
+        let mut prepared = 0;
+        for rule in rules.active(ScanProfile::Comprehensive) {
+            for (patterns, matcher) in [
+                (&rule.declaration.keywords_any, &rule.keyword_matcher),
+                (
+                    &rule.declaration.value_suppressors_any,
+                    &rule.suppressor_matcher,
+                ),
+            ] {
+                let (Some(patterns), Some(matcher)) = (patterns, matcher) else {
+                    continue;
+                };
+                assert!(
+                    matches!(matcher.match_kind(), MatchKind::Standard),
+                    "{} builds a matcher whose match kind rejects overlapping search",
+                    rule.declaration.name
+                );
+                assert!(
+                    patterns.len() <= AUTO_DFA_PATTERN_LIMIT,
+                    "{} declares {} patterns, past the limit that keeps `Auto` on a DFA",
+                    rule.declaration.name,
+                    patterns.len()
+                );
+                assert!(
+                    matches!(matcher.kind(), AhoCorasickKind::DFA),
+                    "{} resolves overlapping search with {:?} rather than a DFA",
+                    rule.declaration.name,
+                    matcher.kind()
+                );
+                let _ = matcher
+                    .find_overlapping_iter(b"placeholder example")
+                    .count();
+                prepared += 1;
+            }
+        }
+        assert!(prepared > 0, "no rule compiled a prepared matcher");
     }
 
     #[test]

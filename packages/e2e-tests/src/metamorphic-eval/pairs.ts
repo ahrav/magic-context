@@ -7,7 +7,7 @@ import {
 } from "../historian-eval/contract";
 import type { MetamorphicReportEntry, PairKey } from "./report";
 import type { Transform, TurnTransform } from "./transforms";
-import { remapGold } from "./transforms";
+import { derivativeScenarioId, remapGold } from "./transforms";
 
 type PairRejection = Extract<MetamorphicReportEntry, { kind: "lint-red" | "error" }>;
 
@@ -85,6 +85,11 @@ export function admitPair(
                 authoredSemanticsOutsideTranscript(base)
         ) {
             diagnostics.push("derivative changed authored fields outside the transcript and gold");
+        }
+        // The report binds a derivative score to its pair by reconstructing this id, so a transform that
+        // names its derivative any other way would publish a report the parser refuses.
+        if (derivative.scenario.id !== derivativeScenarioId(key)) {
+            diagnostics.push(`derivative id ${derivative.scenario.id} is not derived from its pair key`);
         }
         if (diagnostics.length > 0) {
             return {

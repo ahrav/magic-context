@@ -1,11 +1,14 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { REPORT_SCHEMA_VERSION as RETRIEVAL_REPORT_SCHEMA } from "../../../plugin/scripts/retrieval-benchmark/report";
-import { GATE_ID_RE, REASON_CODE_RE, makeContractPrimitives } from "../contract-primitives";
+import { REPORT_SCHEMA_VERSION as RETRIEVAL_REPORT_SCHEMA, type BenchmarkReport } from "../../../plugin/scripts/retrieval-benchmark/report";
+import { REASON_CODE_RE, makeContractPrimitives, vocabulary } from "../contract-primitives";
 import { DREAMER_EVAL_REPORT_SCHEMA } from "../dreamer-eval/contract";
+import { SCENARIO_ID_RE } from "../historian-eval/contract";
+import type { SystemVersionTuple } from "../historian-eval/runner";
 import { LANE_REPORT_SCHEMA as HISTORIAN_REPORT_SCHEMA } from "../historian-eval/scorer";
+import { parseSystemVersionTuple } from "../historian-eval/system-tuple";
 import { INCIDENT_REPORT_SCHEMA } from "../incident-pool/report";
 import { METAMORPHIC_REPORT_SCHEMA } from "../metamorphic-eval/report";
-import { PRIMARY_ARM_IDS } from "../paired-delta/contract";
+import type { PairedDeltaPolicyModel } from "../paired-delta/contract";
 import { PRIMARY_ENDPOINTS, type PrimaryEndpoint } from "../paired-delta/estimator";
 import { PAIRED_DELTA_REPORT_SCHEMA, type SecondaryMetrics } from "../paired-delta/report";
 
@@ -167,28 +170,18 @@ export const SECONDARY_SLOT_SOURCES: Readonly<Partial<Record<UtilitySlotId, { me
 export const NOISE_FLOOR_SOURCES = ["calibration", "none"] as const;
 export type NoiseFloorSource = (typeof NOISE_FLOOR_SOURCES)[number];
 
-export interface PolicyModel {
-    providerId: string;
-    modelId: string;
-    contextLimit: number;
-}
+export type PolicyModel = PairedDeltaPolicyModel;
 
-export interface SystemProjection {
-    repoCommitSha: string;
-    bunVersion: string;
-    opencodeVersion: string;
-    historianModelId: string;
-    probeModelId: string;
-    parserImpl: "ts";
-    chunkTokenBudget: number | null;
-}
+export type SystemProjection = SystemVersionTuple;
 
-export interface ReleaseFingerprintsProjection {
-    corpus: string;
-    judgments: string;
-    syntheticProfiles: string;
-    manifest: string;
-}
+export type ReleaseFingerprintsProjection = BenchmarkReport["semantic"]["releaseFingerprints"];
+
+const RELEASE_FINGERPRINTS_KEYS = vocabulary<keyof ReleaseFingerprintsProjection>({
+    corpus: true,
+    judgments: true,
+    syntheticProfiles: true,
+    manifest: true,
+});
 
 export type LaneIdentity =
     | { kind: "identityless" }
@@ -236,10 +229,8 @@ export const SCORECARD_POLICY_KEYS = [
     "baselineScorecardReportFingerprint",
 ] as const;
 
-const SCENARIO_ID_RE = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
-
-function nonNegativeNumber(value: unknown, label: string): number {
-    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) fail(`${label}: number-invalid`);
+function positiveNumber(value: unknown, label: string): number {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) fail(`${label}: positive-number-required`);
     return value as number;
 }
 
@@ -254,18 +245,7 @@ function exactIdSequence<T extends string>(raw: unknown, expected: readonly T[],
 }
 
 function parseSystemProjection(raw: unknown, label: string): SystemProjection {
-    const value = record(raw, label);
-    exact(value, ["repoCommitSha", "bunVersion", "opencodeVersion", "historianModelId", "probeModelId", "parserImpl", "chunkTokenBudget"], label);
-    if (value.parserImpl !== "ts") fail(`${label}.parserImpl: enum-invalid`);
-    return {
-        repoCommitSha: string(value.repoCommitSha, `${label}.repoCommitSha`),
-        bunVersion: string(value.bunVersion, `${label}.bunVersion`),
-        opencodeVersion: string(value.opencodeVersion, `${label}.opencodeVersion`),
-        historianModelId: string(value.historianModelId, `${label}.historianModelId`),
-        probeModelId: string(value.probeModelId, `${label}.probeModelId`),
-        parserImpl: "ts",
-        chunkTokenBudget: value.chunkTokenBudget === null ? null : integer(value.chunkTokenBudget, `${label}.chunkTokenBudget`, 1),
-    };
+    return parseSystemVersionTuple(p, raw, label) ?? fail(`${label}: object-required`);
 }
 
 export function parseLaneIdentity(raw: unknown, lane: LaneId, label: string): LaneIdentity {
@@ -290,7 +270,7 @@ export function parseLaneIdentity(raw: unknown, lane: LaneId, label: string): La
         case "retrieval": {
             exact(value, ["kind", "releaseFingerprints"], label);
             const fingerprints = record(value.releaseFingerprints, `${label}.releaseFingerprints`);
-            exact(fingerprints, ["corpus", "judgments", "syntheticProfiles", "manifest"], `${label}.releaseFingerprints`);
+            exact(fingerprints, RELEASE_FINGERPRINTS_KEYS, `${label}.releaseFingerprints`);
             return {
                 kind,
                 releaseFingerprints: {
@@ -332,6 +312,8 @@ function parseModelMatrix(raw: unknown, label: string): PolicyModel[] {
         };
     });
     if (models.length === 0) fail(`${label}: empty`);
+    // A repeated provider/model identity runs that model more times than `replicateCount` states.
+    unique(models.map((model) => `${model.providerId}\u0000${model.modelId}`), label);
     return models;
 }
 
@@ -348,9 +330,15 @@ export function parseScorecardPolicy(raw: unknown): ScorecardPolicy {
     if (secondaryMetricSlots.some((slot) => SECONDARY_SLOT_SOURCES[slot] === undefined)) fail("policy.secondaryMetricSlots: not-secondary");
     const requiredMetricSlots = idArray(root.requiredMetricSlots, "policy.requiredMetricSlots", REASON_CODE_RE)
         .map((slot, index) => enumeration(slot, METRIC_SLOT_IDS, `policy.requiredMetricSlots[${index}]`));
+    const primaryEndpoint = enumeration(root.primaryEndpoint, PRIMARY_ENDPOINTS, "policy.primaryEndpoint");
+    // Promotion reads the primary endpoint's delta, so a policy that does not require that slot
+    // pre-registers a decision on a metric the evidence is allowed to omit.
+    if (!requiredMetricSlots.includes(PRIMARY_ENDPOINT_SLOTS[primaryEndpoint])) {
+        fail("policy.requiredMetricSlots: primary-endpoint-slot-required");
+    }
     return {
         schema: SCORECARD_POLICY_SCHEMA,
-        primaryEndpoint: enumeration(root.primaryEndpoint, PRIMARY_ENDPOINTS, "policy.primaryEndpoint"),
+        primaryEndpoint,
         secondaryMetricSlots,
         gates: exactIdSequence(root.gates, SCORECARD_GATE_IDS, "policy.gates", "exact-gate-set-required"),
         injectionCanaryScenarioIds: canaryIds,
@@ -361,7 +349,7 @@ export function parseScorecardPolicy(raw: unknown): ScorecardPolicy {
         },
         modelMatrix: parseModelMatrix(root.modelMatrix, "policy.modelMatrix"),
         replicateCount: integer(root.replicateCount, "policy.replicateCount", 1),
-        releaseCostBudgetUsd: nonNegativeNumber(root.releaseCostBudgetUsd, "policy.releaseCostBudgetUsd"),
+        releaseCostBudgetUsd: positiveNumber(root.releaseCostBudgetUsd, "policy.releaseCostBudgetUsd"),
         requiredLanes: parseRequiredLanes(root.requiredLanes, "policy.requiredLanes"),
         requiredMetricSlots,
         pairedDeltaPolicyFingerprint: hex64(root.pairedDeltaPolicyFingerprint, "policy.pairedDeltaPolicyFingerprint"),
@@ -373,4 +361,4 @@ export function scorecardPolicyFingerprint(policy: ScorecardPolicy): string {
     return canonicalFingerprint(policy);
 }
 
-export { GATE_ID_RE, PRIMARY_ARM_IDS, REASON_CODE_RE };
+export { REASON_CODE_RE };

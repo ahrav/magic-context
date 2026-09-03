@@ -35,12 +35,17 @@ pub const RING_PROFILE: &str = mc_shm_transport::profile::MC_HOST_RING_PROFILE;
 #[doc(hidden)]
 pub type PublishHook = Arc<dyn Fn(FrameType, u16) + Send + Sync>;
 
+/// Builds the release-pinned ring profile.
+///
+/// # Panics
+///
+/// Panics only if the compile-time profile constants are internally invalid.
 pub fn ring_profile() -> TargetProfile {
     mc_shm_transport::profile::mc_host_ring_profile()
         .expect("static shared-memory profile is valid")
 }
 
-/// Admission limits sufficient for one connection.
+/// Returns exact admission charges required by one ring connection.
 pub fn per_connection_limits() -> ShmHostLimits {
     let charges = ring_profile().charges();
     ShmHostLimits {
@@ -58,7 +63,10 @@ pub fn per_connection_limits() -> ShmHostLimits {
 /// Ceiling on sparse ring virtual arena bytes this process admits at once.
 pub const MAX_RING_RESIDENT_BYTES: u64 = 1 << 30;
 
-/// Admission limits for `connections` concurrent sparse rings, bounded by aggregate virtual arena bytes. One connection stays admissible.
+/// Computes process admission limits for concurrent sparse rings.
+///
+/// The admitted count is clamped to at least one, and to [`MAX_RING_RESIDENT_BYTES`] divided by one ring's arena bytes.
+/// Returns `None` if a count conversion or charge multiplication overflows.
 pub fn process_limits(connections: usize) -> Option<ShmHostLimits> {
     let one = per_connection_limits();
     let affordable = MAX_RING_RESIDENT_BYTES
@@ -79,6 +87,9 @@ pub fn process_limits(connections: usize) -> Option<ShmHostLimits> {
 }
 
 /// Process-wide owner of ring admission and endpoint creation.
+///
+/// Admission accounting is shared across endpoint threads. Lifecycle counters
+/// are monotonic and may be observed concurrently through [`Self::diagnostics`].
 pub struct RingTransport {
     profile: Arc<TargetProfile>,
     admission: Arc<AdmissionController>,
@@ -100,16 +111,10 @@ pub(crate) struct PreparedRing {
     pub(crate) read_cancel: CancellationToken,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Redacted failure to admit, create, or start a shared-memory ring.
+#[derive(thiserror::Error, Debug, Clone, Copy)]
+#[error("shared-memory ring is unavailable")]
 pub struct RingUnavailable;
-
-impl std::fmt::Display for RingUnavailable {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("shared-memory ring is unavailable")
-    }
-}
-
-impl std::error::Error for RingUnavailable {}
 
 impl RingTransport {
     /// Builds the process-wide transport with finite admission limits.
@@ -129,6 +134,8 @@ impl RingTransport {
     }
 
     /// Returns redacted aggregate admission accounting.
+    ///
+    /// Returns an admission error if accounting has entered a terminal state.
     pub fn accounting(
         &self,
     ) -> Result<
@@ -138,7 +145,10 @@ impl RingTransport {
         self.admission.snapshot()
     }
 
-    /// Bounded, aggregate-only state for authenticated doctor output.
+    /// Returns bounded, aggregate-only state for authenticated doctor output.
+    ///
+    /// Atomic counters are snapshots and need not describe one simultaneous
+    /// lifecycle instant.
     pub fn diagnostics(&self) -> serde_json::Value {
         let charges = |value: ResourceCharges| {
             serde_json::json!({
@@ -657,6 +667,10 @@ pub struct RingClientEndpoint {
 
 impl RingClientEndpoint {
     /// Attaches a descriptor and its setup-socket file descriptors.
+    ///
+    /// Descriptor parsing, profile mismatch, grant mismatch, and ring-attach
+    /// failures return a redacted [`RingClientError`]. File descriptors are
+    /// consumed even when attachment fails.
     pub fn attach_with_descriptors(
         descriptor: &serde_json::Value,
         descriptors: [OwnedFd; RING_DESCRIPTOR_COUNT],
@@ -680,7 +694,9 @@ impl RingClientEndpoint {
         Ok(Self { to_host, from_host })
     }
 
-    /// Publishes one complete consumer frame under the caller's deadline.
+    /// Publishes one complete peer-to-host frame under `deadline`.
+    ///
+    /// Reservation, write, and commit failures return a redacted error.
     pub fn send(
         &self,
         header: EnvelopeHeader,
@@ -698,7 +714,14 @@ impl RingClientEndpoint {
         Ok(())
     }
 
-    /// Waits for one complete host frame and records its completion.
+    /// Waits up to `timeout` for one host-to-peer frame and releases its lease.
+    ///
+    /// Timeout, malformed headers, copy failures, and release failures return a
+    /// redacted error.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the current instant plus `timeout` overflows, as [`Duration::MAX`] does.
     pub fn recv(&self, timeout: Duration) -> Result<(EnvelopeHeader, Vec<u8>), RingClientError> {
         let deadline = StdInstant::now() + timeout;
         loop {
@@ -715,6 +738,9 @@ impl RingClientEndpoint {
         }
     }
 
+    /// Receives and releases one frame without waiting.
+    ///
+    /// Returns `Ok(None)` when no committed frame is available.
     pub fn try_recv(&self) -> Result<Option<(EnvelopeHeader, Vec<u8>)>, RingClientError> {
         self.try_recv_with(|_| Some(()))
             .map(|frame| frame.map(|(header, body, ())| (header, body)))
@@ -762,7 +788,8 @@ fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N], RingClientError> {
 }
 
 /// Redacted test-peer attachment or I/O failure.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, thiserror::Error)]
+#[error("shared-memory peer operation failed")]
 pub struct RingClientError;
 
 impl fmt::Debug for RingClientError {
@@ -770,14 +797,6 @@ impl fmt::Debug for RingClientError {
         formatter.write_str("RingClientError(<redacted>)")
     }
 }
-
-impl fmt::Display for RingClientError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("shared-memory peer operation failed")
-    }
-}
-
-impl std::error::Error for RingClientError {}
 
 #[cfg(test)]
 mod tests {

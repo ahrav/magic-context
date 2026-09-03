@@ -14,13 +14,19 @@ use mc_store::{
 use serde::Serialize;
 use serde_json::Value;
 
+/// Estimated strong and weak counters stored beside an `Arc` allocation.
 pub(crate) const ARC_ALLOCATION_OVERHEAD_BYTES: usize = size_of::<usize>() * 2;
 const BTREE_ENTRY_NODE_OVERHEAD_BYTES: usize = size_of::<usize>() * 3;
 
+/// Estimates bytes retained by a cloned string, including its inline header.
 pub(crate) fn cloned_string_retained_bytes(value: &str) -> usize {
     size_of::<String>().saturating_add(value.len())
 }
 
+/// Estimates `BTreeMap` allocation bytes for `len` entries.
+///
+/// The estimate charges each entry for inline key and value storage plus a
+/// fixed three-word share of node metadata. Arithmetic saturates at `usize::MAX`.
 pub(crate) fn btree_map_allocation_bytes<K, V>(len: usize) -> usize {
     len.saturating_mul(
         size_of::<K>()
@@ -29,6 +35,10 @@ pub(crate) fn btree_map_allocation_bytes<K, V>(len: usize) -> usize {
     )
 }
 
+/// Estimates allocated hashbrown bucket bytes from admission capacity.
+///
+/// The estimate includes inline keys, inline values, and one control byte per
+/// bucket. Arithmetic saturates at `usize::MAX`.
 pub(crate) fn hash_map_allocation_bytes<K, V>(map: &HashMap<K, V>) -> usize {
     // hashbrown uses one control byte per bucket and admits seven entries per eight buckets.
     // The calculation converts admission capacity to bucket count because `capacity()` reports admission capacity.
@@ -40,10 +50,15 @@ pub(crate) fn hash_map_allocation_bytes<K, V>(map: &HashMap<K, V>) -> usize {
     )
 }
 
+/// Estimates total retained bytes for a JSON value, including its inline enum.
 pub(crate) fn value_retained_bytes(value: &Value) -> usize {
     size_of::<Value>().saturating_add(value_heap_bytes(value))
 }
 
+/// Estimates heap bytes reachable from a JSON value.
+///
+/// String and vector branches charge capacity. Object branches charge entry
+/// count because `serde_json::Map` does not expose tree-node capacity.
 pub(crate) fn value_heap_bytes(value: &Value) -> usize {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) => 0,
@@ -62,11 +77,18 @@ pub(crate) fn value_heap_bytes(value: &Value) -> usize {
     }
 }
 
+/// Estimates the retained JSON representation of a serializable wire value.
+///
+/// # Panics
+///
+/// Panics when a CK wire value fails serialization. CK wire values are expected
+/// to serialize because accounting inspects their retained original JSON this way.
 fn serialized_value_retained_bytes(value: &impl Serialize) -> usize {
     let value = serde_json::to_value(value).expect("CK wire values must serialize for accounting");
     value_retained_bytes(&value)
 }
 
+/// Estimates heap bytes retained by provider namespaces, fields, and JSON values.
 pub(crate) fn provider_extras_heap_bytes(extras: &ProviderExtras) -> usize {
     btree_map_allocation_bytes::<String, BTreeMap<String, Value>>(extras.len()).saturating_add(
         extras
@@ -92,6 +114,7 @@ fn optional_string_heap_bytes(value: Option<&String>) -> usize {
     value.map_or(0, String::capacity)
 }
 
+/// Estimates string-capacity bytes retained by optional message origin metadata.
 pub(crate) fn origin_heap_bytes(origin: Option<&MessageOrigin>) -> usize {
     origin.map_or(0, |origin| {
         origin
@@ -102,6 +125,7 @@ pub(crate) fn origin_heap_bytes(origin: Option<&MessageOrigin>) -> usize {
     })
 }
 
+/// Estimates string-capacity bytes retained by harness metadata.
 pub(crate) fn harness_meta_heap_bytes(meta: &HarnessMeta) -> usize {
     optional_string_heap_bytes(meta.harness_id.as_ref())
         .saturating_add(optional_string_heap_bytes(meta.finish.as_ref()))
@@ -174,6 +198,10 @@ fn kind_heap_bytes(kind: &CkKind) -> usize {
     }
 }
 
+/// Estimates total bytes retained by one CK wire block.
+///
+/// The total includes the inline block, typed heap fields, and a serialized
+/// estimate of the independently retained original JSON. Arithmetic saturates.
 pub(crate) fn ck_wire_block_retained_bytes(block: &CkWireBlock) -> usize {
     size_of::<CkWireBlock>()
         .saturating_add(kind_heap_bytes(&block.kind))
@@ -185,6 +213,10 @@ pub(crate) fn ck_wire_block_retained_bytes(block: &CkWireBlock) -> usize {
         .saturating_add(serialized_value_retained_bytes(block))
 }
 
+/// Estimates total bytes retained by one CK wire message.
+///
+/// Block inline storage is charged through content capacity. Each block and the
+/// message also charge their independently retained original JSON trees.
 pub(crate) fn ck_wire_message_retained_bytes(message: &CkWireMessage) -> usize {
     let blocks = message
         .content

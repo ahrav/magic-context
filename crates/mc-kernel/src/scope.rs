@@ -1,0 +1,1509 @@
+//! Scope persistence, canonicalization, and conservative set predicates.
+//!
+//! Write paths redact text before storage and append scope changes to the surrounding envelope.
+//! Predicate inputs use a closed ten-dimension vocabulary. Canonical scopes contain at most one
+//! term per dimension. Unknown graph relations and unresolvable values fail closed for matching
+//! and subsumption, while overlap intentionally over-approximates unknown pairs.
+
+use rusqlite::{params, OptionalExtension};
+use serde::Serialize;
+
+use super::envelope::{Envelope, ObjectRow, PendingChange};
+use super::redaction::{record, redact, RedactedField};
+use super::{KernelError, Sensitivity};
+
+/// Unvalidated storage representation of one scope term.
+///
+/// `operator` selects which value field is legal. Canonical decoding rejects missing values,
+/// conflicting fields, unknown operators, empty sets, invalid ranges, and invalid commit OIDs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopeTermSpec {
+    pub dimension: String,
+    pub operator: String,
+    pub exact_value: Option<String>,
+    pub set_values: Option<Vec<String>>,
+    pub range_start: Option<String>,
+    pub range_end: Option<String>,
+    pub version_range: Option<String>,
+    pub git_oid: Option<String>,
+    pub git_start_oid: Option<String>,
+    pub git_end_oid: Option<String>,
+    pub payload: Option<String>,
+}
+
+/// Scope insertion request and ordered term rows.
+///
+/// Identifiers must be nonblank and `source_revision` must be nonnegative. Text fields pass
+/// through redaction before any row or change record is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeSpec {
+    pub scope_id: String,
+    pub object_id: String,
+    pub domain_id: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub source_revision: i64,
+    pub sensitivity: Sensitivity,
+    pub terms: Vec<ScopeTermSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScopeWriteOutcome {
+    pub scope_id: String,
+    pub object_id: String,
+}
+
+impl ScopeWriteOutcome {
+    pub fn result_json(&self) -> String {
+        serde_json::to_string(self).expect("string-only outcome is serializable")
+    }
+}
+
+struct RedactedScope {
+    scope_id: RedactedField,
+    object_id: RedactedField,
+    domain_id: RedactedField,
+    source_kind: RedactedField,
+    source_id: RedactedField,
+    source_revision: i64,
+    sensitivity: Sensitivity,
+    terms: Vec<RedactedTerm>,
+}
+
+struct RedactedTerm {
+    dimension: RedactedField,
+    operator: RedactedField,
+    exact_value: Option<RedactedField>,
+    set_values: Option<Vec<RedactedField>>,
+    range_start: Option<RedactedField>,
+    range_end: Option<RedactedField>,
+    version_range: Option<RedactedField>,
+    git_oid: Option<RedactedField>,
+    git_start_oid: Option<RedactedField>,
+    git_end_oid: Option<RedactedField>,
+    payload: Option<RedactedField>,
+}
+
+impl Envelope<'_> {
+    /// Inserts one scope, its object-registry row, and its ordered terms in this transaction.
+    ///
+    /// The referenced domain must exist and remain valid. Success appends a `scope_insert`
+    /// pending change. Invalid fields return `InvalidInput`; a missing domain returns `NotFound`.
+    /// The surrounding envelope transaction owns commit or rollback.
+    pub fn insert_scope(&mut self, spec: ScopeSpec) -> Result<ScopeWriteOutcome, KernelError> {
+        let spec = RedactedScope::new(spec)?;
+        let domain_exists = self
+            .tx
+            .query_row(
+                "SELECT 1 FROM domains
+                 WHERE domain_id=?1 AND invalidated_commit_seq IS NULL",
+                [&spec.domain_id.text],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|_| KernelError::Io)?
+            .is_some();
+        if !domain_exists {
+            return Err(KernelError::NotFound);
+        }
+        let object = spec.object_row(self.commit_seq);
+        self.tx
+            .execute(
+                "INSERT INTO object_registry(
+                     object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                     created_commit_seq,sensitivity_class
+                 ) VALUES (?1,'scope',?2,?3,?4,?5,?6,?7)",
+                params![
+                    object.object_id,
+                    object.domain_id,
+                    object.source_kind,
+                    object.source_id,
+                    object.source_revision,
+                    self.commit_seq,
+                    object.sensitivity.as_str(),
+                ],
+            )
+            .map_err(super::map_sqlite)?;
+        for (name, field) in [
+            ("object_id", &spec.object_id),
+            ("domain_id", &spec.domain_id),
+            ("source_kind", &spec.source_kind),
+            ("source_id", &spec.source_id),
+        ] {
+            record(
+                self.tx,
+                "object_registry",
+                &spec.object_id.text,
+                name,
+                field,
+                Some(self.commit_seq),
+            )?;
+        }
+        self.tx
+            .execute(
+                "INSERT INTO scopes(
+                     scope_id,object_id,domain_id,created_commit_seq,sensitivity_class
+                 ) VALUES (?1,?2,?3,?4,?5)",
+                params![
+                    spec.scope_id.text,
+                    spec.object_id.text,
+                    spec.domain_id.text,
+                    self.commit_seq,
+                    spec.sensitivity.as_str(),
+                ],
+            )
+            .map_err(super::map_sqlite)?;
+        insert_scope_terms(self.tx, &spec.scope_id.text, &spec.terms)?;
+        let redactions = spec.text_fields();
+        for (name, field) in &redactions {
+            record(
+                self.tx,
+                "scopes",
+                &spec.scope_id.text,
+                name,
+                field,
+                Some(self.commit_seq),
+            )?;
+        }
+        let outcome = ScopeWriteOutcome {
+            scope_id: spec.scope_id.text.clone(),
+            object_id: spec.object_id.text.clone(),
+        };
+        self.changes.push(PendingChange {
+            object,
+            kind: "scope_insert",
+            replaced_object_id: None,
+            redactions,
+            audit: None,
+        });
+        Ok(outcome)
+    }
+}
+
+impl RedactedScope {
+    fn new(spec: ScopeSpec) -> Result<Self, KernelError> {
+        if spec.source_revision < 0
+            || [
+                &spec.scope_id,
+                &spec.object_id,
+                &spec.domain_id,
+                &spec.source_kind,
+                &spec.source_id,
+            ]
+            .into_iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err(KernelError::InvalidInput);
+        }
+        let terms = spec
+            .terms
+            .into_iter()
+            .map(RedactedTerm::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            scope_id: redact(&spec.scope_id)?,
+            object_id: redact(&spec.object_id)?,
+            domain_id: redact(&spec.domain_id)?,
+            source_kind: redact(&spec.source_kind)?,
+            source_id: redact(&spec.source_id)?,
+            source_revision: spec.source_revision,
+            sensitivity: spec.sensitivity,
+            terms,
+        })
+    }
+
+    fn object_row(&self, commit_seq: i64) -> ObjectRow {
+        ObjectRow {
+            object_id: self.object_id.text.clone(),
+            object_kind: "scope".to_string(),
+            domain_id: self.domain_id.text.clone(),
+            source_kind: self.source_kind.text.clone(),
+            source_id: self.source_id.text.clone(),
+            source_revision: self.source_revision,
+            created_commit_seq: commit_seq,
+            invalidated_commit_seq: None,
+            superseded_by: None,
+            sensitivity: self.sensitivity,
+        }
+    }
+
+    fn text_fields(&self) -> Vec<(String, RedactedField)> {
+        let mut fields = vec![
+            ("scope_id".to_string(), self.scope_id.clone()),
+            ("object_id".to_string(), self.object_id.clone()),
+            ("domain_id".to_string(), self.domain_id.clone()),
+            ("source_kind".to_string(), self.source_kind.clone()),
+            ("source_id".to_string(), self.source_id.clone()),
+        ];
+        for (ordinal, term) in self.terms.iter().enumerate() {
+            fields.extend(term.text_fields(i64::try_from(ordinal).unwrap_or(i64::MAX)));
+        }
+        fields
+    }
+}
+
+impl RedactedTerm {
+    fn new(spec: ScopeTermSpec) -> Result<Self, KernelError> {
+        if spec.dimension.trim().is_empty() || spec.operator.trim().is_empty() {
+            return Err(KernelError::InvalidInput);
+        }
+        Ok(Self {
+            dimension: redact(&spec.dimension)?,
+            operator: redact(&spec.operator)?,
+            exact_value: spec.exact_value.as_deref().map(redact).transpose()?,
+            set_values: spec
+                .set_values
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| redact(value))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?,
+            range_start: spec.range_start.as_deref().map(redact).transpose()?,
+            range_end: spec.range_end.as_deref().map(redact).transpose()?,
+            version_range: spec.version_range.as_deref().map(redact).transpose()?,
+            git_oid: spec.git_oid.as_deref().map(redact).transpose()?,
+            git_start_oid: spec.git_start_oid.as_deref().map(redact).transpose()?,
+            git_end_oid: spec.git_end_oid.as_deref().map(redact).transpose()?,
+            payload: spec.payload.as_deref().map(redact).transpose()?,
+        })
+    }
+
+    fn text_fields(&self, ordinal: i64) -> Vec<(String, RedactedField)> {
+        let prefix = format!("terms.{ordinal}");
+        let mut fields = vec![
+            (format!("{prefix}.dimension"), self.dimension.clone()),
+            (format!("{prefix}.operator"), self.operator.clone()),
+        ];
+        for (name, value) in [
+            ("exact_value", &self.exact_value),
+            ("range_start", &self.range_start),
+            ("range_end", &self.range_end),
+            ("version_range", &self.version_range),
+            ("git_oid", &self.git_oid),
+            ("git_start_oid", &self.git_start_oid),
+            ("git_end_oid", &self.git_end_oid),
+            ("payload", &self.payload),
+        ] {
+            if let Some(value) = value {
+                fields.push((format!("{prefix}.{name}"), value.clone()));
+            }
+        }
+        if let Some(values) = &self.set_values {
+            for (index, value) in values.iter().enumerate() {
+                fields.push((format!("{prefix}.set_values.{index}"), value.clone()));
+            }
+        }
+        fields
+    }
+}
+
+fn text(field: &Option<RedactedField>) -> Option<&str> {
+    field.as_ref().map(|value| value.text.as_str())
+}
+
+fn insert_scope_terms(
+    tx: &rusqlite::Transaction<'_>,
+    scope_id: &str,
+    terms: &[RedactedTerm],
+) -> Result<(), KernelError> {
+    for (ordinal, term) in terms.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal).map_err(|_| KernelError::InvalidInput)?;
+        let set_values = term
+            .set_values
+            .as_ref()
+            .map(|values| {
+                serde_json::to_vec(
+                    &values
+                        .iter()
+                        .map(|value| value.text.as_str())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .transpose()
+            .map_err(|_| KernelError::InvalidInput)?;
+        tx.execute(
+            "INSERT INTO scope_term(
+                 scope_id,ordinal,dimension,operator,exact_value,set_values,range_start,
+                 range_end,version_range,git_oid,git_start_oid,git_end_oid,payload
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                scope_id,
+                ordinal,
+                term.dimension.text,
+                term.operator.text,
+                text(&term.exact_value),
+                set_values,
+                text(&term.range_start),
+                text(&term.range_end),
+                text(&term.version_range),
+                text(&term.git_oid),
+                text(&term.git_start_oid),
+                text(&term.git_end_oid),
+                term.payload.as_ref().map(|value| value.text.as_bytes()),
+            ],
+        )
+        .map_err(super::map_sqlite)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Scope algebra: closed vocabulary, canonical form, and predicates.
+// ---------------------------------------------------------------------------
+
+use std::collections::BTreeSet;
+
+pub(super) fn contains_redaction_placeholder(value: &str) -> bool {
+    mc_core::redaction::contains_redaction_token(value)
+        || value.contains(super::envelope::OPERATOR_REDACTION_PLACEHOLDER)
+}
+
+/// The ten bounded scope dimensions. Stored strings are exactly the
+/// `as_str` values; anything else fails decode (fail closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Dimension {
+    Domain,
+    Project,
+    Entity,
+    Branch,
+    Environment,
+    Region,
+    Deployment,
+    RequestClass,
+    CallerClass,
+    Platform,
+}
+
+impl Dimension {
+    pub const ALL: [Dimension; 10] = [
+        Dimension::Domain,
+        Dimension::Project,
+        Dimension::Entity,
+        Dimension::Branch,
+        Dimension::Environment,
+        Dimension::Region,
+        Dimension::Deployment,
+        Dimension::RequestClass,
+        Dimension::CallerClass,
+        Dimension::Platform,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Domain => "domain",
+            Self::Project => "project",
+            Self::Entity => "entity",
+            Self::Branch => "branch",
+            Self::Environment => "environment",
+            Self::Region => "region",
+            Self::Deployment => "deployment",
+            Self::RequestClass => "request_class",
+            Self::CallerClass => "caller_class",
+            Self::Platform => "platform",
+        }
+    }
+
+    pub fn from_stored(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|dimension| dimension.as_str() == value)
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Domain => 0,
+            Self::Project => 1,
+            Self::Entity => 2,
+            Self::Branch => 3,
+            Self::Environment => 4,
+            Self::Region => 5,
+            Self::Deployment => 6,
+            Self::RequestClass => 7,
+            Self::CallerClass => 8,
+            Self::Platform => 9,
+        }
+    }
+}
+
+const DIMENSION_COUNT: usize = Dimension::ALL.len();
+
+/// One decoded scope term value. `RedactedPlaceholder` captures values the
+/// write path already replaced with a redaction token: they are unresolvable
+/// inputs, never ordinary exact values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TermValue {
+    Exact(String),
+    Set(BTreeSet<String>),
+    /// Half-open `[start, end)` over the dimension's value domain
+    /// (lexicographic byte order). `None` = unbounded on that side.
+    Range {
+        start: Option<String>,
+        end: Option<String>,
+    },
+    VersionRange(VersionSpec),
+    /// Lower-hex commit OID whose descendant cone is the value set.
+    GitReachable(String),
+    RedactedPlaceholder,
+}
+
+#[derive(Debug, Clone)]
+pub struct VersionSpec {
+    raw: String,
+    req: semver::VersionReq,
+    interval: Option<VersionInterval>,
+}
+
+impl VersionSpec {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let req = semver::VersionReq::parse(raw).ok()?;
+        let interval = parsed_version_req_interval(&req);
+        Some(Self {
+            raw: raw.to_string(),
+            req,
+            interval,
+        })
+    }
+
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+}
+
+impl std::ops::Deref for VersionSpec {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+impl PartialEq for VersionSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl Eq for VersionSpec {}
+
+/// Why a scope failed to decode into canonical form. Malformed scopes
+/// evaluate uncertain and never match.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum ScopeFormError {
+    #[error("unknown scope dimension {0:?}")]
+    UnknownDimension(String),
+    #[error("unknown scope operator {0:?}")]
+    UnknownOperator(String),
+    #[error("duplicate scope dimension {}", .0.as_str())]
+    DuplicateDimension(Dimension),
+    #[error("scope term on {} has no value", .0.as_str())]
+    MissingValue(Dimension),
+    #[error("scope term on {} sets columns its operator does not own", .0.as_str())]
+    ConflictingColumns(Dimension),
+    #[error("scope term on {} has an invalid range", .0.as_str())]
+    InvalidRange(Dimension),
+    #[error("scope term on {} has an unparseable version range", .0.as_str())]
+    InvalidVersionRange(Dimension),
+    #[error("scope term on {} has an invalid git OID", .0.as_str())]
+    InvalidOid(Dimension),
+    #[error("scope term on {} has an empty set", .0.as_str())]
+    EmptySet(Dimension),
+}
+
+/// Canonical scope: at most one term per dimension, ordered by dimension.
+/// The only constructor is `from_term_specs`, so every value of this type
+/// is canonical by construction and predicates can require it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalScope {
+    terms: [Option<TermValue>; DIMENSION_COUNT],
+    version_requirements: [Option<semver::VersionReq>; DIMENSION_COUNT],
+    version_intervals: [Option<VersionInterval>; DIMENSION_COUNT],
+    present: u16,
+}
+
+impl CanonicalScope {
+    /// Decodes raw term rows (any order) into canonical form. Duplicate
+    /// dimensions, unknown vocabulary, and undecodable payloads are
+    /// malformed.
+    pub fn from_term_specs(terms: &[ScopeTermSpec]) -> Result<Self, ScopeFormError> {
+        let mut canonical = std::array::from_fn(|_| None);
+        let mut version_requirements = std::array::from_fn(|_| None);
+        let mut version_intervals = std::array::from_fn(|_| None);
+        let mut present = 0u16;
+        for term in terms {
+            let dimension = Dimension::from_stored(&term.dimension)
+                .ok_or_else(|| ScopeFormError::UnknownDimension(term.dimension.clone()))?;
+            let index = dimension.index();
+            let value = decode_term_value(dimension, term)?;
+            let parsed_version = match &value {
+                TermValue::VersionRange(spec) => Some((spec.req.clone(), spec.interval.clone())),
+                _ => None,
+            };
+            if canonical[index].replace(value).is_some() {
+                return Err(ScopeFormError::DuplicateDimension(dimension));
+            }
+            present |= 1 << index;
+            if let Some((requirement, interval)) = parsed_version {
+                version_requirements[index] = Some(requirement);
+                if let Some(interval) = interval {
+                    version_intervals[index] = Some(interval);
+                }
+            }
+        }
+        Ok(Self {
+            terms: canonical,
+            version_requirements,
+            version_intervals,
+            present,
+        })
+    }
+
+    /// The empty scope constrains nothing and matches every context.
+    pub fn unconstrained() -> Self {
+        Self {
+            terms: std::array::from_fn(|_| None),
+            version_requirements: std::array::from_fn(|_| None),
+            version_intervals: std::array::from_fn(|_| None),
+            present: 0,
+        }
+    }
+
+    /// Iterates present terms in `Dimension::ALL` order.
+    pub fn terms(&self) -> impl Iterator<Item = (Dimension, &TermValue)> {
+        let mut present = self.present;
+        std::iter::from_fn(move || {
+            if present == 0 {
+                return None;
+            }
+            let index = present.trailing_zeros() as usize;
+            present &= present - 1;
+            let dimension = Dimension::ALL[index];
+            Some((
+                dimension,
+                self.terms[index]
+                    .as_ref()
+                    .expect("occupancy bit identifies a canonical term"),
+            ))
+        })
+    }
+
+    pub fn term(&self, dimension: Dimension) -> Option<&TermValue> {
+        self.terms[dimension.index()].as_ref()
+    }
+
+    fn version_requirement(&self, dimension: Dimension) -> Option<&semver::VersionReq> {
+        self.version_requirements[dimension.index()].as_ref()
+    }
+
+    fn version_interval(&self, dimension: Dimension) -> Option<&VersionInterval> {
+        self.version_intervals[dimension.index()].as_ref()
+    }
+
+    fn has_placeholder(&self) -> bool {
+        self.terms
+            .iter()
+            .flatten()
+            .any(|value| matches!(value, TermValue::RedactedPlaceholder))
+    }
+}
+
+pub(super) fn is_lower_hex_oid(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(super) fn is_commit_oid(value: &str) -> bool {
+    is_lower_hex_oid(value)
+}
+
+fn decode_term_value(
+    dimension: Dimension,
+    term: &ScopeTermSpec,
+) -> Result<TermValue, ScopeFormError> {
+    let extra_columns = |allowed: [bool; 7]| -> bool {
+        let present = [
+            term.exact_value.is_some(),
+            term.set_values.is_some(),
+            term.range_start.is_some() || term.range_end.is_some(),
+            term.version_range.is_some(),
+            term.git_oid.is_some(),
+            term.git_start_oid.is_some() || term.git_end_oid.is_some(),
+            term.payload.is_some(),
+        ];
+        present
+            .iter()
+            .zip(allowed.iter())
+            .any(|(present, allowed)| *present && !*allowed)
+    };
+    match term.operator.as_str() {
+        "exact" => {
+            if extra_columns([true, false, false, false, false, false, false]) {
+                return Err(ScopeFormError::ConflictingColumns(dimension));
+            }
+            let value = term
+                .exact_value
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or(ScopeFormError::MissingValue(dimension))?;
+            if contains_redaction_placeholder(value) {
+                return Ok(TermValue::RedactedPlaceholder);
+            }
+            Ok(TermValue::Exact(value.to_string()))
+        }
+        "set" => {
+            if extra_columns([false, true, false, false, false, false, false]) {
+                return Err(ScopeFormError::ConflictingColumns(dimension));
+            }
+            let values = term
+                .set_values
+                .as_ref()
+                .ok_or(ScopeFormError::MissingValue(dimension))?;
+            if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+                return Err(ScopeFormError::EmptySet(dimension));
+            }
+            if values
+                .iter()
+                .any(|value| contains_redaction_placeholder(value))
+            {
+                return Ok(TermValue::RedactedPlaceholder);
+            }
+            Ok(TermValue::Set(values.iter().cloned().collect()))
+        }
+        "range" => {
+            if extra_columns([false, false, true, false, false, false, false]) {
+                return Err(ScopeFormError::ConflictingColumns(dimension));
+            }
+            let start = term.range_start.clone();
+            let end = term.range_end.clone();
+            if start.is_none() && end.is_none() {
+                return Err(ScopeFormError::MissingValue(dimension));
+            }
+            if start.as_deref() == Some("") || end.as_deref() == Some("") {
+                return Err(ScopeFormError::InvalidRange(dimension));
+            }
+            if start.as_deref().is_some_and(contains_redaction_placeholder)
+                || end.as_deref().is_some_and(contains_redaction_placeholder)
+            {
+                return Ok(TermValue::RedactedPlaceholder);
+            }
+            if let (Some(start), Some(end)) = (&start, &end) {
+                if start >= end {
+                    return Err(ScopeFormError::InvalidRange(dimension));
+                }
+            }
+            Ok(TermValue::Range { start, end })
+        }
+        "version_range" => {
+            if extra_columns([false, false, false, true, false, false, false]) {
+                return Err(ScopeFormError::ConflictingColumns(dimension));
+            }
+            let raw = term
+                .version_range
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or(ScopeFormError::MissingValue(dimension))?;
+            if contains_redaction_placeholder(raw) {
+                return Ok(TermValue::RedactedPlaceholder);
+            }
+            let spec =
+                VersionSpec::parse(raw).ok_or(ScopeFormError::InvalidVersionRange(dimension))?;
+            Ok(TermValue::VersionRange(spec))
+        }
+        "git_reachable" => {
+            if extra_columns([false, false, false, false, true, false, false]) {
+                return Err(ScopeFormError::ConflictingColumns(dimension));
+            }
+            let oid = term
+                .git_oid
+                .as_deref()
+                .ok_or(ScopeFormError::MissingValue(dimension))?;
+            if !is_lower_hex_oid(oid) {
+                return Err(ScopeFormError::InvalidOid(dimension));
+            }
+            Ok(TermValue::GitReachable(oid.to_string()))
+        }
+        other => Err(ScopeFormError::UnknownOperator(other.to_string())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scope predicates.
+// ---------------------------------------------------------------------------
+
+/// Answers ancestry questions against a frozen graph snapshot. `None` means
+/// the oracle cannot decide the pair (an OID outside the snapshot), which
+/// routes the caller into the approximation rule: `scope_subsumes` and
+/// `scope_equivalent` under-approximate (false), `scope_overlaps`
+/// over-approximates (true), and `scope_matches` reports uncertain.
+pub trait GraphOracle {
+    /// `Some(true)` when `ancestor` is an ancestor of, or equal to,
+    /// `descendant` in the commit DAG.
+    fn is_ancestor_or_equal(&self, ancestor: &str, descendant: &str) -> Option<bool>;
+}
+
+/// Oracle for callers with no graph: every git comparison is unknown.
+pub struct UnknownGraph;
+
+impl GraphOracle for UnknownGraph {
+    fn is_ancestor_or_equal(&self, _ancestor: &str, _descendant: &str) -> Option<bool> {
+        None
+    }
+}
+
+/// Three-valued match verdict. `Uncertain` covers unresolvable inputs:
+/// redaction placeholders, missing context values, unparseable versions,
+/// and graph pairs the oracle cannot decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchOutcome {
+    Matches,
+    DoesNotMatch,
+    Uncertain,
+}
+
+/// Resolved query-side values the scope predicates compare against, one text
+/// value per dimension plus the checkout HEAD for git-reachability terms.
+/// Values are resolved before predicate evaluation (never ambient state).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopeMatchContext {
+    values: [Option<String>; DIMENSION_COUNT],
+    coerced: [Option<VersionReading>; DIMENSION_COUNT],
+    head_commit: Option<String>,
+}
+
+impl ScopeMatchContext {
+    /// Creates a context with no resolved dimension values or checkout commit.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets one resolved dimension value and caches its version coercion, if parseable.
+    pub fn with_value(mut self, dimension: Dimension, value: impl Into<String>) -> Self {
+        let value = value.into();
+        self.coerced[dimension.index()] = VersionReading::parse(&value);
+        self.values[dimension.index()] = Some(value);
+        self
+    }
+
+    /// Sets the checkout commit used by `git_reachable` terms.
+    ///
+    /// This builder does not validate OID syntax. Graph-oracle resolution determines whether the
+    /// value can participate in a match.
+    pub fn with_head_commit(mut self, oid: impl Into<String>) -> Self {
+        self.head_commit = Some(oid.into());
+        self
+    }
+
+    pub fn value(&self, dimension: Dimension) -> Option<&str> {
+        self.values[dimension.index()].as_deref()
+    }
+
+    fn coerced_version(&self, dimension: Dimension) -> Option<&VersionReading> {
+        self.coerced[dimension.index()].as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionReading {
+    comparable: semver::Version,
+    prerelease: Option<semver::Version>,
+}
+
+impl VersionReading {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        if let Ok(version) = semver::Version::parse(raw) {
+            let prerelease = (!version.pre.is_empty()).then(|| version.clone());
+            return Some(Self {
+                comparable: demote_pre_to_build(version)?,
+                prerelease,
+            });
+        }
+        Some(Self {
+            comparable: coerce_platform_version(raw)?,
+            prerelease: None,
+        })
+    }
+
+    fn matches(&self, req: &semver::VersionReq) -> bool {
+        match &self.prerelease {
+            Some(version) if req_names_prerelease(req) => req.matches(version),
+            _ => req.matches(&self.comparable),
+        }
+    }
+}
+
+fn req_names_prerelease(req: &semver::VersionReq) -> bool {
+    req.comparators
+        .iter()
+        .any(|comparator| !comparator.pre.is_empty())
+}
+
+/// Coerces semantic and platform-style version text into a comparable semantic version.
+///
+/// Prerelease text moves to build metadata unless a requirement explicitly names a prerelease.
+/// The first one to three numeric components form the comparable version.
+/// A four-component platform version such as `10.0.19041.1` truncates to `10.0.19041`.
+/// Invalid or empty input returns `None`.
+pub fn coerce_version(raw: &str) -> Option<semver::Version> {
+    VersionReading::parse(raw).map(|reading| reading.comparable)
+}
+
+fn coerce_platform_version(raw: &str) -> Option<semver::Version> {
+    let (core, _build) = match raw.split_once('+') {
+        Some((core, build)) => (core, Some(build)),
+        None => (raw, None),
+    };
+    let (numeric, suffix) = match core.split_once('-') {
+        Some((numeric, suffix)) => (numeric, Some(suffix)),
+        None => (core, None),
+    };
+    let mut components = [0u64; 3];
+    let mut count = 0usize;
+    let mut trailing_suffix: Option<&str> = None;
+    let mut cursor = 0usize;
+    while count < 3 && cursor < numeric.len() {
+        let part_len = numeric[cursor..]
+            .find('.')
+            .unwrap_or(numeric.len() - cursor);
+        let part = &numeric[cursor..cursor + part_len];
+        match part.parse::<u64>() {
+            Ok(value) => {
+                components[count] = value;
+                count += 1;
+                cursor += part_len + 1;
+            }
+            Err(_) => {
+                let digit_len = part.bytes().take_while(u8::is_ascii_digit).count();
+                if digit_len == 0 || digit_len == part.len() {
+                    return None;
+                }
+                components[count] = part[..digit_len].parse().ok()?;
+                count += 1;
+                trailing_suffix =
+                    Some(numeric[cursor + digit_len..].trim_start_matches(['-', '.', '_']));
+                break;
+            }
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    let build_source = trailing_suffix.or(suffix);
+    let build = match build_source {
+        Some(suffix) if !suffix.is_empty() => {
+            let valid_build_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '.';
+            let sanitized: std::borrow::Cow<'_, str> = if suffix.chars().all(valid_build_char) {
+                std::borrow::Cow::Borrowed(suffix)
+            } else {
+                std::borrow::Cow::Owned(
+                    suffix
+                        .chars()
+                        .map(|c| if valid_build_char(c) { c } else { '-' })
+                        .collect(),
+                )
+            };
+            semver::BuildMetadata::new(&sanitized).ok()?
+        }
+        _ => semver::BuildMetadata::EMPTY,
+    };
+    let mut version = semver::Version::new(components[0], components[1], components[2]);
+    version.build = build;
+    Some(version)
+}
+
+fn demote_pre_to_build(mut version: semver::Version) -> Option<semver::Version> {
+    if version.pre.is_empty() {
+        return Some(version);
+    }
+    let merged = if version.build.is_empty() {
+        version.pre.as_str().to_string()
+    } else {
+        format!("{}.{}", version.pre, version.build)
+    };
+    version.build = semver::BuildMetadata::new(&merged).ok()?;
+    version.pre = semver::Prerelease::EMPTY;
+    Some(version)
+}
+
+/// Half-open-ish version interval derived from a conjunctive `VersionReq`.
+/// `None` bounds are unbounded. Bounds are `(version, inclusive)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VersionInterval {
+    lo: Option<(semver::Version, bool)>,
+    hi: Option<(semver::Version, bool)>,
+}
+
+impl VersionInterval {
+    fn full() -> Self {
+        Self { lo: None, hi: None }
+    }
+
+    fn is_empty(&self) -> bool {
+        match (&self.lo, &self.hi) {
+            (Some((lo, lo_inc)), Some((hi, hi_inc))) => {
+                lo > hi || (lo == hi && !(*lo_inc && *hi_inc))
+            }
+            _ => false,
+        }
+    }
+
+    fn intersect(self, other: Self) -> Self {
+        let lo = match (self.lo, other.lo) {
+            (None, bound) | (bound, None) => bound,
+            (Some((a, a_inc)), Some((b, b_inc))) => {
+                if a > b || (a == b && !a_inc && b_inc) {
+                    Some((a, a_inc))
+                } else {
+                    Some((b, b_inc))
+                }
+            }
+        };
+        let hi = match (self.hi, other.hi) {
+            (None, bound) | (bound, None) => bound,
+            (Some((a, a_inc)), Some((b, b_inc))) => {
+                if a < b || (a == b && !a_inc && b_inc) {
+                    Some((a, a_inc))
+                } else {
+                    Some((b, b_inc))
+                }
+            }
+        };
+        Self { lo, hi }
+    }
+
+    /// `self` contains `other` as sets of versions.
+    fn contains(&self, other: &Self) -> bool {
+        if other.is_empty() {
+            return true;
+        }
+        if self.is_empty() {
+            return false;
+        }
+        let lo_ok = match (&self.lo, &other.lo) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some((a, a_inc)), Some((b, b_inc))) => a < b || (a == b && (*a_inc || !*b_inc)),
+        };
+        let hi_ok = match (&self.hi, &other.hi) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some((a, a_inc)), Some((b, b_inc))) => a > b || (a == b && (*a_inc || !*b_inc)),
+        };
+        lo_ok && hi_ok
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        if self.is_empty() || other.is_empty() {
+            return false;
+        }
+        let below =
+            |hi: &Option<(semver::Version, bool)>, lo: &Option<(semver::Version, bool)>| match (
+                hi, lo,
+            ) {
+                (Some((hi, hi_inc)), Some((lo, lo_inc))) => {
+                    hi < lo || (hi == lo && !(*hi_inc && *lo_inc))
+                }
+                _ => false,
+            };
+        !below(&self.hi, &other.lo) && !below(&other.hi, &self.lo)
+    }
+}
+
+/// Maps one comparator (with empty pre-release) to an interval. `None` when
+/// the comparator shape has no interval reading, which routes callers into
+/// the approximation rule.
+fn comparator_interval(comparator: &semver::Comparator) -> Option<VersionInterval> {
+    use semver::Op;
+    if !comparator.pre.is_empty() {
+        return None;
+    }
+    let major = comparator.major;
+    let minor = comparator.minor;
+    let patch = comparator.patch;
+    let version = |ma: u64, mi: u64, pa: u64| semver::Version::new(ma, mi, pa);
+    let lo_exact = version(major, minor.unwrap_or(0), patch.unwrap_or(0));
+    let interval = match comparator.op {
+        Op::Exact | Op::Wildcard => match (minor, patch) {
+            (Some(mi), Some(pa)) => VersionInterval {
+                lo: Some((version(major, mi, pa), true)),
+                hi: Some((version(major, mi, pa), true)),
+            },
+            (Some(mi), None) => VersionInterval {
+                lo: Some((version(major, mi, 0), true)),
+                hi: Some((version(major, mi.checked_add(1)?, 0), false)),
+            },
+            (None, _) => VersionInterval {
+                lo: Some((version(major, 0, 0), true)),
+                hi: Some((version(major.checked_add(1)?, 0, 0), false)),
+            },
+        },
+        Op::Greater => match (minor, patch) {
+            (Some(mi), Some(pa)) => VersionInterval {
+                lo: Some((version(major, mi, pa), false)),
+                hi: None,
+            },
+            (Some(mi), None) => VersionInterval {
+                lo: Some((version(major, mi.checked_add(1)?, 0), true)),
+                hi: None,
+            },
+            (None, _) => VersionInterval {
+                lo: Some((version(major.checked_add(1)?, 0, 0), true)),
+                hi: None,
+            },
+        },
+        Op::GreaterEq => VersionInterval {
+            lo: Some((lo_exact, true)),
+            hi: None,
+        },
+        Op::Less => VersionInterval {
+            lo: None,
+            hi: Some((lo_exact, false)),
+        },
+        Op::LessEq => match (minor, patch) {
+            (Some(mi), Some(pa)) => VersionInterval {
+                lo: None,
+                hi: Some((version(major, mi, pa), true)),
+            },
+            (Some(mi), None) => VersionInterval {
+                lo: None,
+                hi: Some((version(major, mi.checked_add(1)?, 0), false)),
+            },
+            (None, _) => VersionInterval {
+                lo: None,
+                hi: Some((version(major.checked_add(1)?, 0, 0), false)),
+            },
+        },
+        Op::Tilde => match (minor, patch) {
+            (Some(mi), _) => VersionInterval {
+                lo: Some((lo_exact, true)),
+                hi: Some((version(major, mi.checked_add(1)?, 0), false)),
+            },
+            (None, _) => VersionInterval {
+                lo: Some((lo_exact, true)),
+                hi: Some((version(major.checked_add(1)?, 0, 0), false)),
+            },
+        },
+        Op::Caret => {
+            let hi = if major > 0 || minor.is_none() {
+                version(major.checked_add(1)?, 0, 0)
+            } else if minor != Some(0) || patch.is_none() {
+                version(0, minor?.checked_add(1)?, 0)
+            } else {
+                version(0, 0, patch?.checked_add(1)?)
+            };
+            VersionInterval {
+                lo: Some((lo_exact, true)),
+                hi: Some((hi, false)),
+            }
+        }
+        _ => return None,
+    };
+    Some(interval)
+}
+
+/// Normalizes a validated requirement string into one interval. `None` when
+/// any comparator resists the interval reading (pre-release comparators or
+/// unknown operators).
+fn version_req_interval(raw: &str) -> Option<VersionInterval> {
+    let req = semver::VersionReq::parse(raw).ok()?;
+    parsed_version_req_interval(&req)
+}
+
+fn parsed_version_req_interval(req: &semver::VersionReq) -> Option<VersionInterval> {
+    let mut interval = VersionInterval::full();
+    for comparator in &req.comparators {
+        interval = interval.intersect(comparator_interval(comparator)?);
+    }
+    Some(interval)
+}
+
+pub(super) fn version_req_matches(raw: &str, value: &str) -> Option<bool> {
+    let req = semver::VersionReq::parse(raw).ok()?;
+    parsed_version_req_matches(&req, value)
+}
+
+pub(super) fn parsed_version_req_matches(req: &semver::VersionReq, value: &str) -> Option<bool> {
+    Some(VersionReading::parse(value)?.matches(req))
+}
+
+/// Whether every context matched by `b` is matched by `a`, per the
+/// cross-operator matrix. `None` = no decision procedure for the pair.
+fn term_subsumes(a: &TermValue, b: &TermValue, oracle: &dyn GraphOracle) -> Option<bool> {
+    use TermValue::*;
+    match (a, b) {
+        (RedactedPlaceholder, _) | (_, RedactedPlaceholder) => None,
+        (Exact(u), Exact(v)) => Some(u == v),
+        (Exact(u), Set(s)) => Some(s.len() == 1 && s.contains(u)),
+        (Exact(_), _) => Some(false),
+        (Set(t), Exact(v)) => Some(t.contains(v)),
+        (Set(t), Set(s)) => Some(s.is_subset(t)),
+        (Set(_), _) => Some(false),
+        (Range { start, end }, Exact(v)) => Some(range_contains(start, end, v)),
+        (Range { start, end }, Set(s)) => {
+            Some(s.iter().all(|value| range_contains(start, end, value)))
+        }
+        (Range { start: ps, end: pe }, Range { start: rs, end: re }) => {
+            Some(range_bound_le(ps, rs) && range_bound_ge(pe, re))
+        }
+        (Range { .. }, _) => Some(false),
+        (VersionRange(q), Exact(v)) => version_req_matches(q, v),
+        (VersionRange(q), Set(s)) => {
+            let mut all = true;
+            for value in s {
+                match version_req_matches(q, value) {
+                    Some(true) => {}
+                    Some(false) => {
+                        all = false;
+                        break;
+                    }
+                    None => return None,
+                }
+            }
+            Some(all)
+        }
+        (VersionRange(q), VersionRange(vr)) => {
+            if q == vr {
+                return Some(true);
+            }
+            let outer = version_req_interval(q)?;
+            let inner = version_req_interval(vr)?;
+            Some(outer.contains(&inner))
+        }
+        (VersionRange(_), _) => Some(false),
+        (GitReachable(h), GitReachable(g)) => {
+            if h == g {
+                return Some(true);
+            }
+            // descendants(h) ⊇ descendants(g) exactly when h is an ancestor
+            // of g in the DAG.
+            oracle.is_ancestor_or_equal(h, g)
+        }
+        (GitReachable(_), _) => Some(false),
+    }
+}
+
+/// Whether the two value sets can intersect. `None` = no decision procedure.
+fn term_overlaps(a: &TermValue, b: &TermValue, oracle: &dyn GraphOracle) -> Option<bool> {
+    use TermValue::*;
+    match (a, b) {
+        (RedactedPlaceholder, _) | (_, RedactedPlaceholder) => None,
+        (Exact(u), Exact(v)) => Some(u == v),
+        (Exact(u), Set(s)) | (Set(s), Exact(u)) => Some(s.contains(u)),
+        (Exact(u), Range { start, end }) | (Range { start, end }, Exact(u)) => {
+            Some(range_contains(start, end, u))
+        }
+        (Exact(u), VersionRange(q)) | (VersionRange(q), Exact(u)) => version_req_matches(q, u),
+        (Set(t), Set(s)) => Some(!t.is_disjoint(s)),
+        (Set(s), Range { start, end }) | (Range { start, end }, Set(s)) => {
+            Some(s.iter().any(|value| range_contains(start, end, value)))
+        }
+        (Set(s), VersionRange(q)) | (VersionRange(q), Set(s)) => {
+            let mut any = false;
+            for value in s {
+                match version_req_matches(q, value) {
+                    Some(true) => {
+                        any = true;
+                        break;
+                    }
+                    Some(false) => {}
+                    None => return None,
+                }
+            }
+            Some(any)
+        }
+        (Range { start: ps, end: pe }, Range { start: rs, end: re }) => {
+            Some(ranges_overlap(ps, pe, rs, re))
+        }
+        (VersionRange(q), VersionRange(vr)) => {
+            if q == vr {
+                let interval = version_req_interval(q)?;
+                return Some(!interval.is_empty());
+            }
+            let left = version_req_interval(q)?;
+            let right = version_req_interval(vr)?;
+            Some(left.overlaps(&right))
+        }
+        (GitReachable(h), GitReachable(g)) => {
+            if h == g {
+                return Some(true);
+            }
+            // Cones intersect when either commit is an ancestor of the
+            // other; incomparable commits may still share a descendant, so
+            // a double-negative is not decidable from ancestry alone.
+            match (
+                oracle.is_ancestor_or_equal(h, g),
+                oracle.is_ancestor_or_equal(g, h),
+            ) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                _ => None,
+            }
+        }
+        // Cross-domain pairs (git vs text, range vs version_range) have no
+        // shared decision procedure.
+        _ => None,
+    }
+}
+
+fn range_contains(start: &Option<String>, end: &Option<String>, value: &str) -> bool {
+    start.as_deref().is_none_or(|start| value >= start)
+        && end.as_deref().is_none_or(|end| value < end)
+}
+
+/// `a` (a start bound) is at or below `b`. `None` = unbounded start.
+fn range_bound_le(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(a), Some(b)) => a <= b,
+    }
+}
+
+/// `a` (an end bound) is at or above `b`. `None` = unbounded end.
+fn range_bound_ge(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(a), Some(b)) => a >= b,
+    }
+}
+
+fn ranges_overlap(
+    a_start: &Option<String>,
+    a_end: &Option<String>,
+    b_start: &Option<String>,
+    b_end: &Option<String>,
+) -> bool {
+    let starts_before_end = |start: &Option<String>, end: &Option<String>| match (start, end) {
+        (Some(start), Some(end)) => start < end,
+        _ => true,
+    };
+    starts_before_end(a_start, b_end) && starts_before_end(b_start, a_end)
+}
+
+fn term_matches(
+    term: &TermValue,
+    version_requirement: Option<&semver::VersionReq>,
+    dimension: Dimension,
+    ctx: &ScopeMatchContext,
+    oracle: &dyn GraphOracle,
+) -> MatchOutcome {
+    if matches!(term, TermValue::RedactedPlaceholder) {
+        return MatchOutcome::Uncertain;
+    }
+    if let TermValue::GitReachable(oid) = term {
+        let Some(head) = ctx.head_commit.as_deref() else {
+            return MatchOutcome::Uncertain;
+        };
+        return match oracle.is_ancestor_or_equal(oid, head) {
+            Some(true) => MatchOutcome::Matches,
+            Some(false) => MatchOutcome::DoesNotMatch,
+            None => MatchOutcome::Uncertain,
+        };
+    }
+    let Some(value) = ctx.value(dimension) else {
+        return MatchOutcome::Uncertain;
+    };
+    if contains_redaction_placeholder(value) {
+        return MatchOutcome::Uncertain;
+    }
+    match term {
+        TermValue::Exact(expected) => bool_outcome(expected == value),
+        TermValue::Set(values) => bool_outcome(values.contains(value)),
+        TermValue::Range { start, end } => bool_outcome(range_contains(start, end, value)),
+        TermValue::VersionRange(_) => ctx
+            .coerced_version(dimension)
+            .map(|version| {
+                bool_outcome(version.matches(
+                    version_requirement.expect("canonical version range has a parsed requirement"),
+                ))
+            })
+            .unwrap_or(MatchOutcome::Uncertain),
+        TermValue::GitReachable(_) | TermValue::RedactedPlaceholder => unreachable!(),
+    }
+}
+
+fn bool_outcome(value: bool) -> MatchOutcome {
+    if value {
+        MatchOutcome::Matches
+    } else {
+        MatchOutcome::DoesNotMatch
+    }
+}
+
+/// Whether `scope` matches the resolved context: the conjunction of its
+/// terms, with absent dimensions matching everything.
+pub fn scope_matches(
+    scope: &CanonicalScope,
+    ctx: &ScopeMatchContext,
+    oracle: &dyn GraphOracle,
+) -> MatchOutcome {
+    let mut outcome = MatchOutcome::Matches;
+    for (dimension, term) in scope.terms() {
+        match term_matches(
+            term,
+            scope.version_requirement(dimension),
+            dimension,
+            ctx,
+            oracle,
+        ) {
+            MatchOutcome::DoesNotMatch => return MatchOutcome::DoesNotMatch,
+            MatchOutcome::Uncertain => outcome = MatchOutcome::Uncertain,
+            MatchOutcome::Matches => {}
+        }
+    }
+    outcome
+}
+
+/// Sound, not complete: `true` guarantees every context matched by `b` is
+/// matched by `a`; pairs without a decision procedure answer `false`.
+pub fn scope_subsumes(a: &CanonicalScope, b: &CanonicalScope, oracle: &dyn GraphOracle) -> bool {
+    a.terms()
+        .all(|(dimension, term_a)| match b.term(dimension) {
+            Some(term_b) => match (term_a, term_b) {
+                (TermValue::VersionRange(_), TermValue::Exact(value)) => a
+                    .version_requirement(dimension)
+                    .and_then(|requirement| parsed_version_req_matches(requirement, value))
+                    .unwrap_or(false),
+                (TermValue::VersionRange(_), TermValue::Set(values)) => {
+                    let Some(requirement) = a.version_requirement(dimension) else {
+                        return false;
+                    };
+                    values.iter().all(|value| {
+                        parsed_version_req_matches(requirement, value).unwrap_or(false)
+                    })
+                }
+                (TermValue::VersionRange(left), TermValue::VersionRange(right)) => {
+                    if left == right {
+                        true
+                    } else {
+                        a.version_interval(dimension)
+                            .zip(b.version_interval(dimension))
+                            .is_some_and(|(outer, inner)| outer.contains(inner))
+                    }
+                }
+                _ => term_subsumes(term_a, term_b, oracle).unwrap_or(false),
+            },
+            // `a` constrains a dimension `b` leaves open: some context outside
+            // `a`'s value set matches `b`.
+            None => false,
+        })
+}
+
+/// Over-approximates: `false` guarantees disjoint value sets; pairs without
+/// a decision procedure answer `true`.
+pub fn scope_overlaps(a: &CanonicalScope, b: &CanonicalScope, oracle: &dyn GraphOracle) -> bool {
+    a.terms()
+        .all(|(dimension, term_a)| match b.term(dimension) {
+            Some(term_b) => match (term_a, term_b) {
+                (TermValue::VersionRange(_), TermValue::Exact(value)) => a
+                    .version_requirement(dimension)
+                    .and_then(|requirement| parsed_version_req_matches(requirement, value))
+                    .unwrap_or(true),
+                (TermValue::Exact(value), TermValue::VersionRange(_)) => b
+                    .version_requirement(dimension)
+                    .and_then(|requirement| parsed_version_req_matches(requirement, value))
+                    .unwrap_or(true),
+                (TermValue::VersionRange(_), TermValue::Set(values)) => a
+                    .version_requirement(dimension)
+                    .map(|requirement| {
+                        values.iter().any(|value| {
+                            parsed_version_req_matches(requirement, value).unwrap_or(true)
+                        })
+                    })
+                    .unwrap_or(true),
+                (TermValue::Set(values), TermValue::VersionRange(_)) => b
+                    .version_requirement(dimension)
+                    .map(|requirement| {
+                        values.iter().any(|value| {
+                            parsed_version_req_matches(requirement, value).unwrap_or(true)
+                        })
+                    })
+                    .unwrap_or(true),
+                (TermValue::VersionRange(left), TermValue::VersionRange(right)) => {
+                    match (a.version_interval(dimension), b.version_interval(dimension)) {
+                        (Some(left_interval), Some(right_interval)) => {
+                            if left == right {
+                                !left_interval.is_empty()
+                            } else {
+                                left_interval.overlaps(right_interval)
+                            }
+                        }
+                        _ => true,
+                    }
+                }
+                _ => term_overlaps(term_a, term_b, oracle).unwrap_or(true),
+            },
+            None => true,
+        })
+}
+
+/// Mutual subsumption, with a fast path on canonical-form equality for
+/// scopes free of unresolvable placeholder terms.
+pub fn scope_equivalent(a: &CanonicalScope, b: &CanonicalScope, oracle: &dyn GraphOracle) -> bool {
+    if a == b && !a.has_placeholder() {
+        return true;
+    }
+    scope_subsumes(a, b, oracle) && scope_subsumes(b, a, oracle)
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::{version_req_matches, VersionReading};
+
+    fn requirement_strategy() -> impl Strategy<Value = String> {
+        (0u64..5, 0u64..5, 0u64..5, 0u8..8).prop_map(|(major, minor, patch, shape)| match shape {
+            0 => format!("={major}.{minor}.{patch}"),
+            1 => format!(">={major}.{minor}.{patch}"),
+            2 => format!("<{major}.{minor}.{patch}"),
+            3 => format!("^{major}.{minor}.{patch}"),
+            4 => format!("~{major}.{minor}.{patch}"),
+            5 => format!("{major}.{minor}.*"),
+            6 => format!(">={major}.{minor}.{patch}, <{}.0.0", major + 1),
+            _ => format!(">={major}.{minor}.{patch}-beta.1"),
+        })
+    }
+
+    fn version_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            (0u64..7, 0u64..7, 0u64..7)
+                .prop_map(|(major, minor, patch)| format!("{major}.{minor}.{patch}")),
+            (0u64..7, 0u64..7).prop_map(|(major, minor)| format!("{major}.{minor}")),
+            (0u64..7).prop_map(|major| major.to_string()),
+            (0u64..7, 0u64..7, 0u64..7)
+                .prop_map(|(major, minor, patch)| format!("{major}.{minor}.{patch}-beta.1")),
+            Just("not-a-version".to_string()),
+            Just(String::new()),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            rng_algorithm: prop::test_runner::RngAlgorithm::ChaCha,
+            rng_seed: prop::test_runner::RngSeed::Fixed(0x5C0BEA16F),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn version_matching_agrees_with_semver(
+            requirement in requirement_strategy(),
+            value in version_strategy(),
+        ) {
+            let expected = semver::VersionReq::parse(&requirement)
+                .ok()
+                .and_then(|requirement| {
+                    VersionReading::parse(&value)
+                        .map(|version| version.matches(&requirement))
+                });
+            prop_assert_eq!(version_req_matches(&requirement, &value), expected);
+        }
+    }
+}

@@ -77,9 +77,9 @@ export interface RolloutRecord extends RolloutCoordinate {
     checks: CheckResult[];
     usage: TokenUsage;
     costUsd: number;
-    /** Spend on earlier attempts at this coordinate, which replacement would otherwise erase from the file the next resume reconstructs spend from. commentlint: allow(JUDGE) */
+    /** Spend on earlier attempts at this coordinate, which replacement would otherwise erase from the file the next resume reconstructs spend from. */
     priorAttemptsCostUsd: number;
-    /** The dearest single attempt at this coordinate. The reserve needs the price of one call, which a sum of several cheap failures overstates. commentlint: allow(JUDGE) */
+    /** The dearest single attempt at this coordinate. The reserve needs the price of one call, which a sum of several cheap failures overstates. */
     maxAttemptCostUsd: number;
     costSource: "observed" | "estimated";
     wallClockMs: number;
@@ -116,7 +116,7 @@ export interface RolloutHandle {
 export interface RolloutStore {
     list(): RolloutRecord[];
     put(record: RolloutRecord): void;
-    /** Optional because a store need not hold anything: `list()` can claim a records path, and a run that rejects before any rollout frees the claim here so a corrected call can retry in the same process. commentlint: allow(JUDGE) */
+    /** Optional because a store need not hold anything: `list()` can claim a records path, and a run that rejects before any rollout frees the claim here so a corrected call can retry in the same process. */
     release?(): void;
 }
 
@@ -168,7 +168,7 @@ export interface PairedDeltaRunResult {
         | "deadline-reached"
         | "invalid-stored-records"
         | "harness-unreclaimed"
-        /** A failed rollout's billed usage could not be read, so its record carries only the worst-case estimate, which the historian's retry tree can exceed; the run stops rather than admit later arms against an understated `spentUsd`. commentlint: allow(JUDGE) */
+        /** A failed rollout's billed usage could not be read, so its record carries only the worst-case estimate, which the historian's retry tree can exceed; the run stops rather than admit later arms against an understated `spentUsd`. */
         | "usage-unmeasured";
     /**
      * Whether some failed rollout's spend could not be measured, independent of `status`.
@@ -211,7 +211,7 @@ export async function verifyDualMockResolution(input: {
     }): Promise<{ providerId: string; modelId: string; contextLimit: number }>;
 }): Promise<void> {
     const fixtureRoute = { providerId: "mock-anthropic", modelId: "mock-sonnet" };
-    /** The gate exists to prove two distinct routes resolve independently, and the provider is what decides the endpoint: `writeConfigs` writes the generated fixture provider after the contributed ones, so a live route naming that provider is served by the fixture regardless of the model it names. A different model under it resolves against the same mock and echoes back what was asked, so the route checks pass while every supposedly live rollout runs on fixture traffic. commentlint: allow(JUDGE) */
+    /** The gate exists to prove two distinct routes resolve independently, and the provider is what decides the endpoint: `writeConfigs` writes the generated fixture provider after the contributed ones, so a live route naming that provider is served by the fixture regardless of the model it names. A different model under it resolves against the same mock and echoes back what was asked, so the route checks pass while every supposedly live rollout runs on fixture traffic. */
     if (input.liveProviderId === fixtureRoute.providerId) {
         throw new Error(
             "dual-mock live route duplicates the fixture provider " +
@@ -222,8 +222,8 @@ export async function verifyDualMockResolution(input: {
         fixtureRoute,
         { providerId: input.liveProviderId, modelId: input.liveModelId },
     ];
-    /** The callback receives a copy: handed the same object, a `sendPrompt` that normalizes its argument in place would rewrite the expectation too, and the comparison below could then agree after both identities had been changed — certifying a live route that resolved through the fixture provider. commentlint: allow(JUDGE) */
-    /** One prompt at a time, fixture first, rather than concurrently: a `sendPrompt` that throws means the harness cannot serve a route at all, and the live route is a real provider call, so the free route's failure must not have already spent it. The comparison below is index-based, so the order this preserves is the order it reads. commentlint: allow(JUDGE) */
+    /** The callback receives a copy: handed the same object, a `sendPrompt` that normalizes its argument in place would rewrite the expectation too, and the comparison below could then agree after both identities had been changed — certifying a live route that resolved through the fixture provider. */
+    /** One prompt at a time, fixture first, rather than concurrently: a `sendPrompt` that throws means the harness cannot serve a route at all, and the live route is a real provider call, so the free route's failure must not have already spent it. The comparison below is index-based, so the order this preserves is the order it reads. */
     const resolved = [];
     for (const route of routes) resolved.push(await input.sendPrompt({ ...route }));
     for (let index = 0; index < routes.length; index++) {
@@ -252,7 +252,7 @@ const ARM_ID_SET: ReadonlySet<string> = new Set(ARM_IDS);
  * non-finite or negative cost would disable the cost cap: adding NaN to the
  * spent total makes every later cap comparison false.
  */
-/** Raised when a records file cannot be parsed. A distinct type because the exit code a caller keys off has to separate "this file needs inspection" from "the run stopped on budget"; matching diagnostic prose would couple the CLI to wording that is free to change. Every rejection `parseRolloutRecords` raises uses it — syntax, per-record shape, duplicate coordinates, and the file-wide spend total all mean the same thing to a caller, so a rule that threw a plain `Error` would silently downgrade to the resumable code. commentlint: allow(JUDGE) */
+/** Raised when a records file cannot be parsed. A distinct type because the exit code a caller keys off has to separate "this file needs inspection" from "the run stopped on budget"; matching diagnostic prose would couple the CLI to wording that is free to change. Every rejection `parseRolloutRecords` raises uses it — syntax, per-record shape, duplicate coordinates, and the file-wide spend total all mean the same thing to a caller, so a rule that threw a plain `Error` would silently downgrade to the resumable code. */
 export class RolloutRecordsInvalidError extends Error {}
 
 
@@ -290,14 +290,14 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
         ] as const) {
             if (!isNonNegativeAmount(value)) fail(`${label}-invalid`);
         }
-        /** Each figure can be finite while their sum is not, and that sum is what the pre-scan adds to `spentUsd`: one `Infinity` there makes every later cap comparison false and serializes as `null`. commentlint: allow(JUDGE) */
+        /** Each figure can be finite while their sum is not, and that sum is what the pre-scan adds to `spentUsd`: one `Infinity` there makes every later cap comparison false and serializes as `null`. */
         if (!Number.isFinite((record.priorAttemptsCostUsd as number) + (record.costUsd as number))) {
             fail("attempt-cost-total-invalid");
         }
         if (record.costSource !== "observed" && record.costSource !== "estimated") {
             fail("cost-source-invalid");
         }
-        /** `parseArmedCellResult` is the contract's own validator, so the store cannot drift from it: it enforces the cross-field rules a local copy kept missing — `criticalTotal <= checksTotal`, `criticalPassed <= checksPassed`, a reason code exactly when the health is not completed, and the reason-to-health pairings `REASON_CODE_HEALTHS` admits. commentlint: allow(JUDGE) */
+        /** `parseArmedCellResult` is the contract's own validator, so the store cannot drift from it: it enforces the cross-field rules a local copy kept missing — `criticalTotal <= checksTotal`, `criticalPassed <= checksPassed`, a reason code exactly when the health is not completed, and the reason-to-health pairings `REASON_CODE_HEALTHS` admits. */
         const armedCell = ((): ArmedCellResult => {
             try {
                 return parseArmedCellResult(record.cell);
@@ -324,10 +324,10 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
             fail("checks-invalid");
         }
         const vector = checks as CheckResult[];
-        /** A completed record suppresses its live rollout, so its counts must agree with the vector stored beside them: `parseArmedCellResult` validates the cell alone and cannot see the checks. commentlint: allow(JUDGE) */
+        /** A completed record suppresses its live rollout, so its counts must agree with the vector stored beside them: `parseArmedCellResult` validates the cell alone and cannot see the checks. */
         if (armedCell.runHealth === "completed") {
             if (
-                /** A live record sets this flag only for a claimed success that failed a critical check, so the combination cannot have been produced by a run and would inflate invalid-success counts. commentlint: allow(JUDGE) */
+                /** A live record sets this flag only for a claimed success that failed a critical check, so the combination cannot have been produced by a run and would inflate invalid-success counts. */
                 (armedCell.invalidSuccess && armedCell.criticalPassed >= armedCell.criticalTotal) ||
                 vector.length !== armedCell.checksTotal ||
                 vector.filter((check) => check.passed).length !== armedCell.checksPassed
@@ -336,7 +336,7 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
             }
         }
     });
-    /** `put` indexes by coordinate and refuses to replace completed evidence, so a duplicate makes both wrong at once: the pre-scan bills every copy, and the index points at whichever landed last rather than at the completed record it must protect. commentlint: allow(JUDGE) */
+    /** `put` indexes by coordinate and refuses to replace completed evidence, so a duplicate makes both wrong at once: the pre-scan bills every copy, and the index points at whichever landed last rather than at the completed record it must protect. */
     const seen = new Set<string>();
     (raw as RolloutRecord[]).forEach((record, index) => {
         const key = coordinateKey(record);
@@ -347,7 +347,7 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
         }
         seen.add(key);
     });
-    /** Every attempt cost is non-negative, so a finite total over the whole file makes every subset total finite too — including the matrix subset the pre-scan bills. Checked here rather than at the pre-scan because the store releases its claim when parsing rejects, which leaves a corrected records path retryable in the same process. commentlint: allow(JUDGE) */
+    /** Every attempt cost is non-negative, so a finite total over the whole file makes every subset total finite too — including the matrix subset the pre-scan bills. Checked here rather than at the pre-scan because the store releases its claim when parsing rejects, which leaves a corrected records path retryable in the same process. */
     const total = (raw as RolloutRecord[]).reduce(
         (sum, record) => sum + record.priorAttemptsCostUsd + record.costUsd,
         0,
@@ -358,12 +358,12 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
     return raw as RolloutRecord[];
 }
 
-/** Two runners over one records path each cache the pre-run array and publish a private snapshot, so the later rename erases the other's record after both paid calls happened — and the erased spend is then repeated on resume. The lock is taken before the first read, because by the time a write conflicts the money is already gone. commentlint: allow(JUDGE) */
+/** Two runners over one records path each cache the pre-run array and publish a private snapshot, so the later rename erases the other's record after both paid calls happened — and the erased spend is then repeated on resume. The lock is taken before the first read, because by the time a write conflicts the money is already gone. */
 export class RolloutStoreBusyError extends Error {}
-/** A publication that lost its lock may have replaced a coordinate another owner wrote, so the file is suspect in the same way a malformed one is: it must be inspected, not resumed. A subclass of the busy error because callers that retry on contention should keep doing so, while the exit-code mapping can tell the two apart. commentlint: allow(JUDGE) */
+/** A publication that lost its lock may have replaced a coordinate another owner wrote, so the file is suspect in the same way a malformed one is: it must be inspected, not resumed. A subclass of the busy error because callers that retry on contention should keep doing so, while the exit-code mapping can tell the two apart. */
 export class RolloutStorePublishConflictError extends RolloutStoreBusyError {}
 
-/** Read-only stores never claim ownership, so inspecting a records file never conflicts with the run that owns it. commentlint: allow(JUDGE) */
+/** Read-only stores never claim ownership, so inspecting a records file never conflicts with the run that owns it. */
 const ownedRecordPaths = new Set<string>();
 
 
@@ -385,23 +385,23 @@ export class FileRolloutStore implements RolloutStore {
     list(): RolloutRecord[] {
         this.acquire();
         try {
-            /** Detached for the same reason the write is: a consumer that edits a returned record must not be editing the cache. commentlint: allow(JUDGE) */
+            /** Detached for the same reason the write is: a consumer that edits a returned record must not be editing the cache. */
             return this.load().map((record) => structuredClone(record));
         } catch (error) {
-            /** A records file this store cannot parse leaves nothing to release the claim: the run throws, and only an explicit `release()` — which the caller never reaches — would free the path for the corrected retry. commentlint: allow(JUDGE) */
+            /** A records file this store cannot parse leaves nothing to release the claim: the run throws, and only an explicit `release()` — which the caller never reaches — would free the path for the corrected retry. */
             this.release();
             throw error;
         }
     }
 
-    /** Removes this process's claim on the records path. Safe to call when no lock is held. commentlint: allow(JUDGE) */
+    /** Removes this process's claim on the records path. Safe to call when no lock is held. */
     release(): void {
         const held = this.held;
         if (held === null) return;
-        /** The on-disk claim goes first because removing it can fail, and disowning a claim this process still holds is worse than reporting the failure: a later `acquire` would find the directory carrying its own live pid, which `lockAbandoned` will never reclaim, and spin to `RolloutStoreBusyError` against a lock it orphaned itself. Keeping the handle on a throw leaves the two views agreeing that ownership was never given up. commentlint: allow(JUDGE) */
+        /** The on-disk claim goes first because removing it can fail, and disowning a claim this process still holds is worse than reporting the failure: a later `acquire` would find the directory carrying its own live pid, which `lockAbandoned` will never reclaim, and spin to `RolloutStoreBusyError` against a lock it orphaned itself. Keeping the handle on a throw leaves the two views agreeing that ownership was never given up. */
         held.release();
         this.held = null;
-        /** Ownership is what made the cached snapshot authoritative, so it is dropped with the claim: another owner can advance the file while this instance holds nothing, and a reacquisition serving the old array would pay for a coordinate that owner already completed and then be refused replacement by `put`. commentlint: allow(JUDGE) */
+        /** Ownership is what made the cached snapshot authoritative, so it is dropped with the claim: another owner can advance the file while this instance holds nothing, and a reacquisition serving the old array would pay for a coordinate that owner already completed and then be refused replacement by `put`. */
         this.records = null;
         this.indexByCoordinate = new Map();
         ownedRecordPaths.delete(this.claim);
@@ -409,15 +409,15 @@ export class FileRolloutStore implements RolloutStore {
     }
 
     private acquire(): void {
-        /** A read-only store observes the file without claiming it, so a report or an assertion can read records the owning run is still writing. commentlint: allow(JUDGE) */
+        /** A read-only store observes the file without claiming it, so a report or an assertion can read records the owning run is still writing. */
         if (this.readOnly || this.held !== null) return;
-        /** `acquireRecoverableLock`'s nonce is per module, not per instance, so a second store in this process would read its own nonce back and believe it owns the lock. commentlint: allow(JUDGE) */
+        /** `acquireRecoverableLock`'s nonce is per module, not per instance, so a second store in this process would read its own nonce back and believe it owns the lock. */
         if (ownedRecordPaths.has(this.claim)) {
             throw new RolloutStoreBusyError(
                 `rollout store ${this.path} is already owned in this process`,
             );
         }
-        /** The records path's directory is created by the first publish, so the lock cannot assume it exists. commentlint: allow(JUDGE) */
+        /** The records path's directory is created by the first publish, so the lock cannot assume it exists. */
         mkdirSync(dirname(this.lockPath), { recursive: true });
         try {
             this.held = acquireRecoverableLock(this.lockPath, {
@@ -438,7 +438,7 @@ export class FileRolloutStore implements RolloutStore {
             throw new Error(`rollout store ${this.path} was opened read-only`);
         }
         this.acquire();
-        /** Ownership is checked before the work and again immediately before the rename, and the file is fingerprinted across the same span: merging into current contents is not by itself enough, because the merge reads a snapshot that a new holder can supersede before this rename lands, and the rename would then drop the coordinate that holder published. The pair of checks does not make the window zero — no check can stay true through the syscall after it — but a publication that loses the race is now detected and retried instead of silently overwriting paid evidence. commentlint: allow(JUDGE) */
+        /** Ownership is checked before the work and again immediately before the rename, and the file is fingerprinted across the same span: merging into current contents is not by itself enough, because the merge reads a snapshot that a new holder can supersede before this rename lands, and the rename would then drop the coordinate that holder published. The pair of checks does not make the window zero — no check can stay true through the syscall after it — but a publication that loses the race is now detected and retried instead of silently overwriting paid evidence. */
         for (let attempt = 0;; attempt += 1) {
             if (!lockHeldByThisProcess(this.lockPath)) {
                 this.invalidate();
@@ -446,20 +446,20 @@ export class FileRolloutStore implements RolloutStore {
                     `rollout store ${this.path} lock was taken over by another owner`,
                 );
             }
-            /** The write merges into what the file holds now, not into the snapshot this instance cached: an intervening owner's records are read back and kept, so a coordinate this process never knew about survives the merge. commentlint: allow(JUDGE) */
+            /** The write merges into what the file holds now, not into the snapshot this instance cached: an intervening owner's records are read back and kept, so a coordinate this process never knew about survives the merge. */
             const merged = [...this.reload()];
-            /** Taken from the reload rather than by reading again: it is the same bytes, one fewer read, and it removes the window a separate read opened between hashing and parsing. commentlint: allow(JUDGE) */
+            /** Taken from the reload rather than by reading again: it is the same bytes, one fewer read, and it removes the window a separate read opened between hashing and parsing. */
             const fingerprint = this.loadedFingerprint;
             const key = coordinateKey(record);
             const index = this.indexByCoordinate.get(key);
             if (index !== undefined && merged[index]?.cell.runHealth === "completed") {
                 throw new Error(`refusing to replace completed rollout ${key}`);
             }
-            /** The caller keeps a reference to the record it passed and the run returns the same object in its result, so installing it directly made the cache an alias of caller-owned state: an edited result — a `costUsd` set to zero — would then be served by `list()` in place of the correct file, understating restored spend and letting further paid arms pass the cap. commentlint: allow(JUDGE) */
+            /** The caller keeps a reference to the record it passed and the run returns the same object in its result, so installing it directly made the cache an alias of caller-owned state: an edited result — a `costUsd` set to zero — would then be served by `list()` in place of the correct file, understating restored spend and letting further paid arms pass the cap. */
             const stored = structuredClone(record);
             if (index !== undefined) merged[index] = stored;
             else merged.push(stored);
-            /** Re-read rather than trusted: between the fingerprint above and here this call did its own reload, and a new holder publishing in that span means the merge is already stale. Retried a bounded number of times, because a path under continuous rewriting is contention to report rather than a race to keep losing. commentlint: allow(JUDGE) */
+            /** Re-read rather than trusted: between the fingerprint above and here this call did its own reload, and a new holder publishing in that span means the merge is already stale. Retried a bounded number of times, because a path under continuous rewriting is contention to report rather than a race to keep losing. */
             if (
                 !lockHeldByThisProcess(this.lockPath) ||
                 this.recordsFingerprint() !== fingerprint
@@ -472,9 +472,9 @@ export class FileRolloutStore implements RolloutStore {
             }
             // The records file feeds spend and resume decisions for later runs, so
             // it stays owner-only even though report artifacts are world-readable.
-            /** The merge is built and published detached from the cache, and the cache is replaced only once the rename lands: mutating the cached array in place left a failed publication — a full disk, a refused rename — holding evidence that never reached the file, so a retry on this instance resumed a record the next process cannot see and the paid rollout was repeated. commentlint: allow(JUDGE) */
+            /** The merge is built and published detached from the cache, and the cache is replaced only once the rename lands: mutating the cached array in place left a failed publication — a full disk, a refused rename — holding evidence that never reached the file, so a retry on this instance resumed a record the next process cannot see and the paid rollout was repeated. */
             publishJsonAtomically(merged, this.path, { mode: 0o600 });
-            /** Checked again after the rename, because the checks before it cannot span the syscall. A clobber requires the lock to have moved, so observing it still held here is what licenses treating the publication as sound; observing it lost means this rename may have replaced a coordinate a new holder published, and that snapshot was never read, so it cannot be merged back. The loss is therefore reported rather than repaired — the file is left as written and the caller is told not to trust it as a complete ledger. commentlint: allow(JUDGE) */
+            /** Checked again after the rename, because the checks before it cannot span the syscall. A clobber requires the lock to have moved, so observing it still held here is what licenses treating the publication as sound; observing it lost means this rename may have replaced a coordinate a new holder published, and that snapshot was never read, so it cannot be merged back. The loss is therefore reported rather than repaired — the file is left as written and the caller is told not to trust it as a complete ledger. */
             if (!lockHeldByThisProcess(this.lockPath)) {
                 this.invalidate();
                 throw new RolloutStorePublishConflictError(
@@ -491,7 +491,7 @@ export class FileRolloutStore implements RolloutStore {
         }
     }
 
-    /** Identifies the exact contents a load was built from. A hash rather than a timestamp because two writes inside one filesystem timestamp tick are exactly the interleaving being fenced, and an absent file is a state to distinguish rather than an error. Recorded by `load` from the same bytes it parsed, so the fence compares against what was actually merged rather than against a second read that could already differ. commentlint: allow(JUDGE) */
+    /** Identifies the exact contents a load was built from. A hash rather than a timestamp because two writes inside one filesystem timestamp tick are exactly the interleaving being fenced, and an absent file is a state to distinguish rather than an error. Recorded by `load` from the same bytes it parsed, so the fence compares against what was actually merged rather than against a second read that could already differ. */
     private loadedFingerprint = "absent";
 
     private recordsFingerprint(): string {
@@ -503,7 +503,7 @@ export class FileRolloutStore implements RolloutStore {
         }
     }
 
-    /** The handle is deliberately kept. A reclaimer that sidelined this lock can still restore the owner record, and a restored record names this live process, which `lockAbandoned` will never reclaim — so discarding the handle here left the path blocked until the process exited. Retaining it is safe because `releaseLock` re-reads before deleting anything and removes only a record carrying this process's nonce, sweeping sidelines otherwise. The in-process reservation is kept for the same span: every handle in this process shares one lock nonce, so a second store acquiring this path would have its lock deleted by this store's later release, which reads that shared nonce as its own. Only cleanup releases either. commentlint: allow(JUDGE) */
+    /** The handle is deliberately kept. A reclaimer that sidelined this lock can still restore the owner record, and a restored record names this live process, which `lockAbandoned` will never reclaim — so discarding the handle here left the path blocked until the process exited. Retaining it is safe because `releaseLock` re-reads before deleting anything and removes only a record carrying this process's nonce, sweeping sidelines otherwise. The in-process reservation is kept for the same span: every handle in this process shares one lock nonce, so a second store acquiring this path would have its lock deleted by this store's later release, which reads that shared nonce as its own. Only cleanup releases either. */
     private invalidate(): void {
         this.records = null;
         this.indexByCoordinate = new Map();
@@ -515,14 +515,14 @@ export class FileRolloutStore implements RolloutStore {
     }
 
     private load(): RolloutRecord[] {
-        /** The cache is only ever authoritative while the lock is held, and a read-only store never takes it: `acquire` is a no-op and neither `reload` nor `invalidate` is reachable without `put`. A reader that cached would answer every later `list` from its first snapshot while writers advance the file, so it re-reads instead. commentlint: allow(JUDGE) */
+        /** The cache is only ever authoritative while the lock is held, and a read-only store never takes it: `acquire` is a no-op and neither `reload` nor `invalidate` is reachable without `put`. A reader that cached would answer every later `list` from its first snapshot while writers advance the file, so it re-reads instead. */
         if (this.records && !this.readOnly) return this.records;
         let records: RolloutRecord[] = [];
         this.loadedFingerprint = "absent";
         try {
             const text = readFileSync(this.path, "utf8");
             this.loadedFingerprint = createHash("sha256").update(text).digest("hex");
-            /** Parsed separately so a truncated file is reported as an unusable records file rather than a bare `SyntaxError`: both mean the same thing to a caller — inspect this path — and only the typed error reaches the exit code that says so. commentlint: allow(JUDGE) */
+            /** Parsed separately so a truncated file is reported as an unusable records file rather than a bare `SyntaxError`: both mean the same thing to a caller — inspect this path — and only the typed error reaches the exit code that says so. */
             let parsed: unknown;
             try {
                 parsed = JSON.parse(text) as unknown;
@@ -576,7 +576,7 @@ export function interventionFor(
     }
 }
 
-/** A stored record binds to the run's commit and pinned model, and a completed one also echoes them back; anything else is re-run rather than rehydrated. Pre-scan accounting and rehydration share this test so a record cannot be charged as resumed and then executed again. commentlint: allow(JUDGE) */
+/** A stored record binds to the run's commit and pinned model, and a completed one also echoes them back; anything else is re-run rather than rehydrated. Pre-scan accounting and rehydration share this test so a record cannot be charged as resumed and then executed again. */
 function bindingMatches(record: RolloutRecord, options: RunPairedDeltaOptions): boolean {
     return record.repoCommit === options.repoCommit &&
         record.openCodeVersion === options.openCodeVersion &&
@@ -595,7 +595,7 @@ function completedIdentityMatches(
         );
 }
 
-/** Completed evidence must be scorable against the declaration it is standing in for, so the vector is revalidated and its aggregates recomputed rather than trusted from the file. The script fingerprint and intervention are compared here as well: only the regret ladder reaches `computeRegretRungs`, so a primary record would otherwise carry a drifted declaration straight into the analysis. A record that cannot show its harness was reclaimed is refused for the same reason a live one is. commentlint: allow(JUDGE) */
+/** Completed evidence must be scorable against the declaration it is standing in for, so the vector is revalidated and its aggregates recomputed rather than trusted from the file. The script fingerprint and intervention are compared here as well: only the regret ladder reaches `computeRegretRungs`, so a primary record would otherwise carry a drifted declaration straight into the analysis. A record that cannot show its harness was reclaimed is refused for the same reason a live one is. */
 function resumableEvidence(record: RolloutRecord, scenario: ScenarioDeclaration): boolean {
     if (record.harnessDisposed !== true) return false;
     if (record.baseScriptFingerprint !== baseScriptFingerprint(scenario)) return false;
@@ -626,21 +626,21 @@ function isResumable(record: RolloutRecord, options: RunPairedDeltaOptions): boo
         completedIdentityMatches(record, options);
 }
 
-/** Every rejection here describes an experiment that cannot produce the measurements it would report: an empty matrix, a cap no comparison can trip, or a price that makes a cost unwritable. commentlint: allow(JUDGE) */
+/** Every rejection here describes an experiment that cannot produce the measurements it would report: an empty matrix, a cap no comparison can trip, or a price that makes a cost unwritable. */
 function validateRunOptions(options: RunPairedDeltaOptions): void {
     if (options.scenarios.length === 0) {
         throw new Error("scenarios must not be empty");
     }
     const ids = new Set(options.scenarios.map(({ scenarioId }) => scenarioId));
-    /** The loop visits every declaration while the coordinate map is keyed by id, so a repeated id would pay for a coordinate the store already holds completed evidence for and then fail to record it. commentlint: allow(JUDGE) */
+    /** The loop visits every declaration while the coordinate map is keyed by id, so a repeated id would pay for a coordinate the store already holds completed evidence for and then fail to record it. */
     if (ids.size !== options.scenarios.length) {
         throw new Error("scenarios contain a duplicate scenarioId");
     }
-    /** A non-positive or fractional count silently produces a matrix with no measurements — or one the loop rounds up — and the run would still report `completed`. commentlint: allow(JUDGE) */
+    /** A non-positive or fractional count silently produces a matrix with no measurements — or one the loop rounds up — and the run would still report `completed`. */
     if (!Number.isSafeInteger(options.replicateCount) || options.replicateCount < 1) {
         throw new Error("replicateCount must be a positive integer");
     }
-    /** A negative price makes a rollout's cost negative, which subtracts from `spentUsd` and lets the cap admit calls after the real spend passed it. commentlint: allow(JUDGE) */
+    /** A negative price makes a rollout's cost negative, which subtracts from `spentUsd` and lets the cap admit calls after the real spend passed it. */
     if (
         Object.values(options.pricesPerMillionTokens).some(
             (price) => !Number.isFinite(price) || price < 0,
@@ -648,7 +648,7 @@ function validateRunOptions(options: RunPairedDeltaOptions): void {
     ) {
         throw new Error("pricesPerMillionTokens must be finite and non-negative");
     }
-    /** Every cap comparison against `NaN` is false, so an unchecked cap pays for the whole matrix; the same holds for the deadline's remaining-time test. commentlint: allow(JUDGE) */
+    /** Every cap comparison against `NaN` is false, so an unchecked cap pays for the whole matrix; the same holds for the deadline's remaining-time test. */
     for (const [label, value] of [
         ["maxCostUsd", options.maxCostUsd],
         ["deskCostCeilingUsd", options.deskCostCeilingUsd],
@@ -660,7 +660,7 @@ function validateRunOptions(options: RunPairedDeltaOptions): void {
     if (!Number.isFinite(options.deadlineEpochMs)) {
         throw new Error("deadlineEpochMs must be finite");
     }
-    /** The failure estimate is priced from a scenario's context limit, so a price that is finite on its own can still make the fallback `Infinity`, which JSON writes as `null` and the next resume rejects. commentlint: allow(JUDGE) */
+    /** The failure estimate is priced from a scenario's context limit, so a price that is finite on its own can still make the fallback `Infinity`, which JSON writes as `null` and the next resume rejects. */
     for (const scenario of options.scenarios) {
         if (!Number.isFinite(worstCaseUsd(scenario, options.pricesPerMillionTokens))) {
             throw new Error(
@@ -672,19 +672,18 @@ function validateRunOptions(options: RunPairedDeltaOptions): void {
 
 /**
  * Rejections raised before any rollout release the store, so a corrected call can retry in the same process; a rejection after a rollout has run leaves the claim held because the run's records are the caller's to reconcile.
- * commentlint: allow(JUDGE)
  */
 export async function runPairedDelta(
     options: RunPairedDeltaOptions,
     dependencies: RunnerDependencies,
 ): Promise<PairedDeltaRunResult> {
-    /** Option-only validation runs before `store.list()`, which claims the records path for this process: a call rejected after that claim would leave the path owned until exit and fail the corrected retry with `RolloutStoreBusyError`. commentlint: allow(JUDGE) */
+    /** Option-only validation runs before `store.list()`, which claims the records path for this process: a call rejected after that claim would leave the path owned until exit and fail the corrected retry with `RolloutStoreBusyError`. */
     validateRunOptions(options);
     const stored = options.store.list();
-    /** `parseRolloutRecords` rejects a duplicate coordinate, but `RolloutStore` is an interface any caller can implement and the map below keeps only the last record while the pre-scan bills every copy: a completed earlier duplicate behind a failed later one would be retried, paid for, and then refused replacement by `put`, losing the new evidence. commentlint: allow(JUDGE) */
+    /** `parseRolloutRecords` rejects a duplicate coordinate, but `RolloutStore` is an interface any caller can implement and the map below keeps only the last record while the pre-scan bills every copy: a completed earlier duplicate behind a failed later one would be retried, paid for, and then refused replacement by `put`, losing the new evidence. */
     const duplicateKeys = new Set<string>();
     for (const record of stored) {
-        /** Checked before the key is computed: `coordinateKey` dereferences the entry, so a store returning `null` would be diagnosed by a `TypeError` raised outside the release path — leaving a store whose `list()` took a claim holding it through the rejected resume. commentlint: allow(JUDGE) */
+        /** Checked before the key is computed: `coordinateKey` dereferences the entry, so a store returning `null` would be diagnosed by a `TypeError` raised outside the release path — leaving a store whose `list()` took a claim holding it through the rejected resume. */
         if (record === null || typeof record !== "object" || Array.isArray(record)) {
             releaseBeforeThrowing(options.store);
             throw new RolloutRecordsInvalidError(
@@ -714,7 +713,7 @@ export async function runPairedDelta(
     let status: PairedDeltaRunResult["status"] = "completed";
     let anyUsageUnmeasured = false;
     let startedAny = false;
-    /** A creation that lost its deadline race still yields a handle that owns a live harness. Its disposal is settled before the run returns so an unreclaimed one reaches the caller as `harness-unreclaimed` rather than as silence. commentlint: allow(JUDGE) */
+    /** A creation that lost its deadline race still yields a handle that owns a live harness. Its disposal is settled before the run returns so an unreclaimed one reaches the caller as `harness-unreclaimed` rather than as silence. */
     const lateDisposals: Promise<boolean>[] = [];
     const selectedScenarioIds = new Set(options.scenarios.map(({ scenarioId }) => scenarioId));
     const inMatrix = (record: RolloutRecord): boolean =>
@@ -737,12 +736,12 @@ export async function runPairedDelta(
         }
     }
 
-    /** The pre-scan restores spend and the reserve floor only. The rollout counters are incremented where a record enters `records` — at rehydration or after a rollout runs — because a run that stops at the cap or the deadline never reaches its later coordinates, and counting them here would report rollouts absent from the result. commentlint: allow(JUDGE) */
+    /** The pre-scan restores spend and the reserve floor only. The rollout counters are incremented where a record enters `records` — at rehydration or after a rollout runs — because a run that stops at the cap or the deadline never reaches its later coordinates, and counting them here would report rollouts absent from the result. */
     for (const record of stored) {
-        /** A record from another commit or pinned model priced a different build, so it informs neither this run's reserve nor its spend. commentlint: allow(JUDGE) */
+        /** A record from another commit or pinned model priced a different build, so it informs neither this run's reserve nor its spend. */
         if (!inMatrix(record) || !bindingMatches(record, options)) continue;
-        /** `parseRolloutRecords` rejects a negative or non-finite attempt cost, but `RolloutStore` is an interface any caller can implement, so the figures reaching this loop are checked here too: a negative balance keeps `spentUsd + admissionReserveUsd` under the cap and buys arms the cap should have refused, and a negative reserve floor understates the next call. commentlint: allow(JUDGE) */
-        /** The measurement fields travel the same untrusted path as the costs and feed the run's token, turn, and latency reporting, so a resume cannot rehydrate a record whose counters are malformed: `resumableEvidence` revalidates the check vector and the declaration but reads none of these. commentlint: allow(JUDGE) */
+        /** `parseRolloutRecords` rejects a negative or non-finite attempt cost, but `RolloutStore` is an interface any caller can implement, so the figures reaching this loop are checked here too: a negative balance keeps `spentUsd + admissionReserveUsd` under the cap and buys arms the cap should have refused, and a negative reserve floor understates the next call. */
+        /** The measurement fields travel the same untrusted path as the costs and feed the run's token, turn, and latency reporting, so a resume cannot rehydrate a record whose counters are malformed: `resumableEvidence` revalidates the check vector and the declaration but reads none of these. */
         const usage: Partial<TokenUsage> = record.usage ?? {};
         for (const [label, value] of [
             ["cost", record.costUsd],
@@ -758,7 +757,7 @@ export async function runPairedDelta(
                 );
             }
         }
-        /** `coordinateKey` renders a numeric `0` and the string `"0"` identically and the matrix comparisons coerce, so a non-integer index would key and resume as a replicate it is not. commentlint: allow(JUDGE) */
+        /** `coordinateKey` renders a numeric `0` and the string `"0"` identically and the matrix comparisons coerce, so a non-integer index would key and resume as a replicate it is not. */
         if (!isNonNegativeCount(record.replicateIndex)) {
             releaseBeforeThrowing(options.store);
             throw new RolloutRecordsInvalidError(
@@ -767,7 +766,7 @@ export async function runPairedDelta(
                     "point at a fresh records path",
             );
         }
-        /** The envelope names the shape every later read assumes, so a record from another schema cannot stand in as completed evidence for this one. commentlint: allow(JUDGE) */
+        /** The envelope names the shape every later read assumes, so a record from another schema cannot stand in as completed evidence for this one. */
         if (record.schema !== ROLLOUT_RECORD_SCHEMA) {
             releaseBeforeThrowing(options.store);
             throw new RolloutRecordsInvalidError(
@@ -775,7 +774,7 @@ export async function runPairedDelta(
                     `${coordinateKey(record)}; point at a fresh records path`,
             );
         }
-        /** The contract's own validator runs before anything reads the cell, because a store that returns a null or absent cell would otherwise be diagnosed by a `TypeError` raised outside the release path — leaving a lock-owning store holding its claim through a rejected resume, so even a corrected retry stays blocked. It also rules out the combinations a matching arm and matching counts still admit: a reason code paired with a health it cannot carry, or a completed cell carrying one at all. commentlint: allow(JUDGE) */
+        /** The contract's own validator runs before anything reads the cell, because a store that returns a null or absent cell would otherwise be diagnosed by a `TypeError` raised outside the release path — leaving a lock-owning store holding its claim through a rejected resume, so even a corrected retry stays blocked. It also rules out the combinations a matching arm and matching counts still admit: a reason code paired with a health it cannot carry, or a completed cell carrying one at all. */
         const cell = ((): ArmedCellResult => {
             try {
                 return parseArmedCellResult(record.cell);
@@ -788,7 +787,7 @@ export async function runPairedDelta(
                 );
             }
         })();
-        /** `parseRolloutRecords` rejects a record whose cell names a different arm than its coordinate, and the rehydration path reads the cell as the coordinate's own result: a custom store could otherwise stand an `mc-off` cell in for `mc-on` and suppress the treatment rollout. commentlint: allow(JUDGE) */
+        /** `parseRolloutRecords` rejects a record whose cell names a different arm than its coordinate, and the rehydration path reads the cell as the coordinate's own result: a custom store could otherwise stand an `mc-off` cell in for `mc-on` and suppress the treatment rollout. */
         if (cell.armId !== record.armId) {
             releaseBeforeThrowing(options.store);
             throw new RolloutRecordsInvalidError(
@@ -796,7 +795,7 @@ export async function runPairedDelta(
                     `${coordinateKey(record)}; point at a fresh records path`,
             );
         }
-        /** A record counted as neither observed nor estimated disappears from the run's provenance totals while still suppressing its rollout. commentlint: allow(JUDGE) */
+        /** A record counted as neither observed nor estimated disappears from the run's provenance totals while still suppressing its rollout. */
         if (record.costSource !== "observed" && record.costSource !== "estimated") {
             releaseBeforeThrowing(options.store);
             throw new RolloutRecordsInvalidError(
@@ -804,7 +803,7 @@ export async function runPairedDelta(
                     `${coordinateKey(record)}; point at a fresh records path`,
             );
         }
-        /** `finiteUsage` admits a live observation only at non-negative safe integers, because a counter near `Number.MAX_VALUE` prices to `Infinity` and a fractional token or turn count is not a measurement any harness can produce. A persisted record has to clear the same bar or a resume reports counts the live path would have refused. commentlint: allow(JUDGE) */
+        /** `finiteUsage` admits a live observation only at non-negative safe integers, because a counter near `Number.MAX_VALUE` prices to `Infinity` and a fractional token or turn count is not a measurement any harness can produce. A persisted record has to clear the same bar or a resume reports counts the live path would have refused. */
         for (const [label, value] of [
             ["turns", record.turns],
             ["usage-input", usage.input],
@@ -820,7 +819,7 @@ export async function runPairedDelta(
                 );
             }
         }
-        /** A completed cell priced as an estimate is a combination the live path cannot produce: unpriceable usage is what selects `estimated`, and that same condition marks the result invalid rather than completed. Accepting it let a record suppress its rollout while restoring no spend, which is the one direction that spends money. commentlint: allow(JUDGE) */
+        /** A completed cell priced as an estimate is a combination the live path cannot produce: unpriceable usage is what selects `estimated`, and that same condition marks the result invalid rather than completed. Accepting it let a record suppress its rollout while restoring no spend, which is the one direction that spends money. */
         if (record.costSource === "estimated" && cell.runHealth === "completed") {
             releaseBeforeThrowing(options.store);
             throw new RolloutRecordsInvalidError(
@@ -828,12 +827,12 @@ export async function runPairedDelta(
                     `${coordinateKey(record)}; point at a fresh records path`,
             );
         }
-        /** A failure the live path records is charged at least the arm's own bound, because the attempt is presumed to have billed even when no usage came back. An estimated failure priced below that bound is therefore a record the runner cannot have written, and accepting it restored a ledger missing the first attempt — letting two full-price attempts run under a cap sized for one. commentlint: allow(JUDGE) */
+        /** A failure the live path records is charged at least the arm's own bound, because the attempt is presumed to have billed even when no usage came back. An estimated failure priced below that bound is therefore a record the runner cannot have written, and accepting it restored a ledger missing the first attempt — letting two full-price attempts run under a cap sized for one. */
         if (record.costSource === "estimated") {
             const declared = options.scenarios.find(
                 ({ scenarioId }) => scenarioId === record.scenarioId,
             );
-            /** `inMatrix` already rejected a record naming no selected scenario, so an absent declaration here would be a contradiction rather than untrusted input. commentlint: allow(JUDGE) */
+            /** `inMatrix` already rejected a record naming no selected scenario, so an absent declaration here would be a contradiction rather than untrusted input. */
             const bound = declared === undefined
                 ? 0
                 : worstCaseUsd(declared, options.pricesPerMillionTokens, record.armId);
@@ -845,9 +844,9 @@ export async function runPairedDelta(
                 );
             }
         }
-        /** An observed cost claims to be `tokenCostUsd` of the counters beside it, so the two are checked against each other: every other rule here reads the fields in isolation, which a record with valid counters and a falsified total passes intact, and the total is what restores spend and admits later paid arms. A relative comparison rather than equality because the value survived a JSON round trip. commentlint: allow(JUDGE) */
+        /** An observed cost claims to be `tokenCostUsd` of the counters beside it, so the two are checked against each other: every other rule here reads the fields in isolation, which a record with valid counters and a falsified total passes intact, and the total is what restores spend and admits later paid arms. A relative comparison rather than equality because the value survived a JSON round trip. */
         if (record.costSource === "observed") {
-            /** The loop above refuses a missing or non-integer counter, so the four are numbers by the time this runs; `Partial` is the declared shape only because the record is untrusted on arrival. commentlint: allow(JUDGE) */
+            /** The loop above refuses a missing or non-integer counter, so the four are numbers by the time this runs; `Partial` is the declared shape only because the record is untrusted on arrival. */
             const priced = tokenCostUsd({
                 input: usage.input as number,
                 output: usage.output as number,
@@ -868,7 +867,7 @@ export async function runPairedDelta(
         }
         reserveUsd = bumpReserve(reserveUsd, record);
         spentUsd += record.priorAttemptsCostUsd + record.costUsd;
-        /** `parseRolloutRecords` bounds the file's whole total, but `RolloutStore` is an interface any caller can implement, so a store that skips that check still cannot hand this loop an unbounded ledger: an infinite `spentUsd` makes every cap comparison false and serializes as `null`. A store reaching this throw holds no records claim to release, because the file store rejects the same total while parsing. commentlint: allow(JUDGE) */
+        /** `parseRolloutRecords` bounds the file's whole total, but `RolloutStore` is an interface any caller can implement, so a store that skips that check still cannot hand this loop an unbounded ledger: an infinite `spentUsd` makes every cap comparison false and serializes as `null`. A store reaching this throw holds no records claim to release, because the file store rejects the same total while parsing. */
         if (!Number.isFinite(spentUsd)) {
             releaseBeforeThrowing(options.store);
             throw new RolloutRecordsInvalidError(
@@ -876,7 +875,7 @@ export async function runPairedDelta(
                     `${coordinateKey(record)}; point at a fresh records path`,
             );
         }
-        /** A stored attempt means this matrix has already started, whatever it was billed: a zero-cost first arm would otherwise keep the first-rollout exemption and let the next arm start with the reserve already over budget. commentlint: allow(JUDGE) */
+        /** A stored attempt means this matrix has already started, whatever it was billed: a zero-cost first arm would otherwise keep the first-rollout exemption and let the next arm start with the reserve already over budget. */
         startedAny = true;
     }
 
@@ -891,9 +890,9 @@ export async function runPairedDelta(
                 cells: {},
                 regret: null,
             };
-            /** A completed record from another binding cannot be replaced and the coordinate key carries no binding, so any arm executed beside it could never form a valid comparison; the coordinate stops rather than paying for evidence it cannot use. commentlint: allow(JUDGE) */
+            /** A completed record from another binding cannot be replaced and the coordinate key carries no binding, so any arm executed beside it could never form a valid comparison; the coordinate stops rather than paying for evidence it cannot use. */
             let coordinateBlocked = false;
-            /** A blocked coordinate can never form a valid comparison, so the primary arms are inspected before any of them runs: the record that blocks may belong to a later arm, and discovering it inside the loop lets the earlier arms pay for evidence the coordinate must discard. Only the primary arms are unconditionally scheduled, so preflighting the regret ladder would refuse coordinates whose ladder never runs. commentlint: allow(JUDGE) */
+            /** A blocked coordinate can never form a valid comparison, so the primary arms are inspected before any of them runs: the record that blocks may belong to a later arm, and discovering it inside the loop lets the earlier arms pay for evidence the coordinate must discard. Only the primary arms are unconditionally scheduled, so preflighting the regret ladder would refuse coordinates whose ladder never runs. */
             const blockingStoredArm = (armId: ArmId): RolloutCoordinate | null => {
                 const coordinate: RolloutCoordinate = {
                     poolManifestFingerprint: options.poolManifestFingerprint,
@@ -903,7 +902,7 @@ export async function runPairedDelta(
                 };
                 const existing = storedByCoordinate.get(coordinateKey(coordinate));
                 if (existing === undefined) return null;
-                /** Validated here too, not only on the resume path: the pre-scan skips a record bound to another commit or model, so an in-matrix wrong-binding record reaches this dereference unchecked, and a null cell would raise a `TypeError` outside the release path — leaving a lock-owning store holding its claim through the rejected run. commentlint: allow(JUDGE) */
+                /** Validated here too, not only on the resume path: the pre-scan skips a record bound to another commit or model, so an in-matrix wrong-binding record reaches this dereference unchecked, and a null cell would raise a `TypeError` outside the release path — leaving a lock-owning store holding its claim through the rejected run. */
                 try {
                     parseArmedCellResult(existing.cell);
                 } catch (error) {
@@ -938,7 +937,7 @@ export async function runPairedDelta(
                 }
             }
             const runArm = async (armId: ArmId): Promise<RolloutRecord | null> => {
-                /** Checked before anything is created: a blocked coordinate can be reached from the ladder as well as the primary loop, and the caller's own check runs only after this call would have paid. commentlint: allow(JUDGE) */
+                /** Checked before anything is created: a blocked coordinate can be reached from the ladder as well as the primary loop, and the caller's own check runs only after this call would have paid. */
                 if (coordinateBlocked) return null;
                 const coordinate: RolloutCoordinate = {
                     poolManifestFingerprint: options.poolManifestFingerprint,
@@ -949,7 +948,7 @@ export async function runPairedDelta(
                 const existing = storedByCoordinate.get(coordinateKey(coordinate));
                 const boundToRun = existing !== undefined && bindingMatches(existing, options);
                 if (existing) {
-                    /** The regret ladder is scheduled after the primary arms, so its records reach this check without a preflight; `blockingStoredArm` reads the same conditions and pushes the same coordinate. commentlint: allow(JUDGE) */
+                    /** The regret ladder is scheduled after the primary arms, so its records reach this check without a preflight; `blockingStoredArm` reads the same conditions and pushes the same coordinate. */
                     const blocked = blockingStoredArm(armId);
                     if (blocked) {
                         invalidStoredCoordinates.push(blocked);
@@ -968,7 +967,7 @@ export async function runPairedDelta(
                     status = "deadline-reached";
                     return null;
                 }
-                /** A failure at this arm is charged `max(reserve, worstCase)`, so admission has to hold that floor: a cheap first arm otherwise leaves the reserve below the fallback and admits a call whose own failure charge passes the cap. commentlint: allow(JUDGE) */
+                /** A failure at this arm is charged `max(reserve, worstCase)`, so admission has to hold that floor: a cheap first arm otherwise leaves the reserve below the fallback and admits a call whose own failure charge passes the cap. */
                 const admissionReserveUsd = Math.max(
                     reserveUsd,
                     worstCaseUsd(scenario, options.pricesPerMillionTokens, armId),
@@ -980,8 +979,8 @@ export async function runPairedDelta(
                 startedAny = true;
                 const intervention = interventionFor(scenario, armId);
                 const startedAt = dependencies.now();
-                /** The previous attempt's spend is retained on the replacement record because `put` keeps one record per coordinate, so the file a later resume reads would otherwise show only the last attempt. commentlint: allow(JUDGE) */
-                /** Only spend on this run's own binding carries forward; an attempt priced under a different commit or model was never charged to this run's ledger. commentlint: allow(JUDGE) */
+                /** The previous attempt's spend is retained on the replacement record because `put` keeps one record per coordinate, so the file a later resume reads would otherwise show only the last attempt. */
+                /** Only spend on this run's own binding carries forward; an attempt priced under a different commit or model was never charged to this run's ledger. */
                 const priorAttemptsCostUsd = existing && boundToRun
                     ? existing.priorAttemptsCostUsd + existing.costUsd
                     : 0;
@@ -997,12 +996,12 @@ export async function runPairedDelta(
                 let disposed = false;
                 let disposalFailed = false;
                 try {
-                    /** Creation spawns the harness, so it is inside the deadline: a hung create would otherwise outlive `deadlineEpochMs` unbounded. The handle is captured off the promise rather than the race result, so one that arrives after the deadline is still disposed instead of leaking a live harness. commentlint: allow(JUDGE) */
+                    /** Creation spawns the harness, so it is inside the deadline: a hung create would otherwise outlive `deadlineEpochMs` unbounded. The handle is captured off the promise rather than the race result, so one that arrives after the deadline is still disposed instead of leaking a live harness. */
                     creation = dependencies.createRollout({
                         scenario,
                         coordinate,
                         baseScriptFingerprint: fingerprint,
-                        /** The adapter resolves symbolic locator handles, so it gets its own copy: mutating the descriptor the comparison keeps would make the declaration-match check accept whatever the adapter produced. commentlint: allow(JUDGE) */
+                        /** The adapter resolves symbolic locator handles, so it gets its own copy: mutating the descriptor the comparison keeps would make the declaration-match check accept whatever the adapter produced. */
                         intervention: structuredClone(intervention),
                     });
                     const pendingCreation = creation;
@@ -1011,26 +1010,26 @@ export async function runPairedDelta(
                     }, () => {});
                     const started = await withRolloutDeadline(() => pendingCreation, remainingMs);
                     handle = started;
-                    /** Creation consumed part of the budget, so the rollout gets what is left rather than the allowance measured before it. commentlint: allow(JUDGE) */
+                    /** Creation consumed part of the budget, so the rollout gets what is left rather than the allowance measured before it. */
                     const runMs = options.deadlineEpochMs - dependencies.now();
                     if (runMs <= 0) throw new RolloutDeadlineError("deadline reached before run");
-                    /** Preparation and the rollout are bounded as separate steps because the deadline only rejects the race, never the work: a single step whose `prepare()` overran would lose the race, then resolve and call `run()` from the losing continuation — starting a paid rollout past the deadline, on a handle `finally` has already disposed, with no record of it. Bounding them apart means an overrun leaves nothing to continue into. commentlint: allow(JUDGE) */
+                    /** Preparation and the rollout are bounded as separate steps because the deadline only rejects the race, never the work: a single step whose `prepare()` overran would lose the race, then resolve and call `run()` from the losing continuation — starting a paid rollout past the deadline, on a handle `finally` has already disposed, with no record of it. Bounding them apart means an overrun leaves nothing to continue into. */
                     const prepare = started.prepare?.bind(started);
                     if (prepare) {
                         const pendingPrepare = prepare();
-                        /** The deadline rejects the race, never the work: a preparation that loses can still finish and create what it was setting up — a session, a seeded oracle resource — after `finally` has already disposed the handle. Tracking it disposes the handle again once it settles, which is the same treatment a creation that lost its race gets, and without it that resource survives the run unreported. commentlint: allow(JUDGE) */
+                        /** The deadline rejects the race, never the work: a preparation that loses can still finish and create what it was setting up — a session, a seeded oracle resource — after `finally` has already disposed the handle. Tracking it disposes the handle again once it settles, which is the same treatment a creation that lost its race gets, and without it that resource survives the run unreported. */
                         pendingPrepare.catch(() => {});
                         try {
                             await withRolloutDeadline(() => pendingPrepare, runMs);
                         } catch (error) {
                             lateDisposals.push(
-                                /** Only a preparation that *resolves* late has produced something to reclaim; one that rejects created nothing, and `disposeLateHandle` reads a rejection as already reclaimed. commentlint: allow(JUDGE) */
+                                /** Only a preparation that *resolves* late has produced something to reclaim; one that rejects created nothing, and `disposeLateHandle` reads a rejection as already reclaimed. */
                                 disposeLateHandle(pendingPrepare.then(() => started)),
                             );
                             throw error;
                         }
                     }
-                    /** Preparation spent from the same budget, so the rollout is bounded by what remains after it. commentlint: allow(JUDGE) */
+                    /** Preparation spent from the same budget, so the rollout is bounded by what remains after it. */
                     const rolloutMs = options.deadlineEpochMs - dependencies.now();
                     if (rolloutMs <= 0) {
                         throw new RolloutDeadlineError("deadline reached before run");
@@ -1059,7 +1058,7 @@ export async function runPairedDelta(
                                 billed,
                                 LATE_DISPOSAL_GRACE_MS,
                             );
-                            /** Validated here, not only in `failedRecord`: that sanitizer nulls a malformed counter and prices the estimate, which is the fallback this status exists to refuse. commentlint: allow(JUDGE) */
+                            /** Validated here, not only in `failedRecord`: that sanitizer nulls a malformed counter and prices the estimate, which is the fallback this status exists to refuse. */
                             billedOnFailure = finiteUsage(reported?.usage);
                             if (billedOnFailure === null || reported.settled !== true) {
                                 usageUnmeasured = true;
@@ -1071,16 +1070,16 @@ export async function runPairedDelta(
                     }
                 } finally {
                     if (handle) {
-                        /** A `dispose()` that never settles would hold the run open with the paid record unwritten, so cleanup is bounded like a late handle's and a hang is reported as an unreclaimed harness rather than waited on. commentlint: allow(JUDGE) */
+                        /** A `dispose()` that never settles would hold the run open with the paid record unwritten, so cleanup is bounded like a late handle's and a hang is reported as an unreclaimed harness rather than waited on. */
                         const outcome = await settleDisposal(handle);
                         if (outcome === "reclaimed") disposed = true;
                         else {
-                            /** A harness left running outranks whatever ended the rollout: the deadline only bounded this arm, while an unreclaimed harness threatens every arm after it. commentlint: allow(JUDGE) */
+                            /** A harness left running outranks whatever ended the rollout: the deadline only bounded this arm, while an unreclaimed harness threatens every arm after it. */
                             disposalFailed = true;
                             failure ??= outcome.error;
                         }
                     } else {
-                        /** A handle that lost the creation race still owns a harness, so it is disposed when it arrives; nothing waits on it because a hung creation is what the deadline is for. commentlint: allow(JUDGE) */
+                        /** A handle that lost the creation race still owns a harness, so it is disposed when it arrives; nothing waits on it because a hung creation is what the deadline is for. */
                         if (creation) lateDisposals.push(disposeLateHandle(creation));
                     }
                 }
@@ -1120,7 +1119,7 @@ export async function runPairedDelta(
                 coordinateResult.cells[armId] = record;
                 spentUsd += record.costUsd;
                 reserveUsd = bumpReserve(reserveUsd, record);
-                /** A harness that would not dispose may still be holding its workspace and session, so the next arm would measure a contaminated environment; the run ends rather than producing arms whose comparison cannot be trusted. commentlint: allow(JUDGE) */
+                /** A harness that would not dispose may still be holding its workspace and session, so the next arm would measure a contaminated environment; the run ends rather than producing arms whose comparison cannot be trusted. */
                 if (usageUnmeasured) anyUsageUnmeasured = true;
                 if (disposalFailed) status = "harness-unreclaimed";
                 else if (usageUnmeasured) status = "usage-unmeasured";
@@ -1146,7 +1145,7 @@ export async function runPairedDelta(
                 mcOn?.cell.runHealth === "completed" &&
                 mcOn.cell.criticalPassed < mcOn.cell.criticalTotal
             ) {
-                /** The trigger is what makes the ladder scheduled, so its rungs are preflighted here rather than beside the primary arms: checking them before the trigger fired would refuse coordinates whose ladder never runs, and checking them one at a time lets an earlier rung pay for evidence a later stale rung invalidates. commentlint: allow(JUDGE) */
+                /** The trigger is what makes the ladder scheduled, so its rungs are preflighted here rather than beside the primary arms: checking them before the trigger fired would refuse coordinates whose ladder never runs, and checking them one at a time lets an earlier rung pay for evidence a later stale rung invalidates. */
                 for (const armId of REGRET_ARM_IDS.slice(1)) {
                     const blocked = blockingStoredArm(armId);
                     if (blocked) {
@@ -1172,7 +1171,7 @@ export async function runPairedDelta(
                         coordinates.push(coordinateResult);
                         break outer;
                     }
-                    /** Stopping the ladder is by design, but the rungs below this one never ran either way, so the coordinate is short of the evidence it claims whether the rung failed or was never usable. The derivation below reads only the primary arms, and no regret arm is a member, so nothing downstream would notice. commentlint: allow(JUDGE) */
+                    /** Stopping the ladder is by design, but the rungs below this one never ran either way, so the coordinate is short of the evidence it claims whether the rung failed or was never usable. The derivation below reads only the primary arms, and no regret arm is a member, so nothing downstream would notice. */
                     if (rung?.cell.runHealth !== "completed") {
                         coordinateResult.incomplete = true;
                         break;
@@ -1196,8 +1195,8 @@ export async function runPairedDelta(
         if (reclaimed.some((ok) => !ok)) status = "harness-unreclaimed";
     }
 
-    /** A cap or deadline stop invites a resume; unusable stored records forbid one until the file is inspected, so the stronger warning wins. An unreclaimed harness outranks both, because a live process has to be dealt with before anything is rerun. Unmeasured usage also stands: it is the one status whose checkpoint must not be resumed at all, and the workflow keys that refusal on this status alone. commentlint: allow(JUDGE) */
-    /** Read through the declared type: `status` is assigned inside `runArm`, which control-flow narrowing does not see, and a narrowed literal makes the second comparison a type error. commentlint: allow(JUDGE) */
+    /** A cap or deadline stop invites a resume; unusable stored records forbid one until the file is inspected, so the stronger warning wins. An unreclaimed harness outranks both, because a live process has to be dealt with before anything is rerun. Unmeasured usage also stands: it is the one status whose checkpoint must not be resumed at all, and the workflow keys that refusal on this status alone. */
+    /** Read through the declared type: `status` is assigned inside `runArm`, which control-flow narrowing does not see, and a narrowed literal makes the second comparison a type error. */
     const outranksStoredRecords: readonly PairedDeltaRunResult["status"][] = [
         "harness-unreclaimed",
         "usage-unmeasured",
@@ -1206,7 +1205,7 @@ export async function runPairedDelta(
         status = "invalid-stored-records";
     }
 
-    /** Derived from `records` at the end rather than counted along the way: every field they summarize already lives on each record, and a future path that pushes one — a new arm, another resume branch — cannot forget to update a counter it does not touch. commentlint: allow(JUDGE) */
+    /** Derived from `records` at the end rather than counted along the way: every field they summarize already lives on each record, and a future path that pushes one — a new arm, another resume branch — cannot forget to update a counter it does not touch. */
     return {
         status,
         usageUnmeasured: anyUsageUnmeasured,
@@ -1230,7 +1229,7 @@ function interventionFingerprint(value: unknown): string | null {
     }
 }
 
-/** The contract owns which health each reason may carry, and it exposes that as a validator rather than a table, so the pairing is discovered by asking `parseArmedCellResult` instead of restating its rules here: a narrowed admissible set, or a new reason code, changes this answer without an edit. `preferred` is tried first, so a reason admitting several healths keeps the one that describes how the rollout actually ended. commentlint: allow(JUDGE) */
+/** The contract owns which health each reason may carry, and it exposes that as a validator rather than a table, so the pairing is discovered by asking `parseArmedCellResult` instead of restating its rules here: a narrowed admissible set, or a new reason code, changes this answer without an edit. `preferred` is tried first, so a reason admitting several healths keeps the one that describes how the rollout actually ended. */
 function healthFor(reasonCode: ReasonCode | null, preferred: RunHealth): RunHealth {
     if (reasonCode === null) return "completed";
     const candidates = [
@@ -1259,7 +1258,7 @@ function contractAdmits(reasonCode: ReasonCode, runHealth: RunHealth): boolean {
     }
 }
 
-/** One named bundle rather than a positional tail: these functions carried three adjacent numbers and two adjacent booleans, so `priorAttemptsCostUsd` and `priorMaxAttemptCostUsd` could be transposed at a call site with nothing to catch it — and a silent swap there corrupts the cost ledger the caps are checked against. commentlint: allow(JUDGE) */
+/** One named bundle rather than a positional tail: these functions carried three adjacent numbers and two adjacent booleans, so `priorAttemptsCostUsd` and `priorMaxAttemptCostUsd` could be transposed at a call site with nothing to catch it — and a silent swap there corrupts the cost ledger the caps are checked against. */
 interface RecordInputs {
     options: RunPairedDeltaOptions;
     coordinate: RolloutCoordinate;
@@ -1291,7 +1290,7 @@ function completedRecord(
         priorMaxAttemptCostUsd,
         disposalFailed,
     } = inputs;
-    /** Read once, then used from this snapshot for both validation and classification: the observation crosses the adapter boundary, so an accessor-backed field could answer `true` to a `typeof` gate and the truthy string `"false"` to the classification that decides whether the rollout counts as evidence, or throw on its second read and lose the paid rollout before `store.put()`. Named fields are copied rather than spread so nothing else the adapter attached rides along. commentlint: allow(JUDGE) */
+    /** Read once, then used from this snapshot for both validation and classification: the observation crosses the adapter boundary, so an accessor-backed field could answer `true` to a `typeof` gate and the truthy string `"false"` to the classification that decides whether the rollout counts as evidence, or throw on its second read and lose the paid rollout before `store.put()`. Named fields are copied rather than spread so nothing else the adapter attached rides along. */
     const observed = {
         checks: observation.checks,
         claimedDone: observation.claimedDone,
@@ -1306,13 +1305,13 @@ function completedRecord(
     };
     const identityMatches = observed.echoedProviderId === options.pinnedProviderId &&
         observed.echoedModelId === options.pinnedSnapshotId;
-    /** The intervention comes back from the rollout adapter, so it can hold a value `canonicalFingerprint` refuses; a throw here would escape `runArm` after the provider call and lose the paid coordinate instead of recording it. commentlint: allow(JUDGE) */
+    /** The intervention comes back from the rollout adapter, so it can hold a value `canonicalFingerprint` refuses; a throw here would escape `runArm` after the provider call and lose the paid coordinate instead of recording it. */
     const observedInterventionFingerprint = interventionFingerprint(observed.intervention);
     const declarationMatches = observed.baseScriptFingerprint === expectedFingerprint &&
         observedInterventionFingerprint !== null &&
         observedInterventionFingerprint === interventionFingerprint(expectedIntervention);
     const observedUsage = finiteUsage(observed.usage);
-    /** The counters can be individually safe and still price beyond the float range once multiplied, so the computed cost is what has to be finite. commentlint: allow(JUDGE) */
+    /** The counters can be individually safe and still price beyond the float range once multiplied, so the computed cost is what has to be finite. */
     const observedCostUsd = observedUsage === null
         ? null
         : tokenCostUsd(observedUsage, options.pricesPerMillionTokens);
@@ -1321,7 +1320,7 @@ function completedRecord(
             observedCostUsd < 0
         ? null
         : observedUsage;
-    /** Every field copied onto the record crosses the adapter boundary, and one value `JSON.stringify` refuses makes the whole record unwritable — which loses the paid coordinate instead of recording it as malformed. commentlint: allow(JUDGE) */
+    /** Every field copied onto the record crosses the adapter boundary, and one value `JSON.stringify` refuses makes the whole record unwritable — which loses the paid coordinate instead of recording it as malformed. */
     const echoesAreStrings = (observed.echoedProviderId === null ||
         typeof observed.echoedProviderId === "string") &&
         (observed.echoedModelId === null || typeof observed.echoedModelId === "string");
@@ -1329,11 +1328,11 @@ function completedRecord(
         typeof observed.baseScriptFingerprint === "string" &&
         Number.isSafeInteger(observed.turns) &&
         (observed.turns as number) >= 0;
-    /** These gates decide whether the rollout counts as evidence, and a JSON-derived `"false"` is truthy, so a non-boolean would pass the exclusion it is supposed to trip. commentlint: allow(JUDGE) */
+    /** These gates decide whether the rollout counts as evidence, and a JSON-derived `"false"` is truthy, so a non-boolean would pass the exclusion it is supposed to trip. */
     const gatesAreBoolean = typeof observed.absencePreconditionHeld === "boolean" &&
         typeof observed.armIdentityMatches === "boolean" &&
         typeof observed.claimedDone === "boolean";
-    /** A harness that would not dispose may still be running and contaminating later arms, so its result cannot stand as evidence however well the rollout itself went. Non-finite usage is checked next because a cost derived from it would poison `spentUsd` for every later cap comparison. commentlint: allow(JUDGE) */
+    /** A harness that would not dispose may still be running and contaminating later arms, so its result cannot stand as evidence however well the rollout itself went. Non-finite usage is checked next because a cost derived from it would poison `spentUsd` for every later cap comparison. */
     let reasonCode: ReasonCode | null = disposalFailed
         ? "harness-failure"
         : usage === null || !gatesAreBoolean || !shapeIsWritable
@@ -1351,12 +1350,12 @@ function completedRecord(
     let checks: CheckResult[] = [];
     if (runHealth === "completed") {
         try {
-            /** The container is established as an array before it is mapped: `null` or an object would raise a `TypeError` here, which escapes as a non-contract error and loses the paid rollout, where `validateCheckVector` turns the same input into the `invalid-result` this path is built to record. commentlint: allow(JUDGE) */
+            /** The container is established as an array before it is mapped: `null` or an object would raise a `TypeError` here, which escapes as a non-contract error and loses the paid rollout, where `validateCheckVector` turns the same input into the `invalid-result` this path is built to record. */
             if (!Array.isArray(observed.checks)) {
                 validateCheckVector(scenario, []);
                 throw new PairedDeltaContractError(["checks-not-an-array"]);
             }
-            /** Snapshotted before validation, not after: a spread re-reads the adapter's object, so an accessor could answer one value to `validateCheckVector` and another to the copy — recording an outcome the validator never saw — or throw on the second read and lose the paid rollout. The named fields are copied rather than spread so nothing else the adapter attached rides along into the record. commentlint: allow(JUDGE) */
+            /** Snapshotted before validation, not after: a spread re-reads the adapter's object, so an accessor could answer one value to `validateCheckVector` and another to the copy — recording an outcome the validator never saw — or throw on the second read and lose the paid rollout. The named fields are copied rather than spread so nothing else the adapter attached rides along into the record. */
             const snapshot = observed.checks.map(({ id, passed }) => ({ id, passed }));
             validateCheckVector(scenario, snapshot);
             checks = snapshot;
@@ -1366,7 +1365,7 @@ function completedRecord(
             runHealth = "malformed";
         }
     }
-    /** Usage the provider never reported cannot be priced, so an unusable counter falls back to the same worst-case reserve a crashed rollout is charged. commentlint: allow(JUDGE) */
+    /** Usage the provider never reported cannot be priced, so an unusable counter falls back to the same worst-case reserve a crashed rollout is charged. */
     const costUsd = usage === null || observedCostUsd === null
         ? Math.max(reserveUsd, worstCaseUsd(scenario, options.pricesPerMillionTokens, coordinate.armId))
         : observedCostUsd;
@@ -1387,7 +1386,7 @@ function completedRecord(
         baseScriptFingerprint: typeof observed.baseScriptFingerprint === "string"
             ? observed.baseScriptFingerprint
             : expectedFingerprint,
-        /** A descriptor the canonicalizer refuses is also one `JSON.stringify` refuses, and the store must be able to write this record: an unwritable malformed record loses the paid coordinate. Detached through JSON rather than retained, because fingerprinting proves the shape is serializable and not that the object itself is cloneable — an adapter-owned `Proxy` passes the canonicalizer and then fails `structuredClone` inside `put`, after the rollout is paid for and with nothing persisted. commentlint: allow(JUDGE) */
+        /** A descriptor the canonicalizer refuses is also one `JSON.stringify` refuses, and the store must be able to write this record: an unwritable malformed record loses the paid coordinate. Detached through JSON rather than retained, because fingerprinting proves the shape is serializable and not that the object itself is cloneable — an adapter-owned `Proxy` passes the canonicalizer and then fails `structuredClone` inside `put`, after the rollout is paid for and with nothing persisted. */
         intervention: detachedIntervention(observed.intervention, expectedIntervention),
         cell: {
             armId: coordinate.armId,
@@ -1406,7 +1405,7 @@ function completedRecord(
         usage: usage ?? zeroUsage(),
         costUsd,
         priorAttemptsCostUsd,
-        /** The record's own cost, not the rejected `observedCostUsd`: a price that overflowed is the reason `usage` is null, and storing `Infinity` here would serialize as `null` and fail the next resume's parse. commentlint: allow(JUDGE) */
+        /** The record's own cost, not the rejected `observedCostUsd`: a price that overflowed is the reason `usage` is null, and storing `Infinity` here would serialize as `null` and fail the next resume's parse. */
         maxAttemptCostUsd: Math.max(priorMaxAttemptCostUsd, costUsd),
         costSource: usage === null ? "estimated" : "observed",
         wallClockMs,
@@ -1435,7 +1434,7 @@ function failedRecord(
         disposalFailed,
         billedOnFailure,
     } = inputs;
-    /** Reported ahead of the rollout's own failure for the same reason the status is: a timeout bounded this arm, an unreclaimed harness threatens the ones after it. commentlint: allow(JUDGE) */
+    /** Reported ahead of the rollout's own failure for the same reason the status is: a timeout bounded this arm, an unreclaimed harness threatens the ones after it. */
     const providerUnavailable = !disposalFailed && failure instanceof ProviderUnavailableError;
     const deadlineExceeded = !disposalFailed && failure instanceof RolloutDeadlineError;
     const reasonCode: ReasonCode = providerUnavailable
@@ -1444,7 +1443,7 @@ function failedRecord(
             ? "deadline-exceeded"
             : "harness-failure";
     const worstCase = worstCaseUsd(scenario, options.pricesPerMillionTokens, coordinate.armId);
-    /** One expression, because `costUsd` and `maxAttemptCostUsd` have to agree for a first attempt: computing it twice lets a later edit to one branch part them silently. Unavailability no longer discounts the charge: it can be raised by a later turn's request, after earlier turns have already billed, and this path keeps no usage to price. Charging the full bound overstates a first-turn refusal rather than understating a mid-script failure, and only the understatement admits an arm the cap should have stopped. commentlint: allow(JUDGE) */
+    /** One expression, because `costUsd` and `maxAttemptCostUsd` have to agree for a first attempt: computing it twice lets a later edit to one branch part them silently. Unavailability no longer discounts the charge: it can be raised by a later turn's request, after earlier turns have already billed, and this path keeps no usage to price. Charging the full bound overstates a first-turn refusal rather than understating a mid-script failure, and only the understatement admits an arm the cap should have stopped. */
     /** The measured charge when the handle could read it: a nested retry tree in the plugin can bill past any bound this module can derive, and only the understatement admits an arm the cap should have stopped. */
     /** Untrusted like any observation: a non-finite counter would poison the cap it feeds. */
     const measured = finiteUsage(billedOnFailure);
@@ -1491,7 +1490,7 @@ function failedRecord(
 export function computeRegretRungs(
     scenario: ScenarioDeclaration,
     records: Partial<Record<ArmId, RolloutRecord>>,
-    /** The run computes this once per scenario; recomputing it hashes the whole turn script again on every coordinate whose ladder fires. commentlint: allow(JUDGE) */
+    /** The run computes this once per scenario; recomputing it hashes the whole turn script again on every coordinate whose ladder fires. */
     scriptFingerprint = baseScriptFingerprint(scenario),
 ): RegretRungs {
     const completed = REGRET_ARM_IDS.map((armId) => records[armId]).filter(
@@ -1525,16 +1524,16 @@ export function computeRegretRungs(
     };
 }
 
-/** A fresh object per record rather than one shared constant: the record is handed to the caller and to the store, and a single instance made every estimated record in the process alias the same counters — editing one result's usage changed all of them, and later runs in the same process would emit the mutated values beside independently estimated costs. commentlint: allow(JUDGE) */
+/** A fresh object per record rather than one shared constant: the record is handed to the caller and to the store, and a single instance made every estimated record in the process alias the same counters — editing one result's usage changed all of them, and later runs in the same process would emit the mutated values beside independently estimated costs. */
 function zeroUsage(): TokenUsage {
     return { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
 }
 
-/** An observation crosses a process boundary, so its counters are untrusted: a missing field or a `NaN` makes `tokenCostUsd` return `NaN`, which turns `spentUsd` into `NaN` and makes every later cost-cap comparison false. JSON also serializes a non-finite number as `null`, so the corruption would survive into the next resume. commentlint: allow(JUDGE) */
+/** An observation crosses a process boundary, so its counters are untrusted: a missing field or a `NaN` makes `tokenCostUsd` return `NaN`, which turns `spentUsd` into `NaN` and makes every later cost-cap comparison false. JSON also serializes a non-finite number as `null`, so the corruption would survive into the next resume. */
 function finiteUsage(usage: TokenUsage | null | undefined): TokenUsage | null {
     if (usage === null || usage === undefined || typeof usage !== "object") return null;
     const counters = [usage.input, usage.output, usage.cacheCreation, usage.cacheRead];
-    /** Safe integers rather than merely finite ones: a counter near `Number.MAX_VALUE` prices to `Infinity`, which JSON writes as `null` and the next resume rejects as `cost-invalid`. commentlint: allow(JUDGE) */
+    /** Safe integers rather than merely finite ones: a counter near `Number.MAX_VALUE` prices to `Infinity`, which JSON writes as `null` and the next resume rejects as `cost-invalid`. */
     if (counters.some((value) => !Number.isSafeInteger(value) || (value as number) < 0)) {
         return null;
     }
@@ -1546,7 +1545,7 @@ function finiteUsage(usage: TokenUsage | null | undefined): TokenUsage | null {
     };
 }
 
-/** Prices a rollout whose real usage is unknown at the scenario's context limit in and out. commentlint: allow(JUDGE) */
+/** Prices a rollout whose real usage is unknown at the scenario's context limit in and out. */
 /**
  * Extra provider calls an intervention adds beyond `turnScript`, keyed by the intervention
  * rather than by the arm: the calls are caused by the mechanism, so an arm that adopts
@@ -1561,7 +1560,6 @@ function finiteUsage(usage: TokenUsage | null | undefined): TokenUsage | null {
  *
  * The record is total rather than partial, so adding an intervention kind is a compile error
  * until its call cost is declared instead of silently defaulting to zero.
- * commentlint: allow(JUDGE)
  */
 /**
  * Model calls a rollout can make outside its authored turns: OpenCode's own compaction summary plus
@@ -1584,13 +1582,13 @@ function worstCaseUsd(
     prices: TokenPrices,
     armId?: ArmId,
 ): number {
-    /** Each prompt token is billed in exactly one category and the prompt cannot exceed the context limit, so the dearest prompt category bounds the whole prompt: hard-coding the cache counters to zero priced a cached-prefix call at nothing when cache pricing is the only material rate, and summing all three categories at full context would triple-count one prompt instead. commentlint: allow(JUDGE) */
+    /** Each prompt token is billed in exactly one category and the prompt cannot exceed the context limit, so the dearest prompt category bounds the whole prompt: hard-coding the cache counters to zero priced a cached-prefix call at nothing when cache pricing is the only material rate, and summing all three categories at full context would triple-count one prompt instead. */
     const promptPricePerMillion = Math.max(prices.input, prices.cacheCreation, prices.cacheRead);
     const perCallUsd = (
         scenario.modelContextLimit * promptPricePerMillion +
         scenario.modelContextLimit * prices.output
     ) / 1_000_000;
-    /** A rollout drives the whole authored script and each user turn can bill its own request, while an observation reports the usage of every one of them: pricing a single call left the fallback charge and the admission floor short by the turn count, so an arm could pass admission and then bill several times the reserve. A script with no user turn still bills at least one call. commentlint: allow(JUDGE) */
+    /** A rollout drives the whole authored script and each user turn can bill its own request, while an observation reports the usage of every one of them: pricing a single call left the fallback charge and the admission floor short by the turn count, so an arm could pass admission and then bill several times the reserve. A script with no user turn still bills at least one call. */
     const billableTurns = Math.max(
         1,
         scenario.turnScript.filter(({ role }) => role === "user").length,
@@ -1619,24 +1617,24 @@ function exclusionCountsOf(
     return counts;
 }
 
-/** A validation failure reports what is wrong with the records file, and that diagnostic is what the caller acts on; a lock-removal error raised while standing down would replace it with an unrelated filesystem message. The release failure is dropped rather than reported because the store keeps its claim on a throw, so the next acquisition names it. commentlint: allow(JUDGE) */
+/** A validation failure reports what is wrong with the records file, and that diagnostic is what the caller acts on; a lock-removal error raised while standing down would replace it with an unrelated filesystem message. The release failure is dropped rather than reported because the store keeps its claim on a throw, so the next acquisition names it. */
 function releaseBeforeThrowing(store: RolloutStore): void {
     try {
         store.release?.();
     } catch {}
 }
 
-/** Bounded so a records path under continuous rewriting reports contention instead of retrying forever. commentlint: allow(JUDGE) */
+/** Bounded so a records path under continuous rewriting reports contention instead of retrying forever. */
 const PUBLISH_FENCE_ATTEMPTS = 3;
 
-/** The record has to be writable or the paid coordinate is lost, and every route to a detached copy runs adapter-controlled code: `JSON.stringify` calls a `toJSON` hook the canonicalizer never sees, because that reads enumerable fields only. A descriptor that will not detach falls back to the declaration's own, which is already validated — the observed value is evidence worth keeping when it survives, not worth losing a rollout over. commentlint: allow(JUDGE) */
+/** The record has to be writable or the paid coordinate is lost, and every route to a detached copy runs adapter-controlled code: `JSON.stringify` calls a `toJSON` hook the canonicalizer never sees, because that reads enumerable fields only. A descriptor that will not detach falls back to the declaration's own, which is already validated — the observed value is evidence worth keeping when it survives, not worth losing a rollout over. */
 function detachedIntervention(
     observed: unknown,
     expected: InterventionDescriptor,
 ): InterventionDescriptor {
     try {
         const detached = JSON.parse(JSON.stringify(observed)) as unknown;
-        /** The detached value has to be the same descriptor that was validated, not merely a valid one: a hook can return a supported but different descriptor without throwing, and retaining that would record an intervention the arm did not run — refused later as a mismatch, which discards the paid coordinate. Compared against the observed fingerprint rather than the expected one, so a genuine adapter disagreement is still recorded as itself. commentlint: allow(JUDGE) */
+        /** The detached value has to be the same descriptor that was validated, not merely a valid one: a hook can return a supported but different descriptor without throwing, and retaining that would record an intervention the arm did not run — refused later as a mismatch, which discards the paid coordinate. Compared against the observed fingerprint rather than the expected one, so a genuine adapter disagreement is still recorded as itself. */
         const before = interventionFingerprint(observed as InterventionDescriptor);
         if (before === null) return expected;
         return interventionFingerprint(detached as InterventionDescriptor) === before
@@ -1647,13 +1645,13 @@ function detachedIntervention(
     }
 }
 
-/** The reserve is the expected price of the next single call, so it takes the dearest attempt a coordinate has seen — not the cumulative total, which several cheap failures would inflate into a budget the next rollout cannot fit, and not this attempt's cost alone, which a coordinate that failed expensively and then succeeded cheaply would understate. One function because the pre-scan over stored records and the post-rollout bookkeeping must agree: a change applied to one site and not the other would silently undercount the reserve at the other. commentlint: allow(JUDGE) */
-/** The scalar admissibility rules the parser and the pre-scan both apply to an untrusted record. Shared as predicates rather than as one validator because the two callers legitimately differ in what they do with a rejection — the parser reports a code against a file path, the pre-scan releases its claim and names the coordinate — while the rules themselves must not drift. commentlint: allow(JUDGE) */
+/** The reserve is the expected price of the next single call, so it takes the dearest attempt a coordinate has seen — not the cumulative total, which several cheap failures would inflate into a budget the next rollout cannot fit, and not this attempt's cost alone, which a coordinate that failed expensively and then succeeded cheaply would understate. One function because the pre-scan over stored records and the post-rollout bookkeeping must agree: a change applied to one site and not the other would silently undercount the reserve at the other. */
+/** The scalar admissibility rules the parser and the pre-scan both apply to an untrusted record. Shared as predicates rather than as one validator because the two callers legitimately differ in what they do with a rejection — the parser reports a code against a file path, the pre-scan releases its claim and names the coordinate — while the rules themselves must not drift. */
 function isNonNegativeCount(value: unknown): boolean {
     return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
-/** A cost may be fractional but never negative, non-finite, or absent: a `NaN` propagates into `spentUsd` and makes every later cap comparison false. commentlint: allow(JUDGE) */
+/** A cost may be fractional but never negative, non-finite, or absent: a `NaN` propagates into `spentUsd` and makes every later cap comparison false. */
 function isNonNegativeAmount(value: unknown): boolean {
     return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
@@ -1671,7 +1669,7 @@ function coordinateKey(coordinate: RolloutCoordinate): string {
     ].join(":");
 }
 
-/** Resolves `"reclaimed"`, or the failure that prevented it, bounded by `LATE_DISPOSAL_GRACE_MS` so a `dispose()` that never settles cannot hold the run open. commentlint: allow(JUDGE) */
+/** Resolves `"reclaimed"`, or the failure that prevented it, bounded by `LATE_DISPOSAL_GRACE_MS` so a `dispose()` that never settles cannot hold the run open. */
 async function settleDisposal(
     handle: RolloutHandle,
 ): Promise<"reclaimed" | { error: unknown }> {
@@ -1684,7 +1682,7 @@ async function settleDisposal(
     });
     const startedAt = Date.now();
     try {
-        /** `dispose()` is invoked inside the promise chain, so a handler that throws synchronously — before it ever returns a promise — becomes this outcome instead of escaping `runArm`'s `finally` and losing the paid rollout. commentlint: allow(JUDGE) */
+        /** `dispose()` is invoked inside the promise chain, so a handler that throws synchronously — before it ever returns a promise — becomes this outcome instead of escaping `runArm`'s `finally` and losing the paid rollout. */
         const outcome = await Promise.race([
             (async () => handle.dispose())().then(
                 () => "reclaimed" as const,
@@ -1692,7 +1690,7 @@ async function settleDisposal(
             ),
             grace,
         ]);
-        /** A cleanup that holds the event loop past the grace keeps the timer from firing and then wins the race as a microtask, so the elapsed time decides the outcome rather than the ordering: a harness that will not let go inside its bound is unreclaimed whether it eventually returns or not. commentlint: allow(JUDGE) */
+        /** A cleanup that holds the event loop past the grace keeps the timer from firing and then wins the race as a microtask, so the elapsed time decides the outcome rather than the ordering: a harness that will not let go inside its bound is unreclaimed whether it eventually returns or not. */
         if (outcome === "reclaimed" && Date.now() - startedAt >= LATE_DISPOSAL_GRACE_MS) {
             return { error: new Error("harness disposal did not settle") };
         }
@@ -1702,7 +1700,7 @@ async function settleDisposal(
     }
 }
 
-/** Resolves false when a late handle could not be reclaimed. A creation that never settles is bounded by `LATE_DISPOSAL_GRACE_MS` because the deadline it already missed is the reason it is being abandoned. commentlint: allow(JUDGE) */
+/** Resolves false when a late handle could not be reclaimed. A creation that never settles is bounded by `LATE_DISPOSAL_GRACE_MS` because the deadline it already missed is the reason it is being abandoned. */
 async function disposeLateHandle(creation: Promise<RolloutHandle>): Promise<boolean> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const grace = new Promise<"unreclaimed">((resolve) => {
@@ -1720,7 +1718,7 @@ async function disposeLateHandle(creation: Promise<RolloutHandle>): Promise<bool
             ),
             grace,
         ]);
-        /** Cleanup that holds the event loop keeps the grace macrotask from firing and then wins the race as a microtask, so elapsed time decides the outcome here for the same reason it does in `settleDisposal`. commentlint: allow(JUDGE) */
+        /** Cleanup that holds the event loop keeps the grace macrotask from firing and then wins the race as a microtask, so elapsed time decides the outcome here for the same reason it does in `settleDisposal`. */
         if (Date.now() - startedAt >= LATE_DISPOSAL_GRACE_MS) return false;
         return outcome === "reclaimed";
     } catch {
@@ -1730,7 +1728,7 @@ async function disposeLateHandle(creation: Promise<RolloutHandle>): Promise<bool
     }
 }
 
-/** `setTimeout` truncates a delay past the 32-bit millisecond limit and fires almost immediately, so a legitimate deadline more than about 24.8 days out would record the first rollout as `deadline-exceeded`. The wait is therefore chunked: each timer is clamped, and only the round that exhausts the budget rejects. commentlint: allow(JUDGE) */
+/** `setTimeout` truncates a delay past the 32-bit millisecond limit and fires almost immediately, so a legitimate deadline more than about 24.8 days out would record the first rollout as `deadline-exceeded`. The wait is therefore chunked: each timer is clamped, and only the round that exhausts the budget rejects. */
 const TIMER_MAX_MS = 2_147_483_647;
 
 async function withRolloutDeadline<T>(
@@ -1738,7 +1736,7 @@ async function withRolloutDeadline<T>(
     remainingMs: number,
 ): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    /** Armed before `work()` runs: a factory that spawns synchronously would otherwise consume the budget before the timer existed and then race against a full fresh allowance. commentlint: allow(JUDGE) */
+    /** Armed before `work()` runs: a factory that spawns synchronously would otherwise consume the budget before the timer existed and then race against a full fresh allowance. */
     const expiry = new Promise<never>((_, reject) => {
         let left = remainingMs;
         const arm = (): void => {
@@ -1757,23 +1755,23 @@ async function withRolloutDeadline<T>(
         arm();
     });
     const startedAt = Date.now();
-    /** `work()` runs inside the guard because a `run()` or `prepare()` that throws synchronously — a valid implementation, since the contract only promises a returned promise — would otherwise escape before the timer could be cleared, leaving `expiry` armed to hold the process open and then reject with no consumer. commentlint: allow(JUDGE) */
+    /** `work()` runs inside the guard because a `run()` or `prepare()` that throws synchronously — a valid implementation, since the contract only promises a returned promise — would otherwise escape before the timer could be cleared, leaving `expiry` armed to hold the process open and then reject with no consumer. */
     let pending: Promise<T> | undefined;
-    /** Stamped from the promise's own settlement callback rather than after the race resumes, so the bound reads when the work finished instead of when this frame got the CPU back: blocking the event loop delays the expiry macrotask and lets a fulfilled promise win the race however late it resolved, while an in-time result whose continuation is merely descheduled must not be failed for it. commentlint: allow(JUDGE) */
+    /** Stamped from the promise's own settlement callback rather than after the race resumes, so the bound reads when the work finished instead of when this frame got the CPU back: blocking the event loop delays the expiry macrotask and lets a fulfilled promise win the race however late it resolved, while an in-time result whose continuation is merely descheduled must not be failed for it. */
     let settledAt: number | undefined;
     const stamp = (): void => {
         settledAt ??= Date.now();
     };
     try {
         pending = work();
-        /** A factory that blocks past its allowance and returns an already-resolved promise has already overrun by the time it returns, and no timer could have fired while it held the loop. commentlint: allow(JUDGE) */
+        /** A factory that blocks past its allowance and returns an already-resolved promise has already overrun by the time it returns, and no timer could have fired while it held the loop. */
         if (Date.now() - startedAt >= remainingMs) {
             throw new RolloutDeadlineError(
                 `rollout still in flight after the ${remainingMs}ms deadline budget`,
             );
         }
         pending.then(stamp, stamp);
-        /** The race is captured as an outcome rather than awaited directly, because a rejection that settles late would otherwise be rethrown before the elapsed check ran: a `ProviderUnavailableError` arriving past the deadline would then be recorded as a provider failure, and a final arm could leave the run reporting `completed`. commentlint: allow(JUDGE) */
+        /** The race is captured as an outcome rather than awaited directly, because a rejection that settles late would otherwise be rethrown before the elapsed check ran: a `ProviderUnavailableError` arriving past the deadline would then be recorded as a provider failure, and a final arm could leave the run reporting `completed`. */
         const outcome = await Promise.race([
             pending.then(
                 (value) => ({ ok: true as const, value }),

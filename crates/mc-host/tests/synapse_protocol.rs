@@ -1,3 +1,8 @@
+//! End-to-end Synapse protocol proofs for admission, deadlines, paging, replay, and shutdown.
+//!
+//! Tests use separate routes where transport scheduling is part of the claim and a paused Tokio clock
+//! where exact deadline ordering matters. Deterministic engine call logs verify inference order and absence.
+
 mod support;
 
 use support::synapse::{
@@ -30,6 +35,7 @@ async fn spawn_query(
     })
 }
 
+/// Yields without advancing paused time and panics after 10,000 unsuccessful scheduler turns.
 async fn yield_until(predicate: impl Fn() -> bool) {
     for _ in 0..10_000 {
         if predicate() {
@@ -49,6 +55,7 @@ fn waiter_limits(max_waiting_queries: usize) -> SynapseLimits {
     }
 }
 
+/// Keeps Tokio's paused clock from auto-advancing while concurrency assertions are pending.
 fn keep_paused_clock_manual() -> (
     std::sync::Arc<std::sync::atomic::AtomicBool>,
     tokio::task::JoinHandle<()>,

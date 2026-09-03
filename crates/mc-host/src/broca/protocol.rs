@@ -1,4 +1,8 @@
+//! Closed JSON request and event vocabulary for Broca management routes.
 //!
+//! Request parsing bounds body size and nesting before deserialization. Field validation rejects
+//! ambiguous model references and command-line option injection. Event encoders preserve shapes
+//! consumed by historian classification.
 
 use crate::control::check_string;
 use crate::synapse::protocol::{
@@ -13,32 +17,52 @@ use super::config::{MAX_OUTPUT_TOKENS_BOUND, MAX_SEND_BODY_BYTES, TEMPERATURE_RA
 const MAX_BODY_DEPTH: usize = 8;
 /// The encoder caps error-unit diagnostics at 512 bytes to preserve terminal replay headroom.
 const MAX_UNIT_DIAGNOSTIC_BYTES: usize = 512;
+/// Maximum UTF-8 byte length accepted for a run identifier.
 pub const MAX_RUN_ID_BYTES: usize = 128;
 const MAX_MODEL_FIELD_BYTES: usize = 256;
 
+/// Run is admitted but has not started backend execution.
 pub const STATUS_QUEUED: &str = "queued";
+/// Run is executing in its selected harness.
 pub const STATUS_RUNNING: &str = "running";
+/// Run reached a successful terminal event.
 pub const STATUS_COMPLETED: &str = "completed";
+/// Run reached an error terminal event.
 pub const STATUS_FAILED: &str = "failed";
+/// Run was cancelled before successful completion.
 pub const STATUS_CANCELLED: &str = "cancelled";
+/// Requested run is not retained by the session.
 pub const STATUS_MISSING: &str = "missing";
 
+/// Validated Broca management operation.
 #[derive(Debug, PartialEq)]
 pub enum Request {
+    /// Starts one model run.
     Send(SendRequest),
+    /// Replays session events from the beginning, then follows live events.
     Subscribe,
+    /// Reads retained state for one run.
     Status { run_id: String },
+    /// Requests cancellation of one run.
     Cancel { run_id: String },
+    /// Deletes the bound session and its retained runs.
     Delete,
 }
 
+/// Validated model invocation parameters retained by the supervisor.
 #[derive(Clone, PartialEq)]
 pub struct SendRequest {
+    /// User prompt delivered through harness stdin.
     pub prompt: String,
+    /// Optional system prompt delivered through harness-private configuration.
     pub system: Option<String>,
+    /// Canonical provider name before any harness-specific alias mapping.
     pub provider: String,
+    /// Provider model name without the provider prefix.
     pub model: String,
+    /// Requested output-token ceiling.
     pub max_output_tokens: u64,
+    /// Finite sampling temperature within the configured range.
     pub temperature: f64,
 }
 
@@ -188,6 +212,10 @@ fn decode_request(body: &[u8]) -> Result<Request, RequestError> {
     }
 }
 
+/// Validates and decodes one management request body.
+///
+/// Binary frames, bodies above 512 KiB, excessive nesting, unknown methods, and invalid method
+/// parameters return [`RequestError`].
 pub fn parse_request(body: &[u8], binary: bool) -> Result<Request, RequestError> {
     preflight(body, binary)?;
     decode_request(body)
@@ -245,15 +273,18 @@ fn parse_send(params: SendParams) -> Result<Request, RequestError> {
 // Response and event field names must remain compatible with `HistorianProducer`'s `unit_*` helpers and `classify_run_state`.
 // ---------------------------------------------------------------------------
 
+/// Encodes the run identifier returned after a successful send.
 pub fn send_response_body(run_id: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "run_id": run_id })).expect("send response serializes")
 }
 
+/// Encodes retained run state for a status request.
 pub fn status_response_body(run_id: &str, state: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "run_id": run_id, "state": state }))
         .expect("status response serializes")
 }
 
+/// Encodes the acknowledgement used by cancel and delete operations.
 pub fn ok_response_body() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "ok": true })).expect("ok response serializes")
 }
@@ -263,10 +294,12 @@ fn control_event(unit: serde_json::Value) -> Vec<u8> {
         .expect("control event serializes")
 }
 
+/// Encodes the first in-band lifecycle event for an executing run.
 pub fn run_started_unit(run_id: &str) -> Vec<u8> {
     control_event(serde_json::json!({ "type": "run_started", "run_id": run_id }))
 }
 
+/// Encodes the selected harness before backend output is published.
 pub fn harness_dispatch_unit(run_id: &str, harness: Harness) -> Vec<u8> {
     control_event(serde_json::json!({
         "type": "harness_dispatch",

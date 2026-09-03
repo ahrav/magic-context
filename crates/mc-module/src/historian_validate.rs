@@ -29,7 +29,6 @@ pub struct ChunkLine {
     pub ordinal: u64,
     /// message_id is the last flat block's `<mid>#<index>` ID.
     /// message_id is empty only when the raw message has no flat blocks.
-    /// compartment boundary.
     pub message_id: String,
     /// anchorable is true only when message_id names a real flat block.
     /// A compartment must end on an anchorable block to avoid impossible coverage boundaries.
@@ -225,18 +224,11 @@ pub struct ValidatedChunk {
 }
 
 /// Validation failures are plain, serializable messages because callers include them in repair prompts and telemetry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[error("{message}")]
 pub struct HistorianValidationError {
     pub message: String,
 }
-
-impl std::fmt::Display for HistorianValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for HistorianValidationError {}
 
 fn validation_error(message: impl Into<String>) -> HistorianValidationError {
     HistorianValidationError {
@@ -1160,7 +1152,6 @@ fn attr_importance_regex() -> &'static Regex {
 }
 
 /// Self-closing tier tags represent empty tiers.
-/// Mismatched closing digits terminate an opened tier.
 /// Mismatched closing digits terminate an opened tier.
 fn tier_open_regexes() -> &'static [Regex; 4] {
     static RE: OnceLock<[Regex; 4]> = OnceLock::new();

@@ -1,3 +1,10 @@
+//! Converts OpenCode MessageV2 JSON to CK wire messages and back.
+//!
+//! Decode sidecars retain native envelopes and block identities so unchanged
+//! provider fields round-trip byte-for-byte at the JSON value level. Encoding
+//! preserves message order and folds adjacent call/result pairs into OpenCode's
+//! single tool-part representation.
+
 use super::json::{media_kind, opaque_arc, set_string, set_value, string_field, synth_tool_id};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -31,6 +38,12 @@ pub fn decode_opencode_with_sidecar(
     decode_opencode_with_sidecar_and_base(messages, prior, 0)
 }
 
+/// Decodes messages while inheriting stable message-ID pins from `prior`.
+///
+/// Explicit absolute ordinals win. Missing ordinals are assigned from
+/// `provisional_base + index + 1` with saturating arithmetic. The last
+/// compaction part becomes the extracted boundary and is omitted from CK
+/// content. Unknown parts remain opaque.
 pub fn decode_opencode_with_sidecar_and_base(
     messages: &[MessageV2Json],
     prior: Option<&DecodeSidecar>,
@@ -277,6 +290,10 @@ pub(crate) fn decode_opencode_sidecar_incremental(
     sidecar
 }
 
+/// Encodes CK messages and reuses retained native envelopes when available.
+///
+/// `mutation_exempt_mid` selects one retained message for exact raw replay.
+/// In debug builds, encoding panics if two emitted tool parts share a call ID.
 pub fn encode_opencode(
     messages: &[CkWireMessage],
     sidecar: &DecodeSidecar,
@@ -288,6 +305,8 @@ pub fn encode_opencode(
     }
 }
 
+/// Encodes CK messages with a session ID for new synthetic user messages.
+///
 /// `session_id` applies only to newly created synthetic user messages.
 /// Retained raw values preserve provider fields that CK does not model.
 /// The decoder retains compaction parts to replay untouched ingress.

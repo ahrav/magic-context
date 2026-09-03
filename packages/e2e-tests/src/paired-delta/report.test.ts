@@ -88,23 +88,27 @@ function report(overrides: Partial<Parameters<typeof buildPairedDeltaReport>[0]>
         runSummary: {
             status: "completed" as const,
             spentUsd: 12.5,
-            observedCostRollouts: 6,
-            estimatedCostRollouts: 1,
+            // A completed run stored every primary arm for all twelve coordinates. Each unhealthy coordinate has
+            // one failed arm priced as an estimate, which is one of the exclusions below, and two observed arms.
+            observedCostRollouts: 33,
+            estimatedCostRollouts: 3,
             refusedRegretLadders: { "intervention-mismatch": 2 },
             plannedCoordinates: 12,
-            healthyCoordinates: 12,
-            evidenceComplete: true,
+            healthyCoordinates: 9,
+            // A calibration run with a partial matrix cannot be valid for pool sizing.
+            evidenceComplete: false,
             calibrationFingerprint: null,
         },
         exclusions: [
             { armId: "mc-off", reasonCode: "provider-unavailable", count: 2 },
             { armId: "compaction", reasonCode: "deadline-exceeded", count: 1 },
         ],
+        // A healthy coordinate completed every primary arm, so each map carries all three.
         secondaryMetrics: {
-            invalidSuccessRateByArm: { "mc-on": 0.1, "mc-off": 0 },
-            finalAttemptTokensByArm: { "mc-on": 1000, "mc-off": 800 },
-            finalAttemptWallClockMsByArm: { "mc-on": 4000, "mc-off": 3000 },
-            finalAttemptTurnsByArm: { "mc-on": 8, "mc-off": 7 },
+            invalidSuccessRateByArm: { "mc-on": 0.1, "mc-off": 0, compaction: 0 },
+            finalAttemptTokensByArm: { "mc-on": 1000, "mc-off": 800, compaction: 900 },
+            finalAttemptWallClockMsByArm: { "mc-on": 4000, "mc-off": 3000, compaction: 3500 },
+            finalAttemptTurnsByArm: { "mc-on": 8, "mc-off": 7, compaction: 7 },
         },
         ...overrides,
     });
@@ -244,6 +248,7 @@ describe("paired-delta report", () => {
                 { coordinateId: "a:b", familyId: "c", endpoint: "mc-on-vs-mc-off", delta: 0.3, runHealth: "completed" },
                 { coordinateId: "a:b", familyId: "c", endpoint: "mc-on-vs-compaction", delta: 0.3, runHealth: "completed" },
                 { coordinateId: "a:b", familyId: "c", endpoint: "retrieval", delta: 0.5, runHealth: "completed" },
+                { coordinateId: "a", familyId: "b:c", endpoint: "retrieval", delta: 0.4, runHealth: "completed" },
                 { coordinateId: "a", familyId: "b:c", endpoint: "formation", delta: 0.7, runHealth: "completed" },
             ],
             minimumAnalyzableFamilyCount: 1,
@@ -259,7 +264,7 @@ describe("paired-delta report", () => {
         const built = report({ policyDocument: policy, analysis });
         expect(built.body.regret.raw.map(({ coordinateId, familyId, retrieval, formation }) =>
             [coordinateId, familyId, retrieval, formation])).toEqual([
-            ["a", "b:c", null, 0.7],
+            ["a", "b:c", 0.4, 0.7],
             ["a:b", "c", 0.5, null],
         ]);
     });
@@ -321,6 +326,95 @@ describe("paired-delta report", () => {
                 finalAttemptTurnsByArm: {},
             },
         })).toThrow(/metric-arm-invalid-mc-onn/);
+        // Healthy evidence means every primary arm ran, so the builder refuses a map missing one, as the parser does.
+        expect(() => report({
+            secondaryMetrics: {
+                invalidSuccessRateByArm: { "mc-on": 0.1, "mc-off": 0 },
+                finalAttemptTokensByArm: { "mc-on": 1000, "mc-off": 800, compaction: 900 },
+                finalAttemptWallClockMsByArm: { "mc-on": 4000, "mc-off": 3000, compaction: 3500 },
+                finalAttemptTurnsByArm: { "mc-on": 4, "mc-off": 3, compaction: 3 },
+            },
+        })).toThrow(/metric-arm-missing-invalidSuccessRateByArm-compaction/);
+        // The parser requires integer token and turn totals and an endpoint on every floor, so the builder does too.
+        expect(() => report({
+            secondaryMetrics: {
+                invalidSuccessRateByArm: { "mc-on": 0.1, "mc-off": 0, compaction: 0 },
+                finalAttemptTokensByArm: { "mc-on": 1000.5, "mc-off": 800, compaction: 900 },
+                finalAttemptWallClockMsByArm: { "mc-on": 4000, "mc-off": 3000, compaction: 3500 },
+                finalAttemptTurnsByArm: { "mc-on": 4, "mc-off": 3, compaction: 3 },
+            },
+        })).toThrow(/metric-invalid/);
+        const unscopedFloor = structuredClone(report().body.analysis);
+        const floored = unscopedFloor.endpoints[0]!.families[0]!;
+        floored.noise = { label: "inside-floor", floor: { familyId: floored.familyId, value: 1.5, interval: { lower: 0, upper: 1.5 } } };
+        expect(() => report({ analysis: unscopedFloor })).toThrow(new RegExp(`noise-floor-endpoint-missing-${floored.familyId}`));
+        // The parser admits only the runner's refusal reasons and derives completeness outside calibration, so
+        // the builder refuses the shapes it would reject.
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, refusedRegretLadders: { vibes: 1 } },
+        })).toThrow(/refusal-reason-invalid-vibes/);
+        // A calibration fingerprint requires every primary family to include a noise floor.
+        const floorlessFamily = report().body.analysis.endpoints[0]!.families[0]!;
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, calibrationFingerprint: H1, evidenceComplete: false },
+        })).toThrow(new RegExp(`noise-floor-required-${floorlessFamily.familyId}`));
+        const flooredAnalysis = structuredClone(report().body.analysis);
+        for (const endpoint of flooredAnalysis.endpoints) {
+            for (const family of endpoint.families) {
+                family.noise = { label: "inside-floor", floor: { endpoint: endpoint.endpoint as "mc-on-vs-mc-off" | "mc-on-vs-compaction", familyId: family.familyId, value: 1.5, interval: { lower: 0, upper: 1.5 } } };
+            }
+        }
+        expect(() => report({
+            analysis: flooredAnalysis,
+            runSummary: { ...report().body.runSummary, calibrationFingerprint: H1, evidenceComplete: true },
+        })).toThrow(/evidence-complete-mismatch/);
+        // A completed run stored every primary arm of every planned coordinate.
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, observedCostRollouts: 27, estimatedCostRollouts: 0 },
+        })).toThrow(/completed-run-shortfall/);
+        // Each coordinate records at most one entry per arm; healthy coordinates use every primary arm.
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, observedCostRollouts: 70, estimatedCostRollouts: 3 },
+        })).toThrow(/exceeds-plan \(runSummary\.observedCostRollouts\)/);
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, observedCostRollouts: 26, estimatedCostRollouts: 10 },
+        })).toThrow(/healthy-coordinate-shortfall \(runSummary\.observedCostRollouts\)/);
+        // A coordinate refuses its ladder or produces raw regret records, never both, and at most once each.
+        const rawCoordinates = new Set(report().body.analysis.rawRegretRecords.map(({ coordinateId }) => coordinateId)).size;
+        expect(rawCoordinates).toBeGreaterThan(0);
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, refusedRegretLadders: { "intervention-mismatch": 12 - rawCoordinates + 1 } },
+        })).toThrow(/exceeds-plan \(analysis\.rawRegretRecords\)/);
+        // A calibration run is complete only over a completed, fully healthy matrix.
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, evidenceComplete: true },
+        })).toThrow(/evidence-complete-mismatch/);
+        expect(() => report({
+            analysis: flooredAnalysis,
+            runSummary: { ...report().body.runSummary, calibrationFingerprint: "calibration-2026", evidenceComplete: false },
+        })).toThrow(/calibration-fingerprint-invalid/);
+        // Only a calibration floor shape is publishable: `[0, value]` with a value under 2.
+        const oddFloor = structuredClone(report().body.analysis);
+        const oddFamily = oddFloor.endpoints[0]!.families[0]!;
+        oddFamily.noise = { label: "inside-floor", floor: { endpoint: oddFloor.endpoints[0]!.endpoint as "mc-on-vs-compaction", familyId: oddFamily.familyId, value: 0.2, interval: { lower: 0.1, upper: 0.3 } } };
+        expect(() => report({ analysis: oddFloor })).toThrow(new RegExp(`noise-floor-shape-invalid-${oddFamily.familyId}`));
+        // A floor names the endpoint and family that carry it.
+        const swappedFloor = structuredClone(report().body.analysis);
+        const swappedFamily = swappedFloor.endpoints[0]!.families[0]!;
+        swappedFamily.noise = { label: "inside-floor", floor: { endpoint: swappedFloor.endpoints[1]!.endpoint as "mc-on-vs-mc-off", familyId: swappedFamily.familyId, value: 1.5, interval: { lower: 0, upper: 1.5 } } };
+        expect(() => report({ analysis: swappedFloor })).toThrow(new RegExp(`noise-floor-owner-mismatch-${swappedFamily.familyId}`));
+        // A usage-unmeasured run stored the estimated-cost failure that produced the status.
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, status: "usage-unmeasured", estimatedCostRollouts: 0, observedCostRollouts: 36, evidenceComplete: false },
+        })).toThrow(/status-evidence-required/);
+        // A regret rung exists only with every earlier one.
+        const skippedRung = structuredClone(report().body.analysis);
+        skippedRung.rawRegretRecords = skippedRung.rawRegretRecords.filter(({ endpoint }) => endpoint !== "retrieval");
+        expect(() => report({ analysis: skippedRung })).toThrow(/ladder-prefix-missing-/);
+        // The parser requires a positive plan, so the builder refuses an empty one too.
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, plannedCoordinates: 0, healthyCoordinates: 0 },
+        })).toThrow(/run-summary-invalid/);
     });
 
     it("separates a schema mismatch from a fingerprint mismatch when publishing", () => {
@@ -946,6 +1040,297 @@ describe("parsePairedDeltaReport", () => {
         const badStatus = structuredClone(built) as unknown as { body: { runSummary: Record<string, unknown> } };
         badStatus.body.runSummary.status = "done";
         expect(() => parsePairedDeltaReport(badStatus)).toThrow(/report\.body\.runSummary\.status: enum-invalid/);
+    });
+
+    it("rejects a fingerprint-consistent body that violates the builder's cross-field invariants", () => {
+        const built = report();
+        // The fingerprint is an unkeyed digest, so a writer can recompute it over a rewritten body.
+        const forge = (mutate: (body: typeof built.body) => void): unknown => {
+            const body = structuredClone(built.body);
+            mutate(body);
+            return { schema: built.schema, body, reportFingerprint: canonicalFingerprint(body) };
+        };
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.evidenceSufficient = false; })))
+            .toThrow(/report\.body\.analysis\.evidenceSufficient: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.endpoints[0]!.familyCount = 99; })))
+            .toThrow(/report\.body\.analysis\.endpoints\[0\]\.familyCount: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.endpoints.push({ ...body.analysis.endpoints[0]!, endpoint: "representation" });
+        }))).toThrow(/report\.body\.analysis\.endpoints\[2\]\.endpoint: enum-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.policyFingerprint = H1; })))
+            .toThrow(/report\.body\.analysis: lane-binding-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.regret.providerMixed = []; })))
+            .toThrow(/report\.body\.regret\.providerMixed: analysis-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.regret.raw[0]!.retrieval = 0.9; })))
+            .toThrow(/report\.body\.regret\.raw: analysis-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.secondaryMetrics.invalidSuccessRateByArm["mc-on"] = 1.5; })))
+            .toThrow(/invalidSuccessRateByArm\.mc-on: number-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.secondaryMetrics.finalAttemptTokensByArm["mc-on"] = -1; })))
+            .toThrow(/finalAttemptTokensByArm\.mc-on: integer-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.spentUsd = -1; })))
+            .toThrow(/report\.body\.runSummary\.spentUsd: number-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.healthyCoordinates = 13; })))
+            .toThrow(/report\.body\.runSummary\.healthyCoordinates: integer-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.exclusions.push({ ...body.exclusions[0]! }); })))
+            .toThrow(/report\.body\.exclusions: duplicate/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.bootstrapResamples = 1; })))
+            .toThrow(/report\.body\.analysis\.bootstrapResamples: integer-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.bootstrapSeed = 0x1_0000_0000; })))
+            .toThrow(/report\.body\.analysis\.bootstrapSeed: integer-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.endpoints[0]!.pointEstimate += 0.5;
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.pointEstimate: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const endpoint = body.analysis.endpoints[0]!;
+            endpoint.resolution = endpoint.resolution === "resolved" ? "unresolved" : "resolved";
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.resolution: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.analyzableFamilyCount += 1;
+            body.analysis.evidenceSufficient = body.analysis.analyzableFamilyCount >= body.analysis.minimumAnalyzableFamilyCount;
+        }))).toThrow(/report\.body\.analysis\.analyzableFamilyCount: derived-mismatch/);
+        // An inverted interval reads as excluding zero, which would let the resolution check pass.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.endpoints[0]!.interval = { lower: 1, upper: -1 };
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.interval: interval-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const family = body.analysis.endpoints[0]!.families[0]!;
+            expect(family.noise).toEqual({ label: "no-noise-floor", floor: null });
+            family.noise.label = "outside-floor";
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.noise\.label: derived-mismatch/);
+        // A primary estimate needs coordinates present at both endpoints, so one endpoint alone or two
+        // endpoints over different family sets is a topology the estimator cannot produce.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.endpoints = [body.analysis.endpoints[0]!];
+        }))).toThrow(/report\.body\.analysis\.endpoints: paired-endpoints-required/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            // Keeps the row's code-unit order so the set comparison, not the order check, is what fires.
+            body.analysis.endpoints[1]!.families[0]!.familyId = "fam-0-elsewhere";
+        }))).toThrow(/report\.body\.analysis\.endpoints: family-set-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.status = "cost-cap-reached";
+            body.runSummary.observedCostRollouts = 0;
+        }))).toThrow(/report\.body\.runSummary\.observedCostRollouts: healthy-coordinate-shortfall/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.exclusions[0]!.count = 99; })))
+            .toThrow(/report\.body\.exclusions: [a-z-]+-exceeds-plan/);
+        // The builder sorts exclusions and limitations, so a reordered archive is not a shape it can emit.
+        expect(() => parsePairedDeltaReport(forge((body) => { body.exclusions.reverse(); })))
+            .toThrow(/report\.body\.exclusions: order-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.limitations = ["b caveat", "a caveat"]; })))
+            .toThrow(/report\.body\.limitations: order-invalid/);
+        // The regret estimates are replayed with the archived resample count over the archived records, so both
+        // sizes are bounded, separately and together.
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.bootstrapResamples = 10 ** 9; })))
+            .toThrow(/report\.body\.analysis\.bootstrapResamples: integer-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.bootstrapResamples = 100_000;
+            // Appended after the last record with ascending suffixes, so the archive stays in producer order.
+            const template = body.analysis.rawRegretRecords.at(-1)!;
+            for (let index = 0; index < 500; index += 1) {
+                body.analysis.rawRegretRecords.push({ ...template, coordinateId: `${template.coordinateId}-z${String(index).padStart(4, "0")}` });
+            }
+        }))).toThrow(/report\.body\.analysis\.rawRegretRecords: bootstrap-work-too-large/);
+        // The estimator emits endpoints, families, and raw records in code-unit order.
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.endpoints.reverse(); })))
+            .toThrow(/report\.body\.analysis\.endpoints: order-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.endpoints[0]!.families.reverse(); })))
+            .toThrow(/report\.body\.analysis\.endpoints\[0\]\.families: order-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            expect(body.analysis.rawRegretRecords.length).toBeGreaterThan(1);
+            body.analysis.rawRegretRecords.reverse();
+        }))).toThrow(/report\.body\.analysis\.rawRegretRecords: order-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.refusedRegretLadders = { vibes: 1 }; })))
+            .toThrow(/report\.body\.runSummary\.refusedRegretLadders\.vibes: enum-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.refusedRegretLadders = { "intervention-mismatch": 99 }; })))
+            .toThrow(/report\.body\.runSummary\.refusedRegretLadders: exceeds-plan/);
+        // Outside calibration, completeness follows from sufficiency and a fully healthy matrix.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.calibrationFingerprint = H1;
+            body.runSummary.evidenceComplete = !body.runSummary.evidenceComplete;
+        }))).toThrow(/report\.body\.runSummary\.evidenceComplete: derived-mismatch/);
+        // A calibration fingerprint requires every primary family to include a noise floor.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.calibrationFingerprint = H1;
+            body.runSummary.evidenceComplete = body.analysis.evidenceSufficient
+                && body.runSummary.healthyCoordinates >= body.runSummary.plannedCoordinates;
+            expect(body.analysis.endpoints[0]!.families[0]!.noise.floor).toBeNull();
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.noise\.floor: floor-required/);
+        // A calibration report derives completeness from calibration validity, which the body does not carry,
+        // but validity needs a completed run over a full matrix, so a partial matrix cannot be complete.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            expect(body.runSummary.calibrationFingerprint).toBeNull();
+            expect(body.runSummary.healthyCoordinates).toBeLessThan(body.runSummary.plannedCoordinates);
+            body.runSummary.evidenceComplete = true;
+        }))).toThrow(/report\.body\.runSummary\.evidenceComplete: derived-mismatch/);
+        // Twelve healthy coordinates observed three primary arms each, plus the two archived regret rungs.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.healthyCoordinates = body.runSummary.plannedCoordinates;
+            body.runSummary.observedCostRollouts = 38;
+            body.runSummary.estimatedCostRollouts = 0;
+            body.exclusions = [];
+            body.runSummary.evidenceComplete = true;
+        }))).not.toThrow();
+        // Every raw regret rung is a completed, observed regret-arm record beyond the primary arms.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.healthyCoordinates = body.runSummary.plannedCoordinates;
+            body.runSummary.observedCostRollouts = 37;
+            body.runSummary.estimatedCostRollouts = 0;
+            body.exclusions = [];
+            body.runSummary.evidenceComplete = true;
+        }))).toThrow(/report\.body\.runSummary\.observedCostRollouts: healthy-coordinate-shortfall/);
+        // Healthy evidence implies every primary arm appears in each secondary-metric map.
+        expect(() => parsePairedDeltaReport(forge((body) => { delete body.secondaryMetrics.invalidSuccessRateByArm["mc-on"]; })))
+            .toThrow(/report\.body\.secondaryMetrics\.invalidSuccessRateByArm\.mc-on: arm-required/);
+        // Refusals and raw ladders partition the planned coordinates.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.refusedRegretLadders = { "intervention-mismatch": 12 };
+        }))).toThrow(/report\.body\.analysis\.rawRegretRecords: exceeds-plan/);
+        // A floor is 1.96 * sqrt(variance / n) over deltas in {-1, 0, 1}, so it stays under 2.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const family = body.analysis.endpoints[0]!.families[0]!;
+            family.noise.floor = { endpoint: "mc-on-vs-compaction", familyId: family.familyId, value: 3, interval: { lower: 0, upper: 3 } };
+            family.noise.label = "inside-floor";
+            family.resolution = "unresolved";
+            body.analysis.endpoints[0]!.resolution = "unresolved";
+        }))).toThrow(/noise\.floor\.value: number-invalid/);
+        // Rungs run in order and stop at the first failure.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.rawRegretRecords = body.analysis.rawRegretRecords.filter(({ endpoint }) => endpoint !== "retrieval");
+        }))).toThrow(/report\.body\.analysis\.rawRegretRecords: ladder-prefix-missing-/);
+        // A regret estimate is recomputed whole from its archived raw deltas and bootstrap settings, so neither a
+        // family's mean nor its interval and resolution can be rewritten.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const estimate = body.analysis.providerMixedRegret[0]!;
+            const family = estimate.families[0]!;
+            family.pointEstimate += 0.05;
+            estimate.pointEstimate = estimate.families.reduce((sum, { pointEstimate }) => sum + pointEstimate, 0) / estimate.families.length;
+            body.regret.providerMixed = body.analysis.providerMixedRegret;
+        }))).toThrow(/report\.body\.analysis\.providerMixedRegret\[0\](\.interval)?: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const family = body.analysis.providerMixedRegret[0]!.families[0]!;
+            family.interval = { lower: family.pointEstimate - 0.01, upper: family.pointEstimate + 0.01 };
+            body.regret.providerMixed = body.analysis.providerMixedRegret;
+        }))).toThrow(/report\.body\.analysis\.providerMixedRegret\[0\]: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.status = "usage-unmeasured";
+            body.runSummary.estimatedCostRollouts = 0;
+            body.runSummary.observedCostRollouts = 36;
+        }))).toThrow(/report\.body\.runSummary\.estimatedCostRollouts: status-evidence-required/);
+        // An aggregate regret endpoint has raw observations behind it.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.rawRegretRecords = body.analysis.rawRegretRecords.filter(({ endpoint }) => endpoint !== "formation");
+            body.regret.raw = body.regret.raw.map((row) => ({ ...row, formation: null }));
+        }))).toThrow(/report\.body\.analysis: aggregate-without-raw-formation/);
+        // A raw regret endpoint has its aggregate estimate.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.providerMixedRegret = body.analysis.providerMixedRegret.filter(({ endpoint }) => endpoint !== "formation");
+            body.regret.providerMixed = body.analysis.providerMixedRegret;
+        }))).toThrow(/report\.body\.analysis\.rawRegretRecords\[\d+\]\.endpoint: aggregate-required/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.plannedCoordinates = 0;
+            body.runSummary.healthyCoordinates = 0;
+        }))).toThrow(/report\.body\.runSummary\.plannedCoordinates: integer-invalid/);
+        // A calibrated floor's interval is exactly [0, value].
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const family = body.analysis.endpoints[0]!.families[0]!;
+            family.noise.floor = { endpoint: "mc-on-vs-compaction", familyId: family.familyId, value: 0.5, interval: { lower: 0.1, upper: 0.5 } };
+        }))).toThrow(/noise\.floor\.interval: derived-mismatch/);
+        // Deltas are differences of values in [0, 1].
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.endpoints[0]!.families[0]!.pointEstimate = 2; })))
+            .toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.pointEstimate: number-invalid/);
+        // Every exclusion is a final record the two cost counters also count.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.status = "cost-cap-reached";
+            body.runSummary.observedCostRollouts = 29;
+            body.runSummary.estimatedCostRollouts = 0;
+        }))).toThrow(/report\.body\.runSummary\.observedCostRollouts: exclusion-shortfall/);
+        // A completed run stored every primary arm for every planned coordinate.
+        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.estimatedCostRollouts = 0; })))
+            .toThrow(/report\.body\.runSummary\.observedCostRollouts: completed-run-shortfall/);
+        // An estimated cost marks a failed cell, and every failed cell is an exclusion.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.status = "cost-cap-reached";
+            body.exclusions = [];
+        }))).toThrow(/report\.body\.runSummary\.estimatedCostRollouts: exclusion-shortfall/);
+        // A completed run recorded every unhealthy coordinate's failed primary cell, so each one is an exclusion.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.estimatedCostRollouts = 1;
+            body.runSummary.observedCostRollouts = 35;
+            body.exclusions = [{ armId: "mc-off", reasonCode: "provider-unavailable", count: 1 }];
+        }))).toThrow(/report\.body\.exclusions: unhealthy-coordinate-shortfall/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.secondaryMetrics.finalAttemptTokensByArm["mc-on"] = 0.5; })))
+            .toThrow(/finalAttemptTokensByArm\.mc-on: integer-invalid/);
+        // A primary arm's exclusions fit within the unhealthy coordinates.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.exclusions.find(({ armId }) => armId === "compaction")!.count = 4;
+        }))).toThrow(/report\.body\.exclusions: compaction-exceeds-plan/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.estimatedCostRollouts = 999; })))
+            .toThrow(/report\.body\.runSummary\.observedCostRollouts: exceeds-plan/);
+        // Every analyzable family needs a coordinate whose primary arms all completed.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.healthyCoordinates = 0;
+            body.runSummary.evidenceComplete = false;
+        }))).toThrow(/report\.body\.analysis\.analyzableFamilyCount: healthy-coordinate-shortfall/);
+        // Joining ids with a separator would let an embedded separator forge a matching family set.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const [first, second] = body.analysis.endpoints;
+            first!.families[0]!.familyId = "a";
+            first!.families[1]!.familyId = "b\u0000c";
+            second!.families[0]!.familyId = "a\u0000b";
+            second!.families[1]!.familyId = "c";
+        }))).toThrow(/report\.body\.analysis\.endpoints: family-set-mismatch/);
+        // The aggregate replay is bounded by families times resamples before it starts.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.bootstrapResamples = 100_000;
+            const endpoint = body.analysis.endpoints[0]!;
+            const template = endpoint.families.at(-1)!;
+            for (let index = 0; index < 300; index += 1) {
+                endpoint.families.push({ ...template, familyId: `${template.familyId}-z${String(index).padStart(4, "0")}` });
+            }
+            endpoint.familyCount = endpoint.families.length;
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families: bootstrap-work-too-large/);
+        // The aggregate interval is a bootstrap over the published family means, so it cannot be rewritten.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const estimate = body.analysis.endpoints[0]!;
+            estimate.interval = { lower: estimate.interval.lower + 0.01, upper: estimate.interval.upper + 0.01 };
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.interval: derived-mismatch/);
+        // A family cannot be `resolved` over an interval that includes zero.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const family = body.analysis.endpoints[0]!.families[0]!;
+            family.interval = { lower: -1, upper: 1 };
+            family.resolution = "resolved";
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.resolution: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.endpoints[0]!.families[0]!.noise.floor = {
+                endpoint: "mc-on-vs-mc-off",
+                familyId: "fam-somebody-else",
+                value: 0.5,
+                interval: { lower: 0, upper: 0.5 },
+            };
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.noise\.floor\.familyId: floor-owner-mismatch/);
+        // `calibrationNoiseFloors` is the only floor producer and always names the endpoint it measured.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const family = body.analysis.endpoints[0]!.families[0]!;
+            family.noise.floor = { familyId: family.familyId, value: 1.5, interval: { lower: 0, upper: 1.5 } };
+            family.noise.label = "inside-floor";
+            family.resolution = "unresolved";
+            body.analysis.endpoints[0]!.resolution = "unresolved";
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.noise\.floor: fields-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const endpoint = body.analysis.endpoints[0]!;
+            endpoint.families = [];
+            endpoint.familyCount = 0;
+            endpoint.resolution = "unresolved";
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families: families-required/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const family = body.analysis.endpoints[0]!.families[0]!;
+            expect(body.analysis.endpoints[0]!.endpoint).toBe("mc-on-vs-compaction");
+            family.noise.floor = {
+                endpoint: "mc-on-vs-mc-off",
+                familyId: family.familyId,
+                value: 0.5,
+                interval: { lower: 0, upper: 0.5 },
+            };
+        }))).toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.noise\.floor\.endpoint: floor-owner-mismatch/);
     });
 
     it("preserves an endpoint-scoped noise floor through the round trip", () => {

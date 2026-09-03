@@ -1,0 +1,107 @@
+//! Magic Context semantic kernel: the durable store that owns its own SQLite
+//! connections, fences every write against the lease epoch, and exposes commit
+//! envelopes, admission, CAS artifacts, scope algebra, and backup as one API.
+//!
+//! Extracted from `mc-store` so the kernel and its proofs build independently of
+//! that crate's legacy cache-state store.
+
+#![forbid(unsafe_code)]
+
+pub mod sqlite_runtime;
+
+mod admission;
+mod anchor;
+pub mod applicability;
+mod backup;
+mod cas;
+mod durable_fs;
+mod envelope;
+mod facts;
+mod object_write;
+pub(crate) mod open;
+mod outbox;
+mod redaction;
+mod retention;
+pub mod schema;
+mod scope;
+mod slice;
+
+pub use admission::{
+    evaluate_admission, served_visibility_row, surface_visibility, AdmissionDecision,
+    AdmissionDomainSpec, AdmissionEvent, AdmissionRequest, Disposition, EffectiveMaturity,
+    Evaluation, EvaluationInputs, EventKind, Maturity, Outcome, PriorDecision, SourceClass,
+    Surface, SurfaceVisibility, TaintClass, VisibilityRow, VisibleAsOf, VisibleRow,
+    POLICY_REVISION,
+};
+pub use anchor::{
+    encode_anchor_captures, evaluate_non_git, AnchorCapture, AnchorCondition, AnchorDecodeError,
+    AnchorEvaluation, AnchorKind, AnchorRowSpec, ContextDependency, GitCondition, PatchIdCapture,
+    QueryContext, ANCHOR_CAPTURE_SCHEMA,
+};
+#[cfg(all(target_os = "linux", feature = "test-support"))]
+pub use backup::filesystem_is_unsafe_for_test;
+#[cfg(all(target_os = "macos", feature = "test-support"))]
+pub use backup::filesystem_name_is_unsafe_for_test;
+#[cfg(feature = "test-support")]
+pub use backup::{
+    owner_is_current_for_test, restore_marker_is_valid_for_test,
+    sensitivity_bearing_tables_for_test, verify_backup_with_deadline_for_test, RestoreFault,
+};
+pub use backup::{BackupManifest, BackupRequest};
+#[cfg(feature = "test-support")]
+pub use cas::{
+    ArtifactDeletionFault, ArtifactDeletionHook, ArtifactGcFault, ArtifactIngestFault,
+    ArtifactIngestHook,
+};
+pub use cas::{
+    ArtifactDeletionIdentity, ArtifactDeletionKind, ArtifactDeletionRequest,
+    ArtifactDeletionResult, ArtifactDestination, ArtifactEligibility, ArtifactError,
+    ArtifactErrorKind, ArtifactGcResult, ArtifactHandle, ArtifactIngestRequest,
+    BarrierConsumerStatus, DeletionBarrierStatus, EligibilityDeniedReason, ProviderEgress,
+    MAX_PAYLOAD_BYTES,
+};
+pub use envelope::{
+    AlignmentProjectionSpec, CommitIntent, CommitReceipt, DomainSpec, Envelope, KnownAsOf,
+    ObjectRow, RemediationTarget, RepositoryProvenance, Sensitivity, StagingCandidateRow,
+    StagingCandidateSpec, OPERATOR_REDACTION_PLACEHOLDER,
+};
+pub use facts::{ArtifactBudgetFacts, KernelFacts, OutboxLag, MAIN_FILE_WARN_BYTES};
+#[cfg(feature = "test-support")]
+pub use open::reset_marker_is_valid_for_test;
+pub use open::{KernelError, KernelStore};
+pub use outbox::{ConsumerAbandonment, OutboxPruneResult};
+pub use retention::{StagingMaintenanceResult, StagingTerminalState, STAGING_RETENTION_MS};
+pub use scope::{
+    coerce_version, scope_equivalent, scope_matches, scope_overlaps, scope_subsumes,
+    CanonicalScope, Dimension, GraphOracle, MatchOutcome, ScopeFormError, ScopeMatchContext,
+    ScopeSpec, ScopeTermSpec, ScopeWriteOutcome, TermValue, UnknownGraph, VersionSpec,
+};
+pub use slice::{
+    AlignmentRebuild, AlignmentRow, AlignmentSnapshot, DecisionEventOutcome, DecisionEventPayload,
+    DecisionEventSpec, DecisionPayload, DecisionRow, DecisionSpec, DecisionWriteOutcome,
+    ObservationDependencySpec, ObservationPayload, ObservationRow, ObservationSpec,
+    ObservationWriteOutcome, RetirementOutcome, SliceSnapshot,
+};
+
+/// A constraint violation is permanent and a lock wait is retryable, so collapsing both into `Io` would make either untreatable.
+pub(crate) fn map_sqlite(error: rusqlite::Error) -> KernelError {
+    let rusqlite::Error::SqliteFailure(failure, _) = &error else {
+        return KernelError::Io;
+    };
+    match failure.code {
+        rusqlite::ffi::ErrorCode::ConstraintViolation => KernelError::Conflict,
+        rusqlite::ffi::ErrorCode::DatabaseBusy | rusqlite::ffi::ErrorCode::DatabaseLocked => {
+            KernelError::Busy
+        }
+        _ => KernelError::Io,
+    }
+}
+
+/// Wall-clock milliseconds since the Unix epoch, saturating rather than failing so
+/// a clock before the epoch cannot abort a durable write.
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}

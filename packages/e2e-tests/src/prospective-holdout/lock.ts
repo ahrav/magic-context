@@ -45,7 +45,7 @@ function holderAlive(pid: number): boolean {
     }
 }
 
-/** Distinguishes "this path holds no parseable claim" from "this path could not be read at all". Release has to tell them apart: an unreadable record may still be this process's own claim, and treating a transient `EIO` or `EACCES` as a foreign owner let release report success over a directory it had not removed. commentlint: allow(JUDGE) */
+/** Distinguishes "this path holds no parseable claim" from "this path could not be read at all". Release has to tell them apart: an unreadable record may still be this process's own claim, and treating a transient `EIO` or `EACCES` as a foreign owner let release report success over a directory it had not removed. */
 class LockOwnerUnreadableError extends Error {}
 
 function parseLockOwner(text: string): LockOwner | null {
@@ -63,7 +63,7 @@ function parseLockOwner(text: string): LockOwner | null {
     }
 }
 
-/** The three answers a lock record can give, kept apart because they license different actions. `owner` is a claim that can be judged. `none` means the path carries no claim, because the record is absent — the narrow window between `mkdirSync` and the owner write — or because its bytes do not parse. `unreadable` means the record may hold a claim that could not be read. Treating `unreadable` as `none` lets an inaccessible live lock look abandoned: the verdict falls back to the directory's mtime, which a lock held across a whole multi-minute rollout leaves older than the lease, and takeover then reads its own failed read as confirmation that the path still carries the recordless claim it judged. commentlint: allow(JUDGE) */
+/** The three answers a lock record can give, kept apart because they license different actions. `owner` is a claim that can be judged. `none` means the path carries no claim, because the record is absent — the narrow window between `mkdirSync` and the owner write — or because its bytes do not parse. `unreadable` means the record may hold a claim that could not be read. Treating `unreadable` as `none` lets an inaccessible live lock look abandoned: the verdict falls back to the directory's mtime, which a lock held across a whole multi-minute rollout leaves older than the lease, and takeover then reads its own failed read as confirmation that the path still carries the recordless claim it judged. */
 type LockOwnerRead =
     | { status: "owner"; owner: LockOwner }
     | { status: "none" }
@@ -78,18 +78,18 @@ function readLockOwnerRecord(lock: string): LockOwnerRead {
         if (code === "ENOENT" || code === "ENOTDIR") return { status: "none" };
         return { status: "unreadable", code };
     }
-    /** The checked bytes are parsed here rather than re-read: a second read can fail where the first succeeded, and a failure answered as "no claim" is exactly the conflation this type exists to prevent. commentlint: allow(JUDGE) */
+    /** The checked bytes are parsed here rather than re-read: a second read can fail where the first succeeded, and a failure answered as "no claim" is exactly the conflation this type exists to prevent. */
     const owner = parseLockOwner(text);
     return owner === null ? { status: "none" } : { status: "owner", owner };
 }
 
-/** The null-collapsing view, for callers whose answer is the same either way: a read that failed and a record that is absent both mean "not confirmed to be this process's claim". commentlint: allow(JUDGE) */
+/** The null-collapsing view, for callers whose answer is the same either way: a read that failed and a record that is absent both mean "not confirmed to be this process's claim". */
 function readLockOwner(lock: string): LockOwner | null {
     const read = readLockOwnerRecord(lock);
     return read.status === "owner" ? read.owner : null;
 }
 
-/** Release deletes a directory, so it must not read a transient `EIO` as proof the claim is foreign. An absent record and one whose bytes do not parse stay `null`; anything else raises. commentlint: allow(JUDGE) */
+/** Release deletes a directory, so it must not read a transient `EIO` as proof the claim is foreign. An absent record and one whose bytes do not parse stay `null`; anything else raises. */
 function readLockOwnerForRelease(lock: string): LockOwner | null {
     const read = readLockOwnerRecord(lock);
     if (read.status === "unreadable") {
@@ -116,7 +116,7 @@ export interface LockAbandonment {
  */
 export function lockAbandoned(lock: string): LockAbandonment | null {
     const read = readLockOwnerRecord(lock);
-    /** A record that could not be read is not evidence of an absent claim, so the mtime fallback below is not licensed here: that path exists for the window in which a live holder has created the directory and not yet written its record, and using it for a failed read judges an inaccessible live lock abandoned. commentlint: allow(JUDGE) */
+    /** A record that could not be read is not evidence of an absent claim, so the mtime fallback below is not licensed here: that path exists for the window in which a live holder has created the directory and not yet written its record, and using it for a failed read judges an inaccessible live lock abandoned. */
     if (read.status === "unreadable") return null;
     if (read.status === "owner") {
         const { owner } = read;
@@ -147,7 +147,7 @@ function sameLockOwner(left: LockOwner | null, right: LockOwner | null): boolean
  */
 let sidelineSequence = 0;
 
-/** The stable part of this process's sideline paths: what release sweeps by, and what a takeover extends with a per-takeover suffix. commentlint: allow(JUDGE) */
+/** The stable part of this process's sideline paths: what release sweeps by, and what a takeover extends with a per-takeover suffix. */
 export function lockSidelinePrefix(lock: string): string {
     return `${lock}.reclaimed-${LOCK_NONCE}`;
 }
@@ -162,14 +162,13 @@ export function lockSidelinePath(lock: string): string {
  * `sideline` is the foreign owner's only lock record; restore it before removal, by `link` into the reclaimed path or by moving the directory itself.
  * If neither restoration succeeds, leave `sideline` in place: deleting it can destroy a live owner's lock record, and an orphaned sideline only leaves `lock` unreclaimed.
  * Exported for tests: the branch is reachable only through a rename that races a live claimant, which a single process cannot stage.
- * commentlint: allow(JUDGE)
  */
 export function restoreOrRemoveSideline(
     lock: string,
     sideline: string,
     judged: LockAbandonment,
 ): void {
-    /** The removal below destroys the sideline, so a read that merely failed must not stand in for an absent record: `sameLockOwner` matches two nulls, so a failed read against an mtime-judged verdict would delete a directory that may carry a live claim. An unreadable sideline falls through to the restoration attempts, which leave it in place when neither lands. commentlint: allow(JUDGE) */
+    /** The removal below destroys the sideline, so a read that merely failed must not stand in for an absent record: `sameLockOwner` matches two nulls, so a failed read against an mtime-judged verdict would delete a directory that may carry a live claim. An unreadable sideline falls through to the restoration attempts, which leave it in place when neither lands. */
     const read = readLockOwnerRecord(sideline);
     if (
         read.status !== "unreadable" &&
@@ -179,7 +178,7 @@ export function restoreOrRemoveSideline(
         return;
     }
     try {
-        /** `link` refuses an occupied destination, so a third claimant that already published its own record is not overwritten. commentlint: allow(JUDGE) */
+        /** `link` refuses an occupied destination, so a third claimant that already published its own record is not overwritten. */
         linkSync(join(sideline, LOCK_OWNER_FILE), join(lock, LOCK_OWNER_FILE));
     } catch {
         try {
@@ -205,7 +204,7 @@ export function restoreOrRemoveSideline(
  * A hard kill between the rename and removal leaves the sideline directory in the lock's parent, where no later acquisition removes it.
  */
 export function takeOverLock(lock: string, judged: LockAbandonment): void {
-    /** The verification read has to distinguish a failure from an absent record, because `sameLockOwner` treats two nulls as a match: a recordless lock judged by mtime, verified through a read that merely failed, confirms itself and moves whatever claim the path actually holds. commentlint: allow(JUDGE) */
+    /** The verification read has to distinguish a failure from an absent record, because `sameLockOwner` treats two nulls as a match: a recordless lock judged by mtime, verified through a read that merely failed, confirms itself and moves whatever claim the path actually holds. */
     const read = readLockOwnerRecord(lock);
     if (read.status === "unreadable") return;
     if (!sameLockOwner(read.status === "owner" ? read.owner : null, judged.owner)) return;
@@ -252,11 +251,11 @@ function claimLock(lock: string): LockClaim {
 }
 
 function releaseLock(lock: string): void {
-    /** A release has to reach this process's record wherever a reclaimer has moved it: a takeover that sidelined the directory can still restore it, and a record restored after its owner released would hold the path until that owner's process exits, because `lockAbandoned` will not reclaim a live holder's pid. The reclaimer's nonce names the sideline, so the sidelines are matched by this process's own owner record rather than by path. commentlint: allow(JUDGE) */
+    /** A release has to reach this process's record wherever a reclaimer has moved it: a takeover that sidelined the directory can still restore it, and a record restored after its owner released would hold the path until that owner's process exits, because `lockAbandoned` will not reclaim a live holder's pid. The reclaimer's nonce names the sideline, so the sidelines are matched by this process's own owner record rather than by path. */
     const parent = dirname(lock);
     const prefix = `${basename(lock)}.reclaimed-`;
     const sweepSidelines = (): void => {
-        /** An enumeration failure is not an empty directory: a parent that permits traversal by known path while denying listing would make every sweep skip this process's displaced claim, and release would then report success over a claim still on disk. `ENOENT` is the one case that genuinely means there is nothing to sweep. commentlint: allow(JUDGE) */
+        /** An enumeration failure is not an empty directory: a parent that permits traversal by known path while denying listing would make every sweep skip this process's displaced claim, and release would then report success over a claim still on disk. `ENOENT` is the one case that genuinely means there is nothing to sweep. */
         let siblings: string[];
         try {
             siblings = readdirSync(parent);
@@ -270,7 +269,7 @@ function releaseLock(lock: string): void {
         for (const entry of siblings) {
             if (!entry.startsWith(prefix)) continue;
             const sideline = join(parent, entry);
-            /** The propagating read, for the same reason the main lock uses it: a read failure here is not proof the sideline is someone else's, and skipping it would let release report success while this process's displaced claim is still on disk. commentlint: allow(JUDGE) */
+            /** The propagating read, for the same reason the main lock uses it: a read failure here is not proof the sideline is someone else's, and skipping it would let release report success while this process's displaced claim is still on disk. */
             if (readLockOwnerForRelease(sideline)?.nonce !== LOCK_NONCE) continue;
             rmSync(sideline, { recursive: true, force: true });
         }
@@ -279,16 +278,16 @@ function releaseLock(lock: string): void {
     // A lock reclaimed from this process belongs to the reclaimer.
     // Deleting a reclaimed lock would let another waiter acquire a lock the reclaimer still believes it holds.
     if (readLockOwnerForRelease(lock)?.nonce !== LOCK_NONCE) {
-        /** A takeover between the sweep and the read above moves this record to a sideline neither observation covered, so the sweep runs again once the path is known not to carry it. Each pass narrows the interleaving rather than closing it: reclamation cannot be made atomic against a concurrent reclaimer, which is why a holder that intends to act reads the lock again instead of trusting acquisition. commentlint: allow(JUDGE) */
+        /** A takeover between the sweep and the read above moves this record to a sideline neither observation covered, so the sweep runs again once the path is known not to carry it. Each pass narrows the interleaving rather than closing it: reclamation cannot be made atomic against a concurrent reclaimer, which is why a holder that intends to act reads the lock again instead of trusting acquisition. */
         sweepSidelines();
         return;
     }
     rmSync(lock, { recursive: true, force: true });
-    /** `force` succeeds against an absent path, so the removal above cannot distinguish "deleted this claim" from "a reclaimer moved it first". A reclaimer that then restores the displaced directory would leave this process's record at `lock` with the handle already marked released. Sweeping again catches the record wherever it landed, and the ownership re-read catches a restoration to `lock` itself. commentlint: allow(JUDGE) */
+    /** `force` succeeds against an absent path, so the removal above cannot distinguish "deleted this claim" from "a reclaimer moved it first". A reclaimer that then restores the displaced directory would leave this process's record at `lock` with the handle already marked released. Sweeping again catches the record wherever it landed, and the ownership re-read catches a restoration to `lock` itself. */
     sweepSidelines();
     if (readLockOwnerForRelease(lock)?.nonce === LOCK_NONCE) {
         rmSync(lock, { recursive: true, force: true });
-        /** The same check-then-delete gap as above, so it gets the same treatment: a reclaimer moving this record between the check and the removal leaves it at a sideline, and only a sweep behind the delete finds it there. Each pass narrows the interleaving; none closes it, because reclamation cannot be made atomic against a concurrent reclaimer. commentlint: allow(JUDGE) */
+        /** The same check-then-delete gap as above, so it gets the same treatment: a reclaimer moving this record between the check and the removal leaves it at a sideline, and only a sweep behind the delete finds it there. Each pass narrows the interleaving; none closes it, because reclamation cannot be made atomic against a concurrent reclaimer. */
         sweepSidelines();
     }
 }
@@ -351,7 +350,7 @@ export function acquireRecoverableLock(
     }
     let released = false;
     return {
-        /** The flag is set only once cleanup returns. Setting it first made a transient failure permanent: the directory still carried this live owner record, and a second call — believing the work was done — reported success to a caller that then disowned the claim, leaving a lock nothing could reclaim until the process exited. commentlint: allow(JUDGE) */
+        /** The flag is set only once cleanup returns. Setting it first made a transient failure permanent: the directory still carried this live owner record, and a second call — believing the work was done — reported success to a caller that then disowned the claim, leaving a lock nothing could reclaim until the process exited. */
         release(): void {
             if (released) return;
             releaseLock(lockPath);

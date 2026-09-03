@@ -1,3 +1,4 @@
+//! Reads and validates the host connection file for clients.
 //!
 //! Reads remain anchored to open directory and file descriptors.
 //! Traversal never follows links.
@@ -5,7 +6,6 @@
 //! Connection key bytes never appear in formatting or errors.
 
 use std::{
-    error::Error,
     ffi::OsString,
     fmt, io,
     path::{Path, PathBuf},
@@ -22,20 +22,33 @@ use crate::{
     wire::PROTOCOL_VERSION,
 };
 
+/// Current on-disk connection-file schema.
 pub const SCHEMA_VERSION: u32 = 2;
+/// Minimum accepted key length for callers that generate key material.
 pub const MIN_KEY_LEN: usize = 32;
+/// Exact key length accepted by [`ConnectionInfo::validate`].
 pub const KEY_LEN: usize = 32;
+/// Byte length of a daemon incarnation identifier.
 pub const DAEMON_ID_LEN: usize = 16;
+/// Maximum connection-file size read from disk.
 pub const MAX_CONNECTION_FILE_LEN: usize = 65_536;
 
+/// Authenticated endpoint and daemon identity published for clients.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionInfo {
+    /// On-disk schema version.
     pub schema: u32,
+    /// Host wire protocol version.
     pub wire_version: u8,
+    /// Absolute path to the setup socket.
     pub setup_socket: String,
+    /// Connection authentication key.
     pub key: Vec<u8>,
+    /// Daemon incarnation identifier.
     pub daemon_id: [u8; DAEMON_ID_LEN],
+    /// Daemon process identifier.
     pub pid: u32,
+    /// Daemon software version.
     pub daemon_ver: String,
 }
 
@@ -54,6 +67,7 @@ impl fmt::Debug for ConnectionInfo {
 }
 
 impl ConnectionInfo {
+    /// Validates schema, protocol, endpoint, key length, and daemon version.
     pub fn validate(&self) -> Result<(), ConnectionFileError> {
         if self.schema != SCHEMA_VERSION {
             return Err(ConnectionFileError::UnsupportedSchema {
@@ -83,99 +97,41 @@ impl ConnectionInfo {
     }
 }
 
-#[derive(Debug)]
+/// Failure while opening, reading, decoding, or validating a connection file.
+#[derive(Debug, thiserror::Error)]
 pub enum ConnectionFileError {
-    InvalidPath {
-        path: PathBuf,
-    },
+    #[error("invalid connection file path {}", path.display())]
+    InvalidPath { path: PathBuf },
+    #[error("connection file {op} failed for {}: {source}", path.display())]
     Io {
         op: &'static str,
         path: PathBuf,
         source: io::Error,
     },
-    Insecure {
-        path: PathBuf,
-    },
-    TooLarge {
-        path: PathBuf,
-        max: usize,
-    },
-    Replaced {
-        path: PathBuf,
-    },
+    #[error("refusing insecure connection file at {}: wrong type, owner, mode, or link count", path.display())]
+    Insecure { path: PathBuf },
+    #[error("connection file {} exceeds {max} byte limit", path.display())]
+    TooLarge { path: PathBuf, max: usize },
+    #[error("connection file {} changed while reading", path.display())]
+    Replaced { path: PathBuf },
+    #[error("connection file JSON read failed for {}: {source}", path.display())]
     Json {
         path: PathBuf,
         source: serde_json::Error,
     },
-    UnsupportedSchema {
-        schema: u32,
-        supported: u32,
-    },
-    WireVersionMismatch {
-        file: u8,
-        supported: u8,
-    },
+    #[error("unsupported connection file schema {schema}; expected {supported}")]
+    UnsupportedSchema { schema: u32, supported: u32 },
+    #[error(
+        "connection file wire version {file} does not match supported wire version {supported}"
+    )]
+    WireVersionMismatch { file: u8, supported: u8 },
+    #[error("invalid connection file: {0}")]
     Invalid(&'static str),
-    InvalidKeyLength {
-        len: usize,
-        expected: usize,
-    },
+    #[error("connection file key is {len} bytes; expected exactly {expected}")]
+    InvalidKeyLength { len: usize, expected: usize },
 }
 
-impl fmt::Display for ConnectionFileError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidPath { path } => {
-                write!(f, "invalid connection file path {}", path.display())
-            }
-            Self::Io { op, path, source } => {
-                write!(f, "connection file {op} failed for {}: {source}", path.display())
-            }
-            Self::Insecure { path } => write!(
-                f,
-                "refusing insecure connection file at {}: wrong type, owner, mode, or link count",
-                path.display()
-            ),
-            Self::TooLarge { path, max } => write!(
-                f,
-                "connection file {} exceeds {max} byte limit",
-                path.display()
-            ),
-            Self::Replaced { path } => {
-                write!(f, "connection file {} changed while reading", path.display())
-            }
-            Self::Json { path, source } => write!(
-                f,
-                "connection file JSON read failed for {}: {source}",
-                path.display()
-            ),
-            Self::UnsupportedSchema { schema, supported } => write!(
-                f,
-                "unsupported connection file schema {schema}; expected {supported}"
-            ),
-            Self::WireVersionMismatch { file, supported } => write!(
-                f,
-                "connection file wire version {file} does not match supported wire version {supported}"
-            ),
-            Self::Invalid(reason) => write!(f, "invalid connection file: {reason}"),
-            Self::InvalidKeyLength { len, expected } => write!(
-                f,
-                "connection file key is {len} bytes; expected exactly {expected}"
-            ),
-        }
-    }
-}
-
-impl Error for ConnectionFileError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            Self::Json { source, .. } => Some(source),
-            _ => None,
-        }
-    }
-}
-
+/// Reads a connection file without following links and rejects replacement during the read.
 pub fn read_for_client(path: impl AsRef<Path>) -> Result<ConnectionInfo, ConnectionFileError> {
     let path = path.as_ref();
     let (parent, name) = open_parent(path)?;
@@ -323,7 +279,6 @@ mod tests {
     use super::*;
 
     /// `mode_bits` widens `st_mode` to match this crate's `u32` mode constants on Darwin and Linux.
-    /// `mode_bits` widens `st_mode` to match this crate's `u32` mode constants on Darwin and Linux.
     #[test]
     fn mode_arithmetic_goes_through_the_portable_accessor() {
         for source in [
@@ -363,9 +318,6 @@ mod tests {
 
     /// A FIFO at the configured path must be rejected rather than waited on.
     /// `NONBLOCK` lets metadata validation reject a FIFO before `open` blocks.
-    ///
-    /// `open_parent` rejects a default-mode temp directory before `open_file` runs.
-    /// `open_parent` rejects a group- or world-writable leaf parent.
     #[test]
     fn a_fifo_is_rejected_rather_than_blocking_the_open() {
         use std::os::unix::fs::PermissionsExt;
