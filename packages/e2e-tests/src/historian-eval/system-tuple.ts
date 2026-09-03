@@ -1,25 +1,16 @@
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import type { ContractPrimitives } from "../contract-primitives";
+import { vocabulary, type ContractPrimitives } from "../contract-primitives";
 import type { SystemVersionTuple } from "./runner";
 
-const SYSTEM_VERSION_TUPLE_KEYS = [
-    "repoCommitSha",
-    "bunVersion",
-    "opencodeVersion",
-    "historianModelId",
-    "probeModelId",
-    "parserImpl",
-    "chunkTokenBudget",
-] as const satisfies readonly (keyof SystemVersionTuple)[];
-
-/**
- * `_keysComplete` fails to compile when `SystemVersionTuple` adds a key absent from `SYSTEM_VERSION_TUPLE_KEYS`.
- *
- * The `satisfies` clause above only proves each listed key exists, not that the list covers the type.
- */
-type MissingKey = Exclude<keyof SystemVersionTuple, (typeof SYSTEM_VERSION_TUPLE_KEYS)[number]>;
-const _keysComplete: MissingKey extends never ? true : never = true;
-void _keysComplete;
+const SYSTEM_VERSION_TUPLE_KEYS = vocabulary<keyof SystemVersionTuple>({
+    repoCommitSha: true,
+    bunVersion: true,
+    opencodeVersion: true,
+    historianModelId: true,
+    probeModelId: true,
+    parserImpl: true,
+    chunkTokenBudget: true,
+});
 
 /**
  * Parses a `SystemVersionTuple` with the caller's primitives so every lane report raises its own error class.

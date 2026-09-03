@@ -1,3 +1,5 @@
+import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { compareCodeUnits } from "../code-unit-order";
 import type { InjectedClaimRecord } from "../historian-eval/claim-read";
 import { normalizeContent } from "../historian-eval/contract";
 import {
@@ -75,13 +77,13 @@ function canonicalizeInjectionSet(
         unique.set(claimKey(canonical), canonical);
     }
     return [...unique.entries()]
-        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .sort(([left], [right]) => compareCodeUnits(left, right))
         .map(([, claim]) => claim);
 }
 
 /** Sorted unique false-authoritative matches, the form both comparison sets publish. */
 export function falseAuthoritativeMatchSet(score: { falseAuthoritativeMatches: readonly string[] }): string[] {
-    return [...new Set(score.falseAuthoritativeMatches)].sort();
+    return [...new Set(score.falseAuthoritativeMatches)].sort(compareCodeUnits);
 }
 
 /** Fail reasons present on the derivative and absent from the baseline, in `FAIL_REASONS` order. */
@@ -175,7 +177,7 @@ export function invariantHolds(evidence: InvariantEvidence): boolean {
         case "expectation-predicate-equality":
             return evidence.changedExpectationIds.length === 0;
         case "false-authoritative-set-equality":
-            return JSON.stringify(evidence.baselineMatches) === JSON.stringify(evidence.derivativeMatches);
+            return canonicalJson(evidence.baselineMatches) === canonicalJson(evidence.derivativeMatches);
         case "scenario-verdict-equality":
             return evidence.baselineVerdict === evidence.derivativeVerdict;
     }

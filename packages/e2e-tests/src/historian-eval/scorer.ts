@@ -24,10 +24,13 @@ import { resolveProjectIdsForIdentities } from "../../../plugin/src/features/mag
 import { createClaimReaderTestDatabase } from "../../../plugin/src/features/magic-context/test-claim-database";
 import type { Database } from "../../../plugin/src/shared/sqlite";
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { compareCodeUnits } from "../code-unit-order";
 import { makeContractPrimitives } from "../contract-primitives";
 import { openTestDb } from "../test-db";
 import { parseSystemVersionTuple, requireScoreSystemBinding } from "./system-tuple";
 import {
+    NO_INJECTED_GOLD_CLAIM,
+    PROBE_CHOICE_SEPARATOR,
     containsCompleteValue,
     decodeXmlEntities,
     matchesGold,
@@ -404,29 +407,26 @@ export function compareProbeAnswer(args: {
         );
         if (promoted.length > 0 && !injectedForProbe && !goldAnswerStatedInCompartments(probe, exchange)) {
             const expected =
-                probe.answerType === "claim-id" ? "<no injected gold claim>" : probe.goldAnswer;
+                probe.answerType === "claim-id" ? NO_INJECTED_GOLD_CLAIM : probe.goldAnswer;
             return { probeId: probe.id, outcome: "error-trimmed", expected, actual: exchange.answerRaw };
         }
     }
 
     let expected: string;
     let pass: boolean;
+    // Both branches accept an answer that equals a candidate after entity decoding and normalization, so
+    // `parseProbeVerdicts` can rederive the outcome from `expected` alone.
+    const answers = (candidate: string): boolean =>
+        exchange.answerRaw !== null &&
+        normalizeContent(decodeXmlEntities(exchange.answerRaw)) === normalizeContent(decodeXmlEntities(candidate));
     if (probe.answerType === "claim-id") {
         const matching = goldClaim === null ? [] : claimsMatchingGold(goldClaim, injectedClaims);
         const injectedMatching = matching.filter((item) => injectedLocators.has(item.revisionLocator));
-        expected = injectedMatching.map((item) => item.publicClaimId).sort().join(" | ") || "<no injected gold claim>";
-        pass =
-            exchange.answerRaw !== null &&
-            injectedMatching.some(
-                (item) => normalizeContent(item.publicClaimId) === normalizeContent(exchange.answerRaw ?? ""),
-            );
+        expected = injectedMatching.map((item) => item.publicClaimId).sort().join(PROBE_CHOICE_SEPARATOR) || NO_INJECTED_GOLD_CLAIM;
+        pass = injectedMatching.some((item) => answers(item.publicClaimId));
     } else {
         expected = probe.goldAnswer;
-        // entity.
-        pass =
-            exchange.answerRaw !== null &&
-            normalizeContent(decodeXmlEntities(exchange.answerRaw)) ===
-                normalizeContent(decodeXmlEntities(probe.goldAnswer));
+        pass = answers(probe.goldAnswer);
     }
     if (pass) return { probeId: probe.id, outcome: "pass", expected, actual: exchange.answerRaw };
 
@@ -1790,7 +1790,8 @@ export function buildLaneReport(
     if (duplicated.length > 0) {
         throw new Error(`historian-eval report: duplicate scenario score(s) [${duplicated.join(", ")}]`);
     }
-    const sorted = [...scores].sort((a, b) => a.scenarioId.localeCompare(b.scenarioId));
+    // `parseLaneReport` compares rebuilt report bytes, so the sort must not depend on the reader's locale.
+    const sorted = [...scores].sort((a, b) => compareCodeUnits(a.scenarioId, b.scenarioId));
     const errors = sorted.filter((score) => score.verdict === "ERROR");
     const scored = sorted.filter((score) => score.verdict !== "ERROR");
 
@@ -1860,15 +1861,12 @@ function parseProbeVerdicts(raw: unknown, label: string): ProbeVerdict[] {
         const outcome = p.enumeration(probe.outcome, PROBE_OUTCOMES, `${probeLabel}.outcome`);
         const expected = p.text(probe.expected, `${probeLabel}.expected`);
         const actual = parseNullableText(probe.actual, `${probeLabel}.actual`);
-        // `compareProbeAnswer` passes only a non-null answer that matches: for an exact probe, `expected`
-        // itself after entity decoding and normalization; for a claim-id probe, one of the ` | `-joined ids in
-        // `expected`. The answer type is not archived, so a pass must satisfy one of the two.
-        // The answer type is not archived, so the two rules are applied jointly: a pass must satisfy one, and a
-        // fail must satisfy neither. That is sound because the scenario contract forbids the id separator in an
-        // exact or multiple-choice answer, so only a claim-id expectation can split into several candidates.
-        const matches = actual !== null && (
-            normalizeContent(decodeXmlEntities(actual)) === normalizeContent(decodeXmlEntities(expected)) ||
-            expected.split(" | ").some((id) => normalizeContent(id) === normalizeContent(actual)));
+        // Splitting `expected` recovers `compareProbeAnswer`'s candidate set for every answer type: the scenario
+        // contract forbids the separator in an authored answer and public claim ids never contain it. commentlint: allow(JUDGE)
+        // `NO_INJECTED_GOLD_CLAIM` is the empty set, which the contract forbids authoring.
+        const matches = actual !== null && expected !== NO_INJECTED_GOLD_CLAIM &&
+            expected.split(PROBE_CHOICE_SEPARATOR).some((candidate) =>
+                normalizeContent(decodeXmlEntities(candidate)) === normalizeContent(decodeXmlEntities(actual)));
         if ((outcome === "pass") !== matches && outcome !== "error-trimmed") {
             p.fail(`${probeLabel}.outcome: derived-mismatch`);
         }
@@ -1932,6 +1930,13 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     }
     const errorReason = parseNullableText(value.errorReason, `${label}.errorReason`);
     const errorDetail = parseNullableText(value.errorDetail, `${label}.errorDetail`);
+    // `scoreRawOutputWithInjectedClaims` assembles its score with no probes and no invalid run, and only a
+    // trimmed probe makes `assembleScore` emit an ERROR, so a raw-output score is a PASS or FAIL. commentlint: allow(JUDGE)
+    if (source === "raw-output") {
+        if (verdict === "ERROR") p.fail(`${label}.verdict: seam-shape-invalid`);
+        if (probeVerdicts.length > 0) p.fail(`${label}.probeVerdicts: seam-shape-invalid`);
+        if (failReasons.includes("invalid-output")) p.fail(`${label}.failReasons: seam-shape-invalid`);
+    }
     if (verdict === "ERROR") {
         if (failReasons.length > 0) p.fail(`${label}.failReasons: derived-mismatch`);
         // Every ERROR is built by `errorScore`, which always names its reason and carries no evidence. The

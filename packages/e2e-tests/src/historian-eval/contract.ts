@@ -235,10 +235,12 @@ function boundedAnswer(value: string, label: string): string {
     return value;
 }
 
+/** Rejects answers containing reply-envelope tags or equal to `NO_INJECTED_GOLD_CLAIM`; `parseProbeVerdicts` treats that marker as unmatchable. */
 function envelopeSafeAnswer(value: string, label: string): string {
     if (value.includes("</answer>") || value.includes("<answer>")) {
         fail(`${label}: answer-envelope-delimiter`);
     }
+    if (value === NO_INJECTED_GOLD_CLAIM) fail(`${label}: reserved-marker`);
     return value;
 }
 
@@ -261,6 +263,9 @@ export const MAX_PROBE_ANSWER_CHARS = MAX_PREDICATE_VALUE_CHARS;
 
 /* */
 export const PROBE_CHOICE_SEPARATOR = " | ";
+
+/** The expectation a claim-id verdict publishes when no matching gold claim was injected, so no answer can pass. */
+export const NO_INJECTED_GOLD_CLAIM = "<no injected gold claim>";
 
 /**
  * Freeze lint uses `MAX_PADDING_TURNS` to determine whether recipe padding can clear its protected tail.

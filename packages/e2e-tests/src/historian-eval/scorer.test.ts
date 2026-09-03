@@ -2405,6 +2405,13 @@ describe("buildLaneReport", () => {
         expect(JSON.stringify(second)).toBe(JSON.stringify(first));
     });
 
+    test("scenarios sort by code unit, so a report parses on a reader with another locale", () => {
+        // `localeCompare` places `hse-a` before `hse-B`; code-unit order does not.
+        const report = buildLaneReport([passScore("hse-a"), passScore("hse-B")]);
+        expect(report.scenarios.map((score) => score.scenarioId)).toEqual(["hse-B", "hse-a"]);
+        expect(parseLaneReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
+    });
+
     test("a report cannot span two systems, and cannot be labelled with a system the scores contradict", () => {
         const system = {
             repoCommitSha: "a".repeat(40),
@@ -2566,9 +2573,22 @@ describe("buildLaneReport", () => {
         expect(() => parseLaneReport(duplicated)).toThrow(/report\.scenarios: lane-invalid \(.*duplicate scenario/);
         const rawOutput = structuredClone(report);
         rawOutput.scenarios[0]!.source = "raw-output";
-        // A raw-output score carries no tuple, so the seam rule is what a well-formed one reaches.
+        // A well-formed raw-output score has a null tuple and no probes, so only the seam rule remains.
         rawOutput.scenarios[0]!.system = null;
+        rawOutput.scenarios[0]!.probeVerdicts = [];
         expect(() => parseLaneReport(rawOutput)).toThrow(/report\.scenarios: lane-invalid \(.*raw-output seam/);
+        // Raw-output scenarios have neither a run nor probes, and each seam-only field fails on its own label.
+        const rawError = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(rawError.scenarios[0]!, { source: "raw-output", system: null, verdict: "ERROR", probeVerdicts: [] });
+        expect(() => parseLaneReport(rawError)).toThrow(/report\.scenarios\[0\]\.verdict: seam-shape-invalid/);
+        const rawProbes = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(rawProbes.scenarios[0]!, { source: "raw-output", system: null });
+        expect(() => parseLaneReport(rawProbes)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: seam-shape-invalid/);
+        const rawInvalidOutput = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(rawInvalidOutput.scenarios[0]!, {
+            source: "raw-output", system: null, probeVerdicts: [], verdict: "FAIL", failReasons: ["invalid-output"],
+        });
+        expect(() => parseLaneReport(rawInvalidOutput)).toThrow(/report\.scenarios\[0\]\.failReasons: seam-shape-invalid/);
         // `scoreFacts` derives both ratios from the counts, and the rebuild carries scenarios through
         // unchanged, so these are the parser's only chance to check them.
         const overMatched = structuredClone(report) as unknown as { scenarios: Record<string, number>[] };
@@ -2615,6 +2635,17 @@ describe("buildLaneReport", () => {
         const foreignSystem = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         foreignSystem.scenarios[0]!.system = { ...LANE_SYSTEM, historianModelId: "other" };
         expect(() => parseLaneReport(foreignSystem)).toThrow(/report\.scenarios\[0\]\.system: report-system-mismatch/);
+        // An ERROR score keeps its record's tuple; `buildLaneReport` resolves every tuple against the root, so a
+        // foreign one fails the rebuild, and a raw-output ERROR fails its own seam rule first.
+        const errored = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(errored.scenarios[0]!, {
+            verdict: "ERROR", failReasons: [], errorReason: "record-snapshot-mismatch", precision: null, recall: null,
+            expectedClaimsMatched: 0, expectedClaimsTotal: 0, visibleClaimsMatched: 0, visibleClaimsTotal: 0, probeVerdicts: [],
+        });
+        errored.scenarios[0]!.system = { ...LANE_SYSTEM, historianModelId: "other" };
+        expect(() => parseLaneReport(errored)).toThrow(/report\.scenarios: lane-invalid \(.*span more than one system/);
+        Object.assign(errored.scenarios[0]!, { source: "raw-output", system: null });
+        expect(() => parseLaneReport(errored)).toThrow(/report\.scenarios\[0\]\.verdict: seam-shape-invalid/);
         // A passing run-record score answered at least one probe.
         const probeless = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         probeless.scenarios[0]!.probeVerdicts = [];
@@ -2636,6 +2667,21 @@ describe("buildLaneReport", () => {
         answerlessPass.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: null }];
         expect(() => parseLaneReport(answerlessPass))
             .toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.outcome: derived-mismatch/);
+        // Decoded exact answers and case-insensitive joined-list ids match normalized candidates.
+        const withProbe = (verdict: Record<string, unknown>): unknown => {
+            const forged = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+            forged.scenarios[0]!.probeVerdicts = [verdict];
+            return forged;
+        };
+        expect(() => parseLaneReport(withProbe({ probeId: "probe-1", outcome: "pass", expected: "AT&amp;T", actual: "at&t" }))).not.toThrow();
+        expect(() => parseLaneReport(withProbe({ probeId: "probe-1", outcome: "pass", expected: "mem-a | mem-b", actual: "MEM-B" }))).not.toThrow();
+        // Entity names are case-sensitive, so `&AMP;` stays literal on both sides and the answers differ.
+        expect(() => parseLaneReport(withProbe({ probeId: "probe-1", outcome: "pass", expected: "AT&AMP;T", actual: "at&amp;t" })))
+            .toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.outcome: derived-mismatch/);
+        // An empty candidate set admits no answer, including its own marker text.
+        expect(() => parseLaneReport(withProbe({
+            probeId: "probe-1", outcome: "pass", expected: "<no injected gold claim>", actual: "<no injected gold claim>",
+        }))).toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.outcome: derived-mismatch/);
         // `assembleScore` turns each published condition into its reason, and the rebuild trusts the declared
         // ones, so a green scenario over failing evidence would otherwise survive both checks.
         const greenOverEvidence = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
@@ -2713,5 +2759,14 @@ describe("compareProbeAnswer claim-id availability", () => {
             injectedClaims: injected,
         });
         expect(unavailable.expected).toBe("<no injected gold claim>");
+
+        // Claim id answers are compared after entity decoding so `parseProbeVerdicts` can rederive outcomes. commentlint: allow(JUDGE)
+        const encoded = compareProbeAnswer({
+            probe: probe!,
+            exchange: { ...exchange, answerRaw: "MEM&#45;backing" },
+            scenario,
+            injectedClaims: injected,
+        });
+        expect(encoded.outcome).toBe("pass");
     });
 });

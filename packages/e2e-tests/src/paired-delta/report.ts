@@ -311,8 +311,8 @@ function parseInterval(raw: unknown, label: string): Interval {
 
 function parseNoiseFloor(raw: unknown, label: string, owner: { familyId: string; endpoint: DeltaEndpoint }): FamilyNoiseFloor {
     const value = p.record(raw, label);
-    const hasEndpoint = Object.hasOwn(value, "endpoint");
-    p.exact(value, hasEndpoint ? ["endpoint", "familyId", "value", "interval"] : ["familyId", "value", "interval"], label);
+    // `calibrationNoiseFloors` copies `endpoint` from a calibration row, where the field is required.
+    p.exact(value, ["endpoint", "familyId", "value", "interval"], label);
     // A floor is 1.96 * sqrt(variance / n) over deltas in {-1, 0, 1}, whose sample variance is at most 2, so
     // no calibration yields a floor of 2 or more.
     const floorValue = p.number(value.value, `${label}.value`, { minimum: 0, maximum: 2 });
@@ -327,14 +327,9 @@ function parseNoiseFloor(raw: unknown, label: string, owner: { familyId: string;
     const familyId = p.string(value.familyId, `${label}.familyId`);
     // `familyId` and `endpoint` must identify the series this floor applies to.
     if (familyId !== owner.familyId) p.fail(`${label}.familyId: floor-owner-mismatch`);
-    const endpoint = hasEndpoint ? p.enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`) : null;
-    if (endpoint !== null && endpoint !== owner.endpoint) p.fail(`${label}.endpoint: floor-owner-mismatch`);
-    return {
-        ...(endpoint === null ? {} : { endpoint }),
-        familyId,
-        value: floorValue,
-        interval,
-    };
+    const endpoint = p.enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`);
+    if (endpoint !== owner.endpoint) p.fail(`${label}.endpoint: floor-owner-mismatch`);
+    return { endpoint, familyId, value: floorValue, interval };
 }
 
 function parseFamilyEstimate(
@@ -483,32 +478,6 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
         if (new Set(familyKeys).size !== 1) p.fail(`${label}.endpoints: family-set-mismatch`);
     }
     const rawRegret = parseRawRegretRecords(value.rawRegretRecords, `${label}.rawRegretRecords`);
-    // Endpoint-less floors with the same `familyId` must have matching fingerprints across primary
-    // endpoints. Endpoint-keyed floors stay independent per endpoint.
-    const unscopedFloors = new Map<string, string>();
-    for (const [index, endpointEstimate] of endpoints.entries()) {
-        for (const [familyIndex, family] of endpointEstimate.families.entries()) {
-            const floor = family.noise.floor;
-            if (floor === undefined || floor === null || floor.endpoint !== undefined) continue;
-            const shape = canonicalFingerprint(floor);
-            const seen = unscopedFloors.get(floor.familyId);
-            if (seen === undefined) unscopedFloors.set(floor.familyId, shape);
-            else if (seen !== shape) {
-                p.fail(`${label}.endpoints[${index}].families[${familyIndex}].noise.floor: floor-conflict`);
-            }
-        }
-    }
-    // An unscoped floor is the fallback for every endpoint of its family, so an endpoint lacking a floor of
-    // its own resolves to it and cannot read as having none.
-    for (const [index, endpointEstimate] of endpoints.entries()) {
-        for (const [familyIndex, family] of endpointEstimate.families.entries()) {
-            if (!unscopedFloors.has(family.familyId)) continue;
-            const floor = family.noise.floor;
-            if (floor === undefined || floor === null) {
-                p.fail(`${label}.endpoints[${index}].families[${familyIndex}].noise.floor: floor-conflict`);
-            }
-        }
-    }
     // `estimateFamilyDeltas` counts the distinct families observed on paired coordinates at the primary
     // endpoints, and every such family appears under at least one of them, so the union reproduces it.
     const observedFamilies = new Set(endpoints.flatMap(({ families }) => families.map(({ familyId }) => familyId)));
@@ -729,14 +698,15 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     // A regret family's point estimate is the mean of its raw deltas at that endpoint, and its families are
     // exactly the families observed there. The interval is a bootstrap and stays unchecked here.
     const rawByEndpointFamily = new Map<string, number[]>();
+    const rawFamiliesByEndpoint = new Map<string, Set<string>>();
     for (const record of body.analysis.rawRegretRecords) {
         const bucket = tupleKey(record.endpoint, record.familyId);
         rawByEndpointFamily.set(bucket, [...(rawByEndpointFamily.get(bucket) ?? []), record.delta]);
+        rawFamiliesByEndpoint.set(record.endpoint, (rawFamiliesByEndpoint.get(record.endpoint) ?? new Set()).add(record.familyId));
     }
     for (const [view, estimates] of [["liveRegret", body.analysis.liveRegret], ["providerMixedRegret", body.analysis.providerMixedRegret]] as const) {
         for (const [index, estimate] of estimates.entries()) {
-            const observedFamilies = new Set(body.analysis.rawRegretRecords
-                .filter(({ endpoint }) => endpoint === estimate.endpoint).map(({ familyId }) => familyId));
+            const observedFamilies = rawFamiliesByEndpoint.get(estimate.endpoint) ?? new Set<string>();
             if (observedFamilies.size !== estimate.families.length ||
                 estimate.families.some(({ familyId }) => !observedFamilies.has(familyId))) {
                 p.fail(`report.body.analysis.${view}[${index}].families: raw-family-mismatch`);
