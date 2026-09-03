@@ -2313,7 +2313,8 @@ pub const DECLARED_RETAINED_RESIDENT_BYTES: u64 = TRANSFORM_SERVE_CACHE_COMBINED
     + TRANSFORM_SNAPSHOT_BUDGET_BYTES as u64
     + BOUNDARY_TOKEN_CACHE_BUDGET_BYTES as u64
     + STATE_IMPORT_MAX_STAGED_BYTES as u64
-    + transform::TAG_CACHE_COMBINED_BUDGET_BYTES as u64;
+    + transform::TAG_CACHE_COMBINED_BUDGET_BYTES as u64
+    + kernel_routes::ingest::MAX_STAGED_BYTES;
 
 #[derive(Debug, Clone)]
 struct NativeDeltaFrontier {
@@ -12120,7 +12121,7 @@ impl McHandler {
                     self.handle_kernel_ingest_begin(channel, &request).await
                 }
                 "kernel.artifact.ingest.page" => {
-                    self.handle_kernel_ingest_page(channel, &request).await
+                    self.handle_kernel_ingest_page(channel, request).await
                 }
                 "kernel.artifact.ingest.finish" => {
                     self.handle_kernel_ingest_finish(channel, &request).await

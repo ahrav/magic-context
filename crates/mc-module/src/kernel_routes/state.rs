@@ -77,6 +77,12 @@ pub enum InvalidReason {
     /// Kernel input validation or admission policy rejected the request.
     InvalidInput,
     AdmissionPolicy,
+    /// The named object does not exist, is not live, or is not scoped to the
+    /// bound project.
+    NotFound,
+    /// A write named an id the registry already holds or otherwise violated a
+    /// storage constraint; retrying with fresh tokens cannot succeed.
+    AlreadyExists,
     PayloadTooLarge,
     /// A staged page's bytes do not match its declared digest, or a page index
     /// was resent with different bytes.
@@ -142,10 +148,10 @@ impl From<KernelError> for KernelOutcome {
             KernelError::Conflict => Self::conflict(ConflictReason::KnownAsOfAdvanced),
             KernelError::InvalidInput => Self::invalid(InvalidReason::InvalidInput),
             KernelError::AdmissionPolicy => Self::invalid(InvalidReason::AdmissionPolicy),
-            // Backup, restore, checkpoint, and lookup outcomes have no `kernel.*`
-            // route that can produce them.
-            KernelError::NotFound
-            | KernelError::InvalidCheckpoint
+            KernelError::NotFound => Self::invalid(InvalidReason::NotFound),
+            // Only the backup, restore, and checkpoint APIs raise these, and no
+            // `kernel.*` route calls those APIs.
+            KernelError::InvalidCheckpoint
             | KernelError::UnsafeDestination
             | KernelError::InvalidBackup
             | KernelError::InvalidRestore => Self::invalid(InvalidReason::Internal),

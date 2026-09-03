@@ -28,7 +28,8 @@ pub enum EgressDecision {
 pub enum RefusalReason {
     /// The caller asserted a class laxer than the stored one.
     UnderDeclared,
-    /// The artifact's owning object is not scoped to the bound project.
+    /// The owning object does not tie the artifact to the bound project: it is
+    /// scoped elsewhere or cites other evidence.
     WrongScope,
     Eligibility(EligibilityDeniedReason),
 }
@@ -121,14 +122,17 @@ fn evaluate(
     let (_, states) = store
         .object_states(std::slice::from_ref(&request.owning_object_id))
         .map_err(KernelOutcome::from)?;
-    // An owning object the store does not know has no project.
-    let scope_id = states
-        .first()
-        .and_then(Option::as_ref)
-        .and_then(|state| state.scope_id.clone());
-    let scope_matches = ScopeFilter::new(project, store)
-        .matches(scope_id.as_deref())
-        .map_err(KernelOutcome::from)?;
+    let owner = states.first().and_then(Option::as_ref);
+    // Without the citation check any own-project object id would authorize
+    // any digest.
+    let cites_artifact = owner
+        .and_then(|state| state.artifact_digest.as_deref())
+        .is_some_and(|digest| digest == request.artifact_digest);
+    let scope_id = owner.and_then(|state| state.scope_id.as_deref());
+    let scope_matches = cites_artifact
+        && ScopeFilter::new(project, store)
+            .matches(scope_id)
+            .map_err(KernelOutcome::from)?;
     Ok(decide_egress(
         &facts,
         request.asserted_sensitivity,

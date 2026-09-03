@@ -647,6 +647,7 @@ async fn replayed_intents_return_one_receipt_and_projects_never_collide() {
         first["tokens"],
         json!([{"object_id": "decision-object-1", "known_as_of": commit_seq}])
     );
+    assert_eq!(first["merged"], json!([]));
     let tip = daemon.tip();
 
     let again = daemon
@@ -741,6 +742,8 @@ async fn a_token_conflicts_when_its_object_advanced_was_retracted_or_was_superse
         )
         .await;
     assert_state(&superseded, "conflict", Some("superseded"));
+    // A token naming an object the store never held is answered like one
+    // naming another project's object, so neither is enumerable.
     let missing = daemon
         .commit(
             "mutate-missing",
@@ -748,7 +751,7 @@ async fn a_token_conflicts_when_its_object_advanced_was_retracted_or_was_superse
             vec![token("never-written", n)],
         )
         .await;
-    assert_state(&missing, "conflict", Some("retracted"));
+    assert_state(&missing, "invalid", Some("not_found"));
     assert_eq!(daemon.tip(), tip, "a conflicting commit writes nothing");
 
     // A token at the current tip on an untouched object lets the mutation land.
@@ -809,6 +812,21 @@ async fn a_merge_folds_every_predecessor_into_one_survivor_in_one_commit() {
             "decision-object-3"
         ]
     );
+    // The survivor's spec content was discarded, and the response says so.
+    assert_eq!(merged["merged"], json!(["decision-object-3"]));
+    let replayed = daemon
+        .commit(
+            "merge",
+            vec![
+                json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": decision_spec(3)}),
+                json!({"op": "supersede_decision", "replaced_object_id": "decision-object-2", "spec": decision_spec(3)}),
+            ],
+            vec![],
+        )
+        .await;
+    assert_eq!(replayed["receipt"]["replayed"], true);
+    assert_eq!(replayed["merged"], merged["merged"]);
+    assert_eq!(replayed["tokens"], merged["tokens"]);
     let after = daemon.read("explicit_search", None).await;
     assert_eq!(object_ids(&after), ["decision-object-3"]);
     let history = daemon
@@ -1529,18 +1547,15 @@ fn refused(reason: &str) -> Value {
     json!({"refused": reason})
 }
 
-/// Artifacts of every class plus an owning object in the bound project and
-/// one in another project.
+fn citing_decision(index: i64, evidence_id: &str) -> Value {
+    let mut spec = decision_spec(index);
+    spec["evidence_id"] = json!(evidence_id);
+    json!({"op": "insert_decision", "spec": spec})
+}
+
 async fn egress_fixture(daemon: &Daemon) -> [String; 3] {
     let store = daemon.store();
     seed_domain(&store);
-    daemon
-        .commit("create-1", vec![insert_decision(1)], vec![])
-        .await;
-    let (route_b, project_b) = daemon.bind_project("project-b").await;
-    let mut write_b = commit_request(&project_b, "b", vec![insert_decision(2)], vec![]);
-    write_b["session_id"] = json!("session-b");
-    assert_state(&daemon.call(route_b, write_b).await, "available", None);
     let normal = store
         .ingest_artifact(ingest("normal", b"public bytes", Sensitivity::Normal))
         .unwrap();
@@ -1554,6 +1569,26 @@ async fn egress_fixture(daemon: &Daemon) -> [String; 3] {
     let secret = store
         .ingest_artifact(ingest("secret", b"classified bytes", Sensitivity::Secret))
         .unwrap();
+    let owners = daemon
+        .commit(
+            "create-owners",
+            vec![
+                citing_decision(1, "evidence-normal"),
+                citing_decision(3, "evidence-sensitive"),
+            ],
+            vec![],
+        )
+        .await;
+    assert_state(&owners, "available", None);
+    let (route_b, project_b) = daemon.bind_project("project-b").await;
+    let mut write_b = commit_request(
+        &project_b,
+        "b",
+        vec![citing_decision(2, "evidence-normal")],
+        vec![],
+    );
+    write_b["session_id"] = json!("session-b");
+    assert_state(&daemon.call(route_b, write_b).await, "available", None);
     [normal.digest, sensitive.digest, secret.digest]
 }
 
@@ -1617,7 +1652,13 @@ async fn egress_gate_rejects_sensitive_remote_and_all_secret_without_a_request()
     // Local egress of a sensitive artifact is eligible when declared honestly.
     assert_eq!(
         daemon
-            .egress(&recorder, &sensitive, "local", "sensitive", owner)
+            .egress(
+                &recorder,
+                &sensitive,
+                "local",
+                "sensitive",
+                "decision-object-3"
+            )
             .await,
         json!("allowed")
     );
@@ -1658,6 +1699,172 @@ async fn egress_gate_rejects_an_under_declared_normal_request_without_a_request(
         refused("sensitive_remote")
     );
     assert_eq!(recorder.requests(), 0);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn egress_gate_requires_the_owning_object_to_cite_the_artifact() {
+    let daemon = Daemon::start().await;
+    let [normal, sensitive, _] = egress_fixture(&daemon).await;
+    let recorder = Recorder(std::sync::atomic::AtomicUsize::new(0));
+
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-3")
+            .await,
+        refused("wrong_scope")
+    );
+    assert_eq!(
+        daemon
+            .egress(
+                &recorder,
+                &sensitive,
+                "local",
+                "sensitive",
+                "decision-object-1"
+            )
+            .await,
+        refused("wrong_scope")
+    );
+    assert_eq!(recorder.requests(), 0);
+
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-1")
+            .await,
+        json!("allowed")
+    );
+    assert_eq!(
+        daemon
+            .egress(
+                &recorder,
+                &sensitive,
+                "local",
+                "sensitive",
+                "decision-object-3"
+            )
+            .await,
+        json!("allowed")
+    );
+    assert_eq!(recorder.requests(), 2);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+async fn commit_b(
+    daemon: &Daemon,
+    route_b: RouteHandle,
+    project_b: &Path,
+    key: &str,
+    operations: Vec<Value>,
+) -> Value {
+    let mut request = commit_request(project_b, key, operations, vec![]);
+    request["session_id"] = json!("session-b");
+    daemon.call(route_b, request).await
+}
+
+fn is_live(store: &mc_kernel::KernelStore, object_id: &str) -> bool {
+    let (_, states) = store.object_states(&[object_id.to_string()]).unwrap();
+    states[0]
+        .as_ref()
+        .is_some_and(|state| state.object.invalidated_commit_seq.is_none())
+}
+
+#[tokio::test]
+async fn another_projects_objects_are_not_found_through_commit_targets_or_tokens() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    assert_state(
+        &daemon.commit("a", vec![insert_decision(1)], vec![]).await,
+        "available",
+        None,
+    );
+    let (route_b, project_b) = daemon.bind_project("project-b").await;
+    assert_state(
+        &commit_b(&daemon, route_b, &project_b, "b", vec![insert_decision(2)]).await,
+        "available",
+        None,
+    );
+    let tip = daemon.tip();
+
+    let retired = daemon
+        .commit(
+            "retire-foreign",
+            vec![json!({"op": "retire_decision", "object_id": "decision-object-2"})],
+            vec![],
+        )
+        .await;
+    assert_state(&retired, "invalid", Some("not_found"));
+    assert!(is_live(&store, "decision-object-2"));
+
+    let superseded = daemon
+        .commit(
+            "supersede-foreign",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-2", "spec": decision_spec(3)})],
+            vec![],
+        )
+        .await;
+    assert_state(&superseded, "invalid", Some("not_found"));
+    assert!(is_live(&store, "decision-object-2"));
+
+    let folded = daemon
+        .commit(
+            "fold-into-foreign",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": decision_spec(2)})],
+            vec![],
+        )
+        .await;
+    assert_state(&folded, "invalid", Some("not_found"));
+    assert!(is_live(&store, "decision-object-1"));
+
+    let probed = daemon
+        .commit(
+            "probe-foreign",
+            vec![json!({"op": "retire_decision", "object_id": "decision-object-1"})],
+            vec![token("decision-object-2", tip)],
+        )
+        .await;
+    assert_state(&probed, "invalid", Some("not_found"));
+    assert!(is_live(&store, "decision-object-1"));
+
+    let missing = daemon
+        .commit(
+            "retire-missing",
+            vec![json!({"op": "retire_decision", "object_id": "never-written"})],
+            vec![],
+        )
+        .await;
+    assert_state(&missing, "invalid", Some("not_found"));
+    assert_eq!(daemon.tip(), tip, "a refused commit writes nothing");
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_write_naming_an_existing_id_is_already_exists_not_a_retryable_conflict() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    assert_state(
+        &daemon
+            .commit("first", vec![insert_decision(1)], vec![])
+            .await,
+        "available",
+        None,
+    );
+    let tip = daemon.tip();
+    let duplicate = daemon
+        .commit("second", vec![insert_decision(1)], vec![])
+        .await;
+    assert_state(&duplicate, "invalid", Some("already_exists"));
+    assert_eq!(daemon.tip(), tip);
+    let retried = daemon
+        .commit(
+            "third",
+            vec![insert_decision(1)],
+            vec![token("decision-object-1", tip)],
+        )
+        .await;
+    assert_state(&retried, "invalid", Some("already_exists"));
+    assert_eq!(daemon.tip(), tip);
     daemon.handler.shutdown().await.unwrap();
 }
 
@@ -2075,10 +2282,11 @@ async fn route_teardown_releases_the_staged_upload_while_the_session_stays_bound
 }
 
 #[tokio::test]
-async fn a_second_upload_on_a_busy_route_or_past_the_pending_cap_is_queue_full() {
+async fn a_second_begin_replaces_or_resumes_and_only_the_pending_cap_is_queue_full() {
     let daemon = Daemon::start().await;
     seed_domain(&daemon.store());
     let payload = vec![b'y'; 100];
+    let replacement = vec![b'z'; 200];
 
     assert_state(
         &daemon
@@ -2087,13 +2295,32 @@ async fn a_second_upload_on_a_busy_route_or_past_the_pending_cap_is_queue_full()
         "available",
         None,
     );
+    assert_eq!(daemon.handler.staging_budget_for_test(), (100, 1));
+
+    let replaced = daemon
+        .ingest_begin(daemon.route, "second", &replacement, 1)
+        .await;
+    assert_state(&replaced, "available", None);
+    assert_eq!(replaced["upload_id"], "second");
+    assert_eq!(daemon.handler.staging_budget_for_test(), (200, 1));
     assert_state(
-        &daemon
-            .ingest_begin(daemon.route, "second", &payload, 1)
-            .await,
-        "unavailable",
-        Some("queue_full"),
+        &daemon.ingest_page(daemon.route, "first", 0, &payload).await,
+        "invalid",
+        Some("upload_not_found"),
     );
+
+    daemon
+        .ingest_page(daemon.route, "second", 0, &replacement)
+        .await;
+    let resumed = daemon
+        .ingest_begin(daemon.route, "second", &replacement, 1)
+        .await;
+    assert_state(&resumed, "available", None);
+    assert_eq!(resumed["upload_id"], "second");
+    assert_eq!(resumed["received_pages"], 1);
+    assert_eq!(resumed["received_bytes"], 200);
+    assert!(resumed["page_bytes_max"].as_u64().unwrap() >= 16 * MIB as u64);
+    assert_eq!(daemon.handler.staging_budget_for_test(), (200, 1));
 
     // Three more routes fill the handler-wide pending cap of four.
     let mut routes = Vec::new();
@@ -2106,7 +2333,7 @@ async fn a_second_upload_on_a_busy_route_or_past_the_pending_cap_is_queue_full()
         );
         routes.push(route);
     }
-    assert_eq!(daemon.handler.staging_budget_for_test(), (400, 4));
+    assert_eq!(daemon.handler.staging_budget_for_test(), (500, 4));
     let overflow = daemon.bind_sibling(30).await;
     assert_state(
         &daemon.ingest_begin(overflow, "overflow", &payload, 1).await,
@@ -2115,12 +2342,12 @@ async fn a_second_upload_on_a_busy_route_or_past_the_pending_cap_is_queue_full()
     );
 
     // Finishing one upload frees a slot for the waiting route.
-    daemon.ingest_page(daemon.route, "first", 0, &payload).await;
     assert_state(
-        &daemon.ingest_finish(daemon.route, "first").await,
+        &daemon.ingest_finish(daemon.route, "second").await,
         "available",
         None,
     );
+    assert_eq!(daemon.handler.staging_budget_for_test(), (300, 3));
     assert_state(
         &daemon.ingest_begin(overflow, "overflow", &payload, 1).await,
         "available",
@@ -2147,5 +2374,92 @@ async fn a_second_upload_on_a_busy_route_or_past_the_pending_cap_is_queue_full()
         Some("payload_too_large"),
     );
     assert_eq!(daemon.handler.staging_budget_for_test(), (400, 4));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn begin_refuses_layouts_and_digests_the_kernel_could_never_accept() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let project = daemon.project.clone();
+
+    let mut one_page = ingest_begin_request(&project, "one-page", b"", 1);
+    one_page["total_bytes"] = json!(mc_kernel::MAX_PAYLOAD_BYTES);
+    assert!(matches!(
+        daemon.handler.dispatch_value_for_test(daemon.route, one_page).await,
+        PreparedOutcome::Error { code, .. } if code == "invalid_params"
+    ));
+
+    let payload = vec![b'q'; 64];
+    let mut upper = ingest_begin_request(&project, "upper", &payload, 1);
+    upper["payload_digest"] = json!(sha256_hex(&payload).to_uppercase());
+    assert!(matches!(
+        daemon.handler.dispatch_value_for_test(daemon.route, upper).await,
+        PreparedOutcome::Error { code, .. } if code == "invalid_params"
+    ));
+
+    let mut upper_intent = ingest_begin_request(&project, "upper-intent", &payload, 1);
+    upper_intent["intent"]["request_digest"] = json!(sha256_hex(&payload).to_uppercase());
+    assert!(matches!(
+        daemon
+            .handler
+            .dispatch_value_for_test(daemon.route, upper_intent)
+            .await,
+        PreparedOutcome::Error { code, .. } if code == "invalid_params"
+    ));
+
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+
+    let finished = daemon
+        .ingest_paged(daemon.route, "lower", &payload, 64)
+        .await;
+    assert_state(&finished, "available", None);
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_page_for_an_unknown_upload_or_an_oversized_frame_is_refused_before_decoding() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let payload = vec![b'p'; 300];
+
+    let mut orphan = ingest_page_request(&daemon.project, "nobody", 0, &payload[..100]);
+    orphan["bytes_base64"] = json!("not base64 at all!");
+    assert_state(
+        &daemon.call(daemon.route, orphan).await,
+        "invalid",
+        Some("upload_not_found"),
+    );
+
+    assert_state(
+        &daemon
+            .ingest_begin(daemon.route, "framed", &payload, 3)
+            .await,
+        "available",
+        None,
+    );
+    assert_state(
+        &daemon
+            .ingest_page(daemon.route, "framed", 3, &payload[..100])
+            .await,
+        "invalid",
+        Some("page_index"),
+    );
+    let mut too_long = ingest_page_request(&daemon.project, "framed", 0, &payload[..100]);
+    too_long["bytes_base64"] =
+        json!("A".repeat(mc_module::kernel_routes::ingest::PAGE_BASE64_BYTES_MAX + 4));
+    assert_state(
+        &daemon.call(daemon.route, too_long).await,
+        "invalid",
+        Some("page_too_large"),
+    );
+    assert_eq!(daemon.handler.staging_budget_for_test(), (300, 1));
+
+    let finished = daemon
+        .ingest_paged(daemon.route, "framed", &payload, 100)
+        .await;
+    assert_state(&finished, "available", None);
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
     daemon.handler.shutdown().await.unwrap();
 }

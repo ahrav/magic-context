@@ -19,6 +19,9 @@ use crate::McHandler;
 const OPERATION: &str = "kernel.eligibility.batch";
 /// Entries held before the oldest is evicted.
 const CACHE_CAPACITY: usize = 4096;
+/// One batch is one registry read plus one `judge` per miss on the blocking
+/// pool, so the candidate count bounds the work a single request can queue.
+const MAX_CANDIDATES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,6 +89,7 @@ impl VerdictCache {
         self.order.clear();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -174,11 +178,9 @@ fn evaluate(
     let (tip, states) = store.object_states(&object_ids)?;
     let lease_epoch = store.lease_epoch();
     let project_scope_id = project.scope_id();
-    let mut filter = ScopeFilter::new(project, store);
-    let mut verdicts = Vec::with_capacity(candidates.len());
-    let mut cache_hits = 0;
-    for (candidate, state) in candidates.iter().zip(&states) {
-        let key = CacheKey {
+    let keys: Vec<CacheKey> = candidates
+        .iter()
+        .map(|candidate| CacheKey {
             lease_epoch,
             tip,
             object_id: candidate.object_id.clone(),
@@ -186,20 +188,38 @@ fn evaluate(
             artifact_digest: candidate.artifact_digest.clone(),
             destination,
             project_scope_id: project_scope_id.clone(),
-        };
-        let cached = coordinator.eligibility_cache().get(&key);
+        })
+        .collect();
+    // `judge` reads SQLite, so the cache guard is held only for the lookups
+    // and then again for the inserts, never across a judgement.
+    let cached: Vec<Option<Verdict>> = {
+        let cache = coordinator.eligibility_cache();
+        keys.iter().map(|key| cache.get(key)).collect()
+    };
+    let cache_hits = cached.iter().filter(|hit| hit.is_some()).count();
+    let mut filter = ScopeFilter::new(project, store);
+    let mut verdicts = Vec::with_capacity(candidates.len());
+    let mut fresh: Vec<(CacheKey, Verdict)> = Vec::new();
+    for ((candidate, state), (key, cached)) in candidates
+        .iter()
+        .zip(&states)
+        .zip(keys.into_iter().zip(cached))
+    {
         let verdict = match cached {
-            Some(verdict) => {
-                cache_hits += 1;
-                verdict
-            }
+            Some(verdict) => verdict,
             None => {
                 let verdict = judge(store, &mut filter, candidate, state.as_ref(), destination)?;
-                coordinator.eligibility_cache().insert(key, verdict);
+                fresh.push((key, verdict));
                 verdict
             }
         };
         verdicts.push((candidate.object_id.clone(), verdict));
+    }
+    if !fresh.is_empty() {
+        let mut cache = coordinator.eligibility_cache();
+        for (key, verdict) in fresh {
+            cache.insert(key, verdict);
+        }
     }
     Ok(BatchResponse {
         known_as_of: tip,
@@ -229,6 +249,11 @@ impl McHandler {
                 "{OPERATION} destination must be local or remote"
             ));
         };
+        if parsed.candidates.len() > MAX_CANDIDATES {
+            return crate::invalid_params_error(format!(
+                "{OPERATION} carries at most {MAX_CANDIDATES} candidates"
+            ));
+        }
         let store = scope.store;
         let project = scope.project;
         let coordinator = self.kernel.clone();

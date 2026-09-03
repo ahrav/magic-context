@@ -2253,6 +2253,14 @@ impl KernelStore {
     }
 }
 
+impl SourceClass {
+    /// Lets a caller refuse an illegal pair before opening a transaction;
+    /// `evaluate_admission` refuses the same pair as `KernelError::AdmissionPolicy`.
+    pub const fn allows(self, taint: TaintClass) -> bool {
+        source_allows_taint(self, taint)
+    }
+}
+
 // policy-digest:tables-start
 impl Maturity {
     const fn rank(self) -> u8 {
