@@ -663,13 +663,16 @@ function rolloutAccountingViolation(
     if (rollouts > plannedCoordinates * ARM_IDS.length) {
         return { path: "runSummary.observedCostRollouts", code: "exceeds-plan" };
     }
+    // Each raw regret record is a rung whose regret arm completed, and a completed cell is always observed.
+    // Regret arms are never primary arms, so these records add to every primary-arm floor.
+    const rungRecords = new Set(analysis.rawRegretRecords.map(({ coordinateId, endpoint }) => `${coordinateId}\u0000${endpoint}`)).size;
     // The runner refuses a completed cell priced as an estimate.
-    if (observedCostRollouts < PRIMARY_ARM_IDS.length * healthyCoordinates) {
+    if (observedCostRollouts < PRIMARY_ARM_IDS.length * healthyCoordinates + rungRecords) {
         return { path: "runSummary.observedCostRollouts", code: "healthy-coordinate-shortfall" };
     }
-    // An excluded record is never one of a healthy coordinate's primary records.
+    // An excluded record is never one of a healthy coordinate's primary records or a completed regret rung.
     const excludedRecords = exclusions.reduce((sum, { count }) => sum + count, 0);
-    if (rollouts < PRIMARY_ARM_IDS.length * healthyCoordinates + excludedRecords) {
+    if (rollouts < PRIMARY_ARM_IDS.length * healthyCoordinates + rungRecords + excludedRecords) {
         return { path: "runSummary.observedCostRollouts", code: "exclusion-shortfall" };
     }
     // An estimated cost means no usage came back, which leaves the cell non-completed and therefore excluded.
@@ -691,8 +694,9 @@ function rolloutAccountingViolation(
         return { path: "analysis.rawRegretRecords", code: "exceeds-plan" };
     }
     // The ladder fires only after a completed, observed mc-on cell, so every refused or raw regret coordinate
-    // implies at least one observed rollout. It may also be a healthy coordinate, so the two bounds do not add.
-    if (observedCostRollouts < rawCoordinates.size + refusedTotal) {
+    // implies one observed rollout beyond its rungs. It may also be a healthy coordinate, so this floor and
+    // the healthy floor do not add.
+    if (observedCostRollouts < rawCoordinates.size + refusedTotal + rungRecords) {
         return { path: "runSummary.observedCostRollouts", code: "regret-coordinate-shortfall" };
     }
     // A healthy coordinate contributes both primary observations, so healthy evidence implies the paired

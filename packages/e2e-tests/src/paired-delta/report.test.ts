@@ -1161,13 +1161,22 @@ describe("parsePairedDeltaReport", () => {
             expect(body.runSummary.healthyCoordinates).toBeLessThan(body.runSummary.plannedCoordinates);
             body.runSummary.evidenceComplete = true;
         }))).toThrow(/report\.body\.runSummary\.evidenceComplete: derived-mismatch/);
+        // Twelve healthy coordinates observed three primary arms each, plus the two archived regret rungs.
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.runSummary.healthyCoordinates = body.runSummary.plannedCoordinates;
-            body.runSummary.observedCostRollouts = 36;
+            body.runSummary.observedCostRollouts = 38;
             body.runSummary.estimatedCostRollouts = 0;
             body.exclusions = [];
             body.runSummary.evidenceComplete = true;
         }))).not.toThrow();
+        // Every raw regret rung is a completed, observed regret-arm record beyond the primary arms.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.healthyCoordinates = body.runSummary.plannedCoordinates;
+            body.runSummary.observedCostRollouts = 37;
+            body.runSummary.estimatedCostRollouts = 0;
+            body.exclusions = [];
+            body.runSummary.evidenceComplete = true;
+        }))).toThrow(/report\.body\.runSummary\.observedCostRollouts: healthy-coordinate-shortfall/);
         // Healthy evidence implies every primary arm appears in each secondary-metric map.
         expect(() => parsePairedDeltaReport(forge((body) => { delete body.secondaryMetrics.invalidSuccessRateByArm["mc-on"]; })))
             .toThrow(/report\.body\.secondaryMetrics\.invalidSuccessRateByArm\.mc-on: arm-required/);
@@ -1231,7 +1240,7 @@ describe("parsePairedDeltaReport", () => {
         // Every exclusion is a final record the two cost counters also count.
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.runSummary.status = "cost-cap-reached";
-            body.runSummary.observedCostRollouts = 27;
+            body.runSummary.observedCostRollouts = 29;
             body.runSummary.estimatedCostRollouts = 0;
         }))).toThrow(/report\.body\.runSummary\.observedCostRollouts: exclusion-shortfall/);
         // A completed run stored every primary arm for every planned coordinate.
