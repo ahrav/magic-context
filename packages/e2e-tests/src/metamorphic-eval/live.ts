@@ -13,7 +13,7 @@ import {
 } from "../historian-eval/scorer";
 import type { InjectedClaimRecord } from "../historian-eval/claim-read";
 import { containsInjectionCanary } from "./injection-canary";
-import { compareInvariants, compareScoreInvariants } from "./invariants";
+import { compareScoreInvariants, injectionSetInvariant } from "./invariants";
 import { admitPair } from "./pairs";
 import {
     CONTROL_SEED,
@@ -76,12 +76,7 @@ export function compareLivePair(
     derivative: LiveObservation,
 ): MetamorphicInvariantVerdict[] {
     return [
-        compareInvariants(
-            baseline.injectedClaims,
-            derivative.injectedClaims,
-            baseline.score,
-            derivative.score,
-        )[0]!,
+        injectionSetInvariant(baseline.injectedClaims, derivative.injectedClaims),
         ...compareScoreInvariants(
             baseline.score,
             derivative.score,

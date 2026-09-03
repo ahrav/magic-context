@@ -316,7 +316,10 @@ describe("deterministic metamorphic runner", () => {
             .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.invariants\\[${verdictEquality}\\]\\.holds: derived-mismatch`));
 
         // A scored pair whose roles ran different systems cannot isolate the transform, so parsing rejects it.
+        // Only a run-record pair carries tuples, so the raw-output report is relabelled as a live one first.
         const crossSystem = structuredClone(report);
+        crossSystem.system = systemTuple();
+        relabelScoredAsRunRecord(crossSystem, systemTuple());
         const crossEntry = crossSystem.entries[scoredIndex]!;
         if (crossEntry.kind !== "scored") throw new Error("unreachable");
         crossEntry.derivativeScore.system = {
@@ -340,7 +343,7 @@ describe("deterministic metamorphic runner", () => {
         forgedTupleEntry.baselineScore.system = systemTuple();
         forgedTupleEntry.derivativeScore.system = systemTuple();
         expect(() => parseMetamorphicReport(forgedTuples))
-            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: report-system-mismatch`));
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.baselineScore\\.system: seam-shape-invalid`));
         // Equal tuples parse, including the null pair this runner produces.
         expect(report.entries[scoredIndex]).toMatchObject({ baselineScore: { system: null }, derivativeScore: { system: null } });
         expect(() => parseMetamorphicReport(report)).not.toThrow();

@@ -153,6 +153,11 @@ function canaryKey(hit: InjectionCanaryHit): string {
     return canonicalJson([hit.scenarioId, hit.role, hit.transformId, hit.transformVersion, hit.seed]);
 }
 
+/** `parseEntry` fixes the control coordinate for every entry at this id, so the id alone classifies a parsed entry. */
+function isControl(entry: { transformId: string }): boolean {
+    return entry.transformId === CONTROL_TRANSFORM_ID;
+}
+
 // Canonical JSON escapes rather than concatenates, so an id containing a separator cannot collide.
 function key(entry: PairKey): string {
     return canonicalJson([entry.scenarioId, entry.transformId, entry.transformVersion, entry.seed]);
@@ -374,7 +379,7 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
     const pair = parsePairKey(value, label);
     // Every control-coordinate check downstream keys on the id alone, so the fixed version and seed are
     // enforced here for every entry kind, not only a scored pair.
-    const isControlPair = pair.transformId === CONTROL_TRANSFORM_ID;
+    const isControlPair = isControl(pair);
     if (isControlPair && (pair.transformVersion !== CONTROL_TRANSFORM_VERSION || pair.seed !== CONTROL_SEED)) {
         p.fail(`${label}: control-pair-coordinates-invalid`);
     }
@@ -568,7 +573,7 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     // were those. A tier-invalid run keeps its scheduled coverage over a partial entry set.
     const backed = new Map<string, number>();
     for (const entry of report.entries) {
-        if (entry.kind === "lint-red" || entry.transformId === CONTROL_TRANSFORM_ID) continue;
+        if (entry.kind === "lint-red" || isControl(entry)) continue;
         backed.set(entry.scenarioId, (backed.get(entry.scenarioId) ?? 0) + 1);
     }
     if (report.tierInvalidReason === null) {
@@ -594,7 +599,7 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     // A disagreement can name a null root: two observations without a tuple are themselves the mismatch.
     const controlKind = report.tierInvalidReason?.kind;
     if (controlKind === "control-error" || controlKind === "control-disagreement") {
-        const controls = report.entries.filter((entry) => entry.transformId === CONTROL_TRANSFORM_ID);
+        const controls = report.entries.filter(isControl);
         if (controls.length !== 1 || controls[0]!.kind !== "error") p.fail(`report.tierInvalidReason: ${controlKind}-entry-required`);
     }
     // Both runners refuse an empty scenario list and write one coverage row per scenario.
@@ -603,7 +608,7 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     // only after both controls ran, and product pairs run only after that entry is scored, so a control role
     // leaves no control entry and a product role leaves an applied coordinate with no entry yet.
     if (report.tierInvalidReason?.kind === "deadline-exhausted") {
-        const controls = report.entries.filter((entry) => entry.transformId === CONTROL_TRANSFORM_ID);
+        const controls = report.entries.filter(isControl);
         const { nextRole } = report.tierInvalidReason;
         if (nextRole === "control-a" || nextRole === "control-b") {
             if (controls.length !== 0 || report.entries.some((entry) => entry.kind === "scored")) {
@@ -623,7 +628,7 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     }
     const covered = new Set(report.coverage.map(({ scenarioId }) => scenarioId));
     for (const [index, entry] of report.entries.entries()) {
-        if (entry.transformId === CONTROL_TRANSFORM_ID) continue;
+        if (isControl(entry)) continue;
         if (!covered.has(entry.scenarioId)) p.fail(`report.entries[${index}]: coverage-row-required`);
     }
     // Both runners build a scenario's coverage row around its canary collection, so a hit names a covered
@@ -636,10 +641,10 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     // The live runner completes and validates its control pair before any product pair, so a tier-valid
     // run-record report carries exactly one scored control.
     if (report.tierInvalidReason === null && sources.has("run-record")) {
-        const controls = report.entries.filter((entry) => entry.transformId === CONTROL_TRANSFORM_ID);
+        const controls = report.entries.filter(isControl);
         if (controls.length !== 1 || controls[0]!.kind !== "scored") p.fail("report.entries: control-pair-required");
         // The controls run only when a product pair was admitted, and a completed run leaves each pair an entry.
-        if (!report.entries.some((entry) => entry.transformId !== CONTROL_TRANSFORM_ID)) {
+        if (!report.entries.some((entry) => !isControl(entry))) {
             p.fail("report.entries: product-entry-required");
         }
     }

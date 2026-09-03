@@ -34,11 +34,11 @@ export function parseSystemVersionTuple(p: ContractPrimitives, raw: unknown, lab
 }
 
 /**
- * Binds a score's tuple to its scoring seam and to the report that carries it.
+ * Binds a run-record score's tuple to the report that carries it.
  *
  * A run-record score reaches the scorer only after its record's system passed shape validation, so it carries
- * a tuple, and where the report names one they must agree. The raw-output scorer stamps `system: null`, so a
- * raw-output score never carries one.
+ * a tuple, and where the report names one they must agree. `parseScenarioScore` owns the raw-output seam's
+ * shape, including its null tuple, so that seam has nothing to bind here.
  */
 export function requireScoreSystemBinding(
     p: ContractPrimitives,
@@ -46,10 +46,7 @@ export function requireScoreSystemBinding(
     reportSystem: SystemVersionTuple | null,
     label: string,
 ): void {
-    if (score.source === "raw-output") {
-        if (score.system !== null) p.fail(`${label}: report-system-mismatch`);
-        return;
-    }
+    if (score.source === "raw-output") return;
     if (score.system === null) p.fail(`${label}: system-required`);
     if (reportSystem !== null && canonicalJson(score.system) !== canonicalJson(reportSystem)) {
         p.fail(`${label}: report-system-mismatch`);

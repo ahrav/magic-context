@@ -1940,10 +1940,12 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     const errorDetail = parseNullableText(value.errorDetail, `${label}.errorDetail`);
     // `scoreRawOutputWithInjectedClaims` assembles its score with no probes and no invalid run, and only a
     // trimmed probe makes `assembleScore` emit an ERROR, so a raw-output score is a PASS or FAIL. commentlint: allow(JUDGE)
+    const system = parseSystemVersionTuple(p, value.system, `${label}.system`);
     if (source === "raw-output") {
         if (verdict === "ERROR") p.fail(`${label}.verdict: seam-shape-invalid`);
         if (probeVerdicts.length > 0) p.fail(`${label}.probeVerdicts: seam-shape-invalid`);
         if (failReasons.includes("invalid-output")) p.fail(`${label}.failReasons: seam-shape-invalid`);
+        if (system !== null) p.fail(`${label}.system: seam-shape-invalid`);
     }
     if (verdict === "ERROR") {
         if (failReasons.length > 0) p.fail(`${label}.failReasons: derived-mismatch`);
@@ -2008,7 +2010,7 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         falseAuthoritativeMatches,
         structuralFindings,
         probeVerdicts,
-        system: parseSystemVersionTuple(p, value.system, `${label}.system`),
+        system,
         source,
     };
 }

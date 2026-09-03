@@ -97,12 +97,11 @@ export function introducedFailReasons(
     );
 }
 
-export function compareInvariants(
+/** The one invariant both runners derive from the injected claim sets rather than from the scores. */
+export function injectionSetInvariant(
     baselineClaims: readonly InjectedClaimRecord[],
     derivativeClaims: readonly InjectedClaimRecord[],
-    baselineScore: ComparableScore,
-    derivativeScore: ComparableScore,
-): InvariantVerdict[] {
+): InjectionSetEqualityVerdict {
     const baseline = canonicalizeInjectionSet(baselineClaims);
     const derivative = canonicalizeInjectionSet(derivativeClaims);
     const baselineKeys = new Set(baseline.map(claimKey));
@@ -115,11 +114,20 @@ export function compareInvariants(
             .filter((claim) => !baselineKeys.has(claimKey(claim)))
             .map((claim): InjectionSetChange => ({ direction: "added-in-derivative", claim })),
     ];
+    return withHolds({ invariant: "injection-set-equality", changes });
+}
+
+export function compareInvariants(
+    baselineClaims: readonly InjectedClaimRecord[],
+    derivativeClaims: readonly InjectedClaimRecord[],
+    baselineScore: ComparableScore,
+    derivativeScore: ComparableScore,
+): InvariantVerdict[] {
     const baselineMatches = falseAuthoritativeMatchSet(baselineScore);
     const derivativeMatches = falseAuthoritativeMatchSet(derivativeScore);
 
     return [
-        withHolds({ invariant: "injection-set-equality", changes }),
+        injectionSetInvariant(baselineClaims, derivativeClaims),
         withHolds({ invariant: "expected-absent-empty", baselineMatches, derivativeMatches }),
         withHolds({
             invariant: "verdict-monotonicity",
