@@ -591,15 +591,14 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
         }
     }
     // `runLiveMetamorphicEval` appends one control error entry before either control reason. commentlint: allow(JUDGE)
-    // A disagreement follows two scored controls, whose run-record tuple the root then names. commentlint: allow(JUDGE)
+    // A disagreement can name a null root: two observations without a tuple are themselves the mismatch.
     const controlKind = report.tierInvalidReason?.kind;
     if (controlKind === "control-error" || controlKind === "control-disagreement") {
         const controls = report.entries.filter((entry) => entry.transformId === CONTROL_TRANSFORM_ID);
         if (controls.length !== 1 || controls[0]!.kind !== "error") p.fail(`report.tierInvalidReason: ${controlKind}-entry-required`);
-        if (controlKind === "control-disagreement" && report.system === null) {
-            p.fail("report.system: control-disagreement-requires-live-report");
-        }
     }
+    // Both runners refuse an empty scenario list and write one coverage row per scenario.
+    if (report.coverage.length === 0) p.fail("report.coverage: coverage-required");
     // The live runner reports an exhausted deadline before the named role starts. The control entry is appended
     // only after both controls ran, and product pairs run only after that entry is scored, so a control role
     // leaves no control entry and a product role leaves an applied coordinate with no entry yet.
@@ -643,6 +642,10 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     if (report.tierInvalidReason === null && sources.has("run-record")) {
         const controls = report.entries.filter((entry) => entry.transformId === CONTROL_TRANSFORM_ID);
         if (controls.length !== 1 || controls[0]!.kind !== "scored") p.fail("report.entries: control-pair-required");
+        // The controls run only when a product pair was admitted, and a completed run leaves each pair an entry.
+        if (!report.entries.some((entry) => entry.transformId !== CONTROL_TRANSFORM_ID)) {
+            p.fail("report.entries: product-entry-required");
+        }
     }
     // One producer writes a report, and each producer scores through one seam.
     if (sources.size > 1) p.fail("report.entries: source-mismatch");

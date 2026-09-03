@@ -851,6 +851,23 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("an aborted record without a string detail is a shape error, not an ERROR carrying it", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            const score = scoreRunRecord(
+                { ...record, error: { reason: "harness-crash", detail: undefined } as unknown as HistorianEvalRunRecord["error"] },
+                scenario,
+            );
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-malformed");
+            expect(score.errorDetail).toContain("[error]");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("a record paired with a different scenario is ERROR, never a misattributed verdict", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {

@@ -105,12 +105,16 @@ function requireHex64(value: string, label: string): void {
     }
 }
 
-function sortedMetrics(metrics: ArmMetrics): ArmMetrics {
+function sortedMetrics(metrics: ArmMetrics, shape: { integer?: boolean } = {}): ArmMetrics {
     for (const [armId, value] of Object.entries(metrics)) {
         if (!ARM_ID_SET.has(armId)) {
             throw new Error(`paired-delta-report: metric-arm-invalid-${armId}`);
         }
         if (value === undefined || !Number.isFinite(value) || value < 0) {
+            throw new Error("paired-delta-report: metric-invalid");
+        }
+        // Token and turn totals sum per-rollout counters the runner admits only as safe integers.
+        if (shape.integer && !Number.isSafeInteger(value)) {
             throw new Error("paired-delta-report: metric-invalid");
         }
     }
@@ -208,6 +212,14 @@ export function buildPairedDeltaReport(input: {
         throw new Error("paired-delta-report: analysis-paired-facts-mismatch");
     }
     requirePolicyBoundEstimatorSettings(policy.policy, input.analysis);
+    // `calibrationNoiseFloors` names the endpoint on every floor; the parser admits no other floor shape.
+    for (const endpoint of input.analysis.endpoints) {
+        for (const family of endpoint.families) {
+            if (family.noise.floor !== null && family.noise.floor.endpoint === undefined) {
+                throw new Error(`paired-delta-report: noise-floor-endpoint-missing-${family.familyId}`);
+            }
+        }
+    }
     const exclusions = [...input.exclusions].sort((left, right) => compareCodeUnits(
         `${left.armId}:${left.reasonCode}`,
         `${right.armId}:${right.reasonCode}`,
@@ -262,11 +274,11 @@ export function buildPairedDeltaReport(input: {
         secondaryMetrics: {
             invalidSuccessRateByArm: sortedMetrics(input.secondaryMetrics.invalidSuccessRateByArm),
             finalAttemptTokensByArm:
-                sortedMetrics(input.secondaryMetrics.finalAttemptTokensByArm),
+                sortedMetrics(input.secondaryMetrics.finalAttemptTokensByArm, { integer: true }),
             finalAttemptWallClockMsByArm:
                 sortedMetrics(input.secondaryMetrics.finalAttemptWallClockMsByArm),
             finalAttemptTurnsByArm:
-                sortedMetrics(input.secondaryMetrics.finalAttemptTurnsByArm),
+                sortedMetrics(input.secondaryMetrics.finalAttemptTurnsByArm, { integer: true }),
         },
         regret: {
             live: input.analysis.liveRegret,

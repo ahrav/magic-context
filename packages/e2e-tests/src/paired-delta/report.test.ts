@@ -334,6 +334,19 @@ describe("paired-delta report", () => {
                 finalAttemptTurnsByArm: { "mc-on": 4, "mc-off": 3, compaction: 3 },
             },
         })).toThrow(/metric-arm-missing-invalidSuccessRateByArm-compaction/);
+        // The parser requires integer token and turn totals and an endpoint on every floor, so the builder does too.
+        expect(() => report({
+            secondaryMetrics: {
+                invalidSuccessRateByArm: { "mc-on": 0.1, "mc-off": 0, compaction: 0 },
+                finalAttemptTokensByArm: { "mc-on": 1000.5, "mc-off": 800, compaction: 900 },
+                finalAttemptWallClockMsByArm: { "mc-on": 4000, "mc-off": 3000, compaction: 3500 },
+                finalAttemptTurnsByArm: { "mc-on": 4, "mc-off": 3, compaction: 3 },
+            },
+        })).toThrow(/metric-invalid/);
+        const unscopedFloor = structuredClone(report().body.analysis);
+        const floored = unscopedFloor.endpoints[0]!.families[0]!;
+        floored.noise = { label: "inside-floor", floor: { familyId: floored.familyId, value: 1.5, interval: { lower: 0, upper: 1.5 } } };
+        expect(() => report({ analysis: unscopedFloor })).toThrow(new RegExp(`noise-floor-endpoint-missing-${floored.familyId}`));
         // The parser requires a positive plan, so the builder refuses an empty one too.
         expect(() => report({
             runSummary: { ...report().body.runSummary, plannedCoordinates: 0, healthyCoordinates: 0 },

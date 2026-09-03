@@ -218,17 +218,23 @@ describe("deterministic metamorphic runner", () => {
         const orphanControlError = structuredClone(report);
         orphanControlError.tierInvalidReason = { kind: "control-error", controlAErrorReason: "boom", controlBErrorReason: null };
         expect(() => parseMetamorphicReport(orphanControlError)).toThrow(/report\.tierInvalidReason: control-error-entry-required/);
-        // So is a control disagreement, and it follows two scored controls, so the report names a live system.
+        // So is a control disagreement.
         const orphanDisagreement = structuredClone(report);
         orphanDisagreement.tierInvalidReason = { kind: "control-disagreement", systemMismatch: true, failedInvariants: [] };
         expect(() => parseMetamorphicReport(orphanDisagreement)).toThrow(/report\.tierInvalidReason: control-disagreement-entry-required/);
-        // The control id sorts before every product transform id, so the entry belongs at the front.
+        // The control id sorts before every product transform id, so the entry belongs at the front. Two control
+        // observations without a tuple are themselves the mismatch, so the root may be null.
         orphanDisagreement.entries.unshift({
             scenarioId: orphanDisagreement.entries[0]!.scenarioId, transformId: "baseline-control", transformVersion: 1, seed: 0,
             kind: "error", error: "tier-invalid: baseline control pair disagreed; product pairs skipped",
         });
         expect(orphanDisagreement.system).toBeNull();
-        expect(() => parseMetamorphicReport(orphanDisagreement)).toThrow(/report\.system: control-disagreement-requires-live-report/);
+        expect(() => parseMetamorphicReport(orphanDisagreement)).not.toThrow();
+        // Both runners write a coverage row per scenario, so an empty coverage array is not a shape they emit.
+        const uncoveredAll = structuredClone(report);
+        uncoveredAll.entries = [];
+        uncoveredAll.coverage = [];
+        expect(() => parseMetamorphicReport(uncoveredAll)).toThrow(/report\.coverage: coverage-required/);
         // A deadline report ends before the named role, so a finished green report cannot carry one.
         const forgedDeadline = structuredClone(report);
         forgedDeadline.tierInvalidReason = { kind: "deadline-exhausted", nextRole: "derivative" };
@@ -1390,6 +1396,16 @@ describe("live metamorphic control tier", () => {
         // The pair whose derivative the deadline pre-empted has no entry yet.
         live.entries.splice(scoredIndex + 1, 1);
         expect(parseMetamorphicReport(JSON.parse(JSON.stringify(live)))).toEqual(live);
+        // A tier-valid live report ran its controls only because a product pair was admitted, so the control
+        // alone, with every product entry deleted, is not a shape the runner emits.
+        const controlOnly = structuredClone(live);
+        controlOnly.tierInvalidReason = null;
+        controlOnly.entries = controlOnly.entries.filter((entry) => entry.transformId === "baseline-control");
+        for (const row of controlOnly.coverage) {
+            row.applied = 0;
+            row.violations = ["no transforms applied"];
+        }
+        expect(() => parseMetamorphicReport(controlOnly)).toThrow(/report\.entries: product-entry-required/);
     });
 
     test("rejects report destinations that reserve another run's auxiliary names", () => {

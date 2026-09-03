@@ -868,7 +868,11 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
         problems.push("authoredTurnOrdinals");
     }
     if (typeof record.contextDbSnapshotPath !== "string") problems.push("contextDbSnapshotPath");
-    if (record.error !== null && typeof record.error?.reason !== "string") problems.push("error");
+    // An aborted record's reason and detail become the ERROR score's `errorReason` and `errorDetail`, which
+    // the report parser admits only as text.
+    if (record.error !== null && (typeof record.error?.reason !== "string" || typeof record.error?.detail !== "string")) {
+        problems.push("error");
+    }
     if (problems.length === 0) return null;
     return errorScore(
         recordScenarioId(record),

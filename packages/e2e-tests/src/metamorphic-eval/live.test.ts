@@ -27,7 +27,7 @@ import {
     type LiveObservation,
 } from "./live";
 import { INJECTION_CANARY } from "./injection-canary";
-import { buildMetamorphicReport, metamorphicExitCode } from "./report";
+import { buildMetamorphicReport, metamorphicExitCode, parseMetamorphicReport } from "./report";
 import { TRANSFORMS } from "./transforms";
 
 function score(overrides: Partial<ScenarioScore> = {}): ScenarioScore {
@@ -311,6 +311,7 @@ describe("live metamorphic orchestration", () => {
             failedInvariants: [],
         });
         expect(metamorphicExitCode(report)).toBe(1);
+        expect(parseMetamorphicReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
     });
 
     test("refuses admission before any model call", async () => {
