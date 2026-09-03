@@ -757,7 +757,10 @@ mod tests {
                 first.1 - second.0 >= WINDOW_OVERLAP_BYTES,
                 "overlap too small: {pair:?}"
             );
-            assert!(second.0 - first.0 >= MIN_WINDOW_ADVANCE_BYTES.min(1));
+            assert!(
+                second.0 - first.0 >= MIN_WINDOW_ADVANCE_BYTES,
+                "advance too small: {pair:?}"
+            );
             assert!(input.is_char_boundary(second.0));
         }
         windows
