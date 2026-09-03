@@ -4,7 +4,6 @@
 //! Each `Run` lock is acquired after the index lock and is never held across an await.
 //!
 //! `Released` drops charges and permits after releasing the index lock because dropping `ByteCharge` acquires the budget waiter lock.
-//! admission.
 //!
 //! Run state is process-local; after restart, every prior run ID resolves to `missing`.
 
@@ -104,9 +103,8 @@ struct RunState {
     started_appended: bool,
     terminal_appended: bool,
     subscriber_count: usize,
-    /// The run task has fully stopped (backend returned or never started).
+    /// The run task has fully stopped because the backend returned or never started.
     /// Cancel and delete wait for `work_done` so no backend work outlives their completion.
-    /// completion (R10).
     work_done: bool,
     /// `work_unresolved` means the backend could not prove its process tree stopped; descendants may still execute a billable request.
     /// `work_done` does not prove descendants stopped; they may still execute a billable request.
@@ -161,7 +159,7 @@ struct Run {
     run_id: String,
     key: SessionKey,
     /// `fingerprint` is the SHA-256 of the exact `session.send` body bytes.
-    /// byte-identical resend matches, anything else conflicts.
+    /// A byte-identical resend matches; any other body conflicts.
     fingerprint: [u8; 32],
     state: Mutex<RunState>,
     notify: Notify,
@@ -200,7 +198,6 @@ struct Inner {
     limits: BrocaLimits,
     backend: Arc<dyn LlmExecutionBackend>,
     /// Each run ID includes a random per-incarnation fence, so a stale ID from a previous process resolves to `missing`, never a live run.
-    /// (R11/KTD12).
     incarnation: String,
     index: Mutex<Index>,
     commands: Arc<Semaphore>,
@@ -228,12 +225,12 @@ pub struct SupervisorMetrics {
     pub tombstones: usize,
 }
 
+/// Owns process-local Broca runs, replay state, and bounded admission resources.
 pub struct Supervisor {
     inner: Arc<Inner>,
 }
 
 /// Every index operation recovers the index lock from poisoning.
-/// as `synapse::jobs::JobTable::lock_jobs`.
 fn lock_index(inner: &Inner) -> MutexGuard<'_, Index> {
     inner
         .index
@@ -279,11 +276,12 @@ impl Supervisor {
         }
     }
 
-    ///
+    /// Returns the backend's static reason when `harness` is unavailable.
     pub fn harness_unavailable_reason(&self, harness: Harness) -> Option<&'static str> {
         self.inner.backend.unavailable_reason(harness)
     }
 
+    /// Returns current permit, byte-budget, and index counts.
     pub fn metrics(&self) -> SupervisorMetrics {
         let inner = &self.inner;
         let index = lock_index(inner);
@@ -313,6 +311,7 @@ impl Supervisor {
             .map_err(|_| app("queue_full", "command callback capacity is exhausted"))
     }
 
+    /// Admits one immutable run or returns the existing run for a byte-identical retry.
     ///
     /// Admission acquires the command permit, candidate active-run reservation, and retained-byte reservation before publishing both indices under the lock.
     /// `session.send` publishes neither index unless both reservations succeed.
@@ -434,7 +433,7 @@ impl Supervisor {
 
     /// A successful cancel resolves only after the run's task has fully stopped, so no backend work outlives it.
     /// An unknown, expired, or already-terminal run succeeds without effect.
-    /// overwritten.
+    /// A committed terminal cannot be overwritten.
     pub async fn cancel(&self, key: &SessionKey, run_id: &str) -> Result<(), RequestError> {
         let _command = self.command_permit()?;
         let run = {
@@ -465,8 +464,7 @@ impl Supervisor {
     }
 
     /// Cancels a live run, waits for its task, purges replay and charges, and installs a bounded tombstone.
-    /// Delete installs a bounded tombstone; a second delete has no effect.
-    /// side-effect free.
+    /// Delete installs a bounded tombstone; a second delete is side-effect free.
     pub async fn delete(&self, key: &SessionKey) -> Result<(), RequestError> {
         let _command = self.command_permit()?;
         let run = {
@@ -530,7 +528,6 @@ impl Supervisor {
             // Use the reservation taken before the wait because the removed run's charges have already been released.
             // Install an uncharged tombstone if both charge attempts fail rather than omit the deletion guard.
             // Do not replace a different live run; it was installed after this run was removed.
-            // tombstone.
             let charge = reserved_tombstone
                 .or_else(|| self.inner.retained.try_charge(key.meta_bytes()))
                 .unwrap_or_else(ByteCharge::none);
@@ -585,7 +582,6 @@ impl Supervisor {
         let mut state = lock_run(&run);
         if state.subscriber_count >= self.inner.limits.max_subscribers_per_run {
             // The total permit drops after the guards, so rejecting a run cannot leak a total slot.
-            // The total permit drops after the guards, so rejecting a run cannot leak a total slot.
             return Err(app(
                 "queue_full",
                 "per-run subscriber capacity is exhausted",
@@ -605,12 +601,10 @@ impl Supervisor {
     /// Drains everything:
     /// Shutdown cancels queued and running backend work, waits for all run tasks, wakes every subscriber, and releases retained state.
     /// After shutdown, the metrics snapshot equals the construction baseline.
-    /// After shutdown, the metrics snapshot equals the construction baseline.
     ///
     /// Returns the number of runs with unproven process-group teardown in `work_unresolved`.
     /// Local state is released even when process-group teardown is unproven.
     /// A drained supervisor does not prove that harness process trees stopped.
-    /// The component must not report a clean shutdown while provider work may still be running.
     /// The component must not report a clean shutdown while provider work may still be running.
     pub async fn shutdown(&self) -> usize {
         let inner = &self.inner;
@@ -626,7 +620,6 @@ impl Supervisor {
         inner.tracker.close();
         inner.tracker.wait().await;
         // Read after the tracker drain because every backend task has returned and each run's teardown verdict is final.
-        // Every backend task has returned, so each run's teardown verdict is final.
         let unresolved = runs
             .iter()
             .filter(|run| lock_run(run).work_unresolved)
@@ -699,8 +692,7 @@ impl Supervisor {
                 );
                 return;
             };
-            // The task rechecks `closing` and run cancellation after acquiring a permit because either can fire while the permit branch wins.
-            // The task rechecks cancellation after acquiring a permit to prevent a cancelled run from starting the backend.
+            // Recheck shutdown and cancellation after acquiring a permit because either can fire while the permit branch wins.
             if inner.closing.is_cancelled() {
                 finish(
                     &inner,
@@ -1018,7 +1010,6 @@ fn enforce_terminal_cap(
                 SessionEntry::Tombstone(tombstone) => {
                     // `keep_key` prevents eviction of the delete operation's resurrection guard.
                     // Evicting the resurrection guard would undo the guard installed by the delete operation.
-                    // installed.
                     (Some(tombstone.created_at), keep_key != Some(key))
                 }
                 SessionEntry::Live(run) => {
@@ -1081,7 +1072,6 @@ fn remove_session(index: &mut Index, key: &SessionKey, released: &mut Released) 
 }
 
 /// A subscriber mid-replay pins its run because releasing its `Arc` replay units early would detach accounting from resident bytes.
-/// resident.
 fn sweep_for(inner: &Arc<Inner>, index: &mut Index, released: &mut Released) {
     let now = Instant::now();
     let retention = inner.limits.terminal_retention;
@@ -1094,7 +1084,7 @@ fn sweep_for(inner: &Arc<Inner>, index: &mut Index, released: &mut Released) {
             }
             SessionEntry::Live(run) => {
                 let state = lock_run(run);
-                // teardown verdict.
+                // Retention starts only after the task has produced its final teardown verdict.
                 state.work_done
                     && state.subscriber_count == 0
                     && state
