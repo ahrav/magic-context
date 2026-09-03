@@ -451,9 +451,6 @@ fn acceptance_failed_check_blocks_before_deep_verification() {
             &EvalBudget::unbounded(),
         )
         .unwrap();
-    // The veto and the durable block both exist before any deep
-    // verification consumer has run (none exists yet — the outbox job is
-    // scheduled, not consumed).
     assert_eq!(report.objects[0].state, ApplicabilityState::Stale);
     assert!(report.auto_injectable().next().is_none());
     assert!(matches!(

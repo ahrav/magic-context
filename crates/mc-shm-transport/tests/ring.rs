@@ -477,7 +477,6 @@ fn grant_slice_rejects_every_truncation_point_and_one_byte_suffix() {
     );
 }
 
-/// ring-profile geometry.
 #[test]
 fn golden_grant_fixture_matches_the_frozen_ring_profile_encoding() {
     const GOLDEN_GRANT_HEX: &str = "0300d489c07ee46333a5fe7901df356f6f460000000020000000000000\
