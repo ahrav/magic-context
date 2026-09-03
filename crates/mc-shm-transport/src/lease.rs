@@ -207,15 +207,22 @@ impl Drop for ReceiveLease<'_> {
 }
 
 /// `LeaseError` reports receive-span or completion failures.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
     /// `LeaseError` reports an invalid span pointer or count.
+    #[error("receive span is invalid")]
     InvalidSpan,
+    #[error("receive span lengths disagree")]
     LengthMismatch,
+    #[error("release identity does not match incarnation")]
     WrongIncarnation,
+    #[error("release identity does not match lane")]
     WrongLane,
+    #[error("release sequence is invalid")]
     InvalidSequence,
+    #[error("release is duplicated")]
     DuplicateRelease,
+    #[error("transport storage is quarantined")]
     Quarantined,
 }
 
@@ -224,19 +231,3 @@ impl fmt::Debug for LeaseError {
         fmt::Display::fmt(self, formatter)
     }
 }
-
-impl fmt::Display for LeaseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::InvalidSpan => "receive span is invalid",
-            Self::LengthMismatch => "receive span lengths disagree",
-            Self::WrongIncarnation => "release identity does not match incarnation",
-            Self::WrongLane => "release identity does not match lane",
-            Self::InvalidSequence => "release sequence is invalid",
-            Self::DuplicateRelease => "release is duplicated",
-            Self::Quarantined => "transport storage is quarantined",
-        })
-    }
-}
-
-impl std::error::Error for LeaseError {}

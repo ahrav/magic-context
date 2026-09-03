@@ -17,7 +17,7 @@
 //! Every envelope version preserves `len` and `ver` meanings and offsets.
 //! `decode_header` enforces the fixed meanings and offsets of `len` and `ver`.
 
-use std::{error::Error, fmt, sync::Arc};
+use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -202,100 +202,41 @@ impl EnvelopeHeader {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
     /// The input contains fewer than `FROZEN_PREFIX_LEN` bytes, so the decoder cannot read `len` or `ver`.
-    TooShortForPrefix {
-        have: usize,
-    },
+    #[error("header shorter than frozen prefix: have {have} bytes")]
+    TooShortForPrefix { have: usize },
     /// `ver` is not a version this build understands.
-    UnsupportedVersion {
-        ver: u8,
-    },
+    #[error("unsupported envelope version {ver}")]
+    UnsupportedVersion { ver: u8 },
     /// The input specifies a known version but contains fewer than that version's header bytes.
-    TooShortForHeader {
-        have: usize,
-        need: usize,
-    },
-    UnknownFrameType {
-        byte: u8,
-    },
+    #[error("header too short for version: have {have} bytes, need {need}")]
+    TooShortForHeader { have: usize, need: usize },
+    #[error("unknown frame type byte {byte}")]
+    UnknownFrameType { byte: u8 },
     /// A reserved flag bit (6-7) is set.
-    ReservedFlagBits {
-        flags: u8,
-    },
+    #[error("reserved flag bits set in flags 0b{flags:08b}")]
+    ReservedFlagBits { flags: u8 },
     /// Priority bits 1-2 hold the reserved value `0b11`.
-    ReservedPriorityBits {
-        flags: u8,
-    },
+    #[error("reserved priority bits set in flags 0b{flags:08b}")]
+    ReservedPriorityBits { flags: u8 },
     /// Admission bits 4-5 hold the reserved value `0b11`.
-    ReservedAdmissionClass {
-        flags: u8,
-    },
+    #[error("reserved admission class set in flags 0b{flags:08b}")]
+    ReservedAdmissionClass { flags: u8 },
     /// `AdmissionClass::Sheddable` cannot be set on a frame type that must be delivered.
-    SheddableIllegalFrameType {
-        ty: FrameType,
-        flags: u8,
-    },
+    #[error("SHEDDABLE admission class is illegal on {ty:?} in flags 0b{flags:08b}")]
+    SheddableIllegalFrameType { ty: FrameType, flags: u8 },
     /// Channel 0 carried an epoch other than its reserved epoch 0.
-    NonzeroEpochOnControlChannel {
-        epoch: u32,
-    },
+    #[error("control channel carried nonzero epoch {epoch}")]
+    NonzeroEpochOnControlChannel { epoch: u32 },
     /// A routed channel carried epoch 0, which is reserved for channel 0.
-    ZeroEpochOnRoutedChannel {
-        channel: u16,
-    },
+    #[error("routed channel {channel} carried zero epoch")]
+    ZeroEpochOnRoutedChannel { channel: u16 },
     /// Pure-header frames require a zero-length body.
-    PureHeaderFrameWithBody {
-        ty: FrameType,
-        len: u32,
-    },
+    #[error("pure-header frame {ty:?} declared non-zero body length {len}")]
+    PureHeaderFrameWithBody { ty: FrameType, len: u32 },
 }
-
-impl fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooShortForPrefix { have } => {
-                write!(f, "header shorter than frozen prefix: have {have} bytes")
-            }
-            Self::UnsupportedVersion { ver } => write!(f, "unsupported envelope version {ver}"),
-            Self::TooShortForHeader { have, need } => {
-                write!(
-                    f,
-                    "header too short for version: have {have} bytes, need {need}"
-                )
-            }
-            Self::UnknownFrameType { byte } => write!(f, "unknown frame type byte {byte}"),
-            Self::ReservedFlagBits { flags } => {
-                write!(f, "reserved flag bits set in flags 0b{flags:08b}")
-            }
-            Self::ReservedPriorityBits { flags } => {
-                write!(f, "reserved priority bits set in flags 0b{flags:08b}")
-            }
-            Self::ReservedAdmissionClass { flags } => {
-                write!(f, "reserved admission class set in flags 0b{flags:08b}")
-            }
-            Self::SheddableIllegalFrameType { ty, flags } => write!(
-                f,
-                "SHEDDABLE admission class is illegal on {ty:?} in flags 0b{flags:08b}"
-            ),
-            Self::NonzeroEpochOnControlChannel { epoch } => {
-                write!(f, "control channel carried nonzero epoch {epoch}")
-            }
-            Self::ZeroEpochOnRoutedChannel { channel } => {
-                write!(f, "routed channel {channel} carried zero epoch")
-            }
-            Self::PureHeaderFrameWithBody { ty, len } => {
-                write!(
-                    f,
-                    "pure-header frame {ty:?} declared non-zero body length {len}"
-                )
-            }
-        }
-    }
-}
-
-impl Error for DecodeError {}
 
 /// The frozen prefix makes `ver` available before the full header length is known.
 fn header_len_for_version(ver: u8) -> Option<usize> {

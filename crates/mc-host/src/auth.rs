@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, future::Future, io, time::Duration};
+use std::{fmt, future::Future, io, time::Duration};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -72,47 +72,52 @@ pub enum AuthStage {
     ClientAuth,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum AuthError {
-    Io {
-        stage: AuthStage,
-        source: io::Error,
-    },
+    #[error("auth {stage:?} I/O error: {source}")]
+    Io { stage: AuthStage, source: io::Error },
+    #[error("auth {stage:?} timed out after {deadline:?}")]
     Timeout {
         stage: AuthStage,
         deadline: Duration,
     },
+    #[error("auth {stage:?} ended early: expected {expected} bytes, got {actual}")]
     UnexpectedEof {
         stage: AuthStage,
         expected: usize,
         actual: usize,
     },
+    #[error("auth {stage:?} message length {len} exceeds hard cap {max}")]
     MessageTooLarge {
         stage: AuthStage,
         len: u32,
         max: u32,
     },
+    #[error("auth {stage:?} JSON encode error: {source}")]
     JsonEncode {
         stage: AuthStage,
         source: serde_json::Error,
     },
+    #[error("auth {stage:?} JSON decode error: {source}")]
     JsonDecode {
         stage: AuthStage,
         source: serde_json::Error,
     },
     /// `InvalidDeadline` reports a total that cannot form an absolute deadline.
-    InvalidDeadline {
-        total: Duration,
-    },
+    #[error("auth deadline {total:?} is not a representable instant")]
+    InvalidDeadline { total: Duration },
+    #[error("auth random generation failed: {0}")]
     Random(getrandom::Error),
-    KeyTooShort {
-        len: usize,
-        min: usize,
-    },
+    #[error("auth key is too short: {len} bytes, need at least {min}")]
+    KeyTooShort { len: usize, min: usize },
+    #[error("invalid server auth proof")]
     InvalidServerProof,
+    #[error("server daemon_id did not match connection file")]
     DaemonIdMismatch,
     /// `DaemonVerMismatch` reports a `daemon_ver` that differs from the connection-file snapshot.
+    #[error("server daemon_ver did not match connection file")]
     DaemonVerMismatch,
+    #[error("invalid client auth proof")]
     InvalidClientAuth,
 }
 
@@ -520,67 +525,6 @@ enum DeadlineIoError {
     Io(io::Error),
     Timeout,
     UnexpectedEof { actual: usize },
-}
-
-impl fmt::Display for AuthError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io { stage, source } => write!(f, "auth {stage:?} I/O error: {source}"),
-            Self::Timeout { stage, deadline } => {
-                write!(f, "auth {stage:?} timed out after {deadline:?}")
-            }
-            Self::UnexpectedEof {
-                stage,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "auth {stage:?} ended early: expected {expected} bytes, got {actual}"
-            ),
-            Self::MessageTooLarge { stage, len, max } => write!(
-                f,
-                "auth {stage:?} message length {len} exceeds hard cap {max}"
-            ),
-            Self::JsonEncode { stage, source } => {
-                write!(f, "auth {stage:?} JSON encode error: {source}")
-            }
-            Self::JsonDecode { stage, source } => {
-                write!(f, "auth {stage:?} JSON decode error: {source}")
-            }
-            Self::Random(source) => write!(f, "auth random generation failed: {source}"),
-            Self::InvalidDeadline { total } => {
-                write!(f, "auth deadline {total:?} is not a representable instant")
-            }
-            Self::KeyTooShort { len, min } => {
-                write!(f, "auth key is too short: {len} bytes, need at least {min}")
-            }
-            Self::InvalidServerProof => write!(f, "invalid server auth proof"),
-            Self::DaemonIdMismatch => write!(f, "server daemon_id did not match connection file"),
-            Self::DaemonVerMismatch => {
-                write!(f, "server daemon_ver did not match connection file")
-            }
-            Self::InvalidClientAuth => write!(f, "invalid client auth proof"),
-        }
-    }
-}
-
-impl Error for AuthError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            Self::JsonEncode { source, .. } | Self::JsonDecode { source, .. } => Some(source),
-            Self::Random(_) => None,
-            Self::Timeout { .. }
-            | Self::UnexpectedEof { .. }
-            | Self::MessageTooLarge { .. }
-            | Self::KeyTooShort { .. }
-            | Self::InvalidServerProof
-            | Self::DaemonIdMismatch
-            | Self::DaemonVerMismatch
-            | Self::InvalidDeadline { .. }
-            | Self::InvalidClientAuth => None,
-        }
-    }
 }
 
 #[cfg(test)]

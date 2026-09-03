@@ -231,35 +231,49 @@ impl HistorianProducerConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HistorianProducerError {
+    #[error("host client {}: {}", .0.code, .0.message)]
     Client(HistorianClientFailure),
+    #[error("historian call {} ({:?}): {}", .0.code, .0.outcome, .0.message)]
     Call(HistorianCallFailure),
-    Json(serde_json::Error),
+    #[error("json: {0}")]
+    Json(#[source] serde_json::Error),
+    #[error("session.send did not return an active run_id")]
     MissingRunId,
+    #[error("historian producer has no bound session")]
     MissingSession,
+    #[error("subscribe stream ended before the run terminal control unit")]
     UnexpectedStreamEnd,
+    #[error("historian producer timed out")]
     TimedOut,
+    #[error("runner protocol violation: {0}")]
     Protocol(String),
+    #[error("session.send outcome is unknown across replay fence (daemon_changed={daemon_changed}, identity_changed={identity_changed})")]
     CrossIncarnationUnknown {
         daemon_changed: bool,
         identity_changed: bool,
     },
+    #[error("{message}", message = cleanup_failed_message(operation, primary.as_deref(), cleanup))]
     CleanupFailed {
         operation: &'static str,
         primary: Option<Box<HistorianProducerError>>,
+        #[source]
         cleanup: Box<HistorianProducerError>,
     },
+    #[error("run {run_id} failed: {detail}")]
     RunFailed {
         run_id: String,
         detail: String,
         classification: Option<ErrorClassification>,
         class_field_present: bool,
     },
+    #[error("run {expected} received terminal control unit after RunStarted {found:?}")]
     TerminalRunMismatch {
         expected: String,
         found: Option<String>,
     },
+    #[error("{message}", message = run_paused_message(run_id, reason.as_deref()))]
     RunPaused {
         run_id: String,
         reason: Option<String>,
@@ -443,63 +457,21 @@ fn abort_or_overflow(s: &str) -> bool {
         || s.contains("overflow")
 }
 
-impl fmt::Display for HistorianProducerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Client(error) => write!(f, "host client {}: {}", error.code, error.message),
-            Self::Call(failure) => write!(
-                f,
-                "historian call {} ({:?}): {}",
-                failure.code, failure.outcome, failure.message
-            ),
-            Self::Json(error) => write!(f, "json: {error}"),
-            Self::MissingRunId => write!(f, "session.send did not return an active run_id"),
-            Self::MissingSession => write!(f, "historian producer has no bound session"),
-            Self::UnexpectedStreamEnd => {
-                write!(f, "subscribe stream ended before the run terminal control unit")
-            }
-            Self::TimedOut => write!(f, "historian producer timed out"),
-            Self::Protocol(detail) => write!(f, "runner protocol violation: {detail}"),
-            Self::CrossIncarnationUnknown {
-                daemon_changed,
-                identity_changed,
-            } => write!(
-                f,
-                "session.send outcome is unknown across replay fence (daemon_changed={daemon_changed}, identity_changed={identity_changed})"
-            ),
-            Self::CleanupFailed {
-                operation,
-                primary,
-                cleanup,
-            } => match primary {
-                Some(primary) => {
-                    write!(f, "{primary} ({operation} cleanup also failed: {cleanup})")
-                }
-                None => write!(f, "{operation} cleanup failed after success: {cleanup}"),
-            },
-            Self::RunFailed { run_id, detail, .. } => write!(f, "run {run_id} failed: {detail}"),
-            Self::TerminalRunMismatch { expected, found } => write!(
-                f,
-                "run {expected} received terminal control unit after RunStarted {found:?}"
-            ),
-            Self::RunPaused { run_id, reason, .. } => {
-                write!(f, "run {run_id} paused")?;
-                if let Some(reason) = reason {
-                    write!(f, ": {reason}")?;
-                }
-                Ok(())
-            }
-        }
+fn cleanup_failed_message(
+    operation: &str,
+    primary: Option<&HistorianProducerError>,
+    cleanup: &HistorianProducerError,
+) -> String {
+    match primary {
+        Some(primary) => format!("{primary} ({operation} cleanup also failed: {cleanup})"),
+        None => format!("{operation} cleanup failed after success: {cleanup}"),
     }
 }
 
-impl Error for HistorianProducerError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Json(error) => Some(error),
-            Self::CleanupFailed { cleanup, .. } => Some(cleanup.as_ref()),
-            _ => None,
-        }
+fn run_paused_message(run_id: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("run {run_id} paused: {reason}"),
+        None => format!("run {run_id} paused"),
     }
 }
 

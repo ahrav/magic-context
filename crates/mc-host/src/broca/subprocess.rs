@@ -842,20 +842,9 @@ pub fn merge_cleanup(
 /// The marker requires a missing registry record and a SIGKILLed group not confirmed gone within the grace period.
 /// Cancel, delete, and shutdown latch `work_unresolved` for `BackendTerminal::FailedUnresolved`.
 /// `work_unresolved` prevents shutdown from claiming an unproven teardown.
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
+#[error("crash-ownership registration failed and the process group could not be confirmed stopped")]
 struct RegistrationTeardownUnproven;
-
-impl std::fmt::Display for RegistrationTeardownUnproven {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "crash-ownership registration failed and the process group \
-             could not be confirmed stopped"
-        )
-    }
-}
-
-impl std::error::Error for RegistrationTeardownUnproven {}
 
 pub(crate) fn spawn_failure(harness: HarnessName, err: &io::Error) -> BackendTerminal {
     if err

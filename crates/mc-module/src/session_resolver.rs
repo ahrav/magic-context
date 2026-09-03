@@ -8,26 +8,15 @@ pub struct ResolvedSession {
     pub last_traffic_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum SessionResolveError {
+    #[error("session.resolve timed out")]
     Timeout,
+    #[error("session.resolve transport failed: {0}")]
     Transport(String),
+    #[error("session.resolve returned an invalid response: {0}")]
     InvalidResponse(String),
 }
-
-impl fmt::Display for SessionResolveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Timeout => write!(f, "session.resolve timed out"),
-            Self::Transport(message) => write!(f, "session.resolve transport failed: {message}"),
-            Self::InvalidResponse(message) => {
-                write!(f, "session.resolve returned an invalid response: {message}")
-            }
-        }
-    }
-}
-
-impl Error for SessionResolveError {}
 
 #[async_trait]
 pub trait SessionResolver: Send + Sync {

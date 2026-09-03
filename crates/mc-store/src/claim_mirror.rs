@@ -160,78 +160,41 @@ pub struct ClaimMirrorApplyResult {
 }
 
 /// Validation, fencing, or storage failure from committed-mirror operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ClaimMirrorError {
+    #[error("store: {0}")]
     Store(cortexkit_store::StoreError),
+    #[error("invalid claim mirror input: {0}")]
     Invalid(String),
+    #[error("claim mirror durable text rejected: {0:?}")]
     Redaction(mc_core::redaction::RedactionErrorKind),
+    #[error("claim mirror has not been seeded")]
     NotSeeded,
-    IncarnationMismatch {
-        expected: String,
-        found: String,
-    },
+    #[error("claim mirror incarnation mismatch: expected {expected}, found {found}")]
+    IncarnationMismatch { expected: String, found: String },
+    #[error(
+        "claim mirror project {project_id} generation mismatch: expected {expected}, found {found}"
+    )]
     GenerationMismatch {
         project_id: i64,
         expected: i64,
         found: i64,
     },
+    #[error(
+        "claim mirror project {project_id} checkpoint mismatch: expected {expected}, found {found}"
+    )]
     CheckpointMismatch {
         project_id: i64,
         expected: i64,
         found: i64,
     },
-    ReceiptConflict {
-        receipt_id: i64,
-    },
-    ResetBlocked {
-        unresolved: usize,
-    },
+    #[error("claim mirror receipt {receipt_id} was replayed with different bytes")]
+    ReceiptConflict { receipt_id: i64 },
+    #[error("claim mirror reset refused while {unresolved} claim intents remain unresolved")]
+    ResetBlocked { unresolved: usize },
+    #[error("claim mirror replacement requires begin_claim_store_rebuild")]
     ResetRequired,
 }
-
-impl std::fmt::Display for ClaimMirrorError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Store(error) => write!(f, "store: {error}"),
-            Self::Invalid(reason) => write!(f, "invalid claim mirror input: {reason}"),
-            Self::Redaction(kind) => write!(f, "claim mirror durable text rejected: {kind:?}"),
-            Self::NotSeeded => write!(f, "claim mirror has not been seeded"),
-            Self::IncarnationMismatch { expected, found } => write!(
-                f,
-                "claim mirror incarnation mismatch: expected {expected}, found {found}"
-            ),
-            Self::GenerationMismatch {
-                project_id,
-                expected,
-                found,
-            } => write!(
-                f,
-                "claim mirror project {project_id} generation mismatch: expected {expected}, found {found}"
-            ),
-            Self::CheckpointMismatch {
-                project_id,
-                expected,
-                found,
-            } => write!(
-                f,
-                "claim mirror project {project_id} checkpoint mismatch: expected {expected}, found {found}"
-            ),
-            Self::ReceiptConflict { receipt_id } => {
-                write!(f, "claim mirror receipt {receipt_id} was replayed with different bytes")
-            }
-            Self::ResetBlocked { unresolved } => write!(
-                f,
-                "claim mirror reset refused while {unresolved} claim intents remain unresolved"
-            ),
-            Self::ResetRequired => write!(
-                f,
-                "claim mirror replacement requires begin_claim_store_rebuild"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ClaimMirrorError {}
 
 impl From<cortexkit_store::StoreError> for ClaimMirrorError {
     fn from(error: cortexkit_store::StoreError) -> Self {

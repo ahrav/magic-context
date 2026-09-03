@@ -2,7 +2,7 @@
 
 mod scanner;
 
-use std::{fmt, sync::LazyLock};
+use std::sync::LazyLock;
 
 use mc_secret_scanner::{
     ConstructionError, LimitExhausted, ScanError, ScanLimits, ScanProfile, Scanner,
@@ -120,7 +120,8 @@ pub enum RedactionErrorKind {
     SecretDetected,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{}", redaction_error_message(.kind))]
 pub struct RedactionError {
     pub(crate) kind: RedactionErrorKind,
 }
@@ -132,21 +133,17 @@ impl RedactionError {
     }
 }
 
-impl fmt::Display for RedactionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self.kind {
-            RedactionErrorKind::Construction => "secret redactor construction failed",
-            RedactionErrorKind::InputLimit => "secret scan input limit exceeded",
-            RedactionErrorKind::CandidateLimit => "secret scan candidate limit exceeded",
-            RedactionErrorKind::WorkLimit => "secret scan work limit exceeded",
-            RedactionErrorKind::InvalidSpan => "secret scan produced an invalid span",
-            RedactionErrorKind::UnknownRule => "secret scan produced an unclassified rule",
-            RedactionErrorKind::SecretDetected => "secret-bearing field was rejected",
-        })
+fn redaction_error_message(kind: &RedactionErrorKind) -> &'static str {
+    match kind {
+        RedactionErrorKind::Construction => "secret redactor construction failed",
+        RedactionErrorKind::InputLimit => "secret scan input limit exceeded",
+        RedactionErrorKind::CandidateLimit => "secret scan candidate limit exceeded",
+        RedactionErrorKind::WorkLimit => "secret scan work limit exceeded",
+        RedactionErrorKind::InvalidSpan => "secret scan produced an invalid span",
+        RedactionErrorKind::UnknownRule => "secret scan produced an unclassified rule",
+        RedactionErrorKind::SecretDetected => "secret-bearing field was rejected",
     }
 }
-
-impl std::error::Error for RedactionError {}
 
 impl From<ConstructionError> for RedactionError {
     fn from(_: ConstructionError) -> Self {

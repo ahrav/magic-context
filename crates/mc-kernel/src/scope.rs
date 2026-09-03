@@ -469,62 +469,27 @@ impl Eq for VersionSpec {}
 
 /// Why a scope failed to decode into canonical form. Malformed scopes
 /// evaluate uncertain and never match.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum ScopeFormError {
+    #[error("unknown scope dimension {0:?}")]
     UnknownDimension(String),
+    #[error("unknown scope operator {0:?}")]
     UnknownOperator(String),
+    #[error("duplicate scope dimension {}", .0.as_str())]
     DuplicateDimension(Dimension),
+    #[error("scope term on {} has no value", .0.as_str())]
     MissingValue(Dimension),
+    #[error("scope term on {} sets columns its operator does not own", .0.as_str())]
     ConflictingColumns(Dimension),
+    #[error("scope term on {} has an invalid range", .0.as_str())]
     InvalidRange(Dimension),
+    #[error("scope term on {} has an unparseable version range", .0.as_str())]
     InvalidVersionRange(Dimension),
+    #[error("scope term on {} has an invalid git OID", .0.as_str())]
     InvalidOid(Dimension),
+    #[error("scope term on {} has an empty set", .0.as_str())]
     EmptySet(Dimension),
 }
-
-impl std::fmt::Display for ScopeFormError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownDimension(value) => write!(f, "unknown scope dimension {value:?}"),
-            Self::UnknownOperator(value) => write!(f, "unknown scope operator {value:?}"),
-            Self::DuplicateDimension(dimension) => {
-                write!(f, "duplicate scope dimension {}", dimension.as_str())
-            }
-            Self::MissingValue(dimension) => {
-                write!(f, "scope term on {} has no value", dimension.as_str())
-            }
-            Self::ConflictingColumns(dimension) => write!(
-                f,
-                "scope term on {} sets columns its operator does not own",
-                dimension.as_str()
-            ),
-            Self::InvalidRange(dimension) => {
-                write!(
-                    f,
-                    "scope term on {} has an invalid range",
-                    dimension.as_str()
-                )
-            }
-            Self::InvalidVersionRange(dimension) => write!(
-                f,
-                "scope term on {} has an unparseable version range",
-                dimension.as_str()
-            ),
-            Self::InvalidOid(dimension) => {
-                write!(
-                    f,
-                    "scope term on {} has an invalid git OID",
-                    dimension.as_str()
-                )
-            }
-            Self::EmptySet(dimension) => {
-                write!(f, "scope term on {} has an empty set", dimension.as_str())
-            }
-        }
-    }
-}
-
-impl std::error::Error for ScopeFormError {}
 
 /// Canonical scope: at most one term per dimension, ordered by dimension.
 /// The only constructor is `from_term_specs`, so every value of this type

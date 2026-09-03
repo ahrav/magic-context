@@ -25,36 +25,25 @@ use crate::routing::RouteRegistry;
 use crate::wire::ByteBudget;
 
 /// HostError reports failures that prevent graceful completion.
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum HostError {
+    #[error("invalid host configuration: {0}")]
     Config(crate::config::ConfigError),
+    #[error("instance startup failed: {0}")]
     Instance(InstanceError),
     /// The host publishes no state when startup validation or handler initialization fails.
     /// published.
+    #[error("handler initialization failed: {0}")]
     InitFailed(String),
     /// A bind, route-gone, or health callback that panics or misses its deadline causes `HostError::LifecycleFatal`; shutdown is not graceful.
+    #[error("fatal lifecycle callback failure: {0}")]
     LifecycleFatal(String),
     /// If host tasks remain unreaped after aborts at the shutdown deadline, shutdown is not graceful.
+    #[error("shutdown deadline expired before host tasks were reaped")]
     ShutdownDeadlineExpired,
+    #[error("host I/O failure: {0}")]
     Io(std::io::Error),
 }
-
-impl std::fmt::Display for HostError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Config(err) => write!(f, "invalid host configuration: {err}"),
-            Self::Instance(err) => write!(f, "instance startup failed: {err}"),
-            Self::InitFailed(msg) => write!(f, "handler initialization failed: {msg}"),
-            Self::LifecycleFatal(msg) => write!(f, "fatal lifecycle callback failure: {msg}"),
-            Self::ShutdownDeadlineExpired => {
-                write!(f, "shutdown deadline expired before host tasks were reaped")
-            }
-            Self::Io(err) => write!(f, "host I/O failure: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for HostError {}
 
 /// FatalCell retains only the first host-fatal lifecycle error.
 pub struct FatalCell {

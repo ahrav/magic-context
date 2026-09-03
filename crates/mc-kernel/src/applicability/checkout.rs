@@ -261,30 +261,21 @@ impl Drop for DeadlineWatchdog {
 
 /// Why a checkout snapshot could not be taken. Every variant renders the
 /// request's objects uncertain; none of them is a store failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotError {
     /// The path is not a git checkout this engine can open.
+    #[error("checkout open failed: {0}")]
     Open(String),
     /// The checkout has no resolvable HEAD commit (unborn branch).
+    #[error("checkout has no resolvable HEAD commit")]
     NoHead,
     /// Deadline exceeded or interrupt raised; partial results discarded.
+    #[error("evaluation budget exhausted")]
     BudgetExhausted,
     /// The status scan or object access failed mid-walk.
+    #[error("checkout status scan failed: {0}")]
     Scan(String),
 }
-
-impl std::fmt::Display for SnapshotError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Open(detail) => write!(f, "checkout open failed: {detail}"),
-            Self::NoHead => f.write_str("checkout has no resolvable HEAD commit"),
-            Self::BudgetExhausted => f.write_str("evaluation budget exhausted"),
-            Self::Scan(detail) => write!(f, "checkout status scan failed: {detail}"),
-        }
-    }
-}
-
-impl std::error::Error for SnapshotError {}
 
 /// One scan's budget together with its submodule nesting depth. Recursing
 /// into a dirty gitlink re-enters the scan, so the depth travels with the

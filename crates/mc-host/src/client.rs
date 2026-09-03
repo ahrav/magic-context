@@ -6,7 +6,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    error::Error,
     fmt,
     io::Write as _,
     os::fd::OwnedFd,
@@ -119,7 +118,8 @@ impl fmt::Display for SendOutcome {
 }
 
 /// `CallError` formatting excludes raw host terminal messages.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{outcome}: {message} ({code})")]
 pub struct CallError {
     outcome: SendOutcome,
     code: String,
@@ -180,16 +180,9 @@ impl fmt::Debug for CallError {
     }
 }
 
-impl fmt::Display for CallError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {} ({})", self.outcome, self.message, self.code)
-    }
-}
-
-impl Error for CallError {}
-
 /// Discovery, authentication, ring setup, or owner-lifecycle failure.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message} ({code})")]
 pub struct ClientError {
     code: &'static str,
     message: &'static str,
@@ -214,14 +207,6 @@ impl fmt::Debug for ClientError {
             .finish()
     }
 }
-
-impl fmt::Display for ClientError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({})", self.message, self.code)
-    }
-}
-
-impl Error for ClientError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {

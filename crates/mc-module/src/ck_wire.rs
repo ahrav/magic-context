@@ -320,45 +320,23 @@ impl FlatProjection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum CkWireError {
+    #[error("message id contains reserved '#': {0}")]
     MidContainsReservedHash(String),
+    #[error("unsupported CK block {kind} at {mid}#{block_index}")]
     UnsupportedBlock {
         mid: String,
         block_index: usize,
         kind: String,
     },
+    #[error("tool_result {tool_call_id} at {mid}#{block_index} has no adjacent tool_call")]
     UnpairedToolResult {
         mid: String,
         block_index: usize,
         tool_call_id: String,
     },
 }
-
-impl std::fmt::Display for CkWireError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CkWireError::MidContainsReservedHash(mid) => {
-                write!(f, "message id contains reserved '#': {mid}")
-            }
-            CkWireError::UnsupportedBlock {
-                mid,
-                block_index,
-                kind,
-            } => write!(f, "unsupported CK block {kind} at {mid}#{block_index}"),
-            CkWireError::UnpairedToolResult {
-                mid,
-                block_index,
-                tool_call_id,
-            } => write!(
-                f,
-                "tool_result {tool_call_id} at {mid}#{block_index} has no adjacent tool_call"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CkWireError {}
 
 pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection, CkWireError> {
     project_messages_from_state(messages, FlatProjectionBuilder::default())

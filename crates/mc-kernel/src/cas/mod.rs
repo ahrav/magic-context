@@ -168,6 +168,8 @@ pub enum ArtifactErrorKind {
     PurgeUnlinkPending,
 }
 
+#[derive(thiserror::Error)]
+#[error("{}", artifact_error_message(.kind, .usage, .cap, .digest))]
 pub struct ArtifactError {
     kind: ArtifactErrorKind,
     usage: Option<u64>,
@@ -230,74 +232,67 @@ impl ArtifactError {
     }
 }
 
-impl fmt::Display for ArtifactError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind {
-            // Two limits produce this error: what may be stored, and the shorter length
-            // redaction can inspect. Naming only the first tells a caller it broke a
-            // limit it is far below, with no way to find the one it actually broke.
-            ArtifactErrorKind::PayloadTooLarge => write!(
-                formatter,
-                "artifact payload exceeds an ingest limit ({MAX_PAYLOAD_BYTES} bytes stored, \
-                 {} bytes inspectable for secrets)",
-                mc_core::redaction::MAX_REDACTABLE_BYTES
-            ),
-            ArtifactErrorKind::Capacity => write!(
-                formatter,
-                "artifact capacity exceeded (usage={}, cap={})",
-                self.usage.unwrap_or(0),
-                self.cap.unwrap_or(0)
-            ),
-            ArtifactErrorKind::StorageExhausted => {
-                formatter.write_str("artifact storage capacity is exhausted")
-            }
-            ArtifactErrorKind::IngestionFailClosed => {
-                formatter.write_str("artifact ingestion is fail-closed until the store is reopened")
-            }
-            ArtifactErrorKind::ReAdmissionBlocked => write!(
-                formatter,
-                "artifact re-admission is blocked for digest {}",
-                self.digest.as_deref().unwrap_or("unknown")
-            ),
-            ArtifactErrorKind::MissingObject => write!(
-                formatter,
-                "artifact object is missing for digest {}",
-                self.digest.as_deref().unwrap_or("unknown")
-            ),
-            ArtifactErrorKind::CorruptObject => write!(
-                formatter,
-                "artifact object hash mismatch for digest {}",
-                self.digest.as_deref().unwrap_or("unknown")
-            ),
-            ArtifactErrorKind::ReferenceUnavailable => {
-                formatter.write_str("artifact reference is not live")
-            }
-            ArtifactErrorKind::ReferenceCommit => {
-                formatter.write_str("artifact canonical reference commit failed")
-            }
-            ArtifactErrorKind::AlignmentRebuild => {
-                formatter.write_str("artifact deletion could not rebuild the alignment projection")
-            }
-            ArtifactErrorKind::ReclaimInProgress => {
-                formatter.write_str("artifact reclamation is in progress; retry ingestion")
-            }
-            ArtifactErrorKind::UnredactableSecret => formatter
-                .write_str("artifact payload holds a recognized secret that cannot be redacted"),
-            ArtifactErrorKind::TextFieldTooLong => write!(
-                formatter,
-                "artifact text field exceeds {MAX_TEXT_FIELD_BYTES} bytes"
-            ),
-            ArtifactErrorKind::DetectionLimit => write!(
-                formatter,
-                "artifact payload exceeds {MAX_PAYLOAD_DETECTIONS} recognized secrets"
-            ),
-            ArtifactErrorKind::InvalidInput => formatter.write_str("artifact input is invalid"),
-            ArtifactErrorKind::PurgeIntent => {
-                formatter.write_str("artifact purge intent could not be made durable")
-            }
-            ArtifactErrorKind::PurgeUnlinkPending => {
-                formatter.write_str("artifact purge committed with durable unlink pending")
-            }
+fn artifact_error_message(
+    kind: &ArtifactErrorKind,
+    usage: &Option<u64>,
+    cap: &Option<u64>,
+    digest: &Option<String>,
+) -> String {
+    match kind {
+        // Two limits produce this error: what may be stored, and the shorter length
+        // redaction can inspect. Naming only the first tells a caller it broke a
+        // limit it is far below, with no way to find the one it actually broke.
+        ArtifactErrorKind::PayloadTooLarge => format!(
+            "artifact payload exceeds an ingest limit ({MAX_PAYLOAD_BYTES} bytes stored, \
+             {} bytes inspectable for secrets)",
+            mc_core::redaction::MAX_REDACTABLE_BYTES
+        ),
+        ArtifactErrorKind::Capacity => format!(
+            "artifact capacity exceeded (usage={}, cap={})",
+            usage.unwrap_or(0),
+            cap.unwrap_or(0)
+        ),
+        ArtifactErrorKind::StorageExhausted => "artifact storage capacity is exhausted".to_string(),
+        ArtifactErrorKind::IngestionFailClosed => {
+            "artifact ingestion is fail-closed until the store is reopened".to_string()
+        }
+        ArtifactErrorKind::ReAdmissionBlocked => format!(
+            "artifact re-admission is blocked for digest {}",
+            digest.as_deref().unwrap_or("unknown")
+        ),
+        ArtifactErrorKind::MissingObject => format!(
+            "artifact object is missing for digest {}",
+            digest.as_deref().unwrap_or("unknown")
+        ),
+        ArtifactErrorKind::CorruptObject => format!(
+            "artifact object hash mismatch for digest {}",
+            digest.as_deref().unwrap_or("unknown")
+        ),
+        ArtifactErrorKind::ReferenceUnavailable => "artifact reference is not live".to_string(),
+        ArtifactErrorKind::ReferenceCommit => {
+            "artifact canonical reference commit failed".to_string()
+        }
+        ArtifactErrorKind::AlignmentRebuild => {
+            "artifact deletion could not rebuild the alignment projection".to_string()
+        }
+        ArtifactErrorKind::ReclaimInProgress => {
+            "artifact reclamation is in progress; retry ingestion".to_string()
+        }
+        ArtifactErrorKind::UnredactableSecret => {
+            "artifact payload holds a recognized secret that cannot be redacted".to_string()
+        }
+        ArtifactErrorKind::TextFieldTooLong => {
+            format!("artifact text field exceeds {MAX_TEXT_FIELD_BYTES} bytes")
+        }
+        ArtifactErrorKind::DetectionLimit => {
+            format!("artifact payload exceeds {MAX_PAYLOAD_DETECTIONS} recognized secrets")
+        }
+        ArtifactErrorKind::InvalidInput => "artifact input is invalid".to_string(),
+        ArtifactErrorKind::PurgeIntent => {
+            "artifact purge intent could not be made durable".to_string()
+        }
+        ArtifactErrorKind::PurgeUnlinkPending => {
+            "artifact purge committed with durable unlink pending".to_string()
         }
     }
 }
@@ -317,8 +312,6 @@ impl fmt::Debug for ArtifactError {
         fmt::Display::fmt(self, formatter)
     }
 }
-
-impl std::error::Error for ArtifactError {}
 
 pub(super) fn prepare_layout(root: &Path) -> Result<PathBuf, KernelError> {
     let root_directory = File::open(root).map_err(|_| KernelError::Io)?;

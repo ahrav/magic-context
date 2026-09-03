@@ -1677,67 +1677,40 @@ struct Channel1NudgeInputs<'a, 'ctx> {
     protected_tags: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TransformError {
+    #[error("store: {0}")]
     Store(McStoreError),
+    #[error("live-source ordinals not strictly increasing")]
     OrdinalViolation,
+    #[error("non-synthetic item used a reserved mc_* id")]
     ReservedId,
+    #[error("unknown frozen-set shape: {0}")]
     UnknownShape(&'static str),
+    #[error("decider re-supplied an already-frozen reduction target with different bytes")]
     ReductionConflict,
+    #[error("{0}")]
     CoverageGap(String),
+    #[error("search: {0}")]
     Search(String),
+    #[error("ck wire: {0}")]
     CkWire(CkWireError),
+    #[error("duplicate flattened block id: {0}")]
     DuplicateBlockId(String),
+    #[error("CK message block identity drift for mid {0}")]
     IdentityDrift(String),
+    #[error("synthetic todo anchor mid {0} is missing from the live tail")]
     SyntheticTodoAnchorMissing(String),
+    #[error("frozen reduction target vanished while its message is live: {0}")]
     FrozenRedTargetVanish(String),
+    #[error("minted boundary not present: {0}")]
     BoundaryNotPresent(String),
+    #[error("compartment boundary ordinal mismatch: {0}")]
     BoundaryOrdinalMismatch(String),
     /// ordinal-continuation rules.
+    #[error("lineage protocol error: {0}")]
     LineageProtocol(String),
 }
-
-impl std::fmt::Display for TransformError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TransformError::Store(e) => write!(f, "store: {e}"),
-            TransformError::OrdinalViolation => {
-                write!(f, "live-source ordinals not strictly increasing")
-            }
-            TransformError::ReservedId => write!(f, "non-synthetic item used a reserved mc_* id"),
-            TransformError::UnknownShape(m) => write!(f, "unknown frozen-set shape: {m}"),
-            TransformError::ReductionConflict => write!(
-                f,
-                "decider re-supplied an already-frozen reduction target with different bytes"
-            ),
-            TransformError::CoverageGap(m) => write!(f, "{m}"),
-            TransformError::Search(m) => write!(f, "search: {m}"),
-            TransformError::CkWire(e) => write!(f, "ck wire: {e}"),
-            TransformError::DuplicateBlockId(id) => write!(f, "duplicate flattened block id: {id}"),
-            TransformError::IdentityDrift(mid) => {
-                write!(f, "CK message block identity drift for mid {mid}")
-            }
-            TransformError::SyntheticTodoAnchorMissing(mid) => write!(
-                f,
-                "synthetic todo anchor mid {mid} is missing from the live tail"
-            ),
-            TransformError::FrozenRedTargetVanish(id) => {
-                write!(
-                    f,
-                    "frozen reduction target vanished while its message is live: {id}"
-                )
-            }
-            TransformError::BoundaryNotPresent(m) => {
-                write!(f, "minted boundary not present: {m}")
-            }
-            TransformError::BoundaryOrdinalMismatch(m) => {
-                write!(f, "compartment boundary ordinal mismatch: {m}")
-            }
-            TransformError::LineageProtocol(m) => write!(f, "lineage protocol error: {m}"),
-        }
-    }
-}
-impl std::error::Error for TransformError {}
 
 impl From<CkWireError> for TransformError {
     fn from(e: CkWireError) -> Self {

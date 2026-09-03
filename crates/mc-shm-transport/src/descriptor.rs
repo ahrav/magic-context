@@ -367,24 +367,39 @@ impl DescriptorCounts {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum DescriptorError {
+    #[error("operating-system random source unavailable")]
     RandomSourceUnavailable,
+    #[error("hardware profile identifier is invalid")]
     InvalidHardwareProfile,
+    #[error("fixed structure is truncated")]
     Truncated,
+    #[error("descriptor schema is unsupported")]
     UnsupportedSchema,
+    #[error("release identity does not match incarnation")]
     WrongIncarnation,
+    #[error("release identity does not match lane")]
     WrongLane,
     /// Sequence is zero or does not match the expected sequence.
+    #[error("release sequence is invalid")]
     InvalidSequence,
     /// body_len exceeds MAX_FRAME_BYTES.
+    #[error("frame exceeds protocol maximum")]
     FrameTooLarge,
+    #[error("arena allocation is invalid")]
     InvalidAllocation,
+    #[error("descriptor span count is invalid")]
     InvalidSpanCount,
+    #[error("descriptor span is outside arena")]
     OutOfBounds,
+    #[error("descriptor arithmetic overflow")]
     Overflow,
+    #[error("descriptor lengths disagree")]
     LengthMismatch,
+    #[error("descriptor wrap metadata is invalid")]
     InvalidWrapMetadata,
+    #[error("wire header disagrees with descriptor")]
     WireHeaderMismatch,
 }
 
@@ -393,27 +408,3 @@ impl fmt::Debug for DescriptorError {
         fmt::Display::fmt(self, formatter)
     }
 }
-
-impl fmt::Display for DescriptorError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::RandomSourceUnavailable => "operating-system random source unavailable",
-            Self::InvalidHardwareProfile => "hardware profile identifier is invalid",
-            Self::Truncated => "fixed structure is truncated",
-            Self::UnsupportedSchema => "descriptor schema is unsupported",
-            Self::WrongIncarnation => "release identity does not match incarnation",
-            Self::WrongLane => "release identity does not match lane",
-            Self::InvalidSequence => "release sequence is invalid",
-            Self::FrameTooLarge => "frame exceeds protocol maximum",
-            Self::InvalidAllocation => "arena allocation is invalid",
-            Self::InvalidSpanCount => "descriptor span count is invalid",
-            Self::OutOfBounds => "descriptor span is outside arena",
-            Self::Overflow => "descriptor arithmetic overflow",
-            Self::LengthMismatch => "descriptor lengths disagree",
-            Self::InvalidWrapMetadata => "descriptor wrap metadata is invalid",
-            Self::WireHeaderMismatch => "wire header disagrees with descriptor",
-        })
-    }
-}
-
-impl std::error::Error for DescriptorError {}

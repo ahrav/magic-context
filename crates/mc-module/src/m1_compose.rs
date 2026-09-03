@@ -12,22 +12,13 @@ use crate::memory_render::{
     assemble_m1, render_new_compartments, render_user_profile_block, M1_PLACEHOLDER,
 };
 
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum M1ComposeError {
+    #[error("store: {0}")]
     Store(McStoreError),
+    #[error("{0}")]
     CoverageGap(CoverageGap),
 }
-
-impl std::fmt::Display for M1ComposeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Store(error) => write!(f, "store: {error}"),
-            Self::CoverageGap(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for M1ComposeError {}
 
 impl From<McStoreError> for M1ComposeError {
     fn from(error: McStoreError) -> Self {

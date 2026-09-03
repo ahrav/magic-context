@@ -37,24 +37,15 @@ pub const PUBLIC_CLAIM_ID_PREFIX: &str = "mcm_";
 /// Both runtimes represent integers through 2^53 - 1 exactly.
 pub const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum ContractError {
     /// `NotCanonical` reports fractional floats, out-of-range integers, and non-finite numbers.
+    #[error("not canonical: {0}")]
     NotCanonical(String),
     /// `MalformedResult` reports a stored result envelope that fails strict decoding.
+    #[error("malformed result: {0}")]
     MalformedResult(String),
 }
-
-impl std::fmt::Display for ContractError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ContractError::NotCanonical(reason) => write!(f, "not canonical: {reason}"),
-            ContractError::MalformedResult(reason) => write!(f, "malformed result: {reason}"),
-        }
-    }
-}
-
-impl std::error::Error for ContractError {}
 
 /// Return the exact cross-runtime safe integer represented by a JSON number.
 /// `None` indicates that the number is not an exact cross-runtime safe integer.

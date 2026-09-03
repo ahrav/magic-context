@@ -158,57 +158,24 @@ pub enum FireOutcome {
     Busy(HistorianDurableState),
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HistorianStateError {
-    InvalidRange {
-        from_ordinal: u64,
-        to_ordinal: u64,
-    },
+    #[error("historian invalid chunk range: from {from_ordinal} is after to {to_ordinal}")]
+    InvalidRange { from_ordinal: u64, to_ordinal: u64 },
+    #[error("historian invalid transition: event {event} cannot run from {from}", from = from.as_str())]
     InvalidTransition {
         from: HistorianPhase,
         event: &'static str,
     },
-    MissingProducerIds {
-        firing_seq: u64,
-    },
-    FingerprintMismatch {
-        expected: String,
-        found: String,
-    },
+    #[error("historian firing {firing_seq} is missing producer ids needed for reattach/publish")]
+    MissingProducerIds { firing_seq: u64 },
+    #[error("historian chunk fingerprint mismatch: expected {expected}, found {found}")]
+    FingerprintMismatch { expected: String, found: String },
+    #[error("store: {0}")]
     Store(McStoreError),
+    #[error("publish: {0}")]
     Publish(HistorianPublishError),
 }
-
-impl fmt::Display for HistorianStateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HistorianStateError::InvalidRange {
-                from_ordinal,
-                to_ordinal,
-            } => write!(
-                f,
-                "historian invalid chunk range: from {from_ordinal} is after to {to_ordinal}"
-            ),
-            HistorianStateError::InvalidTransition { from, event } => write!(
-                f,
-                "historian invalid transition: event {event} cannot run from {}",
-                from.as_str()
-            ),
-            HistorianStateError::MissingProducerIds { firing_seq } => write!(
-                f,
-                "historian firing {firing_seq} is missing producer ids needed for reattach/publish"
-            ),
-            HistorianStateError::FingerprintMismatch { expected, found } => write!(
-                f,
-                "historian chunk fingerprint mismatch: expected {expected}, found {found}"
-            ),
-            HistorianStateError::Store(e) => write!(f, "store: {e}"),
-            HistorianStateError::Publish(e) => write!(f, "publish: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for HistorianStateError {}
 
 impl From<McStoreError> for HistorianStateError {
     fn from(e: McStoreError) -> Self {

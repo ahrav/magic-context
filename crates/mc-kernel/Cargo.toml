@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 gix = { workspace = true }
 semver = { workspace = true }
+thiserror = { workspace = true }
 
 [features]
 # Fault-injection and inspection helpers the kernel proofs drive. Gated so the

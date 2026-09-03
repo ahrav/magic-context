@@ -766,28 +766,15 @@ fn first_parent_blob_changes(
 }
 
 /// Typed non-answers raised from inside patch-ID computation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolveObstacle {
     /// Deadline exceeded or interrupt raised.
+    #[error("evaluation budget exhausted during anchor resolution")]
     BudgetExhausted,
     /// A required object could not be read from the object database.
+    #[error("required object unreadable during anchor resolution")]
     UnreadableObject,
 }
-
-impl std::fmt::Display for ResolveObstacle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BudgetExhausted => {
-                f.write_str("evaluation budget exhausted during anchor resolution")
-            }
-            Self::UnreadableObject => {
-                f.write_str("required object unreadable during anchor resolution")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ResolveObstacle {}
 
 fn budget_gate(budget: &EvalBudget) -> Result<(), ResolveObstacle> {
     if budget.is_exhausted() {

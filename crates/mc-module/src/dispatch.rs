@@ -256,47 +256,20 @@ impl MeasuredOutput<'_> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PreparedOutputError {
+    #[error("prepared body length {len} exceeds wire cap {max}")]
     BodyTooLarge { len: usize, max: usize },
+    #[error("prepared body length overflowed")]
     LengthOverflow,
+    #[error("transform envelope must contain a null ck_messages field")]
     InvalidTransformEnvelope,
-    Serialize(serde_json::Error),
-    Write(io::Error),
+    #[error("prepared JSON serialization failed: {0}")]
+    Serialize(#[source] serde_json::Error),
+    #[error("prepared body write failed: {0}")]
+    Write(#[source] io::Error),
+    #[error("prepared body length mismatch: measured {measured}, wrote {written}")]
     LengthMismatch { measured: usize, written: usize },
-}
-
-impl fmt::Display for PreparedOutputError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BodyTooLarge { len, max } => {
-                write!(f, "prepared body length {len} exceeds wire cap {max}")
-            }
-            Self::LengthOverflow => f.write_str("prepared body length overflowed"),
-            Self::InvalidTransformEnvelope => {
-                f.write_str("transform envelope must contain a null ck_messages field")
-            }
-            Self::Serialize(error) => write!(f, "prepared JSON serialization failed: {error}"),
-            Self::Write(error) => write!(f, "prepared body write failed: {error}"),
-            Self::LengthMismatch { measured, written } => write!(
-                f,
-                "prepared body length mismatch: measured {measured}, wrote {written}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PreparedOutputError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Serialize(error) => Some(error),
-            Self::Write(error) => Some(error),
-            Self::BodyTooLarge { .. }
-            | Self::LengthOverflow
-            | Self::InvalidTransformEnvelope
-            | Self::LengthMismatch { .. } => None,
-        }
-    }
 }
 
 impl From<io::Error> for PreparedOutputError {

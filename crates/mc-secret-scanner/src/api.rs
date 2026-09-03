@@ -175,49 +175,31 @@ impl ScanLimits {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConstructionError {
+    #[error("embedded scanner corpus digest mismatch")]
     CorpusDigestMismatch,
+    #[error("embedded scanner overlay digest mismatch")]
     OverlayDigestMismatch,
+    #[error("invalid embedded scanner rule document")]
     InvalidRuleDocument,
+    #[error("invalid embedded scanner rule identity")]
     InvalidRuleIdentity,
+    #[error("invalid embedded scanner rule pattern")]
     InvalidRulePattern,
+    #[error("invalid embedded scanner rule policy")]
     InvalidRulePolicy,
+    #[error("invalid scanner limits")]
     InvalidLimits,
 }
 
-impl fmt::Display for ConstructionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::CorpusDigestMismatch => "embedded scanner corpus digest mismatch",
-            Self::OverlayDigestMismatch => "embedded scanner overlay digest mismatch",
-            Self::InvalidRuleDocument => "invalid embedded scanner rule document",
-            Self::InvalidRuleIdentity => "invalid embedded scanner rule identity",
-            Self::InvalidRulePattern => "invalid embedded scanner rule pattern",
-            Self::InvalidRulePolicy => "invalid embedded scanner rule policy",
-            Self::InvalidLimits => "invalid scanner limits",
-        })
-    }
-}
-
-impl std::error::Error for ConstructionError {}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanError {
+    #[error("scanner input limit exceeded")]
     InputLimitExceeded,
+    #[error("scanner produced an invalid span")]
     InvalidSpan,
 }
-
-impl fmt::Display for ScanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::InputLimitExceeded => "scanner input limit exceeded",
-            Self::InvalidSpan => "scanner produced an invalid span",
-        })
-    }
-}
-
-impl std::error::Error for ScanError {}
 
 pub(crate) const REVISION: ScannerRevision = ScannerRevision {
     crate_version: env!("CARGO_PKG_VERSION"),

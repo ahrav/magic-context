@@ -25,16 +25,9 @@ use crate::handler::{
 /// Diagnostics report only the `ShutdownError` message's byte length under protocol V24.
 /// Reporting only the byte length prevents component detail from reaching host logs.
 /// A component may include detailed diagnostics in `ShutdownError` because host logs report only its byte length.
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
+#[error("component shutdown failed: {0}")]
 pub struct ShutdownError(pub String);
-
-impl std::fmt::Display for ShutdownError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "component shutdown failed: {}", self.0)
-    }
-}
-
-impl std::error::Error for ShutdownError {}
 
 /// `CompositeComponent` has no shared `initialize` method because each role has a different initialization input.
 pub trait CompositeComponent: Send + Sync + 'static {

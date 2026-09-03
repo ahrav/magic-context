@@ -316,86 +316,35 @@ impl HostConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
-    ZeroLimit {
-        name: &'static str,
-    },
+    #[error("host limit {name} must be nonzero")]
+    ZeroLimit { name: &'static str },
+    #[error("host limit {name} is {configured}; supported maximum is {maximum}")]
     LimitTooLarge {
         name: &'static str,
         configured: usize,
         maximum: usize,
     },
-    ZeroDuration {
-        name: &'static str,
-    },
-    DurationTooLarge {
-        name: &'static str,
-    },
+    #[error("host duration {name} must be nonzero")]
+    ZeroDuration { name: &'static str },
+    #[error("host duration {name} exceeds the supported maximum of {} seconds", MAX_CONFIG_DURATION.as_secs())]
+    DurationTooLarge { name: &'static str },
+    #[error("daemon_ver must be nonempty")]
     EmptyDaemonVer,
     /// The error carries only the offending length to keep diagnostics bounded.
-    InvalidPayloadDigest {
-        len: usize,
-    },
+    #[error("payload_manifest_digest must be 64 lowercase hex characters; got {len} bytes")]
+    InvalidPayloadDigest { len: usize },
+    #[error("daemon_ver makes auth/publication too large ({auth_message_bytes}/{connection_file_bytes} bytes)")]
     DaemonVerTooLarge {
         auth_message_bytes: usize,
         connection_file_bytes: usize,
     },
-    ResidentBytesBelowInteropMinimum {
-        configured: u64,
-        minimum: u64,
-    },
-    ResidentBytesTooLarge {
-        configured: u64,
-        maximum: u64,
-    },
+    #[error("max_resident_bytes {configured} is below the host floor {minimum} (one maximum frame plus the egress and scratch reservations); raise max_resident_bytes to at least {minimum}")]
+    ResidentBytesBelowInteropMinimum { configured: u64, minimum: u64 },
+    #[error("max_resident_bytes {configured} exceeds supported maximum {maximum}")]
+    ResidentBytesTooLarge { configured: u64, maximum: u64 },
 }
-
-impl std::fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ZeroLimit { name } => write!(f, "host limit {name} must be nonzero"),
-            Self::LimitTooLarge {
-                name,
-                configured,
-                maximum,
-            } => write!(
-                f,
-                "host limit {name} is {configured}; supported maximum is {maximum}"
-            ),
-            Self::ZeroDuration { name } => write!(f, "host duration {name} must be nonzero"),
-            Self::DurationTooLarge { name } => write!(
-                f,
-                "host duration {name} exceeds the supported maximum of {} seconds",
-                MAX_CONFIG_DURATION.as_secs()
-            ),
-            Self::EmptyDaemonVer => write!(f, "daemon_ver must be nonempty"),
-            Self::InvalidPayloadDigest { len } => write!(
-                f,
-                "payload_manifest_digest must be 64 lowercase hex characters; got {len} bytes"
-            ),
-            Self::DaemonVerTooLarge {
-                auth_message_bytes,
-                connection_file_bytes,
-            } => write!(
-                f,
-                "daemon_ver makes auth/publication too large ({auth_message_bytes}/{connection_file_bytes} bytes)"
-            ),
-            Self::ResidentBytesBelowInteropMinimum { configured, minimum } => write!(
-                f,
-                "max_resident_bytes {configured} is below the host floor {minimum} \
-                 (one maximum frame plus the egress and scratch reservations); \
-                 raise max_resident_bytes to at least {minimum}"
-            ),
-            Self::ResidentBytesTooLarge { configured, maximum } => write!(
-                f,
-                "max_resident_bytes {configured} exceeds supported maximum {maximum}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {}
 
 #[cfg(test)]
 mod tests {

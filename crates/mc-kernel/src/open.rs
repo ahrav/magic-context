@@ -35,29 +35,51 @@ const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 /// allocation size.
 const RESET_MARKER_MAX_BYTES: u64 = 64 * 1024;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum KernelError {
+    #[error("kernel store is held by another writer")]
     Held,
+    #[error("SQLite engine is unsupported for the kernel store")]
     EngineUnsupported,
+    #[error("kernel store path contains a foreign database family")]
     Foreign,
+    #[error("kernel store identity could not be established safely")]
     Inconclusive,
+    #[error("kernel store I/O failed")]
     Io,
+    #[error("kernel store lock was not acquired before the busy timeout")]
     Busy,
+    #[error("kernel store identity does not match this build")]
     IdentityMismatch,
+    #[error("kernel store writer fence was lost")]
     FenceLost,
+    #[error("kernel operation conflicts with an existing receipt")]
     Conflict,
+    #[error("kernel canonical row payload could not be decoded")]
     CorruptCanonicalRow,
+    #[error("kernel operation input is invalid")]
     InvalidInput,
+    #[error("kernel admission classification or transition is invalid")]
     AdmissionPolicy,
+    #[error("kernel snapshot is newer than the committed tip")]
     FutureSnapshot,
+    #[error("kernel object was not found")]
     NotFound,
+    #[error("outbox checkpoint is invalid")]
     InvalidCheckpoint,
+    #[error("outbox pruning requires at least one consumer")]
     NoRequiredConsumers,
+    #[error("outbox consumer has not reached the commit-log tip")]
     ConsumerPending,
+    #[error("kernel operation was interrupted")]
     Fault,
+    #[error("kernel operation exceeded its deadline")]
     Deadline,
+    #[error("backup destination is not a private local directory")]
     UnsafeDestination,
+    #[error("backup artifact failed verification")]
     InvalidBackup,
+    #[error("restore source failed verification")]
     InvalidRestore,
 }
 
@@ -68,42 +90,11 @@ impl KernelError {
     }
 }
 
-impl fmt::Display for KernelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Held => "kernel store is held by another writer",
-            Self::EngineUnsupported => "SQLite engine is unsupported for the kernel store",
-            Self::Foreign => "kernel store path contains a foreign database family",
-            Self::Inconclusive => "kernel store identity could not be established safely",
-            Self::Io => "kernel store I/O failed",
-            Self::Busy => "kernel store lock was not acquired before the busy timeout",
-            Self::IdentityMismatch => "kernel store identity does not match this build",
-            Self::FenceLost => "kernel store writer fence was lost",
-            Self::Conflict => "kernel operation conflicts with an existing receipt",
-            Self::CorruptCanonicalRow => "kernel canonical row payload could not be decoded",
-            Self::InvalidInput => "kernel operation input is invalid",
-            Self::AdmissionPolicy => "kernel admission classification or transition is invalid",
-            Self::FutureSnapshot => "kernel snapshot is newer than the committed tip",
-            Self::NotFound => "kernel object was not found",
-            Self::InvalidCheckpoint => "outbox checkpoint is invalid",
-            Self::NoRequiredConsumers => "outbox pruning requires at least one consumer",
-            Self::ConsumerPending => "outbox consumer has not reached the commit-log tip",
-            Self::Fault => "kernel operation was interrupted",
-            Self::Deadline => "kernel operation exceeded its deadline",
-            Self::UnsafeDestination => "backup destination is not a private local directory",
-            Self::InvalidBackup => "backup artifact failed verification",
-            Self::InvalidRestore => "restore source failed verification",
-        })
-    }
-}
-
 impl fmt::Debug for KernelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
     }
 }
-
-impl std::error::Error for KernelError {}
 
 pub struct KernelStore {
     writer: Mutex<Connection>,

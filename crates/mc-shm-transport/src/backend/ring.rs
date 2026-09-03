@@ -1862,32 +1862,44 @@ pub fn wire_v2_header(body_len: usize) -> Result<[u8; WIRE_V2_HEADER_BYTES], Pro
 }
 
 /// Producer reservation or commit failure.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum ProducerError {
     /// Reserved spans cannot cover requested bound.
+    #[error("producer bound exceeds legal spans")]
     BoundExceedsSpans,
     /// A write crossed checked capacity.
+    #[error("producer cursor overflow")]
     Overflow,
     /// Commit length exceeds reservation.
+    #[error("commit exceeds reservation")]
     CommitOutsideReservation,
     /// Cursor differs from exact commit length.
+    #[error("producer reservation is underfilled")]
     Underfill,
     /// Reservation was already aborted.
+    #[error("producer reservation is aborted")]
     Aborted,
     /// No descriptor or arena capacity is available.
+    #[error("bounded ring capacity is exhausted")]
     Exhausted,
     /// Backpressure deadline elapsed before publication.
+    #[error("bounded backpressure deadline elapsed")]
     Deadline,
     /// Sequence would wrap within incarnation.
+    #[error("release sequence exhausted")]
     SequenceExhausted,
     /// Wire header version or length disagrees with body.
+    #[error("wire header disagrees with committed body")]
     WireHeaderMismatch,
     /// Candidate is terminally quarantined.
+    #[error("transport storage is quarantined")]
     Quarantined,
     /// Arena planning failure.
-    Arena(ArenaError),
+    #[error("arena reservation failed")]
+    Arena(#[source] ArenaError),
     /// Ring state failure.
-    Ring(RingError),
+    #[error("ring operation failed")]
+    Ring(#[source] RingError),
 }
 
 impl fmt::Debug for ProducerError {
@@ -1896,99 +1908,53 @@ impl fmt::Debug for ProducerError {
     }
 }
 
-impl fmt::Display for ProducerError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::BoundExceedsSpans => "producer bound exceeds legal spans",
-            Self::Overflow => "producer cursor overflow",
-            Self::CommitOutsideReservation => "commit exceeds reservation",
-            Self::Underfill => "producer reservation is underfilled",
-            Self::Aborted => "producer reservation is aborted",
-            Self::Exhausted => "bounded ring capacity is exhausted",
-            Self::Deadline => "bounded backpressure deadline elapsed",
-            Self::SequenceExhausted => "release sequence exhausted",
-            Self::WireHeaderMismatch => "wire header disagrees with committed body",
-            Self::Quarantined => "transport storage is quarantined",
-            Self::Arena(_) => "arena reservation failed",
-            Self::Ring(_) => "ring operation failed",
-        })
-    }
-}
-
-impl std::error::Error for ProducerError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Arena(error) => Some(error),
-            Self::Ring(error) => Some(error),
-            _ => None,
-        }
-    }
-}
-
 /// Ring setup, validation, or receive failure.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum RingError {
     /// Offset or size arithmetic overflowed.
+    #[error("ring arithmetic overflow")]
     ArithmeticOverflow,
     /// Target profile does not select this layout.
+    #[error("target profile does not match ring backend")]
     ProfileMismatch,
     /// Runtime directory or shared object creation failed.
+    #[error("shared object setup failed")]
     ObjectSetupFailed,
     /// Owner, inode, size, type, mode, or seal validation failed.
+    #[error("shared object validation failed")]
     ObjectValidationFailed,
     /// Attachment grant is malformed or mismatched.
+    #[error("attachment grant is invalid")]
     InvalidGrant,
     /// Shared layout fields are invalid.
+    #[error("shared memory layout is invalid")]
     InvalidLayout,
     /// Shared state transition is impossible.
+    #[error("shared ring state is invalid")]
     InvalidSharedState,
     /// Eventfd creation, wait, read, or write failed.
+    #[error("ring doorbell failed")]
     DoorbellFailed,
     /// Sparse page removal failed.
+    #[error("shared arena page removal failed")]
     PageRemovalFailed,
     /// Release sequence would wrap.
+    #[error("release sequence exhausted")]
     SequenceExhausted,
     /// Candidate is terminally quarantined.
+    #[error("transport storage is quarantined")]
     Quarantined,
     /// Descriptor validation failed.
-    Descriptor(DescriptorError),
+    #[error("shared descriptor validation failed")]
+    Descriptor(#[source] DescriptorError),
     /// Lease construction failed.
-    Lease(LeaseError),
+    #[error("receive lease construction failed")]
+    Lease(#[source] LeaseError),
 }
 
 impl fmt::Debug for RingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, formatter)
-    }
-}
-
-impl fmt::Display for RingError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::ArithmeticOverflow => "ring arithmetic overflow",
-            Self::ProfileMismatch => "target profile does not match ring backend",
-            Self::ObjectSetupFailed => "shared object setup failed",
-            Self::ObjectValidationFailed => "shared object validation failed",
-            Self::InvalidGrant => "attachment grant is invalid",
-            Self::InvalidLayout => "shared memory layout is invalid",
-            Self::InvalidSharedState => "shared ring state is invalid",
-            Self::DoorbellFailed => "ring doorbell failed",
-            Self::PageRemovalFailed => "shared arena page removal failed",
-            Self::SequenceExhausted => "release sequence exhausted",
-            Self::Quarantined => "transport storage is quarantined",
-            Self::Descriptor(_) => "shared descriptor validation failed",
-            Self::Lease(_) => "receive lease construction failed",
-        })
-    }
-}
-
-impl std::error::Error for RingError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Descriptor(error) => Some(error),
-            Self::Lease(error) => Some(error),
-            _ => None,
-        }
     }
 }
 
