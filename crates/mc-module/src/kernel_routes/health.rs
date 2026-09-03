@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use mc_kernel::{KernelFacts, KernelStore, MAIN_FILE_WARN_BYTES};
+use mc_kernel::{KernelFacts, MAIN_FILE_WARN_BYTES};
 use serde::Serialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
