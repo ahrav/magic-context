@@ -238,7 +238,7 @@ pub enum HistorianProducerError {
     #[error("historian call {} ({:?}): {}", .0.code, .0.outcome, .0.message)]
     Call(HistorianCallFailure),
     #[error("json: {0}")]
-    Json(#[source] serde_json::Error),
+    Json(#[from] serde_json::Error),
     #[error("session.send did not return an active run_id")]
     MissingRunId,
     #[error("historian producer has no bound session")]
@@ -472,12 +472,6 @@ fn run_paused_message(run_id: &str, reason: Option<&str>) -> String {
     match reason {
         Some(reason) => format!("run {run_id} paused: {reason}"),
         None => format!("run {run_id} paused"),
-    }
-}
-
-impl From<serde_json::Error> for HistorianProducerError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Json(error)
     }
 }
 

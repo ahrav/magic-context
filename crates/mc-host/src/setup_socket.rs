@@ -88,7 +88,7 @@ pub enum PeerClose {
 #[derive(thiserror::Error, Debug)]
 pub enum SetupError {
     #[error("setup socket I/O failed")]
-    Io(#[source] io::Error),
+    Io(#[from] io::Error),
     #[error("setup socket deadline expired")]
     Timeout,
     #[error("setup socket message exceeds its bound")]
@@ -105,12 +105,6 @@ pub enum SetupError {
     DuplicateDescriptors,
     #[error("setup socket ancillary data was truncated")]
     TruncatedAncillary,
-}
-
-impl From<io::Error> for SetupError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
 }
 
 /// Sends one fixed six-descriptor grant in one `SCM_RIGHTS` message.

@@ -267,15 +267,9 @@ pub enum PreparedOutputError {
     #[error("prepared JSON serialization failed: {0}")]
     Serialize(#[source] serde_json::Error),
     #[error("prepared body write failed: {0}")]
-    Write(#[source] io::Error),
+    Write(#[from] io::Error),
     #[error("prepared body length mismatch: measured {measured}, wrote {written}")]
     LengthMismatch { measured: usize, written: usize },
-}
-
-impl From<io::Error> for PreparedOutputError {
-    fn from(error: io::Error) -> Self {
-        Self::Write(error)
-    }
 }
 
 fn checked_body_len(
