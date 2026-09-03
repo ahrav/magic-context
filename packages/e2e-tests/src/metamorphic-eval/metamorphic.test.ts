@@ -25,7 +25,7 @@ import {
     type LiveObservation,
     type LiveRole,
 } from "./live";
-import { buildMetamorphicReport, metamorphicExitCode, parseMetamorphicReport, type MetamorphicReport } from "./report";
+import { buildMetamorphicReport, metamorphicExitCode, parseMetamorphicReport, type MetamorphicReport, type MetamorphicReportEntry } from "./report";
 import { buildScriptedOutput, runDeterministicMetamorphicEval, DETERMINISTIC_SEEDS } from "./runner";
 import { TRANSFORMS, type Transform } from "./transforms";
 import {
@@ -119,6 +119,34 @@ function importancesOf(output: string): number[] {
     return [...output.matchAll(/ importance="(\d+)"/g)].map((match) => Number(match[1]));
 }
 
+/** Relabels a deterministic report's scored pairs as run-record scores, the shape the live runner emits. */
+function relabelScoredAsRunRecord(report: MetamorphicReport, system: SystemVersionTuple | null = null): void {
+    for (const entry of report.entries) {
+        if (entry.kind !== "scored") continue;
+        entry.baselineScore.source = "run-record";
+        entry.derivativeScore.source = "run-record";
+        if (system !== null) {
+            entry.baselineScore.system = system;
+            entry.derivativeScore.system = system;
+        }
+        const probe = { probeId: "probe-1", outcome: "pass" as const, expected: "yes", actual: "yes" };
+        entry.baselineScore.probeVerdicts = [probe];
+        entry.derivativeScore.probeVerdicts = [probe];
+        entry.invariants = entry.invariants.filter(({ invariant }) =>
+            invariant !== "expected-absent-empty" && invariant !== "verdict-monotonicity");
+    }
+}
+
+/** A scored control entry over a product pair's scores, at the fixed control coordinate. */
+function controlEntryFrom(entry: Extract<MetamorphicReportEntry, { kind: "scored" }>): MetamorphicReportEntry {
+    const control = structuredClone(entry);
+    control.transformId = "baseline-control";
+    control.transformVersion = 1;
+    control.seed = 0;
+    control.derivativeScore.scenarioId = control.scenarioId;
+    return control;
+}
+
 describe("deterministic metamorphic runner", () => {
     test("rejects an empty scenario input", () => {
         expect(() => runDeterministicMetamorphicEval([])).toThrow(
@@ -201,6 +229,12 @@ describe("deterministic metamorphic runner", () => {
         });
         expect(orphanDisagreement.system).toBeNull();
         expect(() => parseMetamorphicReport(orphanDisagreement)).toThrow(/report\.system: control-disagreement-requires-live-report/);
+        // A deadline report ends before the named role, so a finished green report cannot carry one.
+        const forgedDeadline = structuredClone(report);
+        forgedDeadline.tierInvalidReason = { kind: "deadline-exhausted", nextRole: "derivative" };
+        expect(() => parseMetamorphicReport(forgedDeadline)).toThrow(/report\.tierInvalidReason: deadline-prefix-invalid/);
+        forgedDeadline.tierInvalidReason = { kind: "deadline-exhausted", nextRole: "control-a" };
+        expect(() => parseMetamorphicReport(forgedDeadline)).toThrow(/report\.tierInvalidReason: deadline-prefix-invalid/);
         // The control coordinate is fixed for every entry kind, not only a scored pair.
         const strayControlSeed = structuredClone(invalid) as unknown as { entries: Record<string, unknown>[] };
         expect(strayControlSeed.entries[0]!.transformId).toBe("baseline-control");
@@ -377,16 +411,7 @@ describe("deterministic metamorphic runner", () => {
         // A raw-output report publishes no root tuple at all.
         expect(() => parseMetamorphicReport(rootMismatch)).toThrow(/report\.system: report-system-mismatch/);
         // Relabelled as a live report, the roles must still name the root's system.
-        for (const entry of rootMismatch.entries) {
-            if (entry.kind !== "scored") continue;
-            entry.baselineScore.source = "run-record";
-            entry.derivativeScore.source = "run-record";
-            const probe = { probeId: "probe-1", outcome: "pass" as const, expected: "yes", actual: "yes" };
-            entry.baselineScore.probeVerdicts = [probe];
-            entry.derivativeScore.probeVerdicts = [probe];
-            entry.invariants = entry.invariants.filter(({ invariant }) =>
-                invariant !== "expected-absent-empty" && invariant !== "verdict-monotonicity");
-        }
+        relabelScoredAsRunRecord(rootMismatch);
         // A live report carries its stability control before any product pair.
         expect(() => parseMetamorphicReport(rootMismatch)).toThrow(/report\.entries: control-pair-required/);
         const rootEntry = rootMismatch.entries[scoredIndex]!;
@@ -394,12 +419,7 @@ describe("deterministic metamorphic runner", () => {
         const otherSystem = { ...systemTuple(), historianModelId: "another-model" };
         rootEntry.baselineScore.system = otherSystem;
         rootEntry.derivativeScore.system = otherSystem;
-        const control = structuredClone(rootEntry);
-        control.transformId = "baseline-control";
-        control.transformVersion = 1;
-        control.seed = 0;
-        control.derivativeScore.scenarioId = control.scenarioId;
-        rootMismatch.entries.push(control);
+        rootMismatch.entries.push(controlEntryFrom(rootEntry));
         rootMismatch.entries.sort((left, right) =>
             `${left.scenarioId}\u0000${left.transformId}`.localeCompare(`${right.scenarioId}\u0000${right.transformId}`));
         expect(() => parseMetamorphicReport(rootMismatch)).toThrow(/report\.entries\[\d+\]: report-system-mismatch/);
@@ -1336,6 +1356,23 @@ describe("live metamorphic control tier", () => {
         expect(report.tierInvalidReason).toEqual({ kind: "deadline-exhausted", nextRole: "control-b" });
         expect(progress.at(-1)?.tierInvalidReason).toEqual(report.tierInvalidReason);
         expect(metamorphicExitCode(report)).toBe(1);
+        expect(parseMetamorphicReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
+    });
+
+    test("a deadline before a product role leaves a scored control and an unfinished coordinate", () => {
+        const live = runDeterministicMetamorphicEval(corpus(), { transforms: [reorder()], seeds: [DETERMINISTIC_SEEDS[0]!] });
+        live.system = systemTuple();
+        relabelScoredAsRunRecord(live, systemTuple());
+        const scoredIndex = live.entries.findIndex((entry) => entry.kind === "scored");
+        const scored = live.entries[scoredIndex]!;
+        if (scored.kind !== "scored") throw new Error("unreachable");
+        live.entries.unshift(controlEntryFrom(scored));
+        live.tierInvalidReason = { kind: "deadline-exhausted", nextRole: "derivative" };
+        // Every applied coordinate has its entry, so nothing was left unfinished.
+        expect(() => parseMetamorphicReport(live)).toThrow(/report\.tierInvalidReason: deadline-prefix-invalid/);
+        // The pair whose derivative the deadline pre-empted has no entry yet.
+        live.entries.splice(scoredIndex + 1, 1);
+        expect(parseMetamorphicReport(JSON.parse(JSON.stringify(live)))).toEqual(live);
     });
 
     test("rejects report destinations that reserve another run's auxiliary names", () => {
@@ -1498,6 +1535,7 @@ describe("live metamorphic control tier", () => {
 
         expect(roles).toEqual([]);
         expect(report.tierInvalidReason).toEqual({ kind: "deadline-exhausted", nextRole: "control-a" });
+        expect(parseMetamorphicReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
     });
 
     test("budgets every declared historian run in a role", () => {

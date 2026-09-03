@@ -557,12 +557,12 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     // is backed by at least that many. The bound is not an equality: a transform that throws during admission
     // also leaves an `error` entry without counting as applied, and the archive does not say which errors
     // were those. A tier-invalid run keeps its scheduled coverage over a partial entry set.
+    const backed = new Map<string, number>();
+    for (const entry of report.entries) {
+        if (entry.kind === "lint-red" || entry.transformId === CONTROL_TRANSFORM_ID) continue;
+        backed.set(entry.scenarioId, (backed.get(entry.scenarioId) ?? 0) + 1);
+    }
     if (report.tierInvalidReason === null) {
-        const backed = new Map<string, number>();
-        for (const entry of report.entries) {
-            if (entry.kind === "lint-red" || entry.transformId === CONTROL_TRANSFORM_ID) continue;
-            backed.set(entry.scenarioId, (backed.get(entry.scenarioId) ?? 0) + 1);
-        }
         for (const [index, row] of report.coverage.entries()) {
             if (row.applied > (backed.get(row.scenarioId) ?? 0)) p.fail(`report.coverage[${index}].applied: derived-mismatch`);
             // Both producers record this violation whenever nothing applied.
@@ -589,6 +589,23 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
         if (controls.length !== 1 || controls[0]!.kind !== "error") p.fail(`report.tierInvalidReason: ${controlKind}-entry-required`);
         if (controlKind === "control-disagreement" && report.system === null) {
             p.fail("report.system: control-disagreement-requires-live-report");
+        }
+    }
+    // The live runner reports an exhausted deadline before the named role starts. The control entry is appended
+    // only after both controls ran, and product pairs run only after that entry is scored, so a control role
+    // leaves no control entry and a product role leaves an applied coordinate with no entry yet.
+    if (report.tierInvalidReason?.kind === "deadline-exhausted") {
+        const controls = report.entries.filter((entry) => entry.transformId === CONTROL_TRANSFORM_ID);
+        const { nextRole } = report.tierInvalidReason;
+        if (nextRole === "control-a" || nextRole === "control-b") {
+            if (controls.length !== 0 || report.entries.some((entry) => entry.kind === "scored")) {
+                p.fail("report.tierInvalidReason: deadline-prefix-invalid");
+            }
+        } else {
+            if (controls.length !== 1 || controls[0]!.kind !== "scored") p.fail("report.tierInvalidReason: deadline-prefix-invalid");
+            if (!report.coverage.some((row) => row.applied > (backed.get(row.scenarioId) ?? 0))) {
+                p.fail("report.tierInvalidReason: deadline-prefix-invalid");
+            }
         }
     }
     // The live runner records this reason only when nothing was admitted and nothing was scored.

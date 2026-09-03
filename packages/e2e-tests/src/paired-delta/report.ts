@@ -241,7 +241,7 @@ export function buildPairedDeltaReport(input: {
         Object.values(input.runSummary.refusedRegretLadders).some((count) =>
             !Number.isSafeInteger(count) || count < 1) ||
         !Number.isSafeInteger(input.runSummary.plannedCoordinates) ||
-        input.runSummary.plannedCoordinates < 0 ||
+        input.runSummary.plannedCoordinates < 1 ||
         !Number.isSafeInteger(input.runSummary.healthyCoordinates) ||
         input.runSummary.healthyCoordinates < 0 ||
         input.runSummary.healthyCoordinates > input.runSummary.plannedCoordinates

@@ -334,6 +334,10 @@ describe("paired-delta report", () => {
                 finalAttemptTurnsByArm: { "mc-on": 4, "mc-off": 3, compaction: 3 },
             },
         })).toThrow(/metric-arm-missing-invalidSuccessRateByArm-compaction/);
+        // The parser requires a positive plan, so the builder refuses an empty one too.
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, plannedCoordinates: 0, healthyCoordinates: 0 },
+        })).toThrow(/run-summary-invalid/);
     });
 
     it("separates a schema mismatch from a fingerprint mismatch when publishing", () => {

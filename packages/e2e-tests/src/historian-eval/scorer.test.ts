@@ -836,6 +836,21 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("a blank record scenario id is a shape error carrying the unknown id", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            // `parseScenarioScore` admits only a non-blank id, so the score must not carry the blank through.
+            const score = scoreRunRecord({ ...record, scenarioId: "   " }, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-malformed");
+            expect(score.scenarioId).toBe("<unknown>");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("a record paired with a different scenario is ERROR, never a misattributed verdict", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {

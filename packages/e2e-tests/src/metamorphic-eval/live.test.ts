@@ -493,7 +493,7 @@ describe("live metamorphic orchestration", () => {
         // sink, so the caller sees the terminal report rather than having to infer
         // it from the return value.
         expect(progress).toEqual([0, 1, 1]);
-        expect(report.tierInvalidReason).toEqual(expect.objectContaining({ kind: "deadline-exhausted" }));
+        expect(report.tierInvalidReason).toEqual({ kind: "deadline-exhausted", nextRole: "derivative" });
         expect(metamorphicExitCode(report)).toBe(1);
     });
 

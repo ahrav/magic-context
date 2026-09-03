@@ -763,13 +763,18 @@ function isIdentityValue(value: unknown): boolean {
     return typeof value === "string" && value.trim().length > 0;
 }
 
+/** The id a malformed record's ERROR score carries; `parseScenarioScore` admits only a non-blank id. */
+function recordScenarioId(record: { scenarioId?: unknown }): string {
+    return typeof record.scenarioId === "string" && record.scenarioId.trim().length > 0 ? record.scenarioId : "<unknown>";
+}
+
 function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null {
     if (record === null || typeof record !== "object" || Array.isArray(record)) {
         return errorScore("<unknown>", "record-malformed", `run record is not an object: ${typeof record}`, null);
     }
     if (record.schema !== RUN_RECORD_SCHEMA) {
         return errorScore(
-            typeof record.scenarioId === "string" && record.scenarioId.length > 0 ? record.scenarioId : "<unknown>",
+            recordScenarioId(record),
             "record-schema-unsupported",
             `run record schema ${JSON.stringify(record.schema)} is not ${RUN_RECORD_SCHEMA}`,
             null,
@@ -778,7 +783,7 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
     const isPair = (value: unknown): boolean =>
         Array.isArray(value) && value.length === 2 && value.every((entry) => typeof entry === "number");
     const problems: string[] = [];
-    if (typeof record.scenarioId !== "string" || record.scenarioId.length === 0) problems.push("scenarioId");
+    if (typeof record.scenarioId !== "string" || record.scenarioId.trim().length === 0) problems.push("scenarioId");
     if (typeof record.scenarioFingerprint !== "string") problems.push("scenarioFingerprint");
     if (typeof record.triggerFingerprint !== "string") problems.push("triggerFingerprint");
     if (typeof record.sessionId !== "string") problems.push("sessionId");
@@ -866,7 +871,7 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
     if (record.error !== null && typeof record.error?.reason !== "string") problems.push("error");
     if (problems.length === 0) return null;
     return errorScore(
-        typeof record.scenarioId === "string" ? record.scenarioId : "<unknown>",
+        recordScenarioId(record),
         "record-malformed",
         `run record field(s) have the wrong shape: [${problems.join(", ")}]`,
         null,
