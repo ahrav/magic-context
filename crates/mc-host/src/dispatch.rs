@@ -1,5 +1,6 @@
-//! This module dispatches requests and orchestrates first-terminal-wins settlement and route/generation closure.
-//! close orchestration.
+//! Dispatches requests and coordinates first-terminal-wins settlement.
+//!
+//! Route and generation closure wait for dispatch work to stop before handler cleanup.
 //!
 //! Logical settlement is distinct from socket-write outcome:
 //! `Settlement` records which terminal won; the writer reports whether bytes were sent.
@@ -23,11 +24,11 @@ use crate::routing::{BindInstall, CloseDecision};
 use crate::runtime::HostShared;
 use crate::wire::{encode_owned_frame, pure_header_flags, response_flags, FrameId};
 
-/// `Settlement` arbitrates first-terminal-wins settlement for one correlation.
+/// Arbitrates first-terminal-wins settlement for one correlation.
 ///
-/// `order` prevents stream items from being queued after a terminal.
-/// `order` makes the `won` check race-free.
-/// `won` flips exactly once when handler completion, cancellation, route close, or teardown arrives first.
+/// `order` makes the `won` check race-free and prevents stream items from being
+/// queued after a terminal. `won` flips once when handler completion,
+/// cancellation, route closure, or teardown arrives first.
 pub struct Settlement {
     won: AtomicBool,
     order: tokio::sync::Mutex<()>,
@@ -38,6 +39,7 @@ pub struct Settlement {
 }
 
 impl Settlement {
+    /// Creates an unsettled correlation shared by dispatch and cancellation paths.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             won: AtomicBool::new(false),
@@ -46,6 +48,7 @@ impl Settlement {
         })
     }
 
+    /// Returns whether any terminal path has won.
     pub fn is_settled(&self) -> bool {
         self.won.load(Ordering::SeqCst)
     }
@@ -55,16 +58,20 @@ impl Settlement {
     }
 }
 
+/// Terminal outcome emitted for one request correlation.
 pub enum Terminal {
+    /// Unary response body and its binary-content flag.
     Response {
         body: OutputBuffer,
         binary: bool,
     },
+    /// Structured protocol error with an optional retry delay.
     Error {
         code: String,
         message: String,
         retry_after_ms: Option<u64>,
     },
+    /// Successful end of a streamed response.
     StreamEnd,
 }
 
@@ -197,8 +204,8 @@ async fn charged_error_body(
     ))
 }
 
-/// Writing directly to `buf` avoids allocating a `serde_json::Value`.
-/// models exactly.
+/// Writes an error envelope directly into `buf` without allocating a
+/// `serde_json::Value`.
 fn error_body_json_into(
     mut buf: Vec<u8>,
     code: &str,
@@ -597,8 +604,8 @@ pub async fn handle_host_shutdown<H: McHostHandler>(
     corr: u64,
 ) {
     loop {
-        // A reopen between `try_own` and the first poll must be handled because `notify_waiters` wakes only enabled or polled futures.
-        // forever.
+        // Enable the change future before `try_own`: `notify_waiters` wakes only
+        // enabled or polled futures, so a reopen in between could otherwise be lost.
         let changed = shared.shutdown_latch.changed();
         tokio::pin!(changed);
         changed.as_mut().enable();
@@ -749,8 +756,10 @@ pub(crate) async fn emit_authoritative_rejection<H: McHostHandler>(
         .await;
 }
 
+/// Dispatches one request after route and capacity admission succeed.
 ///
-/// Route lookup proves `unknown_channel` without consuming capacity; capacity rejections prove no dispatch; only then is the single handler task spawned.
+/// Route lookup proves `unknown_channel` without consuming capacity. Capacity
+/// rejection proves no dispatch occurred. Only then does this spawn one handler task.
 pub async fn dispatch_request<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
@@ -948,7 +957,7 @@ pub async fn dispatch_request<H: McHostHandler>(
                         message,
                         retry_after_ms,
                     }) => {
-                        // max_pending_requests settlements.
+                        // Bound diagnostics retained while this settlement waits for egress.
                         bounded_terminal_error(code, message, retry_after_ms)
                     }
                     Ok(RequestOutcome::Streamed) => Terminal::StreamEnd,
@@ -1075,14 +1084,14 @@ pub async fn open_route<H: McHostHandler>(
                 }
             }
             BindInstall::CloseWins => {
-                // (protocol AE8).
+                // Close won installation, so route-gone must run before finalization (protocol AE8).
                 if run_route_gone(&shared, handle).await {
                     shared.registry.finalize_close(handle);
                 }
             }
         },
         crate::handler::BindOutcome::Reject { code, message } => {
-            // request-error terminals.
+            // Apply the same diagnostic bounds as request-error terminals.
             let (code, message) =
                 if code.len() > MAX_TERMINAL_CODE_LEN || message.len() > MAX_TERMINAL_MESSAGE_LEN {
                     (
@@ -1114,7 +1123,7 @@ pub async fn open_route<H: McHostHandler>(
     }
 }
 
-///
+/// Runs the route-gone callback at most once and reports whether shutdown permits finalization.
 async fn run_route_gone<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     handle: RouteHandle,
@@ -1150,7 +1159,7 @@ pub async fn settle_route<H: McHostHandler>(
     settle_route_work(shared, handle, shared.registry.begin_close(handle)).await
 }
 
-/// stall them.
+/// Settles an owned close decision and completes route cleanup when work stops.
 pub(crate) async fn close_route_decision<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     handle: RouteHandle,
@@ -1208,9 +1217,8 @@ pub(crate) async fn settle_route_work<H: McHostHandler>(
                     .await
                     .is_err()
                 {
-                    // If `tracker.wait()` times out, request code may still execute; do not run route-gone.
-                    // Running route-gone while request code executes races handler cleanup and channel finalization.
-                    // is terminating.
+                    // If `tracker.wait()` times out, request code may still execute.
+                    // Do not race it with handler cleanup and channel finalization.
                     shared.fatal.trip(
                         &shared.shutdown,
                         "dispatch task did not stop before route-gone".to_owned(),
@@ -1312,6 +1320,7 @@ pub async fn send_connection_goodbye(gen: Arc<GenerationCore>, deadline: tokio::
     }
 }
 
+/// Cancels a pending correlation unless a terminal has already won.
 pub fn handle_cancel(gen: &GenerationCore, key: PendingKey) {
     let pending = gen.pending.lock().expect("pending lock");
     if let Some(entry) = pending.get(&key) {

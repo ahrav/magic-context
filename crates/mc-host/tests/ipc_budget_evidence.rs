@@ -102,8 +102,6 @@ fn write_complete(
     }
     let m = attempt.manifest_mut();
     m.histogram = Some(HistogramConfig::default());
-    // Pairing spans arms with different collection schemas; merges within one arm require equal collections.
-    // collection equality.
     m.collection = Some(serde_json::json!({"fixture_arm": arm}));
     m.results = Some(results);
     attempt.finalize(State::Complete).unwrap();
@@ -162,9 +160,6 @@ fn interrupted_attempt_is_retained_and_excluded() {
 
     assert!(evidence::load_attempts(dir.path()).unwrap().is_empty());
 
-    // The interrupt trap finalizes interrupted attempts; they remain available for diagnosis and never aggregate.
-    // The rename atomically publishes and consumes the temporary file.
-    // The rename atomically publishes and consumes the temporary file.
     let finalized = evidence::finalize_interrupted(dir.path()).unwrap();
     assert_eq!(finalized.len(), 1);
     assert!(!attempt_dir.join(evidence::RUNNING_MANIFEST).exists());
@@ -215,10 +210,6 @@ fn sidecar_corruption_blocks_aggregation() {
 
 #[test]
 fn incompatible_manifests_never_merge_or_pair() {
-    // Each incompatibility axis independently rejects histogram merging and gap pairing.
-    // Load rejects schema mismatches because equal foreign schemas would pass pairwise checks.
-    // Load rejects schema mismatches because equal foreign schemas would pass pairwise checks.
-    // check.
     for (name, mutate) in [
         (
             "build",
@@ -317,7 +308,6 @@ fn arm_mismatch_blocks_merge_but_gap_join_survives() {
     );
     let loaded = evidence::load_attempts(dir.path()).unwrap();
 
-    // own attempts.
     let atomic_arm = ArmId {
         name: ARM_ATOMIC.to_owned(),
         class: Some("same-l3".to_owned()),
@@ -349,8 +339,6 @@ fn gap_join_requires_matching_block_and_pair() {
         &[500],
         serde_json::json!({"median_batch_rtt_ns": 500.0}),
     );
-    // Neither serial attempt joins: the block-2 attempt and pair-(2, 3) attempt both mismatch the atomic attempt.
-    // Neither serial attempt joins: the block-2 attempt and pair-(2, 3) attempt both mismatch the atomic attempt.
     write_complete(
         dir.path(),
         ARM_RING_SERIAL,
@@ -369,10 +357,6 @@ fn gap_join_requires_matching_block_and_pair() {
         &[20_000],
         serde_json::json!({"p50_ns": serial_p50(&[20_000])}),
     );
-    // A serial attempt joins only when its topology class matches the atomic attempt's class.
-    // A physical pair can validate for both topology classes when its nodes share an L3 under sub-NUMA clustering.
-    // Observations from different topology classes are not comparable.
-    // not comparable.
     let mut cross = manifest(ARM_RING_SERIAL, 1, Some((0, 1)));
     cross.arm.class = Some("cross-numa".to_owned());
     let mut attempt = Attempt::begin(dir.path(), "serial-cross-b01", cross).unwrap();

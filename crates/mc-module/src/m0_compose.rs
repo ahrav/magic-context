@@ -46,7 +46,7 @@ impl From<McStoreError> for M0ComposeError {
     }
 }
 
-/// `M0Composition` holds bytes and watermarks that HARD persists atomically in `ModuleMeta`.
+/// Frozen m0 bytes and watermarks persisted atomically by a HARD pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct M0Composition {
     /// `m0_bytes` contains docs, the profile, decayed compartments, and memories.
@@ -63,6 +63,7 @@ pub struct M0Composition {
     pub first_covered_ordinal: Option<u64>,
     /// `folded_compartment_seq` advances only on a HARD.
     pub folded_compartment_seq: i64,
+    /// Revision locators for claims included in `m0_bytes`.
     pub rendered_revision_locators: Vec<String>,
     /// The claim rows supply this generation vector.
     pub claim_snapshot_vector: Option<SnapshotVector>,
@@ -71,6 +72,7 @@ pub struct M0Composition {
     pub docs_hash: String,
 }
 
+/// Capability-gated mural input supplied by the host.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct M0MuralInput {
     #[serde(default)]
@@ -83,17 +85,17 @@ pub struct M0MuralInput {
     pub content_hash: Option<String>,
 }
 
+/// Mural payload appended to the composed OpenCode context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct M0MuralBlock {
     pub data_url: String,
     pub content_hash: String,
 }
 
-/// config).
+/// Frozen inputs for one deterministic m0 composition.
 pub struct M0ComposeInputs<'a> {
     pub session_id: &'a str,
-    /// `project_path` comes from the route binding; the request body cannot override it.
-    /// request body).
+    /// `project_path` comes from route binding and cannot be overridden by request content.
     pub project_path: &'a str,
     /// `project_directory` identifies the directory containing `ARCHITECTURE.md` and `STRUCTURE.md`.
     pub project_directory: &'a str,
@@ -101,8 +103,7 @@ pub struct M0ComposeInputs<'a> {
     /// `history_budget_tokens` limits frozen rendering.
     /// The renderer produces estimator-independent output when all compartments fit.
     pub history_budget_tokens: f64,
-    /// Passing system-role content covered by the current fold keeps m0 composition deterministic and replayable.
-    /// replayable.
+    /// System-role content covered by the current fold.
     pub covered_system_messages: &'a [String],
     /// Disabled memory removes both project memories and the user-profile memory block.
     pub memory_enabled: bool,
@@ -269,6 +270,7 @@ fn render_m0_with_decay_pressure_retry(
     m0_bytes
 }
 
+/// Composes m0 from durable state and a frozen claim-mirror snapshot.
 pub fn compose_m0_from_claim_mirror(
     store: &McStore,
     inputs: &M0ComposeInputs<'_>,
