@@ -339,6 +339,10 @@ fn window(input: &str, start: usize, end: usize) -> Result<&str, RedactionError>
 }
 
 /// The overlap contains a complete maximum-size finding footprint, so at least one window scans each finding intact.
+///
+/// A match longer than the overlap can span two windows without either window containing the match whole;
+/// the windowed scan cannot see such a match. Only matches seen whole by one window are either reported
+/// or fail the scan closed with `MatchLimit`.
 pub const WINDOW_OVERLAP_BYTES: usize = 96 * 1024;
 
 const _: () = assert!(
