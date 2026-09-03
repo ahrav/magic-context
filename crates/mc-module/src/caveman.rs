@@ -814,8 +814,9 @@ fn normalize_whitespace(text: &str) -> String {
     output
 }
 
-/// Compresses prose while preserving code, URLs, paths, identifiers, hashes, tags, and `U: ` lines.
+/// Compresses prose while preserving fenced and inline code, `http` and `https` URLs, numbered `§` tags, recognized prefixed identifiers, hashes, paths ending in a short extension, and `U: ` lines.
 ///
+/// Other shapes are compressed, so a bare XML-style tag or an extensionless path such as `/tmp/session` is shortened like prose.
 /// Transformations run in fixed pass order. Output is trimmed; internal ASCII whitespace is
 /// normalized; newline runs contain at most two newlines.
 pub fn compress(text: &str, level: CavemanLevel) -> String {

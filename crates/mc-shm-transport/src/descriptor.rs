@@ -153,7 +153,7 @@ impl ReleaseIdentity {
         self.lane
     }
 
-    /// Returns the nonzero sequence number.
+    /// Returns the raw sequence number without validation, so it is zero when `new` received zero; [`FrameDescriptor::validate`] is what rejects a zero sequence.
     pub const fn sequence(self) -> u64 {
         self.sequence
     }

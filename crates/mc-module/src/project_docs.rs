@@ -62,7 +62,8 @@ fn read_safe_canonical(path: &Path) -> Option<String> {
 
 /// Reads configured project documents and returns their deterministic rendering.
 ///
-/// Missing, non-regular, oversized, unreadable, and non-UTF-8 files are skipped.
+/// Missing, non-regular, unreadable, and non-UTF-8 files are skipped, as are files over 256 KiB at either metadata check.
+/// A file replaced or grown after the second check is read in full, so the size cap does not hold against a concurrent writer.
 /// The hash covers canonical unescaped content in fixed filename order, while
 /// `rendered_block` XML-escapes file names and content. This function does not
 /// panic for filesystem or decoding failures.

@@ -65,7 +65,8 @@ const LOCAL_FILESYSTEMS: &[u64] = &[
 pub struct BackupRequest {
     /// Private directory that receives the published backup.
     pub destination_directory: PathBuf,
-    /// Deadline for capture, copy, verification, and publication.
+    /// The backup checks `deadline` before the writer lock and around capture, copy, and verification.
+    /// Destination validation runs before the first check, and publication with its directory sync runs after the last, so a backup can finish after `deadline`.
     pub deadline: Instant,
     /// Optional expiration time for evidence pins created by the capture.
     pub capture_pin_expires_at: Option<i64>,

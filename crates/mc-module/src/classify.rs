@@ -110,7 +110,7 @@ fn classify_body(text: &str) -> Option<&str> {
         .map(|body| body.as_str())
 }
 
-/// Validates manifest shape, field vocabulary, and exact claim coverage.
+/// Validates manifest shape and exact claim coverage, and rejects an unknown `scope`, but does not range-check `importance`, reject an unrecognized shareability value, or reject unknown attributes.
 ///
 /// Identity is the opaque public claim ID in each `claim` attribute. Claim IDs
 /// are validated before other entry fields, so diagnostics never echo arbitrary
