@@ -2340,7 +2340,8 @@ pub const DECLARED_RETAINED_RESIDENT_BYTES: u64 = TRANSFORM_SERVE_CACHE_COMBINED
     + BOUNDARY_TOKEN_CACHE_BUDGET_BYTES as u64
     + STATE_IMPORT_MAX_STAGED_BYTES as u64
     + transform::TAG_CACHE_COMBINED_BUDGET_BYTES as u64
-    + kernel_routes::ingest::MAX_STAGED_BYTES;
+    + kernel_routes::ingest::MAX_STAGED_BYTES
+    + kernel_routes::eligibility::CACHE_BUDGET_BYTES;
 
 #[derive(Debug, Clone)]
 struct NativeDeltaFrontier {

@@ -14,6 +14,7 @@
 //! declared digest has been checked, the same way an in-process caller sees it.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -28,7 +29,8 @@ use serde_json::{json, Value};
 
 use super::project::IntentRequest;
 use super::{
-    blocking, kernel_response, state_only, InvalidReason, KernelOutcome, UnavailableReason,
+    blocking, kernel_response, state_only, InvalidReason, KernelOpenCoordinator, KernelOutcome,
+    UnavailableReason,
 };
 use crate::dispatch::PreparedOutcome;
 use crate::{sha256_hex, McHandler};
@@ -52,6 +54,11 @@ pub const PAGE_BYTES_MAX: u64 = 16 * MIB;
 /// already counts the trailing `=` padding; valid longer input represents
 /// more decoded bytes and is rejected before decoding.
 pub const PAGE_BASE64_BYTES_MAX: usize = (PAGE_BYTES_MAX as usize).div_ceil(3) * 4;
+/// Pages one upload may declare. Every page costs a map node, a digest, and
+/// its own allocation on top of the bytes it carries, and the staging budget
+/// charges only the bytes, so the count is bounded on its own. An upload at
+/// the allowance needs five pages of [`PAGE_BYTES_MAX`].
+pub const PAGE_COUNT_MAX: u32 = 1024;
 /// Uploads in flight across every route.
 pub const MAX_PENDING_UPLOADS: usize = 4;
 /// Declared bytes staged across every route; every pending upload may be at
@@ -170,6 +177,9 @@ fn is_sha256_hex(value: &str) -> bool {
 }
 
 fn layout_is_possible(total_bytes: u64, page_count: u32) -> bool {
+    if page_count > PAGE_COUNT_MAX {
+        return false;
+    }
     let page_count = u64::from(page_count);
     page_count >= 1 && page_count <= total_bytes && total_bytes <= page_count * PAGE_BYTES_MAX
 }
@@ -376,6 +386,22 @@ impl UploadCoordinator {
     }
 }
 
+/// Releases an upload's staging reservation when dropped. The guard travels
+/// into the blocking finish work with the payload, so the release happens
+/// when that work ends, whether or not the handler future that spawned it is
+/// still being polled: a dropped `spawn_blocking` handle does not stop its
+/// worker, and a handler cancelled mid-finish would otherwise never release.
+struct StagingReservation {
+    kernel: Arc<KernelOpenCoordinator>,
+    bytes: u64,
+}
+
+impl Drop for StagingReservation {
+    fn drop(&mut self) {
+        self.kernel.uploads().release(self.bytes);
+    }
+}
+
 /// Concatenates the pages in index order and ingests the result when it
 /// hashes to the declared digest; the mismatch leaves nothing in the kernel.
 fn finish_upload(store: &KernelStore, upload: Upload) -> Result<ArtifactHandle, KernelOutcome> {
@@ -426,7 +452,7 @@ impl McHandler {
         }
         if !layout_is_possible(parsed.total_bytes, parsed.page_count) {
             return crate::invalid_params_error(format!(
-                "{BEGIN} page_count must be between 1 and total_bytes, \
+                "{BEGIN} page_count must be between 1 and min(total_bytes, {PAGE_COUNT_MAX}), \
                  and total_bytes at most page_count * {PAGE_BYTES_MAX}"
             ));
         }
@@ -567,10 +593,17 @@ impl McHandler {
             Ok(upload) => upload,
             Err(reason) => return state_only(KernelOutcome::invalid(reason)),
         };
-        let total_bytes = upload.total_bytes;
+        let reservation = StagingReservation {
+            kernel: Arc::clone(&self.kernel),
+            bytes: upload.total_bytes,
+        };
         let store = scope.store;
-        let finished = blocking(move || finish_upload(&store, upload)).await;
-        self.kernel.uploads().release(total_bytes);
+        let finished = blocking(move || {
+            let finished = finish_upload(&store, upload);
+            drop(reservation);
+            finished
+        })
+        .await;
         match finished {
             Ok(Ok(handle)) => kernel_response(
                 &KernelOutcome::Available,

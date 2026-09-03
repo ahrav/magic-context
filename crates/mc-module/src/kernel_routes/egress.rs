@@ -11,7 +11,7 @@ use mc_kernel::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::project::{ProjectBinding, ScopeFilter};
+use super::project::{stored_terms, ProjectBinding, ScopeFilter};
 use super::{blocking, kernel_response, state_only, KernelOutcome};
 use crate::dispatch::PreparedOutcome;
 use crate::McHandler;
@@ -135,8 +135,8 @@ fn evaluate(
         .is_some_and(|digest| digest == request.artifact_digest);
     let scope_id = owner.and_then(|state| state.scope_id.as_deref());
     let scope_matches = cites_artifact
-        && ScopeFilter::new(project, store)
-            .matches(scope_id)
+        && ScopeFilter::new(project)
+            .matches(scope_id, &mut stored_terms(store))
             .map_err(KernelOutcome::from)?;
     Ok(decide_egress(
         &facts,

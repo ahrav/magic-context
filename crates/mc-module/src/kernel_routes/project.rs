@@ -111,18 +111,31 @@ impl IntentRequest {
     }
 }
 
+/// The stored terms of one scope, or `None` when no scope row exists.
+pub(crate) type ScopeTerms<'a> =
+    dyn FnMut(&str) -> Result<Option<Vec<ScopeTermSpec>>, KernelError> + 'a;
+
+/// Loads scope terms from the store's own read snapshot.
+pub(crate) fn stored_terms(
+    store: &KernelStore,
+) -> impl FnMut(&str) -> Result<Option<Vec<ScopeTermSpec>>, KernelError> + '_ {
+    move |scope_id| match store.scope_terms(scope_id) {
+        Ok(terms) => Ok(Some(terms)),
+        Err(KernelError::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Answers whether a row's scope names the bound project, remembering each
 /// scope's verdict for the duration of one request.
-pub(crate) struct ScopeFilter<'a> {
-    store: &'a KernelStore,
+pub(crate) struct ScopeFilter {
     context: ScopeMatchContext,
     verdicts: HashMap<String, bool>,
 }
 
-impl<'a> ScopeFilter<'a> {
-    pub(crate) fn new(project: &ProjectBinding, store: &'a KernelStore) -> Self {
+impl ScopeFilter {
+    pub(crate) fn new(project: &ProjectBinding) -> Self {
         Self {
-            store,
             context: project.match_context(),
             verdicts: HashMap::new(),
         }
@@ -133,21 +146,23 @@ impl<'a> ScopeFilter<'a> {
     /// match every project's route. An `Uncertain` verdict (a redacted term,
     /// a term on a dimension the route has no value for, a malformed scope)
     /// and a scope with no stored row are both treated as not matching.
-    pub(crate) fn matches(&mut self, scope_id: Option<&str>) -> Result<bool, KernelError> {
+    pub(crate) fn matches(
+        &mut self,
+        scope_id: Option<&str>,
+        terms: &mut ScopeTerms<'_>,
+    ) -> Result<bool, KernelError> {
         let Some(scope_id) = scope_id else {
             return Ok(false);
         };
         if let Some(verdict) = self.verdicts.get(scope_id) {
             return Ok(*verdict);
         }
-        let verdict = match self.store.scope_terms(scope_id) {
-            Ok(terms) => CanonicalScope::from_term_specs(&terms).is_ok_and(|scope| {
+        let verdict = terms(scope_id)?.is_some_and(|terms| {
+            CanonicalScope::from_term_specs(&terms).is_ok_and(|scope| {
                 scope.term(Dimension::Project).is_some()
                     && scope_matches(&scope, &self.context, &UnknownGraph) == MatchOutcome::Matches
-            }),
-            Err(KernelError::NotFound) => false,
-            Err(error) => return Err(error),
-        };
+            })
+        });
         self.verdicts.insert(scope_id.to_string(), verdict);
         Ok(verdict)
     }

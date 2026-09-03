@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use mc_core::claim_operation::is_lower_hex;
 use mc_host::RouteHandle;
 use mc_kernel::{
     ArtifactDestination, ArtifactEligibility, ArtifactHandle, KernelError, KernelStore,
@@ -12,7 +13,7 @@ use mc_kernel::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::project::{ProjectBinding, ScopeFilter};
+use super::project::{stored_terms, ProjectBinding, ScopeFilter};
 use super::{blocking, kernel_response, state_only, KernelOpenCoordinator, KernelOutcome};
 use crate::dispatch::PreparedOutcome;
 use crate::McHandler;
@@ -20,6 +21,15 @@ use crate::McHandler;
 const OPERATION: &str = "kernel.eligibility.batch";
 /// Entries held before the oldest is evicted.
 const CACHE_CAPACITY: usize = 4096;
+/// Longest `object_id` a candidate may carry. Every candidate becomes a
+/// cache key whether or not the object exists, so the id length is what
+/// bounds the bytes an entry retains.
+pub const MAX_OBJECT_ID_BYTES: usize = 512;
+/// Bytes one entry may retain: the key's strings, held once in the map and
+/// once in the eviction order, plus the fixed-size fields and node overhead.
+const ENTRY_BYTES_MAX: u64 = 2 * (MAX_OBJECT_ID_BYTES as u64 + 64 + 128) + 256;
+/// Resident bytes the verdict cache may hold at capacity.
+pub const CACHE_BUDGET_BYTES: u64 = CACHE_CAPACITY as u64 * ENTRY_BYTES_MAX;
 /// One batch is one registry read plus one `judge` per miss on the blocking
 /// pool, so the candidate count bounds the work a single request can queue.
 const MAX_CANDIDATES: usize = 1024;
@@ -111,7 +121,7 @@ fn parse_destination(value: &str) -> Option<ArtifactDestination> {
 /// for a remote one, whether or not the candidate cites an artifact.
 fn judge(
     store: &KernelStore,
-    filter: &mut ScopeFilter<'_>,
+    filter: &mut ScopeFilter,
     candidate: &Candidate,
     state: Option<&ObjectState>,
     destination: ArtifactDestination,
@@ -128,7 +138,7 @@ fn judge(
     if state.object.source_revision != candidate.source_revision {
         return Ok(Verdict::Stale);
     }
-    if !filter.matches(state.scope_id.as_deref())? {
+    if !filter.matches(state.scope_id.as_deref(), &mut stored_terms(store))? {
         return Ok(Verdict::WrongScope);
     }
     if state.object.sensitivity == Sensitivity::Secret
@@ -207,7 +217,7 @@ fn evaluate(
         keys.iter().map(|key| cache.get(key)).collect()
     };
     let cache_hits = cached.iter().filter(|hit| hit.is_some()).count();
-    let mut filter = ScopeFilter::new(project, store);
+    let mut filter = ScopeFilter::new(project);
     let mut verdicts = Vec::with_capacity(candidates.len());
     let mut fresh: Vec<(CacheKey, Verdict)> = Vec::new();
     for ((candidate, state), (key, cached)) in candidates
@@ -262,6 +272,23 @@ impl McHandler {
         if parsed.candidates.len() > MAX_CANDIDATES {
             return crate::invalid_params_error(format!(
                 "{OPERATION} carries at most {MAX_CANDIDATES} candidates"
+            ));
+        }
+        if parsed.candidates.iter().any(|candidate| {
+            candidate.object_id.is_empty() || candidate.object_id.len() > MAX_OBJECT_ID_BYTES
+        }) {
+            return crate::invalid_params_error(format!(
+                "{OPERATION} object_id must be 1..={MAX_OBJECT_ID_BYTES} bytes"
+            ));
+        }
+        if parsed.candidates.iter().any(|candidate| {
+            candidate
+                .artifact_digest
+                .as_deref()
+                .is_some_and(|digest| !is_lower_hex(digest, 64))
+        }) {
+            return crate::invalid_params_error(format!(
+                "{OPERATION} artifact_digest must be lowercase sha256 hex"
             ));
         }
         let store = scope.store;

@@ -1353,6 +1353,24 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
     let second = daemon.call(daemon.route, request.clone()).await;
     assert_eq!(second["cache_hits"], 9);
     assert_eq!(verdicts(&second), verdicts(&first));
+    // An oversized id or a malformed digest never reaches the cache.
+    for candidate in [
+        json!({"object_id": "x".repeat(mc_module::kernel_routes::eligibility::MAX_OBJECT_ID_BYTES + 1), "source_revision": 1}),
+        json!({"object_id": "", "source_revision": 1}),
+        json!({"object_id": "decision-object-1", "source_revision": 1, "artifact_digest": sensitive.digest.to_uppercase()}),
+    ] {
+        assert!(matches!(
+            daemon
+                .handler
+                .dispatch_value_for_test(
+                    daemon.route,
+                    eligibility_request(&daemon.project, "remote", vec![candidate]),
+                )
+                .await,
+            PreparedOutcome::Error { code, .. } if code == "invalid_params"
+        ));
+    }
+    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 9);
     // A different declared revision is a different key and a different verdict.
     let revised = daemon
         .call(
@@ -2100,7 +2118,106 @@ async fn another_projects_objects_are_not_found_through_commit_targets_or_tokens
         )
         .await;
     assert_state(&missing, "invalid", Some("not_found"));
+
+    // A dependency target is refused like a mutation target.
+    let implements = daemon
+        .commit(
+            "implement-foreign",
+            vec![observation_implementing(1, "decision-object-2")],
+            vec![],
+        )
+        .await;
+    assert_state(&implements, "invalid", Some("not_found"));
     assert_eq!(daemon.tip(), tip, "a refused commit writes nothing");
+
+    let own = daemon
+        .commit(
+            "implement-own",
+            vec![observation_implementing(2, "decision-object-1")],
+            vec![],
+        )
+        .await;
+    assert_state(&own, "available", None);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+fn observation_implementing(index: i64, decision_object_id: &str) -> Value {
+    json!({
+        "op": "insert_observation",
+        "spec": {
+            "observation_id": format!("observation-{index}"),
+            "object_id": format!("observation-object-{index}"),
+            "domain_id": DOMAIN,
+            "observation_kind": "code_present",
+            "payload": {"summary": "code present", "classification": "code_present"},
+            "observed_at": index,
+            "dependencies": [
+                {"dependency_object_id": decision_object_id, "dependency_kind": "implements"}
+            ],
+            "source_id": "memory-lineage",
+            "source_revision": index,
+        },
+    })
+}
+
+#[tokio::test]
+async fn a_row_under_any_scope_naming_the_project_is_readable_and_mutable() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    assert_state(
+        &daemon
+            .commit("seed", vec![insert_decision(1)], vec![])
+            .await,
+        "available",
+        None,
+    );
+    // Another producer's scope, under its own id, names this route's root.
+    let root = daemon.project.canonicalize().unwrap();
+    store
+        .commit(intent("alias-scope"), |envelope| {
+            envelope.insert_scope(ScopeSpec {
+                scope_id: "scope-alias".to_string(),
+                object_id: "scope-alias".to_string(),
+                domain_id: DOMAIN.to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "scope-alias".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+                terms: vec![ScopeTermSpec {
+                    dimension: "project".to_string(),
+                    operator: "exact".to_string(),
+                    exact_value: Some(root.to_string_lossy().into_owned()),
+                    ..ScopeTermSpec::default()
+                }],
+            })?;
+            envelope.insert_decision(store_decision(1, "scope-alias", "alias-lineage"))?;
+            envelope.record_admission(admission(
+                "store-decision-object-1",
+                EventKind::Other,
+                None,
+                (SourceClass::ModelInference, TaintClass::AssistantInference),
+            ))?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let read = daemon.read("explicit_search", None).await;
+    assert_eq!(
+        object_ids(&read),
+        ["decision-object-1", "store-decision-object-1"]
+    );
+    let known_as_of = read["known_as_of"].as_i64().unwrap();
+    // The write path honours the token the read handed out.
+    let retired = daemon
+        .commit(
+            "retire-alias",
+            vec![json!({"op": "retire_decision", "object_id": "store-decision-object-1"})],
+            vec![token("store-decision-object-1", known_as_of)],
+        )
+        .await;
+    assert_state(&retired, "available", None);
+    assert!(!is_live(&store, "store-decision-object-1"));
     daemon.handler.shutdown().await.unwrap();
 }
 
@@ -2652,6 +2769,13 @@ async fn begin_refuses_layouts_and_digests_the_kernel_could_never_accept() {
     one_page["total_bytes"] = json!(mc_kernel::MAX_PAYLOAD_BYTES);
     assert!(matches!(
         daemon.handler.dispatch_value_for_test(daemon.route, one_page).await,
+        PreparedOutcome::Error { code, .. } if code == "invalid_params"
+    ));
+
+    let sliced = vec![b's'; mc_module::kernel_routes::ingest::PAGE_COUNT_MAX as usize + 1];
+    let too_many_pages = ingest_begin_request(&project, "sliced", &sliced, sliced.len() as u32);
+    assert!(matches!(
+        daemon.handler.dispatch_value_for_test(daemon.route, too_many_pages).await,
         PreparedOutcome::Error { code, .. } if code == "invalid_params"
     ));
 

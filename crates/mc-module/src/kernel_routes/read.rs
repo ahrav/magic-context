@@ -7,7 +7,7 @@ use mc_kernel::{KernelError, KernelStore, Surface, SurfaceVisibility, VisibleRow
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::project::{ProjectBinding, ScopeFilter};
+use super::project::{stored_terms, ProjectBinding, ScopeFilter};
 use super::serving;
 use super::{blocking, kernel_response, state_only, KernelOutcome};
 use crate::dispatch::PreparedOutcome;
@@ -60,10 +60,11 @@ pub(crate) fn read_visible(
         None => store.tip()?,
     };
     let visible = store.visible_as_of(surface, requested)?;
-    let mut filter = ScopeFilter::new(project, store);
+    let mut filter = ScopeFilter::new(project);
+    let mut terms = stored_terms(store);
     let mut rows = Vec::with_capacity(visible.rows.len());
     for row in visible.rows {
-        if filter.matches(row.scope_id.as_deref())? {
+        if filter.matches(row.scope_id.as_deref(), &mut terms)? {
             rows.push(row);
         }
     }
@@ -109,11 +110,20 @@ impl McHandler {
                 "{OPERATION} surface must be one of auto_inject, auto_search, explicit_search"
             ));
         };
+        let mut as_of = parsed.as_of;
         if parsed.gated {
             let store = scope.store.clone();
             let now_ms = parsed.clock_ms();
-            let outcome = match blocking(move || store.outbox_lag(now_ms)).await {
-                Ok(Ok(lag)) => serving::project(serving::decide(&lag), surface),
+            let gate = blocking(move || {
+                let tip = store.tip()?;
+                store.outbox_lag(now_ms).map(|lag| (tip, lag))
+            })
+            .await;
+            let outcome = match gate {
+                Ok(Ok((tip, lag))) => {
+                    as_of.get_or_insert(tip);
+                    serving::project(serving::decide(&lag), surface)
+                }
                 Ok(Err(error)) => KernelOutcome::from(error),
                 Err(outcome) => outcome,
             };
@@ -123,7 +133,6 @@ impl McHandler {
         }
         let store = scope.store.clone();
         let project = scope.project.clone();
-        let as_of = parsed.as_of;
         let result = blocking(move || read_visible(&store, &project, surface, as_of)).await;
         let response = match result {
             Ok(Ok(response)) => response,

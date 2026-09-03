@@ -21,7 +21,7 @@ use mc_kernel::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::project::{IntentRequest, ProjectBinding};
+use super::project::{IntentRequest, ProjectBinding, ScopeFilter};
 use super::{blocking, kernel_response, state_only, ConflictReason, InvalidReason, KernelOutcome};
 use crate::dispatch::PreparedOutcome;
 use crate::McHandler;
@@ -356,23 +356,32 @@ fn ensure_scope(
     Ok(())
 }
 
-/// Returning `NotFound` for an out-of-scope object, the same answer a missing
-/// object gets, prevents cross-project object-id enumeration.
+/// The object, when its scope names the bound project by the same algebra
+/// `kernel.read` serves rows with, so every row a read hands a token for is
+/// a row the same route may mutate. Returning `NotFound` for an out-of-scope
+/// object, the same answer a missing object gets, prevents cross-project
+/// object-id enumeration.
 fn scoped_object_state(
     envelope: &Envelope<'_>,
-    project_scope_id: &str,
+    filter: &mut ScopeFilter,
     object_id: &str,
 ) -> Result<ObjectState, KernelError> {
     let state = envelope
         .object_state(object_id)?
         .ok_or(KernelError::NotFound)?;
-    if state.scope_id.as_deref() != Some(project_scope_id) {
+    if !filter.matches(state.scope_id.as_deref(), &mut |scope_id| {
+        envelope.scope_terms(scope_id)
+    })? {
         return Err(KernelError::NotFound);
     }
     Ok(state)
 }
 
-fn apply(envelope: &mut Envelope<'_>, plan: &CommitPlan) -> Result<String, KernelError> {
+fn apply(
+    envelope: &mut Envelope<'_>,
+    filter: &mut ScopeFilter,
+    plan: &CommitPlan,
+) -> Result<String, KernelError> {
     let scope_id = plan.project.scope_id();
     let mut scope_ready = false;
     let mut result = CommitResult::default();
@@ -390,13 +399,11 @@ fn apply(envelope: &mut Envelope<'_>, plan: &CommitPlan) -> Result<String, Kerne
                 spec,
             } => {
                 ensure_scope(envelope, &plan.project, &spec.domain_id, &mut scope_ready)?;
-                scoped_object_state(envelope, &scope_id, replaced_object_id)?;
+                scoped_object_state(envelope, filter, replaced_object_id)?;
                 // A live replacement must belong to the bound project too.
                 let replacement_live = match envelope.object_state(&spec.object_id)? {
                     Some(state) if state.object.invalidated_commit_seq.is_none() => {
-                        if state.scope_id.as_deref() != Some(scope_id.as_str()) {
-                            return Err(KernelError::NotFound);
-                        }
+                        scoped_object_state(envelope, filter, &spec.object_id)?;
                         true
                     }
                     _ => false,
@@ -412,12 +419,19 @@ fn apply(envelope: &mut Envelope<'_>, plan: &CommitPlan) -> Result<String, Kerne
                 result.touched.push(outcome.object_id);
             }
             Operation::RetireDecision { object_id } => {
-                scoped_object_state(envelope, &scope_id, object_id)?;
+                scoped_object_state(envelope, filter, object_id)?;
                 envelope.retire_decision(object_id)?;
                 result.touched.push(object_id.clone());
             }
             Operation::InsertObservation { spec } => {
                 ensure_scope(envelope, &plan.project, &spec.domain_id, &mut scope_ready)?;
+                // A dependency is a claim about its target; the alignment
+                // projection pairs observations with the decisions they cite
+                // without comparing scopes, so a foreign target would let this
+                // project alter another project's derived results.
+                for dependency in &spec.dependencies {
+                    scoped_object_state(envelope, filter, &dependency.dependency_object_id)?;
+                }
                 let spec = spec.clone().into_spec(&plan.source_kind, &scope_id);
                 let outcome = envelope.insert_observation(spec)?;
                 admit(envelope, &outcome.object_id, plan.classes)?;
@@ -432,14 +446,14 @@ fn apply(envelope: &mut Envelope<'_>, plan: &CommitPlan) -> Result<String, Kerne
 fn run(store: &KernelStore, plan: CommitPlan) -> Result<CommitReceipt, CommitFailure> {
     let mut entered = false;
     let mut token_conflict = None;
-    let scope_id = plan.project.scope_id();
+    let mut filter = ScopeFilter::new(&plan.project);
     let result = store.commit_before(
         Instant::now() + plan.deadline,
         plan.intent.clone(),
         |envelope| {
             entered = true;
             for token in &plan.tokens {
-                scoped_object_state(envelope, &scope_id, &token.object_id)?;
+                scoped_object_state(envelope, &mut filter, &token.object_id)?;
                 if let TokenCheck::Conflict(conflict) =
                     envelope.check_token(&token.object_id, token.known_as_of)?
                 {
@@ -447,7 +461,7 @@ fn run(store: &KernelStore, plan: CommitPlan) -> Result<CommitReceipt, CommitFai
                     return Err(KernelError::Conflict);
                 }
             }
-            apply(envelope, &plan)
+            apply(envelope, &mut filter, &plan)
         },
     );
     match result {
