@@ -62,7 +62,9 @@ impl Settlement {
 pub enum Terminal {
     /// Unary response body and its binary-content flag.
     Response {
+        /// Response payload. commentlint: allow(JUDGE)
         body: OutputBuffer,
+        /// Whether payload uses binary encoding. commentlint: allow(JUDGE)
         binary: bool,
     },
     /// Structured protocol error with an optional retry delay.

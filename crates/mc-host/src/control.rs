@@ -100,7 +100,9 @@ pub enum ControlAction {
     HostStatus,
     /// Semantic rejection with a trustworthy correlation; one terminal.
     Reject {
+        /// Machine-readable error category. commentlint: allow(JUDGE)
         code: &'static str,
+        /// Human-readable error detail. commentlint: allow(JUDGE)
         message: String,
     },
 }

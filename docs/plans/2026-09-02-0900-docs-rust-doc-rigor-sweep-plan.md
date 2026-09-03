@@ -41,3 +41,28 @@ Include every tracked `*.rs` file except `release/generated/**` and `docs/eviden
 - Verification gates pass or baseline-equivalent failures are documented.
 - Accuracy review completed.
 - Branch pushed and draft PR URL returned.
+
+# Integration receipt
+
+Status: complete for local integration and verification. Publication remains outside this integration task.
+
+## Merge evidence
+
+- All 32 worker commits are ancestors of the integration tip. Bins 21 through 32 were merged once from `e0d1fdfa`, `b45be059`, `2fef6eef`, `b335f973`, `d19c7263`, `bc42435e`, `1417ef4a`, `e6d3ebfc`, `4dfeacd5`, `de9d7342`, `44d9dcd7`, and `407618c5`.
+- Pre-merge checks rejected out-of-bin paths, non-comment changed lines, missing commits, duplicate ancestry, and steering-comment deletion.
+- Bins 21, 22, and 26 overlapped previously reviewed transport documentation. Git reported conflicts in `src/lib.rs`, `src/lifecycle.rs`, and `tests/fuzz_corpus.rs`. Integration retained the existing, more complete transport wording and all `commentlint` steering directives while merging every non-conflicting bin change. No code tokens changed.
+
+## Audit and review evidence
+
+- Diff audit against `main` found zero non-comment changed Rust lines and zero deleted `SAFETY`, `ponytail`, `commentlint`, copyright, or SPDX steering lines.
+- Fresh review sampled two changed files from each of bins 21 through 32 and inspected public documentation throughout `crates/mc-shm-transport/src/**`.
+- Review fixed one inaccurate `Incarnation::into_bytes` description and added field documentation needed to keep `rustfmt` stable in `control.rs` and `dispatch.rs`.
+- Targeted transport rustdoc with warnings denied and transport doctests pass after review fixes.
+
+## Verification evidence
+
+- `cargo fmt --all -- --check`: pass after review fixes.
+- `RUSTDOCFLAGS='-D warnings' cargo doc -p mc-shm-transport --no-deps`: pass.
+- `cargo test -p mc-shm-transport --doc`: pass, with zero doctests defined.
+- `bun run release:contract:check`: pass for release `0.38.0`, digest `ab3b41c0f4f99f917dc4ac03515a2a36f50d5cb0dde603b4518cf47480e975e2`.
+- Workspace clippy, workspace rustdoc, workspace doctests, and `bun run test:rust` remain blocked by pre-existing compilation failures. `mc-store` produces the same 135 indexed errors on `main` and this branch under `cargo check -p mc-store`, led by `E0308`, missing `GuardedConn` methods, and dependent inference errors. The scanner benchmark's eight `E0277`/`E0308` errors are also reproducible on `main`. Main's workspace clippy additionally fails the transport missing-doc gate that this branch fixes.
