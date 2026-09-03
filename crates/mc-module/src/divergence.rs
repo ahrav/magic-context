@@ -1,29 +1,44 @@
+//! A reusable cache prefix ends at the first divergent served block.
 //!
+//! Appending blocks preserves the reusable prefix and is not divergence. An empty prior sequence
+//! represents a cold start. Reported token depth estimates bytes before the first changed block.
 
 use mc_store::ServedBlockFingerprint;
 use serde::{Deserialize, Serialize};
 
+/// `DivergenceKind` classifies why a served prefix is no longer reusable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DivergenceKind {
+    /// Block identity is stable, but its content fingerprint changed.
     ContentChanged,
+    /// New sequence introduced a block before the expected old block.
     Inserted,
+    /// New sequence omitted the expected old block.
     Removed,
+    /// Both sequences continue with incompatible block order or identity.
     Reordered,
 }
 
+/// `FirstDivergence` identifies the boundary before which the old prefix remains reusable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FirstDivergence {
+    /// Zero-based position of the first incompatible block.
     pub index: usize,
+    /// Old block identifier, or `None` when no old block occupies the position.
     pub block_id_old: Option<String>,
+    /// New block identifier, or `None` when the new sequence ended.
     pub block_id_new: Option<String>,
+    /// Classification derived from block identity and later occurrences.
     pub kind: DivergenceKind,
+    /// Approximate tokens before `index`, using four serialized bytes per token.
     pub approx_token_depth: usize,
 }
 
+/// `first_divergence` returns the first boundary that prevents reusing `old`'s prefix.
 ///
-/// An empty old sequence is a cold start, not a divergence.
-/// A new sequence that retains every old entry in order and only appends blocks is not a divergence.
+/// An empty old sequence is a cold start. A new sequence that preserves every old block in order
+/// and only appends blocks returns `None`.
 pub fn first_divergence(
     old: &[ServedBlockFingerprint],
     new: &[ServedBlockFingerprint],

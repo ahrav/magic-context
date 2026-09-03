@@ -394,7 +394,6 @@ mod fixture {
     }
 
     /// The fixture removes owner write permission from a populated private directory.
-    /// with no owner write bit fails `remove_dir_all` (children cannot be
     /// The resulting `remove_dir_all` failure injects a cleanup failure.
     fn sabotage_cleanup(args: &[String]) {
         let Some(private_file) = flag_value(args, "--system-prompt") else {
@@ -423,7 +422,6 @@ mod fixture {
     }
 
     /// The fixture writes and flushes a complete transcript but leaves its pipes open and does not exit.
-    /// and flushed, but the leader neither closes its pipes nor exits.
     fn print_transcript_then_hang() -> ! {
         if let Some(path) = std::env::var_os(TRANSCRIPT_FILE_ENV) {
             let bytes = fs::read(path).expect("read transcript");
@@ -435,8 +433,6 @@ mod fixture {
     }
 
     /// The fixture replaces stdin with `/dev/null` before printing a complete valid transcript.
-    /// /dev/null (closing the prompt pipe's read end) before a complete,
-    /// valid transcript is printed and the process exits cleanly.
     fn ignore_stdin_print_transcript() -> ! {
         let devnull = fs::File::open("/dev/null").expect("open /dev/null");
         rustix::stdio::dup2_stdin(&devnull).expect("replace stdin");
@@ -1709,7 +1705,7 @@ fn success_transcripts_align_across_harnesses() {
         ),
     );
 
-    // wire families.
+    // Harness dispatch events differ; terminal and assistant events must match.
     assert_eq!(oc_terminal, pi_terminal);
     assert_eq!(&oc_events[1..], &pi_events[1..]);
     assert_eq!(
@@ -1897,7 +1893,6 @@ fn hostile_retry_delays_are_clamped() {
     assert_eq!(failed(&terminal).retry_after_secs, Some(45));
 
     // A number following `retry` without an explicit delay form does not create a retry delay.
-    // backoff.
     let (terminal, _) = run_pi_transcript(&pi_error_lines(
         "temporarily overloaded, please retry. request id 8412345",
     ));
@@ -2297,8 +2292,7 @@ fn pi_extension_stdout_noise_skipped() {
         |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "noisy answer")
     ));
 
-    // A malformed line beginning with `{` is corruption, not noise.
-    // noise.
+    // A malformed line beginning with `{` is corruption, not ignorable extension noise.
     let setup = RunSetup::new();
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"{broken json\n");
@@ -2353,8 +2347,7 @@ fn pi_alias_credential_failure_retries_canonical_provider() {
     assert!(setup.out.path().join("alias-attempted").exists());
 }
 
-/// `AuthRequired` received during Pi's shutdown gap must trigger the canonical retry.
-/// `AuthRequired` must be preserved so the canonical retry runs.
+/// `AuthRequired` received during Pi's shutdown gap must survive draining and trigger the canonical-provider retry.
 fn pi_lingering_credential_failure_still_retries_canonical_provider() {
     let setup = RunSetup::new();
     let limits = SubprocessLimits {
@@ -2441,7 +2434,7 @@ fn pi_self_retry_revokes_the_drain_arming() {
 }
 
 /// A completion containing `toolCall` is intermediate, not terminal for this tool-less run.
-/// unexecuted tool request must not be published as the answer.
+/// An unexecuted tool request must not be published as the answer.
 fn pi_tool_requesting_stop_is_not_terminal() {
     let mut lines = vec![
         serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
@@ -2926,8 +2919,7 @@ fn oversized_json_structure_rejected_without_capping_prose() {
         .any(|event| matches!(event, BackendEvent::AssistantText { text, .. } if text == &prose)));
 }
 
-/// A later retry `message_end` supersedes the failed attempt's terminal decision and text.
-/// contradictory transcript.
+/// A later retry `message_end` supersedes the failed attempt's terminal decision and text without making the transcript contradictory.
 fn pi_auto_retry_supersedes_the_failed_attempts_terminal() {
     let mut lines = vec![
         serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
@@ -2989,8 +2981,7 @@ fn pi_retry_announcement_without_a_new_terminal_fails_as_missing() {
     }
 }
 
-/// A crash bypasses `PrivateDir::cleanup` and `Drop`; startup removes only directories whose recorded owner is provably gone.
-/// host's.
+/// A crash bypasses `PrivateDir::cleanup` and `Drop`; startup removes only directories whose recorded owner is provably gone and preserves directories owned by the current host.
 fn crash_orphaned_run_dirs_swept_only_for_dead_owners() {
     use mc_host::broca::subprocess::group_registry::{private_run_root, sweep_orphaned_run_dirs};
 
