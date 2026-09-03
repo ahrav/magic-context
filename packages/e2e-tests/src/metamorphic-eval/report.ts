@@ -421,8 +421,8 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
             };
         case "scored": {
             p.exact(value, [...PAIR_KEYS, "kind", "baselineScore", "derivativeScore", "invariants"], label);
-            const baselineScore = parseScenarioScore(value.baselineScore, `${label}.baselineScore`);
-            const derivativeScore = parseScenarioScore(value.derivativeScore, `${label}.derivativeScore`);
+            const baselineScore = parseScenarioScore(p, value.baselineScore, `${label}.baselineScore`);
+            const derivativeScore = parseScenarioScore(p, value.derivativeScore, `${label}.derivativeScore`);
             // Equality rather than the live runner's non-null `sameSystem`: the raw-output path scores both
             // roles with a null tuple, so requiring non-null would reject its reports.
             if (canonicalJson(baselineScore.system) !== canonicalJson(derivativeScore.system)) {
@@ -546,8 +546,8 @@ function parseTierInvalidReason(raw: unknown, label: string): TierInvalidReason 
         }
         case "control-error": {
             p.exact(value, ["kind", "controlAErrorReason", "controlBErrorReason"], label);
-            const controlAErrorReason = value.controlAErrorReason === null ? null : p.text(value.controlAErrorReason, `${label}.controlAErrorReason`);
-            const controlBErrorReason = value.controlBErrorReason === null ? null : p.text(value.controlBErrorReason, `${label}.controlBErrorReason`);
+            const controlAErrorReason = p.nullableText(value.controlAErrorReason, `${label}.controlAErrorReason`);
+            const controlBErrorReason = p.nullableText(value.controlBErrorReason, `${label}.controlBErrorReason`);
             // This reason is recorded only when a control errored, and an ERROR score carries its reason.
             if (controlAErrorReason === null && controlBErrorReason === null) {
                 p.fail(`${label}: control-error-reason-required`);

@@ -727,8 +727,7 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     ], "report.body.runSummary");
     const analysis = parseAnalysis(value.analysis, "report.body.analysis");
     const body: PairedDeltaReportBody = {
-        limitations: p.array(value.limitations, "report.body.limitations")
-            .map((line, index) => p.string(line, `report.body.limitations[${index}]`)),
+        limitations: p.stringArray(value.limitations, "report.body.limitations"),
         poolManifestFingerprint: p.hex64(value.poolManifestFingerprint, "report.body.poolManifestFingerprint"),
         pinnedSnapshotId: p.string(value.pinnedSnapshotId, "report.body.pinnedSnapshotId"),
         policyFingerprint: p.hex64(value.policyFingerprint, "report.body.policyFingerprint"),

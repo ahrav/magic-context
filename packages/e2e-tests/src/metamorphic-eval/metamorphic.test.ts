@@ -27,7 +27,7 @@ import {
     type LiveObservation,
     type LiveRole,
 } from "./live";
-import { buildMetamorphicReport, metamorphicExitCode, parseMetamorphicReport, type MetamorphicReport, type MetamorphicReportEntry } from "./report";
+import { MetamorphicReportError, buildMetamorphicReport, metamorphicExitCode, parseMetamorphicReport, type MetamorphicReport, type MetamorphicReportEntry } from "./report";
 import { buildScriptedOutput, runDeterministicMetamorphicEval, DETERMINISTIC_SEEDS } from "./runner";
 import { TRANSFORMS, type Transform } from "./transforms";
 import {
@@ -194,6 +194,13 @@ describe("deterministic metamorphic runner", () => {
         const unknownKind = structuredClone(invalid) as unknown as { entries: Record<string, unknown>[] };
         unknownKind.entries[0]!.kind = "skipped";
         expect(() => parseMetamorphicReport(unknownKind)).toThrow(/report\.entries\[0\]\.kind: enum-invalid/);
+        // A malformed score inside a metamorphic report is this report's contract failure, not the historian lane's.
+        const badScoreIndex = report.entries.findIndex((entry) => entry.kind === "scored");
+        expect(badScoreIndex).toBeGreaterThanOrEqual(0);
+        const badScore = structuredClone(report) as unknown as { entries: Record<string, Record<string, unknown>>[] };
+        badScore.entries[badScoreIndex]!.baselineScore!.verdict = "MAYBE";
+        expect(() => parseMetamorphicReport(badScore)).toThrow(MetamorphicReportError);
+        expect(() => parseMetamorphicReport(badScore)).toThrow(new RegExp(`report\\.entries\\[${badScoreIndex}\\]\\.baselineScore\\.verdict: enum-invalid`));
         // On a completed run, every applied pair left an entry behind.
         const inflatedApplied = structuredClone(report);
         inflatedApplied.coverage[0]!.applied += 1;

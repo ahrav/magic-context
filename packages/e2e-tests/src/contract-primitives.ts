@@ -30,6 +30,8 @@ export interface ContractPrimitives {
     string(value: unknown, label: string): string;
     /** Any string, including empty: for free-form fields where emptiness carries no meaning. `string` rejects blanks. */
     text(value: unknown, label: string): string;
+    /** `text`, or null where the producer writes null for "not recorded". */
+    nullableText(value: unknown, label: string): string | null;
     boolean(value: unknown, label: string): boolean;
     staticId(value: unknown, label: string, pattern: RegExp): string;
     hex64(value: unknown, label: string): string;
@@ -160,6 +162,10 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
         return values;
     }
 
+    function nullableText(value: unknown, label: string): string | null {
+        return value === null ? null : textValue(value, label);
+    }
+
     function textArray(value: unknown, label: string): string[] {
         return array(value, label).map((entry, index) => textValue(entry, `${label}[${index}]`));
     }
@@ -168,5 +174,5 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
         return array(value, label).map((entry, index) => stringValue(entry, `${label}[${index}]`));
     }
 
-    return { fail, record, exact, string: stringValue, text: textValue, boolean: booleanValue, staticId, hex64, enumeration, array, number: numberValue, integer, boundedInteger, countRecord, unique, sorted, idArray, textArray, stringArray };
+    return { fail, record, exact, string: stringValue, text: textValue, nullableText, boolean: booleanValue, staticId, hex64, enumeration, array, number: numberValue, integer, boundedInteger, countRecord, unique, sorted, idArray, textArray, stringArray };
 }

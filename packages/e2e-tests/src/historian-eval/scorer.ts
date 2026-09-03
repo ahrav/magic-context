@@ -25,7 +25,7 @@ import { createClaimReaderTestDatabase } from "../../../plugin/src/features/magi
 import type { Database } from "../../../plugin/src/shared/sqlite";
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { compareCodeUnits } from "../code-unit-order";
-import { makeContractPrimitives } from "../contract-primitives";
+import { makeContractPrimitives, type ContractPrimitives } from "../contract-primitives";
 import { openTestDb } from "../test-db";
 import { parseSystemVersionTuple, requireScoreSystemBinding } from "./system-tuple";
 import {
@@ -1859,15 +1859,11 @@ export class HistorianReportError extends Error {
 
 const p = makeContractPrimitives(HistorianReportError);
 
-function parseRatio(value: unknown, label: string): number | null {
+function parseRatio(p: ContractPrimitives, value: unknown, label: string): number | null {
     return value === null ? null : p.number(value, label, { minimum: 0, maximum: 1 });
 }
 
-function parseNullableText(value: unknown, label: string): string | null {
-    return value === null ? null : p.text(value, label);
-}
-
-function parseProbeVerdicts(raw: unknown, label: string): ProbeVerdict[] {
+function parseProbeVerdicts(p: ContractPrimitives, raw: unknown, label: string): ProbeVerdict[] {
     const verdicts = p.array(raw, label).map((entry, index) => {
         const probeLabel = `${label}[${index}]`;
         const probe = p.record(entry, probeLabel);
@@ -1899,15 +1895,19 @@ function parseProbeVerdicts(raw: unknown, label: string): ProbeVerdict[] {
     return verdicts;
 }
 
-export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
+/**
+ * Parses one archived scenario score. The caller supplies its own primitives so every lane report raises its
+ * own error class for a malformed score, as `parseSystemVersionTuple` does for the tuple.
+ */
+export function parseScenarioScore(p: ContractPrimitives, raw: unknown, label: string): ScenarioScore {
     const value = p.record(raw, label);
     p.exact(value, [
         "scenarioId", "verdict", "failReasons", "errorReason", "errorDetail", "precision", "recall",
         "expectedClaimsMatched", "expectedClaimsTotal", "visibleClaimsMatched", "visibleClaimsTotal",
         "falseAuthoritativeMatches", "structuralFindings", "probeVerdicts", "system", "source",
     ], label);
-    const precision = parseRatio(value.precision, `${label}.precision`);
-    const recall = parseRatio(value.recall, `${label}.recall`);
+    const precision = parseRatio(p, value.precision, `${label}.precision`);
+    const recall = parseRatio(p, value.recall, `${label}.recall`);
     const expectedClaimsMatched = p.integer(value.expectedClaimsMatched, `${label}.expectedClaimsMatched`);
     // The count is the scenario's authored expectation list, which the contract caps.
     const expectedClaimsTotal = p.boundedInteger(value.expectedClaimsTotal, `${label}.expectedClaimsTotal`, 0, MAX_EXPECTATION_ENTRIES);
@@ -1932,7 +1932,7 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     const structuralFindings = p.textArray(value.structuralFindings, `${label}.structuralFindings`);
     // Each match is an `ExpectedAbsent.id`, which the scenario contract admits only as a static id.
     const falseAuthoritativeMatches = p.stringArray(value.falseAuthoritativeMatches, `${label}.falseAuthoritativeMatches`);
-    const probeVerdicts = parseProbeVerdicts(value.probeVerdicts, `${label}.probeVerdicts`);
+    const probeVerdicts = parseProbeVerdicts(p, value.probeVerdicts, `${label}.probeVerdicts`);
     // `assembleScore` turns each of these into its reason, and `buildLaneReport` aggregates the declared
     // reasons rather than re-deriving them, so a contradictory score would rebuild unchanged.
     const derivedReasons = new Set(evidenceFailReasons({
@@ -1945,8 +1945,8 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     for (const reason of failReasons) {
         if (reason !== "invalid-output" && !derivedReasons.has(reason)) p.fail(`${label}.failReasons: derived-mismatch`);
     }
-    const errorReason = parseNullableText(value.errorReason, `${label}.errorReason`);
-    const errorDetail = parseNullableText(value.errorDetail, `${label}.errorDetail`);
+    const errorReason = p.nullableText(value.errorReason, `${label}.errorReason`);
+    const errorDetail = p.nullableText(value.errorDetail, `${label}.errorDetail`);
     // `scoreRawOutputWithInjectedClaims` assembles its score with no probes and no invalid run, and only a
     // trimmed probe makes `assembleScore` emit an ERROR, so a raw-output score is a PASS or FAIL. commentlint: allow(JUDGE)
     const system = parseSystemVersionTuple(p, value.system, `${label}.system`);
@@ -2046,19 +2046,19 @@ export function parseLaneReport(raw: unknown): LaneReport {
     p.exact(aggregate, ["total", "scored", "errors", "errorCountsByReason", "failCountsByReason", "precision", "recall", "falseAuthoritativeRate"], "report.aggregate");
     const report: LaneReport = {
         schema: LANE_REPORT_SCHEMA,
-        releaseVersion: parseNullableText(root.releaseVersion, "report.releaseVersion"),
+        releaseVersion: p.nullableText(root.releaseVersion, "report.releaseVersion"),
         system: parseSystemVersionTuple(p, root.system, "report.system"),
         scenarios: p.array(root.scenarios, "report.scenarios")
-            .map((entry, index) => parseScenarioScore(entry, `report.scenarios[${index}]`)),
+            .map((entry, index) => parseScenarioScore(p, entry, `report.scenarios[${index}]`)),
         aggregate: {
             total: p.integer(aggregate.total, "report.aggregate.total"),
             scored: p.integer(aggregate.scored, "report.aggregate.scored"),
             errors: p.integer(aggregate.errors, "report.aggregate.errors"),
             errorCountsByReason: p.countRecord(aggregate.errorCountsByReason, "report.aggregate.errorCountsByReason"),
             failCountsByReason: p.countRecord(aggregate.failCountsByReason, "report.aggregate.failCountsByReason"),
-            precision: parseRatio(aggregate.precision, "report.aggregate.precision"),
-            recall: parseRatio(aggregate.recall, "report.aggregate.recall"),
-            falseAuthoritativeRate: parseRatio(aggregate.falseAuthoritativeRate, "report.aggregate.falseAuthoritativeRate"),
+            precision: parseRatio(p, aggregate.precision, "report.aggregate.precision"),
+            recall: parseRatio(p, aggregate.recall, "report.aggregate.recall"),
+            falseAuthoritativeRate: parseRatio(p, aggregate.falseAuthoritativeRate, "report.aggregate.falseAuthoritativeRate"),
         },
         red: p.boolean(root.red, "report.red"),
         runFatal: p.boolean(root.runFatal, "report.runFatal"),
