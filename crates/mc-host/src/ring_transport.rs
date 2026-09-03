@@ -65,9 +65,8 @@ pub const MAX_RING_RESIDENT_BYTES: u64 = 1 << 30;
 
 /// Computes process admission limits for concurrent sparse rings.
 ///
-/// The count is clamped to at least one connection and to
-/// [`MAX_RING_RESIDENT_BYTES`]. Returns `None` if a count conversion or charge
-/// multiplication overflows.
+/// The admitted count is clamped to at least one, and to [`MAX_RING_RESIDENT_BYTES`] divided by one ring's arena bytes.
+/// Returns `None` if a count conversion or charge multiplication overflows.
 pub fn process_limits(connections: usize) -> Option<ShmHostLimits> {
     let one = per_connection_limits();
     let affordable = MAX_RING_RESIDENT_BYTES

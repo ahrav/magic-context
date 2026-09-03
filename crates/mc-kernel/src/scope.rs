@@ -881,9 +881,10 @@ fn req_names_prerelease(req: &semver::VersionReq) -> bool {
 
 /// Coerces semantic and platform-style version text into a comparable semantic version.
 ///
-/// Prerelease text is moved to build metadata unless a requirement explicitly names a
-/// prerelease. One to three numeric components are accepted. Invalid or empty input returns
-/// `None`.
+/// Prerelease text moves to build metadata unless a requirement explicitly names a prerelease.
+/// The first one to three numeric components form the comparable version.
+/// A four-component platform version such as `10.0.19041.1` truncates to `10.0.19041`.
+/// Invalid or empty input returns `None`.
 pub fn coerce_version(raw: &str) -> Option<semver::Version> {
     VersionReading::parse(raw).map(|reading| reading.comparable)
 }

@@ -1,7 +1,8 @@
 //! Authenticated setup-socket client for shared-memory ring activation.
 //!
-//! Messages use a four-byte little-endian length prefix. One absolute deadline bounds the full
-//! handshake, including partial reads and writes.
+//! Messages use a four-byte little-endian length prefix. One absolute deadline bounds every
+//! handshake read and write once the socket is connected, including partial transfers. Connection
+//! establishment itself is a blocking connect outside that bound.
 
 use std::io::{self, IoSliceMut, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};

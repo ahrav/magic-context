@@ -1176,7 +1176,9 @@ pub fn readiness_handled() -> bool {
 
 /// Delivers at most one received frame and its external segment views.
 ///
-/// Returns `false` when no frame is ready. A delivered token remains live until `release`; callback failure releases it before returning the callback error.
+/// Returns `false` when no frame is ready. A delivered token remains live until `release`.
+/// Callback failure releases the token and returns the callback error.
+/// A cleanup failure during that release leaves the token live and is appended to the returned error.
 #[napi]
 pub fn poll(
     env: &Env,

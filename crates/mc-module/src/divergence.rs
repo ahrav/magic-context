@@ -1,7 +1,7 @@
 //! A reusable cache prefix ends at the first divergent served block.
 //!
-//! Appending blocks preserves the reusable prefix and is not divergence. An empty prior sequence
-//! represents a cold start. Reported token depth estimates bytes before the first changed block.
+//! Appending blocks preserves the reusable prefix and is not divergence.
+//! An empty prior sequence represents a cold start.
 
 use mc_store::ServedBlockFingerprint;
 use serde::{Deserialize, Serialize};

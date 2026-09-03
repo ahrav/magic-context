@@ -110,9 +110,10 @@ impl std::error::Error for KernelError {}
 
 /// Exclusive writer lease plus pooled SQLite connections for one kernel family.
 ///
-/// One process owns the writer lease. Mutations serialize through `writer`,
-/// while reads rotate across a fixed query-only pool. A failed restore poisons
-/// both paths until the store is reopened.
+/// One process owns the writer lease.
+/// Mutations serialize through `writer`, while reads rotate across a fixed query-only pool.
+/// A restore that cannot recover the original family poisons both paths until the store is reopened.
+/// A restore rejected before displacement, or one whose original family is recovered, leaves both paths usable.
 pub struct KernelStore {
     writer: Mutex<Connection>,
     pub(super) purge_intent_log: Mutex<File>,
