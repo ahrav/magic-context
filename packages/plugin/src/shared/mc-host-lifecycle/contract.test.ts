@@ -139,6 +139,59 @@ describe("parseDaemonResult", () => {
         expect(legal.readiness?.synapse?.reason).toBe("synapse_unsupported");
     });
 
+    test("kernel readiness admits its warn-class ready reasons and rejects contradictions", () => {
+        const withKernel = (kernel: unknown) =>
+            JSON.stringify(
+                validResult({
+                    readiness: {
+                        transport: { state: "ready", reason: "healthy" },
+                        kernel,
+                    },
+                }),
+            );
+        for (const [state, reason] of [
+            ["ready", "healthy"],
+            ["ready", "kernel_lagging"],
+            ["ready", "kernel_capacity_warn"],
+            ["ready", "no_required_consumer"],
+            ["starting", "kernel_starting"],
+            ["starting", "starting"],
+            ["unavailable", "kernel_unavailable"],
+        ] as const) {
+            const parsed = parseDaemonResult(withKernel({ state, reason }));
+            expect(parsed.readiness?.kernel).toEqual({ state, reason });
+        }
+        expect(() =>
+            parseDaemonResult(withKernel({ state: "ready", reason: "kernel_unavailable" })),
+        ).toThrow(/readiness\.kernel is ready with a failing reason/);
+        expect(() =>
+            parseDaemonResult(withKernel({ state: "unavailable", reason: "kernel_lagging" })),
+        ).toThrow(/readiness\.kernel state contradicts its reason/);
+        expect(() =>
+            parseDaemonResult(withKernel({ state: "degraded", reason: "kernel_lagging" })),
+        ).toThrow(/readiness\.kernel\.state is outside its closed set/);
+    });
+
+    test("component-only non-failing reasons are rejected as top-level verdicts", () => {
+        // `ok: true` and the paired remediation are valid for each reason.
+        for (const [reason, remediation] of [
+            ["kernel_lagging", "inspect_kernel_projector"],
+            ["kernel_capacity_warn", "inspect_storage"],
+            ["no_required_consumer", null],
+            ["synapse_unsupported", null],
+        ] as const) {
+            for (const state of ["running", "stopped"] as const) {
+                expect(() =>
+                    parseDaemonResult(
+                        JSON.stringify(
+                            validResult({ ok: true, state, reason, remediation, checks: [] }),
+                        ),
+                    ),
+                ).toThrow(/a component-only reason is not a top-level verdict/);
+            }
+        }
+    });
+
     test("binds pass and fail checks to their reason classes, leaving warn and skip free", () => {
         const withCheck = (status: string, reason: string, remediation: string | null) =>
             JSON.stringify(
@@ -525,10 +578,15 @@ describe("reason vocabulary pins", () => {
             expect(reasonPrecedence(entry.id)).toBe(index + 1);
             expect(remediationForReason(entry.id)).toBe(entry.remediation ?? null);
         });
+        const warnRemediations: Record<string, string> =
+            releaseContract.cli.reasons.warn_remediations;
         for (const reason of releaseContract.cli.reasons.non_failing) {
             expect(reasonPrecedence(reason)).toBeNull();
-            expect(remediationForReason(reason)).toBeNull();
+            expect(remediationForReason(reason)).toBe(warnRemediations[reason] ?? null);
         }
+        expect(remediationForReason("kernel_lagging")).toBe("inspect_kernel_projector");
+        expect(remediationForReason("kernel_capacity_warn")).toBe("inspect_storage");
+        expect(remediationForReason("no_required_consumer")).toBeNull();
     });
 
     test("harness subreason remediation is closed and unknown values fail", () => {

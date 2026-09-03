@@ -213,6 +213,7 @@ const CONTRACT = {
             transport: ["ready", "starting", "unavailable"],
             storage: ["ready", "starting", "unavailable"],
             synapse: ["ready", "starting", "degraded", "unsupported"],
+            kernel: ["ready", "starting", "unavailable"],
         },
         effects: {
             restart_only: true,
@@ -240,6 +241,7 @@ const CONTRACT = {
             "lifecycle.fences",
             "lifecycle.publication",
             "platform.support",
+            "readiness.kernel",
             "readiness.storage",
             "readiness.synapse",
             "readiness.transport",
@@ -249,6 +251,7 @@ const CONTRACT = {
             "align_versions",
             "free_storage",
             "inspect_daemon_process",
+            "inspect_kernel_projector",
             "inspect_storage",
             "inspect_synapse",
             "install_native_payload",
@@ -333,7 +336,9 @@ const CONTRACT = {
                 },
                 { id: "lifecycle_busy", remediation: "wait_and_retry" },
                 { id: "storage_unavailable", remediation: "inspect_storage" },
+                { id: "kernel_unavailable", remediation: "inspect_storage" },
                 { id: "storage_starting", remediation: "wait_and_retry" },
+                { id: "kernel_starting", remediation: "wait_and_retry" },
                 { id: "synapse_degraded", remediation: "inspect_synapse" },
                 { id: "synapse_starting", remediation: "wait_and_retry" },
                 {
@@ -349,10 +354,20 @@ const CONTRACT = {
                 "already_running",
                 "already_stopped",
                 "healthy",
+                "kernel_capacity_warn",
+                "kernel_lagging",
+                "no_required_consumer",
                 "started",
                 "stopped",
                 "synapse_unsupported",
             ],
+            // Warn-class readiness reasons: the component is `ready` but degraded.
+            // Status and doctor stay `ok`, and the check carries this remediation.
+            // A non-failing reason absent from this map has no remediation.
+            warn_remediations: {
+                kernel_capacity_warn: "inspect_storage",
+                kernel_lagging: "inspect_kernel_projector",
+            },
         },
     },
     // Closed Broca unavailability union, in precedence order. Individual credential
@@ -966,14 +981,19 @@ export function validateContractSchema(contract: any): void {
     ) {
         fail("cli.check_statuses is fixed");
     }
-    if (cli.check_ids.length !== 22)
-        fail("the closed v1 check-ID union has exactly 22 entries");
+    if (cli.check_ids.length !== 23)
+        fail("the closed v1 check-ID union has exactly 23 entries");
     assertUniqueSorted(cli.check_ids, "cli.check_ids");
-    if (cli.remediations.length !== 15)
-        fail("the closed remediation union has exactly 15 entries");
+    if (cli.remediations.length !== 16)
+        fail("the closed remediation union has exactly 16 entries");
     assertUniqueSorted(cli.remediations, "cli.remediations");
-    if (cli.reasons.failing_by_precedence.length !== 31) {
-        fail("the failing reason precedence table has exactly 31 rows");
+    assertExactKeys(
+        cli.reasons,
+        ["failing_by_precedence", "non_failing", "warn_remediations"],
+        "cli.reasons",
+    );
+    if (cli.reasons.failing_by_precedence.length !== 33) {
+        fail("the failing reason precedence table has exactly 33 rows");
     }
     assertUnique(
         cli.reasons.failing_by_precedence.map((row: { id: string }) => row.id),
@@ -1001,6 +1021,26 @@ export function validateContractSchema(contract: any): void {
     if (!cli.reasons.non_failing.includes("synapse_unsupported")) {
         fail("synapse_unsupported is a non-failing component reason");
     }
+    const failingIds = new Set<string>(
+        cli.reasons.failing_by_precedence.map((row: { id: string }) => row.id),
+    );
+    for (const id of cli.reasons.non_failing) {
+        if (failingIds.has(id)) fail(`reason ${id} is both failing and non-failing`);
+    }
+    for (const [id, remediation] of Object.entries(cli.reasons.warn_remediations)) {
+        if (!cli.reasons.non_failing.includes(id)) {
+            fail(`warn remediation ${id} is not a non-failing reason`);
+        }
+        if (!cli.remediations.includes(remediation)) {
+            fail(`warn reason ${id} names an unknown remediation`);
+        }
+    }
+    if (cli.reasons.warn_remediations.kernel_lagging !== "inspect_kernel_projector") {
+        fail("kernel_lagging remediation is fixed to inspect_kernel_projector");
+    }
+    if (cli.reasons.warn_remediations.kernel_capacity_warn !== "inspect_storage") {
+        fail("kernel_capacity_warn remediation is fixed to inspect_storage");
+    }
     if (
         JSON.stringify(cli.readiness_states.transport) !==
         JSON.stringify(["ready", "starting", "unavailable"])
@@ -1018,6 +1058,12 @@ export function validateContractSchema(contract: any): void {
         JSON.stringify(["ready", "starting", "degraded", "unsupported"])
     ) {
         fail("synapse readiness states are fixed");
+    }
+    if (
+        JSON.stringify(cli.readiness_states.kernel) !==
+        JSON.stringify(["ready", "starting", "unavailable"])
+    ) {
+        fail("kernel readiness states are fixed");
     }
     if (
         JSON.stringify(cli.effects) !==

@@ -92,13 +92,14 @@ fn remediation_for(reason: &'static str) -> Option<&'static str> {
         | "incompatible_daemon"
         | "incompatible_module"
         | "incompatible_epochs" => Some("align_versions"),
-        "lifecycle_busy" | "storage_starting" | "synapse_starting" | "stopping" | "starting" => {
-            Some("wait_and_retry")
-        }
-        "storage_unavailable" => Some("inspect_storage"),
+        "lifecycle_busy" | "storage_starting" | "kernel_starting" | "synapse_starting"
+        | "stopping" | "starting" => Some("wait_and_retry"),
+        "storage_unavailable" | "kernel_unavailable" => Some("inspect_storage"),
         "synapse_degraded" => Some("inspect_synapse"),
         "not_running" => Some("run_daemon_start"),
-        // Non-failing reasons.
+        // Mirrors `warn_remediations` in `RELEASE_CONTRACT_JSON`.
+        "kernel_capacity_warn" => Some("inspect_storage"),
+        "kernel_lagging" => Some("inspect_kernel_projector"),
         _ => None,
     }
 }
@@ -1681,14 +1682,28 @@ mod tests {
                 "remediation mismatch for {id}"
             );
         }
+        let warn_remediations = contract["cli"]["reasons"]["warn_remediations"]
+            .as_object()
+            .expect("warn remediations");
         for id in contract["cli"]["reasons"]["non_failing"]
             .as_array()
             .expect("non-failing reasons")
         {
-            let reason: &'static str =
-                Box::leak(id.as_str().expect("reason").to_owned().into_boxed_str());
-            assert_eq!(remediation_for(reason), None);
+            let id = id.as_str().expect("reason");
+            let expected = warn_remediations
+                .get(id)
+                .and_then(serde_json::Value::as_str);
+            let reason: &'static str = Box::leak(id.to_owned().into_boxed_str());
+            assert_eq!(
+                remediation_for(reason),
+                expected,
+                "remediation mismatch for {id}"
+            );
         }
+        assert_eq!(
+            remediation_for("kernel_lagging"),
+            Some("inspect_kernel_projector")
+        );
     }
 
     #[test]

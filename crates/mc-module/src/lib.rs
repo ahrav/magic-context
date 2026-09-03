@@ -20,6 +20,7 @@ pub mod historian_producer;
 pub(crate) mod historian_prompt;
 pub(crate) mod historian_validate;
 pub mod injection;
+pub mod kernel_routes;
 pub mod m0_compose;
 pub(crate) mod m1_compose;
 pub(crate) mod memory_render;
@@ -382,6 +383,30 @@ struct StoreOpenWaiterGuard {
 impl Drop for StoreOpenWaiterGuard {
     fn drop(&mut self) {
         self.coordinator.finish_waiter();
+    }
+}
+
+/// `'static` lets running tasks own a `TaskAdmission` and admit follow-on tasks.
+#[derive(Clone)]
+struct TaskAdmission {
+    gate: Arc<Mutex<()>>,
+    cancel: CancellationToken,
+    tasks: TaskTracker,
+}
+
+impl TaskAdmission {
+    /// `None` once shutdown has closed admission; the gate keeps a spawn that
+    /// passed the cancellation check from landing after the tracker closes.
+    fn spawn<F, T>(&self, future: F) -> Option<tokio::task::JoinHandle<T>>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let _gate = self.gate.lock().expect("module spawn gate mutex");
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        Some(self.tasks.spawn(future))
     }
 }
 
@@ -2847,6 +2872,9 @@ impl ProjectionCache {
 pub struct McHandler {
     store: Arc<Mutex<Option<Arc<McStore>>>>,
     store_open: Arc<StoreOpenCoordinator>,
+    /// The kernel store opens after the cache store under the same managed
+    /// directory; routes read it through `kernel_store()`, never the slot.
+    kernel: Arc<kernel_routes::KernelOpenCoordinator>,
     /// `initialize` decodes the storage descriptor, and `activate` consumes it: malformed descriptors fail before publication, while storage opens after transport publication.
     pending_storage: Mutex<Option<StorageDescriptor>>,
     /// `spawn_gate` serializes the task-admission check against shutdown.
@@ -2854,7 +2882,7 @@ pub struct McHandler {
     /// `cancel` is the sole source of task-admission state.
     /// spawn_gate prevents the admission check and following `tasks.spawn` from straddling tracker shutdown.
     /// A second admission boolean would have to change in lockstep with `cancel`, but nothing enforces that.
-    spawn_gate: Mutex<()>,
+    spawn_gate: Arc<Mutex<()>>,
     cancel: CancellationToken,
     tasks: TaskTracker,
     producer_factory: Arc<dyn HistorianProducerFactory>,
@@ -3370,8 +3398,9 @@ impl McHandler {
         McHandler {
             store: Arc::new(Mutex::new(None)),
             store_open: Arc::new(StoreOpenCoordinator::new()),
+            kernel: Arc::new(kernel_routes::KernelOpenCoordinator::new()),
             pending_storage: Mutex::new(None),
-            spawn_gate: Mutex::new(()),
+            spawn_gate: Arc::new(Mutex::new(())),
             cancel,
             tasks: TaskTracker::new(),
             producer_factory,
@@ -3433,16 +3462,20 @@ impl McHandler {
         self.store.lock().expect("store slot mutex").clone()
     }
 
+    fn admission(&self) -> TaskAdmission {
+        TaskAdmission {
+            gate: Arc::clone(&self.spawn_gate),
+            cancel: self.cancel.clone(),
+            tasks: self.tasks.clone(),
+        }
+    }
+
     fn spawn_tracked_task<F, T>(&self, future: F) -> Option<tokio::task::JoinHandle<T>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let _gate = self.spawn_gate.lock().expect("module spawn gate mutex");
-        if self.cancel.is_cancelled() {
-            return None;
-        }
-        Some(self.tasks.spawn(future))
+        self.admission().spawn(future)
     }
 
     fn spawn_module_task<F, T>(&self, future: F) -> Option<tokio::task::JoinHandle<T>>
@@ -3479,15 +3512,41 @@ impl McHandler {
             .waiter_starts
             .fetch_add(1, Ordering::Relaxed);
         let store = Arc::clone(&self.store);
+        let kernel = Arc::clone(&self.kernel);
+        let admission = self.admission();
+        let task_admission = admission.clone();
         let coordinator = Arc::clone(&self.store_open);
         let task_coordinator = Arc::clone(&coordinator);
         let cancel = self.cancel.clone();
-        if self
-            .spawn_tracked_task(async move {
+        if admission
+            .spawn(async move {
                 let _guard = StoreOpenWaiterGuard {
                     coordinator: Arc::clone(&task_coordinator),
                 };
-                Self::run_store_open(store, task_coordinator, descriptor, cancel).await;
+                let policy = *task_coordinator
+                    .policy
+                    .lock()
+                    .expect("store open policy mutex");
+                let opened =
+                    Self::run_store_open(store, task_coordinator, &descriptor, cancel.clone())
+                        .await;
+                // SQLite supplies the path that derives the kernel root.
+                match (opened, &descriptor.backend) {
+                    (true, StorageBackend::Sqlite { path }) => {
+                        kernel
+                            .open(kernel_routes::kernel_root_for(path), policy, cancel.clone())
+                            .await;
+                        if kernel.state() == kernel_routes::KernelState::Ready
+                            && kernel.background_sampler_enabled()
+                        {
+                            task_admission.spawn(kernel.run_sampler(cancel));
+                        }
+                    }
+                    (true, StorageBackend::Postgres { .. }) => {
+                        kernel.mark_unavailable(kernel_routes::UnavailableKind::Unsupported)
+                    }
+                    (false, _) => kernel.mark_unavailable(kernel_routes::UnavailableKind::Store),
+                }
             })
             .is_none()
         {
@@ -3498,28 +3557,29 @@ impl McHandler {
         Ok(())
     }
 
+    /// Returns whether the cache store was installed.
     async fn run_store_open(
         store_slot: Arc<Mutex<Option<Arc<McStore>>>>,
         coordinator: Arc<StoreOpenCoordinator>,
-        descriptor: StorageDescriptor,
+        descriptor: &StorageDescriptor,
         cancel: CancellationToken,
-    ) {
+    ) -> bool {
         let policy = *coordinator.policy.lock().expect("store open policy mutex");
-        let mut last_lease_error = match Self::open_store_once(&descriptor).await {
+        let mut last_lease_error = match Self::open_store_once(descriptor).await {
             Ok(opened) => {
                 if cancel.is_cancelled() {
                     coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
-                    return;
+                    return false;
                 }
                 *store_slot.lock().expect("store slot mutex") = Some(Arc::new(opened));
                 coordinator.phase.store(STORE_OPENED, Ordering::Release);
-                return;
+                return true;
             }
             Err(error) if store_open_error_is_live_lease(&error) => error,
             Err(error) => {
                 eprintln!("mc-module: store open failed: {error}");
                 coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
-                return;
+                return false;
             }
         };
 
@@ -3545,7 +3605,7 @@ impl McHandler {
                     elapsed.as_secs_f64()
                 );
                 coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
-                return;
+                return false;
             }
             if elapsed >= policy.wait_window {
                 eprintln!(
@@ -3553,7 +3613,7 @@ impl McHandler {
                     elapsed.as_secs_f64()
                 );
                 coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
-                return;
+                return false;
             }
 
             let delay = jittered_store_open_delay(backoff, policy.max_backoff, attempt)
@@ -3565,7 +3625,7 @@ impl McHandler {
                         started.elapsed().as_secs_f64()
                     );
                     coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
-                    return;
+                    return false;
                 }
                 _ = tokio::time::sleep(delay) => {}
             }
@@ -3575,17 +3635,17 @@ impl McHandler {
                     started.elapsed().as_secs_f64()
                 );
                 coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
-                return;
+                return false;
             }
             if started.elapsed() >= policy.wait_window {
                 continue;
             }
 
-            match Self::open_store_once(&descriptor).await {
+            match Self::open_store_once(descriptor).await {
                 Ok(opened) => {
                     if cancel.is_cancelled() {
                         coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
-                        return;
+                        return false;
                     }
                     *store_slot.lock().expect("store slot mutex") = Some(Arc::new(opened));
                     coordinator.phase.store(STORE_OPENED, Ordering::Release);
@@ -3593,7 +3653,7 @@ impl McHandler {
                         "mc-module: storage lease released; store opened after {:.2}s",
                         started.elapsed().as_secs_f64()
                     );
-                    return;
+                    return true;
                 }
                 Err(error) if store_open_error_is_live_lease(&error) => {
                     last_lease_error = error;
@@ -3606,7 +3666,7 @@ impl McHandler {
                         started.elapsed().as_secs_f64()
                     );
                     coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
-                    return;
+                    return false;
                 }
             }
         }
@@ -3677,8 +3737,9 @@ impl McHandler {
         McHandler {
             store: Arc::new(Mutex::new(None)),
             store_open: Arc::new(StoreOpenCoordinator::new()),
+            kernel: Arc::new(kernel_routes::KernelOpenCoordinator::new()),
             pending_storage: Mutex::new(None),
-            spawn_gate: Mutex::new(()),
+            spawn_gate: Arc::new(Mutex::new(())),
             cancel: CancellationToken::new(),
             tasks: TaskTracker::new(),
             producer_factory: factory,
@@ -7742,6 +7803,9 @@ impl McHandler {
             Some(store) => Arc::clone(&store),
             None => return store_unavailable_error(),
         };
+        // The same sampled snapshot `health()` reports; a status request never
+        // walks the artifact tree itself.
+        let kernel = self.kernel.health_block().reported().0.to_json();
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
             return match store.load("__health__") {
                 Ok(state) => respond(json!({
@@ -7759,6 +7823,7 @@ impl McHandler {
                     },
                     "storage_versions": storage_versions_block(&store),
                     "memory_holders": self.memory_holder_metrics(),
+                    "kernel": kernel,
                 })),
                 Err(e) => PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
@@ -7824,6 +7889,7 @@ impl McHandler {
                 "state_sync_epoch": STATE_SYNC_EPOCH,
             },
             "storage_versions": storage_versions_block(&store),
+            "kernel": kernel,
         }))
     }
 
@@ -11718,6 +11784,24 @@ impl CompositeComponent for McHandler {
             "storage_state".to_owned(),
             serde_json::Value::String(storage_state.to_owned()),
         );
+        // One atomic load; only the sampler task reads the store for this block.
+        // A sampler that stopped publishing must not leave its last `Ready`
+        // block standing, so an old sample reads as unavailable.
+        let (kernel, stale) = self.kernel.health_block().reported();
+        if storage_state == "ready" && kernel.degrades_health() {
+            report.status = HealthStatus::Degraded;
+            let reason = match kernel.kernel_state {
+                _ if stale => "kernel health sample is stale",
+                kernel_routes::KernelState::Ready => "kernel outbox lag past threshold",
+                kernel_routes::KernelState::Starting => "kernel store is opening",
+                kernel_routes::KernelState::Unavailable => "kernel store is unavailable",
+            };
+            report.detail = Some(match report.detail.take() {
+                Some(detail) => format!("{detail}; {reason}"),
+                None => reason.to_owned(),
+            });
+        }
+        metrics.insert("kernel".to_owned(), kernel.to_json());
         metrics.insert(
             "epochs".to_owned(),
             json!({
@@ -11797,6 +11881,8 @@ impl CompositeComponent for McHandler {
             .expect("prompt surface epoch mutex")
             .clear();
         *self.store.lock().expect("store slot mutex") = None;
+        self.kernel
+            .mark_unavailable(kernel_routes::UnavailableKind::Store);
         Ok(())
     }
 }
@@ -11914,6 +12000,51 @@ impl McHandler {
     async fn dispatch_value(&self, route: RouteHandle, request: Value) -> PreparedOutcome {
         self.dispatch_value_with_inbound_bytes(route, request, None)
             .await
+    }
+
+    /// Integration-test entry to the routing arms; `RequestCtx` is transport-private.
+    #[cfg(feature = "test-support")]
+    pub async fn dispatch_value_for_test(
+        &self,
+        route: RouteHandle,
+        request: Value,
+    ) -> PreparedOutcome {
+        self.dispatch_value_with_inbound_bytes(route, request, None)
+            .await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn kernel_state(&self) -> kernel_routes::KernelState {
+        self.kernel.state()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn kernel_store_for_test(&self) -> Option<Arc<mc_kernel::KernelStore>> {
+        self.kernel.kernel_store().ok()
+    }
+
+    /// Runs one health sample at `now_ms` instead of waiting for the sampler tick.
+    #[cfg(feature = "test-support")]
+    pub async fn sample_kernel_health_for_test(&self, now_ms: i64) {
+        self.kernel.sample(now_ms, &CancellationToken::new()).await;
+    }
+
+    /// Disabling the background sampler lets tests control published snapshots.
+    #[cfg(feature = "test-support")]
+    pub fn disable_kernel_sampler_for_test(&self) {
+        self.kernel.disable_background_sampler();
+    }
+
+    /// Ages the published kernel health block past `SAMPLE_STALE_AFTER`.
+    #[cfg(feature = "test-support")]
+    pub fn expire_kernel_health_for_test(&self) {
+        self.kernel.expire_health_for_test();
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn kernel_unavailable_reason_for_test(&self) -> Option<kernel_routes::UnavailableReason> {
+        (self.kernel.state() == kernel_routes::KernelState::Unavailable)
+            .then(|| self.kernel.unavailable_reason())
     }
 
     #[cfg(test)]

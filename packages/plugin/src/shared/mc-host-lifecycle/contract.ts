@@ -21,6 +21,7 @@ export type TransportReadinessState =
     (typeof releaseContract.cli.readiness_states.transport)[number];
 export type StorageReadinessState = (typeof releaseContract.cli.readiness_states.storage)[number];
 export type SynapseReadinessState = (typeof releaseContract.cli.readiness_states.synapse)[number];
+export type KernelReadinessState = (typeof releaseContract.cli.readiness_states.kernel)[number];
 
 export const DAEMON_RESULT_SCHEMA = releaseContract.cli.result_schema;
 
@@ -36,10 +37,14 @@ const FAILING_REASONS = new Map<string, { precedence: number; remediation: strin
     ]),
 );
 const NON_FAILING_REASONS = new Set<string>(releaseContract.cli.reasons.non_failing);
+const WARN_REMEDIATIONS = new Map<string, string>(
+    Object.entries(releaseContract.cli.reasons.warn_remediations),
+);
 const READINESS_STATES: Record<string, ReadonlySet<string>> = {
     transport: new Set(releaseContract.cli.readiness_states.transport),
     storage: new Set(releaseContract.cli.readiness_states.storage),
     synapse: new Set(releaseContract.cli.readiness_states.synapse),
+    kernel: new Set(releaseContract.cli.readiness_states.kernel),
 };
 
 export function isDaemonReason(value: string): value is DaemonReason {
@@ -53,10 +58,11 @@ export function reasonPrecedence(reason: DaemonReason): number | null {
 
 /**
  * For `harness_unavailable`, this function returns null because remediation depends on the subreason.
+ * Warn-class non-failing reasons resolve through `warn_remediations`; every other non-failing reason has none.
  */
 export function remediationForReason(reason: DaemonReason): Remediation | null {
     const entry = FAILING_REASONS.get(reason);
-    if (!entry) return null;
+    if (!entry) return (WARN_REMEDIATIONS.get(reason) as Remediation | undefined) ?? null;
     return (entry.remediation as Remediation | null) ?? null;
 }
 
@@ -89,6 +95,7 @@ export interface DaemonReadiness {
     transport?: ReadinessRecord;
     storage?: ReadinessRecord;
     synapse?: ReadinessRecord;
+    kernel?: ReadinessRecord;
 }
 
 export interface DaemonCheck {
@@ -201,6 +208,11 @@ function parseReadinessRecord(value: unknown, component: string): ReadinessRecor
             degraded: ["synapse_degraded"],
             unsupported: ["synapse_unsupported"],
         },
+        kernel: {
+            ready: ["healthy", "kernel_lagging", "kernel_capacity_warn", "no_required_consumer"],
+            starting: ["kernel_starting", "starting"],
+            unavailable: ["kernel_unavailable"],
+        },
     } as const;
     const componentAllowed = allowed[component as keyof typeof allowed] as
         | Record<string, readonly string[]>
@@ -303,6 +315,11 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         wedged: "wedged",
         shutdown_timeout: "stopping",
     };
+    // Non-failing top-level verdicts require a fixed daemon state; component-only
+    // reasons such as `kernel_lagging` are rejected here.
+    if (NON_FAILING_REASONS.has(reason) && fixedReasonStates[reason] === undefined) {
+        fail("a component-only reason is not a top-level verdict");
+    }
     const expectedState = fixedReasonStates[reason];
     if (expectedState !== undefined && state !== expectedState) {
         fail("state contradicts the selected reason");
@@ -342,7 +359,8 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
             if (
                 normalized !== "transport" &&
                 normalized !== "storage" &&
-                normalized !== "synapse"
+                normalized !== "synapse" &&
+                normalized !== "kernel"
             ) {
                 fail("readiness carries an unknown component");
             }

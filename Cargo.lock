@@ -2033,6 +2033,7 @@ name = "mc-module"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
+ "arc-swap",
  "async-trait",
  "chrono",
  "chrono-tz",
@@ -2044,11 +2045,14 @@ dependencies = [
  "libc",
  "mc-core",
  "mc-host",
+ "mc-kernel",
+ "mc-module",
  "mc-store",
  "mc-tokenizer",
  "memchr",
  "proptest",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

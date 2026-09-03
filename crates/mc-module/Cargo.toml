@@ -22,6 +22,10 @@ path = "src/bin/ck-mc-host.rs"
 [dependencies]
 mc-core = { workspace = true }
 mc-store = { workspace = true }
+mc-kernel = { workspace = true }
+# Lock-free snapshot swap for the kernel health projection; already a transitive
+# dependency through gix, so it adds no new supply-chain root.
+arc-swap = "1"
 mc-tokenizer = { path = "../mc-tokenizer" }
 mc-host = { path = "../mc-host" }
 cortexkit-store-types = { workspace = true }
@@ -52,6 +56,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 drive-fault = []
 direct-host-fixture = []
 bench-internals = []
+# Exposes the request dispatcher and kernel lifecycle probes to integration
+# tests in `tests/`; enabled only through the self dev-dependency below.
+test-support = []
 
 [[bench]]
 name = "hot_path"
@@ -70,5 +77,8 @@ chrono-tz = "0.10"
 tokio = { workspace = true, features = ["signal"] }
 # `mc-store` enables `test-support` only in dev-dependencies, so production builds exclude the feature.
 mc-store = { workspace = true, features = ["test-support"] }
+mc-kernel = { workspace = true, features = ["test-support"] }
+mc-module = { path = ".", features = ["test-support"] }
+rusqlite = { workspace = true }
 tempfile = "3"
 filetime = "0.2"

@@ -218,6 +218,45 @@ describe("daemon command contract", () => {
         }
     });
 
+    test("human output always renders a kernel readiness line", () => {
+        const withoutKernel = renderDaemonHuman(
+            result("status", {
+                readiness: {
+                    transport: { state: "ready", reason: "healthy" },
+                    storage: { state: "ready", reason: "healthy" },
+                    synapse: { state: "ready", reason: "healthy" },
+                },
+            }),
+        );
+        expect(withoutKernel.split("\n")).toContain("Readiness kernel: unknown");
+
+        const withKernel = renderDaemonHuman(
+            result("status", {
+                readiness: {
+                    transport: { state: "ready", reason: "healthy" },
+                    kernel: { state: "ready", reason: "kernel_lagging" },
+                },
+                checks: [
+                    {
+                        id: "readiness.kernel",
+                        status: "warn",
+                        reason: "kernel_lagging",
+                        remediation: "inspect_kernel_projector",
+                    },
+                ],
+            }),
+        );
+        const lines = withKernel.split("\n");
+        expect(lines).toContain("Readiness kernel: ready (kernel_lagging)");
+        expect(lines).not.toContain("Readiness kernel: unknown");
+        expect(lines).toContain(
+            "Check readiness.kernel: warn (kernel_lagging) remediation=inspect_kernel_projector",
+        );
+
+        // No readiness block at all (start/stop results) renders no readiness lines.
+        expect(renderDaemonHuman(result("stop"))).not.toContain("Readiness");
+    });
+
     test("human restart output reports both committed effects", () => {
         const rendered = renderDaemonHuman(
             result("restart", {
