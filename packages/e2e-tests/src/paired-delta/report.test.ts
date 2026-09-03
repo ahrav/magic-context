@@ -1026,7 +1026,8 @@ describe("parsePairedDeltaReport", () => {
             body.analysis.endpoints = [body.analysis.endpoints[0]!];
         }))).toThrow(/report\.body\.analysis\.endpoints: paired-endpoints-required/);
         expect(() => parsePairedDeltaReport(forge((body) => {
-            body.analysis.endpoints[1]!.families[0]!.familyId = "fam-elsewhere";
+            // Keeps the row's code-unit order so the set comparison, not the order check, is what fires.
+            body.analysis.endpoints[1]!.families[0]!.familyId = "fam-0-elsewhere";
         }))).toThrow(/report\.body\.analysis\.endpoints: family-set-mismatch/);
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.runSummary.status = "cost-cap-reached";
@@ -1039,6 +1040,15 @@ describe("parsePairedDeltaReport", () => {
             .toThrow(/report\.body\.exclusions: order-invalid/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.limitations = ["b caveat", "a caveat"]; })))
             .toThrow(/report\.body\.limitations: order-invalid/);
+        // The estimator emits endpoints, families, and raw records in code-unit order.
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.endpoints.reverse(); })))
+            .toThrow(/report\.body\.analysis\.endpoints: order-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.endpoints[0]!.families.reverse(); })))
+            .toThrow(/report\.body\.analysis\.endpoints\[0\]\.families: order-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            expect(body.analysis.rawRegretRecords.length).toBeGreaterThan(1);
+            body.analysis.rawRegretRecords.reverse();
+        }))).toThrow(/report\.body\.analysis\.rawRegretRecords: order-invalid/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.refusedRegretLadders = { vibes: 1 }; })))
             .toThrow(/report\.body\.runSummary\.refusedRegretLadders\.vibes: enum-invalid/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.refusedRegretLadders = { "intervention-mismatch": 99 }; })))

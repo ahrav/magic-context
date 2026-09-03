@@ -43,8 +43,11 @@ export interface ContractPrimitives {
     /** A `reason -> count` record. Counts are only ever reached by incrementing, so zero means corruption. */
     countRecord(raw: unknown, label: string): Record<string, number>;
     unique(values: readonly string[], label: string): void;
-    /** Rejects an array the builder would have emitted in another order, which its own code-unit sort makes unreachable. */
-    sorted<T>(values: readonly T[], rank: (value: T) => string, label: string): void;
+    /**
+     * Rejects an array the builder would have emitted in another order, which its own code-unit sort makes
+     * unreachable. A tuple rank compares component by component, as a producer sorting on several fields does.
+     */
+    sorted<T>(values: readonly T[], rank: (value: T) => string | readonly string[], label: string): void;
     idArray(value: unknown, label: string, pattern: RegExp): string[];
     /** An array of free-form strings, each admitted by `text`. */
     textArray(value: unknown, label: string): string[];
@@ -135,9 +138,17 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
         if (new Set(values).size !== values.length) fail(`${label}: duplicate`);
     }
 
-    function sorted<T>(values: readonly T[], rank: (value: T) => string, label: string): void {
+    function sorted<T>(values: readonly T[], rank: (value: T) => string | readonly string[], label: string): void {
+        const compare = (left: string | readonly string[], right: string | readonly string[]): number => {
+            if (typeof left === "string" || typeof right === "string") return compareCodeUnits(String(left), String(right));
+            for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+                const order = compareCodeUnits(left[index] ?? "", right[index] ?? "");
+                if (order !== 0) return order;
+            }
+            return 0;
+        };
         for (let index = 1; index < values.length; index += 1) {
-            if (compareCodeUnits(rank(values[index - 1]!), rank(values[index]!)) > 0) fail(`${label}: order-invalid`);
+            if (compare(rank(values[index - 1]!), rank(values[index]!)) > 0) fail(`${label}: order-invalid`);
         }
     }
 

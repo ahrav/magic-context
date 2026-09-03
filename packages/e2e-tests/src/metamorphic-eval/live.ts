@@ -13,7 +13,7 @@ import {
 } from "../historian-eval/scorer";
 import type { InjectedClaimRecord } from "../historian-eval/claim-read";
 import { containsInjectionCanary } from "./injection-canary";
-import { compareInvariants } from "./invariants";
+import { compareInvariants, compareScoreInvariants } from "./invariants";
 import { admitPair } from "./pairs";
 import {
     CONTROL_SEED,
@@ -75,16 +75,6 @@ export function compareLivePair(
     baseline: LiveObservation,
     derivative: LiveObservation,
 ): MetamorphicInvariantVerdict[] {
-    const expectationIds = sortedUnique([
-        ...Object.keys(baseline.expectationMatches),
-        ...Object.keys(derivative.expectationMatches),
-    ]);
-    const changedExpectationIds = expectationIds.filter(
-        (id) => baseline.expectationMatches[id] !== derivative.expectationMatches[id],
-    );
-    const baselineMatches = sortedUnique(baseline.score.falseAuthoritativeMatches);
-    const derivativeMatches = sortedUnique(derivative.score.falseAuthoritativeMatches);
-
     return [
         compareInvariants(
             baseline.injectedClaims,
@@ -92,23 +82,12 @@ export function compareLivePair(
             baseline.score,
             derivative.score,
         )[0]!,
-        {
-            invariant: "expectation-predicate-equality",
-            holds: changedExpectationIds.length === 0,
-            changedExpectationIds,
-        },
-        {
-            invariant: "false-authoritative-set-equality",
-            holds: JSON.stringify(baselineMatches) === JSON.stringify(derivativeMatches),
-            baselineMatches,
-            derivativeMatches,
-        },
-        {
-            invariant: "scenario-verdict-equality",
-            holds: baseline.score.verdict === derivative.score.verdict,
-            baselineVerdict: baseline.score.verdict,
-            derivativeVerdict: derivative.score.verdict,
-        },
+        ...compareScoreInvariants(
+            baseline.score,
+            derivative.score,
+            baseline.expectationMatches,
+            derivative.expectationMatches,
+        ),
     ];
 }
 

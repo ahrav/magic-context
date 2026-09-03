@@ -397,6 +397,7 @@ function parseEndpointEstimates(
         // least one family, and one row per distinct family.
         if (families.length === 0) p.fail(`${itemLabel}.families: families-required`);
         p.unique(families.map(({ familyId }) => familyId), `${itemLabel}.families`);
+        p.sorted(families, ({ familyId }) => familyId, `${itemLabel}.families`);
         const familyCount = p.integer(value.familyCount, `${itemLabel}.familyCount`);
         if (familyCount !== families.length) p.fail(`${itemLabel}.familyCount: derived-mismatch`);
         const pointEstimate = deltaNumber(value.pointEstimate, `${itemLabel}.pointEstimate`);
@@ -404,7 +405,7 @@ function parseEndpointEstimates(
         const resolution = p.enumeration(value.resolution, DELTA_RESOLUTIONS, `${itemLabel}.resolution`);
         const familyMeans = families.map((family) => family.pointEstimate);
         // Using the estimator's `mean` prevents last-bit drift during recomputation.
-        if (families.length > 0 && pointEstimate !== mean(familyMeans)) {
+        if (pointEstimate !== mean(familyMeans)) {
             p.fail(`${itemLabel}.pointEstimate: derived-mismatch`);
         }
         // The endpoint rule is recomputable because each term is published. The per-family rule is not:
@@ -424,6 +425,7 @@ function parseEndpointEstimates(
     // `estimateFamilyDeltas` builds one estimate per endpoint name, so a repeat also makes a later lookup
     // depend on row order.
     p.unique(estimates.map(({ endpoint }) => endpoint), label);
+    p.sorted(estimates, ({ endpoint }) => endpoint, label);
     return estimates;
 }
 
@@ -444,6 +446,8 @@ function parseRawRegretRecords(raw: unknown, label: string): FamilyDeltaAnalysis
     // The estimator rejects a repeated endpoint-coordinate pair, and one coordinate under two families would
     // join two bootstrap clusters, so its family assignment is fixed.
     p.unique(records.map(({ endpoint, coordinateId }) => tupleKey(endpoint, coordinateId)), label);
+    // `estimateFamilyDeltas` emits raw records in its observation order: endpoint, then family, then coordinate.
+    p.sorted(records, ({ endpoint, familyId, coordinateId }) => [endpoint, familyId, coordinateId], label);
     const familyByCoordinate = new Map<string, string>();
     const endpointsByCoordinate = new Map<string, Set<string>>();
     for (const [index, record] of records.entries()) {
@@ -723,7 +727,9 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     const rawFamiliesByEndpoint = new Map<string, Set<string>>();
     for (const record of body.analysis.rawRegretRecords) {
         const bucket = tupleKey(record.endpoint, record.familyId);
-        rawByEndpointFamily.set(bucket, [...(rawByEndpointFamily.get(bucket) ?? []), record.delta]);
+        const deltas = rawByEndpointFamily.get(bucket);
+        if (deltas === undefined) rawByEndpointFamily.set(bucket, [record.delta]);
+        else deltas.push(record.delta);
         rawFamiliesByEndpoint.set(record.endpoint, (rawFamiliesByEndpoint.get(record.endpoint) ?? new Set()).add(record.familyId));
     }
     for (const [view, estimates] of [["liveRegret", body.analysis.liveRegret], ["providerMixedRegret", body.analysis.providerMixedRegret]] as const) {

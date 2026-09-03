@@ -445,6 +445,18 @@ describe("deterministic metamorphic runner", () => {
         strayControl.injectionCanaryHits.push({ scenarioId: "hse-control", role: "control-a", transformId: null, transformVersion: null, seed: null });
         expect(() => parseMetamorphicReport(strayControl))
             .toThrow(/report\.injectionCanaryHits\[0\]: control-role-requires-live-report/);
+        // Both producers publish violations sorted and deduplicated, and lint diagnostics sorted.
+        const shuffledViolations = structuredClone(report);
+        const violationRow = shuffledViolations.coverage[0]!;
+        violationRow.violations = ["z violation", "a violation"];
+        expect(() => parseMetamorphicReport(shuffledViolations)).toThrow(/report\.coverage\[0\]\.violations: order-invalid/);
+        violationRow.violations = ["a violation", "a violation"];
+        expect(() => parseMetamorphicReport(shuffledViolations)).toThrow(/report\.coverage\[0\]\.violations: duplicate/);
+        const shuffledDiagnostics = structuredClone(invalid);
+        const lintRed = shuffledDiagnostics.entries.find((entry) => entry.kind === "lint-red");
+        if (lintRed?.kind !== "lint-red") throw new Error("unreachable");
+        lintRed.diagnostics = ["d2", "d1"];
+        expect(() => parseMetamorphicReport(shuffledDiagnostics)).toThrow(/report\.entries\[\d+\]\.diagnostics: order-invalid/);
         // One hit per role per pair, so a repeated hit is a duplicated observation.
         const doubledHit = structuredClone(report);
         const hit = { scenarioId: doubledHit.coverage[0]!.scenarioId, role: "baseline" as const, transformId: null, transformVersion: null, seed: 1 };

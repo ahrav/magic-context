@@ -379,9 +379,13 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
         p.fail(`${label}: control-pair-coordinates-invalid`);
     }
     switch (kind) {
-        case "lint-red":
+        case "lint-red": {
             p.exact(value, [...PAIR_KEYS, "kind", "diagnostics"], label);
-            return { ...pair, kind, diagnostics: p.textArray(value.diagnostics, `${label}.diagnostics`) };
+            // `admitPair` sorts the lint diagnostics it records.
+            const diagnostics = p.textArray(value.diagnostics, `${label}.diagnostics`);
+            p.sorted(diagnostics, (line) => line, `${label}.diagnostics`);
+            return { ...pair, kind, diagnostics };
+        }
         case "stage-not-scored":
             p.exact(value, [...PAIR_KEYS, "kind", "role", "stage", "error"], label);
             return {
@@ -452,7 +456,13 @@ function parseCoverage(raw: unknown, label: string): ScenarioCoverage[] {
                 if (pair.scenarioId !== scenarioId) p.fail(`${innerLabel}.scenarioId: coverage-scenario-mismatch`);
                 return { ...pair, reason: p.text(inapplicable.reason, `${innerLabel}.reason`) };
             }),
-            violations: p.textArray(value.violations, `${itemLabel}.violations`),
+            violations: (() => {
+                // Both producers publish a scenario's violations sorted and deduplicated.
+                const violations = p.textArray(value.violations, `${itemLabel}.violations`);
+                p.unique(violations, `${itemLabel}.violations`);
+                p.sorted(violations, (line) => line, `${itemLabel}.violations`);
+                return violations;
+            })(),
         };
     });
     // One coverage row per scenario, and `requireSorted` alone admits an adjacent repeat.
