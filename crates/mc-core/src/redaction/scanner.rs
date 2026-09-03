@@ -111,8 +111,36 @@ pub(super) fn render(
     input: &str,
     mut replacements: Vec<Replacement>,
 ) -> Result<Redaction, RedactionError> {
-    // Widest span first so a cluster's union is known from its first member, then
-    // most specific, so the cluster walk can pick a winner without rescanning.
+    sort_for_clustering(&mut replacements);
+    render_sorted(input, replacements)
+}
+
+/// Collapses every overlapping cluster into one replacement covering its union, labelled by its winner.
+///
+/// Rendering the result is identical to rendering the input, so a windowed scan can merge after every
+/// window and count detections rather than raw findings.
+pub(super) fn merge(mut replacements: Vec<Replacement>) -> Vec<Replacement> {
+    sort_for_clustering(&mut replacements);
+    let mut merged: Vec<Replacement> = Vec::with_capacity(replacements.len());
+    for replacement in replacements {
+        match merged.last_mut() {
+            Some(cluster) if replacement.start < cluster.end => {
+                cluster.end = cluster.end.max(replacement.end);
+                if replacement.specificity < cluster.specificity {
+                    cluster.specificity = replacement.specificity;
+                    cluster.secret_type = replacement.secret_type;
+                    cluster.replacement = replacement.replacement;
+                }
+            }
+            _ => merged.push(replacement),
+        }
+    }
+    merged
+}
+
+/// Widest span first so a cluster's union is known from its first member, then
+/// most specific, so the cluster walk can pick a winner without rescanning.
+fn sort_for_clustering(replacements: &mut [Replacement]) {
     replacements.sort_by(|left, right| {
         (left.start, Reverse(left.end), left.specificity).cmp(&(
             right.start,
@@ -120,7 +148,6 @@ pub(super) fn render(
             right.specificity,
         ))
     });
-    render_sorted(input, replacements)
 }
 
 fn describe(

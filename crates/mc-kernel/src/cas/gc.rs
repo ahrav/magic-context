@@ -551,10 +551,14 @@ fn scan_objects(root: &std::path::Path) -> Result<Vec<Candidate>, KernelError> {
     Ok(objects)
 }
 
-/// Returns total bytes occupied by regular files under the artifact object tree.
-pub(crate) fn object_usage(store: &KernelStore) -> Result<u64, KernelError> {
+/// Returns total bytes occupied by regular files under the artifact object
+/// tree, or `None` once `cancelled` returns true.
+pub(crate) fn object_usage(
+    store: &KernelStore,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<u64>, KernelError> {
     let objects = store
         .open_objects_directory()
         .map_err(|_| KernelError::Io)?;
-    super::ingest::regular_file_bytes(&objects).map_err(|_| KernelError::Io)
+    super::ingest::regular_file_bytes(&objects, cancelled).map_err(|_| KernelError::Io)
 }

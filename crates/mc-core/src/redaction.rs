@@ -5,7 +5,7 @@ mod scanner;
 use std::sync::LazyLock;
 
 use mc_secret_scanner::{
-    ConstructionError, LimitExhausted, ScanError, ScanLimits, ScanProfile, Scanner,
+    ConstructionError, Finding, LimitExhausted, ScanError, ScanLimits, ScanProfile, Scanner,
 };
 
 pub const DETECTOR_ID: &str = "mc-secret-scanner";
@@ -117,6 +117,10 @@ pub enum RedactionErrorKind {
     InputLimit,
     CandidateLimit,
     WorkLimit,
+    /// A candidate's full match exceeded `mc_secret_scanner::MAX_MATCH_BYTES`, so the scan stopped instead of dropping it.
+    MatchLimit,
+    /// A windowed scan accumulated more detections than its caller allows.
+    DetectionLimit,
     InvalidSpan,
     UnknownRule,
     /// A field that must stay verbatim was found to hold a secret, so the
@@ -145,6 +149,8 @@ fn redaction_error_message(kind: &RedactionErrorKind) -> &'static str {
         RedactionErrorKind::InputLimit => "secret scan input limit exceeded",
         RedactionErrorKind::CandidateLimit => "secret scan candidate limit exceeded",
         RedactionErrorKind::WorkLimit => "secret scan work limit exceeded",
+        RedactionErrorKind::MatchLimit => "secret scan match length limit exceeded",
+        RedactionErrorKind::DetectionLimit => "secret scan detection limit exceeded",
         RedactionErrorKind::InvalidSpan => "secret scan produced an invalid span",
         RedactionErrorKind::UnknownRule => "secret scan produced an unclassified rule",
         RedactionErrorKind::SecretDetected => "secret-bearing field was rejected",
@@ -188,63 +194,181 @@ impl Redactor {
 
     /// Returns no partial output when scanning exhausts a limit or yields an invalid span.
     pub fn redact(&self, input: &str) -> Result<Redaction, RedactionError> {
-        let replacements = self.replacements(input, 0)?;
+        let findings = WindowScan::new(self).findings(input, 0, true)?;
+        scanner::render(input, scanner::describe_findings(input, &findings, 0)?)
+    }
+
+    /// Detections are counted after overlapping findings merge; exceeding `max_detections` returns before scanning later windows or rendering.
+    pub fn redact_windowed(
+        &self,
+        input: &str,
+        max_detections: usize,
+    ) -> Result<Redaction, RedactionError> {
+        let mut scan = WindowScan::new(self);
+        let mut replacements = Vec::new();
+        for (start, end) in scan_windows(input) {
+            let window = window(input, start, end)?;
+            let findings = scan.findings(window, start, end == input.len())?;
+            replacements.extend(scanner::describe_findings(window, &findings, start)?);
+            replacements = scanner::merge(replacements);
+            if replacements.len() > max_detections {
+                return Err(RedactionError {
+                    kind: RedactionErrorKind::DetectionLimit,
+                });
+            }
+        }
         scanner::render(input, replacements)
     }
 
-    /// Scans `input` and returns its replacements shifted by `base`, the byte
-    /// offset of `input` inside the text they will be rendered against.
-    fn replacements(
-        &self,
-        input: &str,
-        base: usize,
-    ) -> Result<Vec<scanner::Replacement>, RedactionError> {
-        let report = self.scanner.scan(input)?;
+    /// Verdict-only counterpart of [`Self::redact_windowed`]: stops at the first finding and renders no output.
+    pub fn detect_windowed(&self, input: &str) -> Result<bool, RedactionError> {
+        let mut scan = WindowScan::new(self);
+        for (start, end) in scan_windows(input) {
+            if !scan
+                .findings(window(input, start, end)?, start, end == input.len())?
+                .is_empty()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Detects findings in bytes that need not be UTF-8.
+    ///
+    /// Scans text produced by `String::from_utf8_lossy`, one window at a time,
+    /// because invalid bytes expand to three-byte replacement characters.
+    pub fn detect_windowed_bytes(&self, bytes: &[u8]) -> Result<bool, RedactionError> {
+        let mut scan = WindowScan::new(self);
+        let mut buffer = String::with_capacity(MAX_REDACTABLE_BYTES.min(bytes.len() + 3));
+        // Byte offset of `buffer[0]` in the lossy text; zero marks the text's real left edge.
+        let mut start = 0usize;
+        for chunk in bytes.utf8_chunks() {
+            let mut valid = chunk.valid();
+            while !valid.is_empty() {
+                let take = char_floor(valid, MAX_REDACTABLE_BYTES - buffer.len());
+                if take == 0 {
+                    if scan.slide(&mut buffer, &mut start)? {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+                buffer.push_str(&valid[..take]);
+                valid = &valid[take..];
+            }
+            if !chunk.invalid().is_empty() {
+                if buffer.len() + char::REPLACEMENT_CHARACTER.len_utf8() > MAX_REDACTABLE_BYTES
+                    && scan.slide(&mut buffer, &mut start)?
+                {
+                    return Ok(true);
+                }
+                buffer.push(char::REPLACEMENT_CHARACTER);
+            }
+        }
+        Ok(!scan.findings(&buffer, start, true)?.is_empty())
+    }
+}
+
+/// One pass of overlapping windows over a text, in ascending order of `start`.
+///
+/// Each absolute byte position is claimed by exactly one window, so a finding
+/// that two windows both see whole is reported once. Findings within
+/// [`EDGE_MARGIN_BYTES`] of an artificial edge are left to the neighbouring window.
+struct WindowScan<'a> {
+    redactor: &'a Redactor,
+    /// Absolute end of the range earlier windows have claimed.
+    claimed_to: usize,
+}
+
+impl<'a> WindowScan<'a> {
+    const fn new(redactor: &'a Redactor) -> Self {
+        Self {
+            redactor,
+            claimed_to: 0,
+        }
+    }
+
+    /// `start` is the window's byte offset in the full input; `is_last` indicates whether the window reaches its end.
+    fn findings(
+        &mut self,
+        window: &str,
+        start: usize,
+        is_last: bool,
+    ) -> Result<Vec<Finding>, RedactionError> {
+        let mut report = self.redactor.scanner.scan(window)?;
         if let Some(limit) = report.limits_hit {
             return Err(RedactionError {
                 kind: match limit {
                     LimitExhausted::Candidates => RedactionErrorKind::CandidateLimit,
                     LimitExhausted::Work => RedactionErrorKind::WorkLimit,
+                    LimitExhausted::Match => RedactionErrorKind::MatchLimit,
                 },
             });
         }
-        scanner::describe_findings(input, &report.findings, base)
+        let keep_from = if start == 0 { 0 } else { EDGE_MARGIN_BYTES };
+        let keep_to = if is_last {
+            window.len()
+        } else {
+            window.len().saturating_sub(EDGE_MARGIN_BYTES)
+        };
+        let claimed_to = self.claimed_to.saturating_sub(start);
+        report.findings.retain(|finding| {
+            finding.full_span.start() >= keep_from
+                && finding.full_span.end() <= keep_to
+                && finding.full_span.end() > claimed_to
+        });
+        self.claimed_to = start + keep_to;
+        Ok(report.findings)
     }
 
-    /// Redacts text longer than [`MAX_REDACTABLE_BYTES`] by scanning
-    /// line-aligned windows that overlap by [`WINDOW_OVERLAP_BYTES`] and
-    /// rendering every finding against the whole input once. A finding both
-    /// windows see collapses into one placeholder because rendering merges
-    /// overlapping spans; a match one window truncates and the next completes
-    /// merges the same way.
-    pub fn redact_windowed(&self, input: &str) -> Result<Redaction, RedactionError> {
-        if input.len() <= MAX_REDACTABLE_BYTES {
-            return self.redact(input);
+    /// Returns whether the scanned window held a finding.
+    fn slide(&mut self, buffer: &mut String, start: &mut usize) -> Result<bool, RedactionError> {
+        if !self.findings(buffer, *start, false)?.is_empty() {
+            return Ok(true);
         }
-        let mut replacements = Vec::new();
-        for (start, end) in scan_windows(input) {
-            let window = input.get(start..end).ok_or(RedactionError {
-                kind: RedactionErrorKind::InvalidSpan,
-            })?;
-            replacements.extend(self.replacements(window, start)?);
-        }
-        scanner::render(input, replacements)
+        let cut = char_floor(buffer, buffer.len().saturating_sub(WINDOW_OVERLAP_BYTES));
+        buffer.drain(..cut);
+        *start += cut;
+        Ok(false)
     }
 }
 
-/// Bytes shared by consecutive scan windows. A secret is found only when its
-/// whole match, its anchor radius, and its local-context span sit inside one
-/// window, so the overlap has to exceed the sum of the largest of each. The
-/// widest rule radius is 16 KiB and the widest local-context span is 1 KiB;
-/// the remainder covers the longest match, such as a PEM-encoded private key.
-pub const WINDOW_OVERLAP_BYTES: usize = 64 * 1024;
+fn window(input: &str, start: usize, end: usize) -> Result<&str, RedactionError> {
+    input.get(start..end).ok_or(RedactionError {
+        kind: RedactionErrorKind::InvalidSpan,
+    })
+}
 
+/// The overlap contains a complete maximum-size finding footprint, so at least one window scans each finding intact.
+///
+/// A match longer than the overlap can span two windows without either window containing the match whole;
+/// the windowed scan cannot see such a match. Only matches seen whole by one window are either reported
+/// or fail the scan closed with `MatchLimit`.
+pub const WINDOW_OVERLAP_BYTES: usize = 96 * 1024;
+
+const _: () = assert!(
+    mc_secret_scanner::MAX_MATCH_BYTES
+        + 2 * mc_secret_scanner::MAX_RULE_RADIUS
+        + 2 * mc_secret_scanner::MAX_LOCAL_CONTEXT_BYTES
+        <= WINDOW_OVERLAP_BYTES
+);
 const _: () = assert!(WINDOW_OVERLAP_BYTES * 2 <= MAX_REDACTABLE_BYTES);
 
-/// Splits `input` into `[start, end)` windows of at most `MAX_REDACTABLE_BYTES`
-/// whose starts fall on line boundaries and whose consecutive members share at
-/// least `WINDOW_OVERLAP_BYTES`. A line longer than the window minus its
-/// overlap is split at a char boundary instead, so the walk always advances.
+/// Distance from an artificial window edge within which a finding is deferred to the neighbouring window.
+///
+/// At an artificial end-of-slice, `\b` and `$` may match and lookarounds may observe no adjacent input,
+/// and a rule's radius is clipped. The margin is the most context any rule reads past its match on one side.
+pub const EDGE_MARGIN_BYTES: usize =
+    mc_secret_scanner::MAX_RULE_RADIUS + mc_secret_scanner::MAX_LOCAL_CONTEXT_BYTES;
+
+// A deferred finding lies within `MAX_MATCH_BYTES + EDGE_MARGIN_BYTES` of the shared edge.
+const _: () =
+    assert!(mc_secret_scanner::MAX_MATCH_BYTES + 2 * EDGE_MARGIN_BYTES <= WINDOW_OVERLAP_BYTES);
+const _: () = assert!(EDGE_MARGIN_BYTES < MIN_WINDOW_ADVANCE_BYTES);
+
+/// Splits `input` into `[start, end)` windows of at most `MAX_REDACTABLE_BYTES` whose starts fall on line boundaries and whose consecutive members share at least `WINDOW_OVERLAP_BYTES`.
+/// A line longer than the window minus its overlap is split at a char boundary instead, so the walk always advances.
+/// Input at or under `MAX_REDACTABLE_BYTES` is one window.
 fn scan_windows(input: &str) -> Vec<(usize, usize)> {
     let mut windows = Vec::new();
     let mut start = 0usize;
@@ -255,14 +379,14 @@ fn scan_windows(input: &str) -> Vec<(usize, usize)> {
             return windows;
         }
         let target = char_floor(input, end - WINDOW_OVERLAP_BYTES);
-        // The latest line start at or before `target` keeps the overlap at
-        // least as wide as required. Only line starts past `floor` qualify, so
-        // one long line preceded by a short one cannot shrink the advance to a
-        // few bytes and multiply the window count.
+        // The latest line start at or before `target` keeps the overlap at least as wide as required.
+        // Only line starts at or past `floor` qualify, preventing a long line preceded by a short one from shrinking the advance to a few bytes.
+        // A newline before `floor - 1` cannot qualify, and searching from byte 0 each iteration is quadratic in newline-sparse input.
         let floor = start + MIN_WINDOW_ADVANCE_BYTES;
-        let next = input[..target]
+        let search_from = char_floor(input, floor.saturating_sub(1)).min(target);
+        let next = input[search_from..target]
             .rfind('\n')
-            .map(|index| index + 1)
+            .map(|index| search_from + index + 1)
             .filter(|&line_start| line_start >= floor)
             .unwrap_or(target);
         start = next.max(start + 1);
@@ -336,19 +460,31 @@ pub fn redact_transaction_durable_text(input: &str) -> Redaction {
     redact_with(&TRANSACTION_REDACTOR, input)
 }
 
-/// Redacts text of any length by windowed scanning; fails closed the same way
-/// `redact_durable_text` does. Only artifact ingestion, whose payload cap sits
-/// above the scan limit, calls this; every other durable field keeps the
-/// `InputLimit` behavior of `redact_durable_text`.
-pub fn redact_windowed_durable_text(input: &str) -> Redaction {
-    match REDACTOR
+/// Windowed redaction for content that is stored as itself, so no placeholder may stand in for the input on failure; callers must refuse the write on `Err`.
+pub fn redact_windowed_durable_text(
+    input: &str,
+    max_detections: usize,
+) -> Result<Redaction, RedactionError> {
+    REDACTOR
         .as_ref()
         .map_err(|error| *error)
-        .and_then(|redactor| redactor.redact_windowed(input))
-    {
-        Ok(redaction) => redaction,
-        Err(_) => whole_placeholder(input),
-    }
+        .and_then(|redactor| redactor.redact_windowed(input, max_detections))
+}
+
+/// Windowed detection verdict; `Err` means the scan could not prove the input secret-free.
+pub fn detect_windowed_durable_text(input: &str) -> Result<bool, RedactionError> {
+    REDACTOR
+        .as_ref()
+        .map_err(|error| *error)
+        .and_then(|redactor| redactor.detect_windowed(input))
+}
+
+/// Windowed detection verdict over the lossy decoding of `bytes`; `Err` means the scan could not prove the input secret-free.
+pub fn detect_windowed_durable_bytes(bytes: &[u8]) -> Result<bool, RedactionError> {
+    REDACTOR
+        .as_ref()
+        .map_err(|error| *error)
+        .and_then(|redactor| redactor.detect_windowed_bytes(bytes))
 }
 
 /// Identifies the detector build that produced a redaction, for the audit
@@ -621,7 +757,10 @@ mod tests {
                 first.1 - second.0 >= WINDOW_OVERLAP_BYTES,
                 "overlap too small: {pair:?}"
             );
-            assert!(second.0 - first.0 >= MIN_WINDOW_ADVANCE_BYTES.min(1));
+            assert!(
+                second.0 - first.0 >= MIN_WINDOW_ADVANCE_BYTES,
+                "advance too small: {pair:?}"
+            );
             assert!(input.is_char_boundary(second.0));
         }
         windows

@@ -1215,6 +1215,28 @@ fn detection_dense_payload_is_rejected_before_staging() {
 }
 
 #[test]
+fn detection_dense_payload_past_the_scan_limit_is_rejected_not_replaced() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let mut payload = String::new();
+    while payload.len() < 2 * mc_core::redaction::MAX_REDACTABLE_BYTES {
+        payload.push_str("password=hunter-two-");
+        payload.push_str(&payload.len().to_string());
+        payload.push('\n');
+    }
+
+    let error = store
+        .ingest_artifact(request("windowed-detection-flood", payload.into_bytes()))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::DetectionLimit);
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
+}
+
+#[test]
 fn fifo_at_the_digest_destination_does_not_block_ingest() {
     let root = tempfile::tempdir().unwrap();
     let store = KernelStore::open(root.path()).unwrap();
@@ -1443,4 +1465,38 @@ fn oversized_repository_provenance_is_rejected_before_staging() {
     assert_eq!(staged_entries(root.path()), 0);
     assert_eq!(published_objects(root.path()), Vec::<String>::new());
     assert_eq!(reservation_count(root.path()), 0);
+}
+
+#[test]
+fn a_secret_longer_than_the_match_bound_rejects_the_payload_instead_of_storing_it() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    // A PEM body past the scanner's match bound cannot be described as a
+    // finding; the scan reports the limit and the payload is refused rather
+    // than stored in cleartext with no detections.
+    let body_line = "MIIEpAIBAAKCAQEA7bq2k0v9xR3sY1nQ4dJ6fH8zL2mW5cP0uT9eG7iK3oB1aV\n";
+    let mut pem = String::from("-----BEGIN RSA PRIVATE KEY-----\n");
+    while pem.len() < mc_secret_scanner::MAX_MATCH_BYTES + body_line.len() {
+        pem.push_str(body_line);
+    }
+    pem.push_str("-----END RSA PRIVATE KEY-----");
+    assert!(pem.len() > mc_secret_scanner::MAX_MATCH_BYTES);
+
+    for (key, payload) in [
+        ("text", format!("prefix\n{pem}\nsuffix\n").into_bytes()),
+        ("binary", {
+            let mut bytes = format!("\u{fffd}{pem}\n").into_bytes();
+            bytes[0] = 0xff;
+            bytes
+        }),
+    ] {
+        let error = store.ingest_artifact(request(key, payload)).unwrap_err();
+        assert_eq!(error.kind(), ArtifactErrorKind::UnredactableSecret, "{key}");
+    }
+    assert_eq!(live_reservations(root.path()), 0);
+    assert!(!tree_bytes(root.path())
+        .windows(body_line.len())
+        .any(|window| window == body_line.as_bytes()));
 }

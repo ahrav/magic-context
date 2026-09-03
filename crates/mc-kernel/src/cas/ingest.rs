@@ -7,7 +7,7 @@
 
 use std::fs::File;
 
-use mc_core::redaction::Detection;
+use mc_core::redaction::{Detection, RedactionError, RedactionErrorKind};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use rustix::fs::{self as rfs, AtFlags, OFlags};
 use serde::Serialize;
@@ -27,7 +27,9 @@ use crate::durable_fs::{
     sync_publish_directories_with, temp_name, write_and_sync, PublishOutcome, StorageError,
 };
 use crate::envelope::{check_fence, commit_with_writer, ObjectRow, PendingChange};
-use crate::redaction::{identity, record, redact_lossy, redact_payload, RedactedField};
+use crate::redaction::{
+    identity, payload_has_secret, record, redact_lossy, redact_payload, RedactedField,
+};
 use crate::{KernelError, KernelStore, Sensitivity};
 
 const RESERVATION_MS: i64 = 60 * 60 * 1_000;
@@ -127,29 +129,22 @@ impl PreparedArtifact {
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
 
-        // The windowed scan fails closed only on scanner construction or budget
-        // failure, replacing the whole payload with one placeholder. Measuring the
-        // raw payload first keeps that placeholder's length from standing in for
-        // the artifact's when the cap is checked.
-        if request.payload.len() > MAX_PAYLOAD_BYTES {
-            return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
-        }
-
         let (payload_redaction, bytes, inspected) = match std::str::from_utf8(&request.payload) {
             Ok(text) => {
-                let redaction = redact_payload(text);
+                let redaction = redact_payload(text, MAX_PAYLOAD_DETECTIONS)
+                    .map_err(|error| ArtifactError::new(scan_failure(error)))?;
                 let bytes = redaction.text.as_bytes().to_vec();
                 (redaction, bytes, true)
             }
             Err(_) => {
-                {
-                    // Invalid bytes widen to three-byte replacement characters under the
-                    // lossy conversion; the windowed scan has no input limit, so the
-                    // widened text is inspected whole rather than rejected.
-                    let inspected_text = String::from_utf8_lossy(&request.payload);
-                    if !redact_payload(&inspected_text).detections.is_empty() {
+                // Lossy decoding expands invalid bytes to three-byte U+FFFD sequences;
+                // payload_has_secret scans bounded windows to avoid materializing a lossy-decoded payload.
+                match payload_has_secret(&request.payload) {
+                    Ok(false) => {}
+                    Ok(true) => {
                         return Err(ArtifactError::new(ArtifactErrorKind::UnredactableSecret));
                     }
+                    Err(error) => return Err(ArtifactError::new(scan_failure(error))),
                 }
                 (
                     RedactedField {
@@ -164,11 +159,9 @@ impl PreparedArtifact {
         let affirmative_provenance = request.provenance.as_ref().is_some_and(|provenance| {
             !provenance.repository_id.trim().is_empty() && !provenance.revision.trim().is_empty()
         });
+        // A placeholder can be wider than the secret it replaces, so redaction can push the payload past the cap.
         if bytes.len() > MAX_PAYLOAD_BYTES {
             return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
-        }
-        if payload_redaction.detections.len() > MAX_PAYLOAD_DETECTIONS {
-            return Err(ArtifactError::new(ArtifactErrorKind::DetectionLimit));
         }
         // A recognized secret anywhere that is stored verbatim-after-redaction must
         // raise the class, not only one in the payload; otherwise a clean payload
@@ -201,6 +194,24 @@ impl PreparedArtifact {
             artifact_reference,
             redaction_metadata,
         })
+    }
+}
+
+/// A payload is refused when its scan cannot vouch for it. Only a match the
+/// scanner saw but could not describe counts as a secret; every other failure
+/// means the scan did not cover the payload, which is reported as such so an
+/// operator is not told a secret was found when the scan merely stopped.
+fn scan_failure(error: RedactionError) -> ArtifactErrorKind {
+    match error.kind() {
+        RedactionErrorKind::DetectionLimit => ArtifactErrorKind::DetectionLimit,
+        RedactionErrorKind::MatchLimit => ArtifactErrorKind::UnredactableSecret,
+        RedactionErrorKind::Construction
+        | RedactionErrorKind::InputLimit
+        | RedactionErrorKind::CandidateLimit
+        | RedactionErrorKind::WorkLimit
+        | RedactionErrorKind::InvalidSpan
+        | RedactionErrorKind::UnknownRule
+        | RedactionErrorKind::SecretDetected => ArtifactErrorKind::ScanIncomplete,
     }
 }
 
@@ -559,9 +570,11 @@ impl KernelStore {
         digest: &str,
         byte_length: u64,
     ) -> Result<(), ArtifactError> {
-        let usage = regular_file_bytes(objects).map_err(|error| {
-            self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
-        })?;
+        let usage = regular_file_bytes(objects, &|| false)
+            .map_err(|error| {
+                self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
+            })?
+            .expect("an uncancellable walk completes");
         let already_present = object_is_present(objects, digest);
         let projected = usage.saturating_add(if already_present { 0 } else { byte_length });
         if projected > self.artifact_cap {
@@ -940,10 +953,17 @@ fn open_shard_nofollow(objects: &File, name: impl rustix::path::Arg) -> Result<F
 /// Sums regular-file sizes directly below `objects` and its shard directories.
 ///
 /// Symlinks and other file types do not contribute. Entries removed during the
-/// walk are skipped. The sum saturates at [`u64::MAX`].
-pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
+/// walk are skipped. The sum saturates at [`u64::MAX`]. `cancelled` is polled
+/// before every entry at both levels; a true result returns `None`.
+pub(super) fn regular_file_bytes(
+    objects: &File,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<u64>, StorageError> {
     let mut bytes = 0_u64;
     for entry in rfs::Dir::read_from(objects).map_err(classify_errno)? {
+        if cancelled() {
+            return Ok(None);
+        }
         let entry = entry.map_err(classify_errno)?;
         let name = entry.file_name();
         if is_dot_entry(name) {
@@ -971,6 +991,9 @@ pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
             Err(error) => return Err(error),
         };
         for shard_entry in rfs::Dir::read_from(&shard).map_err(classify_errno)? {
+            if cancelled() {
+                return Ok(None);
+            }
             let shard_entry = shard_entry.map_err(classify_errno)?;
             let shard_name = shard_entry.file_name();
             if is_dot_entry(shard_name) {
@@ -986,7 +1009,7 @@ pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
             }
         }
     }
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 fn object_is_present(objects: &File, digest: &str) -> bool {

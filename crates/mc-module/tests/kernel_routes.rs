@@ -1,10 +1,9 @@
-//! Daemon-side kernel route proofs. The proof registry in
-//! `crates/mc-kernel/tests/kernel_proofs/registry.rs` names tests in this file.
+//! Daemon-side kernel route proofs.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cortexkit_store_types::{StorageBackend, StorageDescriptor};
 use mc_host::{
@@ -33,6 +32,14 @@ fn init(descriptor: &StorageDescriptor) -> HostInit {
     }
 }
 
+/// Wall-clock milliseconds, so manual samples carry realistic timestamps.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_millis() as i64
+}
+
 fn kernel_root(descriptor: &StorageDescriptor) -> PathBuf {
     let StorageBackend::Sqlite { path } = &descriptor.backend else {
         panic!("test descriptor is SQLite");
@@ -54,6 +61,8 @@ impl Daemon {
         let data = tempfile::tempdir().unwrap();
         let descriptor = dev_descriptor_at(data.path().to_str().unwrap());
         let handler = McHandler::new();
+        // Disable kernel sampling so assertions observe the controlled timestamp.
+        handler.disable_kernel_sampler_for_test();
         PrimaryComponent::initialize(&handler, init(&descriptor))
             .await
             .unwrap();
@@ -218,12 +227,16 @@ fn insert_domains(store: &mc_kernel::KernelStore, first: i64, count: i64) -> i64
 #[tokio::test]
 async fn health_reads_the_sampled_kernel_block_without_touching_the_store() {
     let daemon = Daemon::start().await;
-    daemon.handler.sample_kernel_health_for_test(1_000).await;
+    let sampled_at = now_ms();
+    daemon
+        .handler
+        .sample_kernel_health_for_test(sampled_at)
+        .await;
     let health = daemon.handler.health().await;
     assert_eq!(health.status, mc_host::HealthStatus::Ok);
     let kernel = kernel_block(&health);
     assert_eq!(kernel["kernel_state"], "ready");
-    assert_eq!(kernel["sampled_at_ms"], 1_000);
+    assert_eq!(kernel["sampled_at_ms"], sampled_at);
     assert_eq!(kernel["core_file_warn"], false);
     assert_eq!(kernel["artifact_warn"], false);
     assert!(kernel["artifact_cap_bytes"].as_u64().unwrap() > 0);
@@ -252,7 +265,7 @@ async fn an_empty_required_consumer_set_raises_a_daemon_health_warning() {
     let store = daemon.handler.kernel_store_for_test().unwrap();
     insert_domains(&store, 1, 3);
     store.mark_outbox_published_through(3, 1).unwrap();
-    daemon.handler.sample_kernel_health_for_test(1_000).await;
+    daemon.handler.sample_kernel_health_for_test(now_ms()).await;
 
     // No consumer: lag is unknown, the block says so, and the daemon stays Ok.
     // The readiness surface renders this as `warn (no_required_consumer)`.
@@ -351,7 +364,7 @@ async fn crossing_the_lag_threshold_raises_a_daemon_health_warning() {
     assert_eq!(kernel["lag_threshold_tripped"], true);
     assert_eq!(health.status, mc_host::HealthStatus::Degraded);
 
-    // The routed status method reports the same block from live facts.
+    // The routed status method reports the same sampled block.
     let status = daemon
         .handler
         .dispatch_value_for_test(
@@ -365,6 +378,100 @@ async fn crossing_the_lag_threshold_raises_a_daemon_health_warning() {
     let value = response_json(&output);
     assert_eq!(value["kernel"]["kernel_state"], "ready");
     assert_eq!(value["kernel"]["required_consumer_count"], 1);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_background_sampler_publishes_facts_on_its_own() {
+    let data = tempfile::tempdir().unwrap();
+    let descriptor = dev_descriptor_at(data.path().to_str().unwrap());
+    let handler = McHandler::new();
+    PrimaryComponent::initialize(&handler, init(&descriptor))
+        .await
+        .unwrap();
+    PrimaryComponent::activate(&handler).await.unwrap();
+    wait_for_state(&handler, KernelState::Ready).await;
+
+    // `Ready` reaches the health block only once the sampler has facts.
+    let started = Instant::now();
+    let kernel = loop {
+        let kernel = kernel_block(&handler.health().await);
+        if kernel["kernel_state"] == "ready" {
+            break kernel;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "sampler never published: {kernel}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(kernel["sampled_at_ms"].as_i64().unwrap() > 0);
+    assert_eq!(kernel["retained_outbox_rows"], 0);
+    assert_eq!(kernel["required_consumer_count"], 0);
+    handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_facts_sample_reports_the_kernel_unavailable_until_one_succeeds() {
+    let daemon = Daemon::start().await;
+    daemon.handler.sample_kernel_health_for_test(now_ms()).await;
+    assert_eq!(
+        daemon.handler.health().await.status,
+        mc_host::HealthStatus::Ok
+    );
+
+    // The store only opens owner-only artifact directories.
+    let objects = kernel_root(&daemon.descriptor).join("artifacts/objects");
+    fs::set_permissions(&objects, fs::Permissions::from_mode(0o755)).unwrap();
+    let failed_at = now_ms();
+    daemon
+        .handler
+        .sample_kernel_health_for_test(failed_at)
+        .await;
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Degraded, "{health:?}");
+    assert!(health
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.ends_with("kernel store is unavailable")));
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["kernel_state"], "unavailable");
+    assert_eq!(kernel["unavailable_reason"], "store_unavailable");
+    assert_eq!(kernel["sampled_at_ms"], failed_at);
+    assert!(kernel.get("core_file_bytes").is_none());
+    assert!(kernel.get("lag_threshold_tripped").is_none());
+    // Routes are not fenced by the health projection.
+    assert_eq!(daemon.handler.kernel_state(), KernelState::Ready);
+    assert!(daemon.handler.kernel_store_for_test().is_some());
+
+    // The routed status method reports the same failed sample.
+    let status = daemon
+        .handler
+        .dispatch_value_for_test(
+            daemon.route,
+            serde_json::json!({"method": "status", "session_id": "session-a"}),
+        )
+        .await;
+    let mc_module::dispatch::PreparedOutcome::Response(output) = status else {
+        panic!("status responded with {status:?}");
+    };
+    let value = response_json(&output);
+    assert_eq!(value["kernel"]["kernel_state"], "unavailable");
+    assert_eq!(value["kernel"]["unavailable_reason"], "store_unavailable");
+
+    fs::set_permissions(&objects, fs::Permissions::from_mode(0o700)).unwrap();
+    let recovered_at = now_ms();
+    daemon
+        .handler
+        .sample_kernel_health_for_test(recovered_at)
+        .await;
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Ok, "{health:?}");
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["kernel_state"], "ready");
+    assert_eq!(kernel["sampled_at_ms"], recovered_at);
+    assert!(kernel.get("unavailable_reason").is_none());
+    assert_eq!(kernel["retained_outbox_rows"], 0);
     daemon.handler.shutdown().await.unwrap();
 }
 
@@ -2666,5 +2773,42 @@ async fn a_page_for_an_unknown_upload_or_an_oversized_frame_is_refused_before_de
         .await;
     assert_state(&finished, "available", None);
     assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stale_ready_sample_reads_as_unavailable_until_a_fresh_one_lands() {
+    let daemon = Daemon::start().await;
+    let stale_at = now_ms();
+    daemon.handler.sample_kernel_health_for_test(stale_at).await;
+    assert_eq!(
+        daemon.handler.health().await.status,
+        mc_host::HealthStatus::Ok
+    );
+    // Staleness is measured on the monotonic clock from the publish, not from
+    // `sampled_at_ms`, so the block is aged rather than backdated.
+    daemon.handler.expire_kernel_health_for_test();
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Degraded, "{health:?}");
+    assert!(health
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.ends_with("kernel health sample is stale")));
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["kernel_state"], "unavailable");
+    assert_eq!(kernel["unavailable_reason"], "store_unavailable");
+    // The stale sample time stays visible so the age can be read off the block.
+    assert_eq!(kernel["sampled_at_ms"], stale_at);
+    assert!(kernel.get("retained_outbox_rows").is_none());
+    // The projection is read-side only: the store is still reachable and a fresh
+    // sample restores the ready block.
+    assert_eq!(daemon.handler.kernel_state(), KernelState::Ready);
+    let fresh_at = now_ms();
+    daemon.handler.sample_kernel_health_for_test(fresh_at).await;
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Ok, "{health:?}");
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["kernel_state"], "ready");
+    assert_eq!(kernel["sampled_at_ms"], fresh_at);
     daemon.handler.shutdown().await.unwrap();
 }

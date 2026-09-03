@@ -183,9 +183,8 @@ impl From<ArtifactErrorKind> for KernelOutcome {
             }
             ArtifactErrorKind::ReAdmissionBlocked
             | ArtifactErrorKind::ReferenceUnavailable
-            | ArtifactErrorKind::UnredactableSecret => {
-                Self::invalid(InvalidReason::ArtifactUnusable)
-            }
+            | ArtifactErrorKind::UnredactableSecret
+            | ArtifactErrorKind::ScanIncomplete => Self::invalid(InvalidReason::ArtifactUnusable),
         }
     }
 }
@@ -232,6 +231,7 @@ mod tests {
         ArtifactErrorKind::AlignmentRebuild,
         ArtifactErrorKind::ReclaimInProgress,
         ArtifactErrorKind::UnredactableSecret,
+        ArtifactErrorKind::ScanIncomplete,
         ArtifactErrorKind::DetectionLimit,
         ArtifactErrorKind::TextFieldTooLong,
         ArtifactErrorKind::InvalidInput,

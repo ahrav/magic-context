@@ -531,7 +531,10 @@ pub fn route_open_response_json(channel: u16, epoch: u32) -> Vec<u8> {
 /// re-emitted only when it has the declared type and range; an invalid field
 /// is dropped while the rest of the block survives, and a block without a
 /// recognizable `kernel_state` is dropped whole so the CLI renders `unknown`.
+/// The wire protocol permits `unavailable_reason` only when `kernel_state` is
+/// `unavailable`.
 fn sanitize_kernel_block(raw: &serde_json::Value) -> Option<serde_json::Value> {
+    // Largest integer exactly representable by an IEEE 754 double.
     const MAX_COUNTER: u64 = 1 << 53;
     let raw = raw.as_object()?;
     let state = raw
@@ -548,25 +551,30 @@ fn sanitize_kernel_block(raw: &serde_json::Value) -> Option<serde_json::Value> {
     if let Some(reason) = raw
         .get("unavailable_reason")
         .and_then(serde_json::Value::as_str)
-        .filter(|reason| matches!(*reason, "store_unavailable" | "store_unsupported"))
+        .filter(|reason| {
+            state == "unavailable" && matches!(*reason, "store_unavailable" | "store_unsupported")
+        })
     {
         block.insert(
             "unavailable_reason".to_owned(),
             serde_json::Value::String(reason.to_owned()),
         );
     }
-    for name in [
-        "sampled_at_ms",
-        "core_file_bytes",
-        "artifact_usage_bytes",
-        "artifact_cap_bytes",
-        "outbox_position_lag",
-        "oldest_unconsumed_age_ms",
-        "retained_outbox_rows",
-        "required_consumer_count",
+    // `null` is a declared value only for the sample time and the two lag
+    // fields; on any other counter it is a type error and is dropped, so a
+    // consumer's `=== 0` or numeric test never sees a null in its place.
+    for (name, nullable) in [
+        ("sampled_at_ms", true),
+        ("core_file_bytes", false),
+        ("artifact_usage_bytes", false),
+        ("artifact_cap_bytes", false),
+        ("outbox_position_lag", true),
+        ("oldest_unconsumed_age_ms", true),
+        ("retained_outbox_rows", false),
+        ("required_consumer_count", false),
     ] {
         match raw.get(name) {
-            Some(serde_json::Value::Null) => {
+            Some(serde_json::Value::Null) if nullable => {
                 block.insert(name.to_owned(), serde_json::Value::Null);
             }
             Some(value) => {
@@ -1252,6 +1260,33 @@ mod tests {
         assert!(partial.get("artifact_usage_bytes").is_none());
         assert!(partial.get("retained_outbox_rows").is_none());
         assert!(partial.get("lag_threshold_tripped").is_none());
+
+        // `null` survives only on the three nullable fields.
+        let nulls = kernel_of(&report(serde_json::json!({
+            "kernel_state": "ready",
+            "sampled_at_ms": null,
+            "outbox_position_lag": null,
+            "oldest_unconsumed_age_ms": null,
+            "core_file_bytes": null,
+            "required_consumer_count": null,
+        })));
+        assert_eq!(nulls["sampled_at_ms"], serde_json::Value::Null);
+        assert_eq!(nulls["outbox_position_lag"], serde_json::Value::Null);
+        assert_eq!(nulls["oldest_unconsumed_age_ms"], serde_json::Value::Null);
+        assert!(nulls.get("core_file_bytes").is_none());
+        assert!(nulls.get("required_consumer_count").is_none());
+
+        // A contradictory `unavailable_reason` is dropped; other fields remain.
+        for state in ["ready", "starting"] {
+            let contradictory = kernel_of(&report(serde_json::json!({
+                "kernel_state": state,
+                "unavailable_reason": "store_unavailable",
+                "retained_outbox_rows": 2,
+            })));
+            assert_eq!(contradictory["kernel_state"], state);
+            assert!(contradictory.get("unavailable_reason").is_none());
+            assert_eq!(contradictory["retained_outbox_rows"], 2);
+        }
 
         // No recognizable state: no block at all.
         let missing = kernel_of(&report(serde_json::json!({ "kernel_state": "broken" })));

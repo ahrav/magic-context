@@ -24,8 +24,14 @@ import { resolveProjectIdsForIdentities } from "../../../plugin/src/features/mag
 import { createClaimReaderTestDatabase } from "../../../plugin/src/features/magic-context/test-claim-database";
 import type { Database } from "../../../plugin/src/shared/sqlite";
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { compareCodeUnits } from "../code-unit-order";
+import { makeContractPrimitives, type ContractPrimitives } from "../contract-primitives";
 import { openTestDb } from "../test-db";
+import { parseSystemVersionTuple, requireScoreSystemBinding } from "./system-tuple";
 import {
+    MAX_EXPECTATION_ENTRIES,
+    NO_INJECTED_GOLD_CLAIM,
+    PROBE_CHOICE_SEPARATOR,
     containsCompleteValue,
     decodeXmlEntities,
     matchesGold,
@@ -70,17 +76,21 @@ export const LANE_REPORT_SCHEMA = "historian-eval-report/v3";
 /* */
 export const FAIL_REASONS = ["false-authoritative", "recall", "structural", "probe", "invalid-output"] as const;
 export type FailReason = (typeof FAIL_REASONS)[number];
+export const SCENARIO_VERDICTS = ["PASS", "FAIL", "ERROR"] as const;
+export type ScenarioVerdict = (typeof SCENARIO_VERDICTS)[number];
+export const PROBE_OUTCOMES = ["pass", "fail", "error-trimmed"] as const;
+export const SCORE_SOURCES = ["run-record", "raw-output"] as const;
 
 export interface ProbeVerdict {
     probeId: string;
-    outcome: "pass" | "fail" | "error-trimmed";
+    outcome: (typeof PROBE_OUTCOMES)[number];
     expected: string;
     actual: string | null;
 }
 
 export interface ScenarioScore {
     scenarioId: string;
-    verdict: "PASS" | "FAIL" | "ERROR";
+    verdict: ScenarioVerdict;
     failReasons: FailReason[];
     errorReason: string | null;
     errorDetail: string | null;
@@ -104,7 +114,7 @@ export interface ScenarioScore {
      *
      * Malformed-record artifacts must become per-scenario `ERROR` results, not seam results.
      */
-    source: "run-record" | "raw-output";
+    source: (typeof SCORE_SOURCES)[number];
 }
 
 export type RawOutputStageResult =
@@ -161,6 +171,11 @@ export function expectationGoldMatchPredicates(
  *
  * Distinctness prevents one visible claim from satisfying multiple expectations and inflating recall.
  */
+/** A claim ratio is undefined over an empty denominator rather than zero. */
+export function claimRatio(matched: number, total: number): number | null {
+    return total === 0 ? null : matched / total;
+}
+
 function maximumGoldMatching(
     expected: readonly ExpectedClaim[],
     visible: ReadonlyArray<{ category: string; content: string }>,
@@ -241,8 +256,8 @@ function scoreFacts(
     const matchedVisible = visible.filter((item) => expected.some((claim) => matchesGold(claim, item)));
     const falseAuthoritativeMatches = falseAuthoritativeMatchesIn(scenario, visible);
     return {
-        precision: visible.length === 0 ? null : matchedVisible.length / visible.length,
-        recall: expected.length === 0 ? null : matchedExpectedCount / expected.length,
+        precision: claimRatio(matchedVisible.length, visible.length),
+        recall: claimRatio(matchedExpectedCount, expected.length),
         expectedClaimsMatched: matchedExpectedCount,
         expectedClaimsTotal: expected.length,
         visibleClaimsMatched: matchedVisible.length,
@@ -393,34 +408,54 @@ export function compareProbeAnswer(args: {
         );
         if (promoted.length > 0 && !injectedForProbe && !goldAnswerStatedInCompartments(probe, exchange)) {
             const expected =
-                probe.answerType === "claim-id" ? "<no injected gold claim>" : probe.goldAnswer;
+                probe.answerType === "claim-id" ? NO_INJECTED_GOLD_CLAIM : probe.goldAnswer;
             return { probeId: probe.id, outcome: "error-trimmed", expected, actual: exchange.answerRaw };
         }
     }
 
     let expected: string;
     let pass: boolean;
+    // Both branches accept an answer that equals a candidate after entity decoding and normalization, so
+    // `parseProbeVerdicts` can rederive the outcome from `expected` alone.
+    const answers = (candidate: string): boolean =>
+        exchange.answerRaw !== null &&
+        normalizeContent(decodeXmlEntities(exchange.answerRaw)) === normalizeContent(decodeXmlEntities(candidate));
     if (probe.answerType === "claim-id") {
         const matching = goldClaim === null ? [] : claimsMatchingGold(goldClaim, injectedClaims);
         const injectedMatching = matching.filter((item) => injectedLocators.has(item.revisionLocator));
-        expected = injectedMatching.map((item) => item.publicClaimId).sort().join(" | ") || "<no injected gold claim>";
-        pass =
-            exchange.answerRaw !== null &&
-            injectedMatching.some(
-                (item) => normalizeContent(item.publicClaimId) === normalizeContent(exchange.answerRaw ?? ""),
-            );
+        expected = injectedMatching.map((item) => item.publicClaimId).sort().join(PROBE_CHOICE_SEPARATOR) || NO_INJECTED_GOLD_CLAIM;
+        pass = injectedMatching.some((item) => answers(item.publicClaimId));
     } else {
         expected = probe.goldAnswer;
-        // entity.
-        pass =
-            exchange.answerRaw !== null &&
-            normalizeContent(decodeXmlEntities(exchange.answerRaw)) ===
-                normalizeContent(decodeXmlEntities(probe.goldAnswer));
+        pass = answers(probe.goldAnswer);
     }
     if (pass) return { probeId: probe.id, outcome: "pass", expected, actual: exchange.answerRaw };
 
     return { probeId: probe.id, outcome: "fail", expected, actual: exchange.answerRaw };
 }
+
+/**
+ * The fail reasons a score's own published evidence implies.
+ *
+ * `invalid-output` is absent because it comes from the run's status rather than anything the score records,
+ * so a consumer can check these four in both directions and that one in neither.
+ */
+export function evidenceFailReasons(score: {
+    recall: number | null;
+    falseAuthoritativeMatches: readonly string[];
+    structuralFindings: readonly string[];
+    probeVerdicts: readonly { outcome: ProbeVerdict["outcome"] }[];
+}): FailReason[] {
+    const reasons = new Set<FailReason>();
+    if (score.falseAuthoritativeMatches.length > 0) reasons.add("false-authoritative");
+    if (score.recall !== null && score.recall < 1) reasons.add("recall");
+    if (score.structuralFindings.length > 0) reasons.add("structural");
+    if (score.probeVerdicts.some((verdict) => verdict.outcome === "fail")) reasons.add("probe");
+    return FAIL_REASONS.filter((reason) => reasons.has(reason));
+}
+
+/** The one ERROR reason `assembleScore` emits; every other ERROR comes from `errorScore` without probe evidence. */
+const TRIMMED_BY_INJECTION_BUDGET = "trimmed-by-injection-budget";
 
 function assembleScore(args: {
     scenarioId: string;
@@ -435,12 +470,13 @@ function assembleScore(args: {
     source: ScenarioScore["source"];
 }): ScenarioScore {
     const { scenarioId, facts, structuralFindings, probeVerdicts, anyRunInvalid, system, source } = args;
-    const failReasons = new Set<FailReason>();
+    const failReasons = new Set<FailReason>(evidenceFailReasons({
+        recall: facts.recall,
+        falseAuthoritativeMatches: facts.falseAuthoritativeMatches,
+        structuralFindings,
+        probeVerdicts,
+    }));
     if (anyRunInvalid) failReasons.add("invalid-output");
-    if (facts.falseAuthoritativeMatches.length > 0) failReasons.add("false-authoritative");
-    if (facts.recall !== null && facts.recall < 1) failReasons.add("recall");
-    if (structuralFindings.length > 0) failReasons.add("structural");
-    if (probeVerdicts.some((verdict) => verdict.outcome === "fail")) failReasons.add("probe");
 
     //
     const trimmed = probeVerdicts.find((verdict) => verdict.outcome === "error-trimmed");
@@ -448,7 +484,7 @@ function assembleScore(args: {
         return {
             ...errorScore(
                 scenarioId,
-                "trimmed-by-injection-budget",
+                TRIMMED_BY_INJECTION_BUDGET,
                 `probe ${trimmed.probeId}: gold claim promoted but absent from the injected set`,
                 system,
                 source,
@@ -731,13 +767,18 @@ function isIdentityValue(value: unknown): boolean {
     return typeof value === "string" && value.trim().length > 0;
 }
 
+/** The id a malformed record's ERROR score carries; `parseScenarioScore` admits only a non-blank id. */
+function recordScenarioId(record: { scenarioId?: unknown }): string {
+    return typeof record.scenarioId === "string" && record.scenarioId.trim().length > 0 ? record.scenarioId : "<unknown>";
+}
+
 function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null {
     if (record === null || typeof record !== "object" || Array.isArray(record)) {
         return errorScore("<unknown>", "record-malformed", `run record is not an object: ${typeof record}`, null);
     }
     if (record.schema !== RUN_RECORD_SCHEMA) {
         return errorScore(
-            typeof record.scenarioId === "string" && record.scenarioId.length > 0 ? record.scenarioId : "<unknown>",
+            recordScenarioId(record),
             "record-schema-unsupported",
             `run record schema ${JSON.stringify(record.schema)} is not ${RUN_RECORD_SCHEMA}`,
             null,
@@ -746,7 +787,7 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
     const isPair = (value: unknown): boolean =>
         Array.isArray(value) && value.length === 2 && value.every((entry) => typeof entry === "number");
     const problems: string[] = [];
-    if (typeof record.scenarioId !== "string" || record.scenarioId.length === 0) problems.push("scenarioId");
+    if (typeof record.scenarioId !== "string" || record.scenarioId.trim().length === 0) problems.push("scenarioId");
     if (typeof record.scenarioFingerprint !== "string") problems.push("scenarioFingerprint");
     if (typeof record.triggerFingerprint !== "string") problems.push("triggerFingerprint");
     if (typeof record.sessionId !== "string") problems.push("sessionId");
@@ -761,7 +802,8 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
         !isIdentityValue(record.system.historianModelId) ||
         !isIdentityValue(record.system.probeModelId) ||
         record.system.parserImpl !== "ts" ||
-        !(record.system.chunkTokenBudget === null || typeof record.system.chunkTokenBudget === "number")
+        !(record.system.chunkTokenBudget === null ||
+            (Number.isSafeInteger(record.system.chunkTokenBudget) && record.system.chunkTokenBudget >= 1))
     ) {
         problems.push("system");
     }
@@ -830,10 +872,14 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
         problems.push("authoredTurnOrdinals");
     }
     if (typeof record.contextDbSnapshotPath !== "string") problems.push("contextDbSnapshotPath");
-    if (record.error !== null && typeof record.error?.reason !== "string") problems.push("error");
+    // An aborted record's reason and detail become the ERROR score's `errorReason` and `errorDetail`, which
+    // the report parser admits only as text.
+    if (record.error !== null && (typeof record.error?.reason !== "string" || typeof record.error?.detail !== "string")) {
+        problems.push("error");
+    }
     if (problems.length === 0) return null;
     return errorScore(
-        typeof record.scenarioId === "string" ? record.scenarioId : "<unknown>",
+        recordScenarioId(record),
         "record-malformed",
         `run record field(s) have the wrong shape: [${problems.join(", ")}]`,
         null,
@@ -1749,15 +1795,17 @@ export function buildLaneReport(
     }
     const system = resolveReportSystem(scores, options.system);
     // not exist.
-    const duplicated = [...new Set(
-        scores
-            .map((score) => score.scenarioId)
-            .filter((id, index, ids) => ids.indexOf(id) !== index),
-    )].sort();
+    const seenIds = new Set<string>();
+    const duplicated = [...new Set(scores.map((score) => score.scenarioId).filter((id) => {
+        const repeated = seenIds.has(id);
+        seenIds.add(id);
+        return repeated;
+    }))].sort(compareCodeUnits);
     if (duplicated.length > 0) {
         throw new Error(`historian-eval report: duplicate scenario score(s) [${duplicated.join(", ")}]`);
     }
-    const sorted = [...scores].sort((a, b) => a.scenarioId.localeCompare(b.scenarioId));
+    // `parseLaneReport` compares rebuilt report bytes, so the sort must not depend on the reader's locale.
+    const sorted = [...scores].sort((a, b) => compareCodeUnits(a.scenarioId, b.scenarioId));
     const errors = sorted.filter((score) => score.verdict === "ERROR");
     const scored = sorted.filter((score) => score.verdict !== "ERROR");
 
@@ -1790,13 +1838,250 @@ export function buildLaneReport(
             errors: errors.length,
             errorCountsByReason,
             failCountsByReason,
-            precision: visibleTotal === 0 ? null : visibleMatched / visibleTotal,
-            recall: expectedTotal === 0 ? null : expectedMatched / expectedTotal,
-            falseAuthoritativeRate: scored.length === 0 ? null : falseAuthoritativeScenarios.length / scored.length,
+            precision: claimRatio(visibleMatched, visibleTotal),
+            recall: claimRatio(expectedMatched, expectedTotal),
+            falseAuthoritativeRate: claimRatio(falseAuthoritativeScenarios.length, scored.length),
         },
         red: sorted.some((score) => score.verdict !== "PASS"),
         runFatal: scored.some((score) => score.failReasons.includes("false-authoritative")),
     };
+}
+
+export class HistorianReportError extends Error {
+    readonly diagnostics: readonly string[];
+
+    constructor(diagnostics: readonly string[]) {
+        super(diagnostics.join("; "));
+        this.name = "HistorianReportError";
+        this.diagnostics = diagnostics;
+    }
+}
+
+const p = makeContractPrimitives(HistorianReportError);
+
+function parseRatio(p: ContractPrimitives, value: unknown, label: string): number | null {
+    return value === null ? null : p.number(value, label, { minimum: 0, maximum: 1 });
+}
+
+function parseProbeVerdicts(p: ContractPrimitives, raw: unknown, label: string): ProbeVerdict[] {
+    const verdicts = p.array(raw, label).map((entry, index) => {
+        const probeLabel = `${label}[${index}]`;
+        const probe = p.record(entry, probeLabel);
+        p.exact(probe, ["probeId", "outcome", "expected", "actual"], probeLabel);
+        const outcome = p.enumeration(probe.outcome, PROBE_OUTCOMES, `${probeLabel}.outcome`);
+        // An authored answer, a public claim id, and the no-injected marker are all non-blank, and
+        // `extractAnswerEnvelope` turns a blank reply into a null answer.
+        const expected = p.string(probe.expected, `${probeLabel}.expected`);
+        const actual = probe.actual === null ? null : p.string(probe.actual, `${probeLabel}.actual`);
+        // Splitting `expected` recovers `compareProbeAnswer`'s candidate set for every answer type: the scenario
+        // contract forbids the separator in an authored answer and public claim ids never contain it. commentlint: allow(JUDGE)
+        // `NO_INJECTED_GOLD_CLAIM` is the empty set, which the contract forbids authoring.
+        const normalizedActual = actual === null ? null : normalizeContent(decodeXmlEntities(actual));
+        const matches = normalizedActual !== null && expected !== NO_INJECTED_GOLD_CLAIM &&
+            expected.split(PROBE_CHOICE_SEPARATOR).some((candidate) =>
+                normalizeContent(decodeXmlEntities(candidate)) === normalizedActual);
+        if ((outcome === "pass") !== matches && outcome !== "error-trimmed") {
+            p.fail(`${probeLabel}.outcome: derived-mismatch`);
+        }
+        return {
+            probeId: p.string(probe.probeId, `${probeLabel}.probeId`),
+            outcome,
+            expected,
+            actual,
+        };
+    });
+    // The scenario contract requires unique probe ids, and each declared probe yields one verdict.
+    p.unique(verdicts.map(({ probeId }) => probeId), label);
+    return verdicts;
+}
+
+/**
+ * Parses one archived scenario score. The caller supplies its own primitives so every lane report raises its
+ * own error class for a malformed score, as `parseSystemVersionTuple` does for the tuple.
+ */
+export function parseScenarioScore(p: ContractPrimitives, raw: unknown, label: string): ScenarioScore {
+    const value = p.record(raw, label);
+    p.exact(value, [
+        "scenarioId", "verdict", "failReasons", "errorReason", "errorDetail", "precision", "recall",
+        "expectedClaimsMatched", "expectedClaimsTotal", "visibleClaimsMatched", "visibleClaimsTotal",
+        "falseAuthoritativeMatches", "structuralFindings", "probeVerdicts", "system", "source",
+    ], label);
+    const precision = parseRatio(p, value.precision, `${label}.precision`);
+    const recall = parseRatio(p, value.recall, `${label}.recall`);
+    const expectedClaimsMatched = p.integer(value.expectedClaimsMatched, `${label}.expectedClaimsMatched`);
+    // The count is the scenario's authored expectation list, which the contract caps.
+    const expectedClaimsTotal = p.boundedInteger(value.expectedClaimsTotal, `${label}.expectedClaimsTotal`, 0, MAX_EXPECTATION_ENTRIES);
+    const visibleClaimsMatched = p.integer(value.visibleClaimsMatched, `${label}.visibleClaimsMatched`);
+    const visibleClaimsTotal = p.integer(value.visibleClaimsTotal, `${label}.visibleClaimsTotal`);
+    if (expectedClaimsMatched > expectedClaimsTotal) p.fail(`${label}.expectedClaimsMatched: integer-invalid`);
+    if (visibleClaimsMatched > visibleClaimsTotal) p.fail(`${label}.visibleClaimsMatched: integer-invalid`);
+    // `maximumGoldMatching` pairs each matched expectation with a distinct visible claim that matches it.
+    if (expectedClaimsMatched > visibleClaimsMatched) p.fail(`${label}.expectedClaimsMatched: integer-invalid`);
+    // `buildLaneReport` carries scenarios through unchanged, so its rebuild cannot reach these fields.
+    if (precision !== claimRatio(visibleClaimsMatched, visibleClaimsTotal)) p.fail(`${label}.precision: derived-mismatch`);
+    // A run whose every attempt failed reports a null recall over a nonzero expectation count, so recall is
+    // checked only where it is stated.
+    if (recall !== null && recall !== claimRatio(expectedClaimsMatched, expectedClaimsTotal)) {
+        p.fail(`${label}.recall: derived-mismatch`);
+    }
+    const source = p.enumeration(value.source, SCORE_SOURCES, `${label}.source`);
+    const verdict = p.enumeration(value.verdict, SCENARIO_VERDICTS, `${label}.verdict`);
+    const failReasons = p.array(value.failReasons, `${label}.failReasons`)
+        .map((entry, index) => p.enumeration(entry, FAIL_REASONS, `${label}.failReasons[${index}]`));
+    p.unique(failReasons, `${label}.failReasons`);
+    const structuralFindings = p.textArray(value.structuralFindings, `${label}.structuralFindings`);
+    // Each match is an `ExpectedAbsent.id`, which the scenario contract admits only as a static id.
+    const falseAuthoritativeMatches = p.stringArray(value.falseAuthoritativeMatches, `${label}.falseAuthoritativeMatches`);
+    const probeVerdicts = parseProbeVerdicts(p, value.probeVerdicts, `${label}.probeVerdicts`);
+    // `assembleScore` turns each of these into its reason, and `buildLaneReport` aggregates the declared
+    // reasons rather than re-deriving them, so a contradictory score would rebuild unchanged.
+    const derivedReasons = new Set(evidenceFailReasons({
+        recall, falseAuthoritativeMatches, structuralFindings, probeVerdicts,
+    }));
+    for (const reason of derivedReasons) {
+        if (!failReasons.includes(reason)) p.fail(`${label}.failReasons: derived-mismatch`);
+    }
+    // `invalid-output` comes from the run's status, which the score does not publish.
+    for (const reason of failReasons) {
+        if (reason !== "invalid-output" && !derivedReasons.has(reason)) p.fail(`${label}.failReasons: derived-mismatch`);
+    }
+    const errorReason = p.nullableText(value.errorReason, `${label}.errorReason`);
+    const errorDetail = p.nullableText(value.errorDetail, `${label}.errorDetail`);
+    // `scoreRawOutputWithInjectedClaims` assembles its score with no probes and no invalid run, and only a
+    // trimmed probe makes `assembleScore` emit an ERROR, so a raw-output score is a PASS or FAIL. commentlint: allow(JUDGE)
+    const system = parseSystemVersionTuple(p, value.system, `${label}.system`);
+    if (source === "raw-output") {
+        if (verdict === "ERROR") p.fail(`${label}.verdict: seam-shape-invalid`);
+        if (probeVerdicts.length > 0) p.fail(`${label}.probeVerdicts: seam-shape-invalid`);
+        if (failReasons.includes("invalid-output")) p.fail(`${label}.failReasons: seam-shape-invalid`);
+        if (system !== null) p.fail(`${label}.system: seam-shape-invalid`);
+    }
+    if (verdict === "ERROR") {
+        if (failReasons.length > 0) p.fail(`${label}.failReasons: derived-mismatch`);
+        // Every ERROR is built by `errorScore`, which always names its reason and carries no evidence. The
+        // rebuild cannot see these fields because the builder sets ERROR scores aside before aggregating.
+        if (errorReason === null) p.fail(`${label}.errorReason: derived-mismatch`);
+        const evidenceless = precision === null && recall === null &&
+            expectedClaimsMatched === 0 && expectedClaimsTotal === 0 &&
+            visibleClaimsMatched === 0 && visibleClaimsTotal === 0 &&
+            falseAuthoritativeMatches.length === 0 && structuralFindings.length === 0;
+        // The trimmed-probe ERROR is the one `assembleScore` builds, under its fixed reason, and it is the only
+        // ERROR that keeps the probe verdicts that led to it.
+        if (!evidenceless) p.fail(`${label}: error-shape-invalid`);
+        const trimmed = errorReason === TRIMMED_BY_INJECTION_BUDGET;
+        if (trimmed !== probeVerdicts.length > 0) p.fail(`${label}.probeVerdicts: error-shape-invalid`);
+        if (trimmed && !probeVerdicts.some((probe) => probe.outcome === "error-trimmed")) {
+            p.fail(`${label}.probeVerdicts: error-shape-invalid`);
+        }
+    } else {
+        // `assembleScore` clears both on any non-error score. The one exception is an aborted record whose
+        // claims still matched an expected-absent predicate: `scoreRunRecord` keeps the abort's reason on
+        // that FAIL, and its reasons are exactly `false-authoritative`. The reason is part of the shape, so a
+        // FAIL that drops it is an ordinary scored FAIL and gets no exemption below.
+        const abortedFalseAuthoritative = source === "run-record" && verdict === "FAIL" &&
+            failReasons.length === 1 && failReasons[0] === "false-authoritative" && errorReason !== null;
+        if ((errorReason !== null || errorDetail !== null) && !abortedFalseAuthoritative) {
+            p.fail(`${label}.errorReason: derived-mismatch`);
+        }
+        // That FAIL is `errorScore` with the matches spliced in, so every other fact stays empty and, since the
+        // abort branch returns before probe scoring, it carries no probe verdict.
+        if (abortedFalseAuthoritative && (precision !== null || recall !== null || expectedClaimsMatched !== 0 ||
+            expectedClaimsTotal !== 0 || visibleClaimsMatched !== 0 || visibleClaimsTotal !== 0 ||
+            structuralFindings.length > 0 || probeVerdicts.length > 0)) {
+            p.fail(`${label}: error-shape-invalid`);
+        }
+        // A lint-admitted scenario declares at least one probe and a run yields a verdict for each, so a
+        // run-record score with no probe evidence never reached the scorer. The raw-output seam has no probes.
+        // The two run-record scores built without scoring carry none: the aborted false-authoritative FAIL, and
+        // the all-attempts-invalid FAIL, whose facts are the empty ones `scoreRunRecord` writes for it, so its
+        // only reason is `invalid-output` and it carries no probe verdict.
+        const allAttemptsInvalid = failReasons.length === 1 && failReasons[0] === "invalid-output" &&
+            probeVerdicts.length === 0 && recall === null && precision === null &&
+            expectedClaimsMatched === 0 && visibleClaimsMatched === 0 && visibleClaimsTotal === 0 &&
+            falseAuthoritativeMatches.length === 0 && structuralFindings.length === 0;
+        const scorerBypassed = allAttemptsInvalid || abortedFalseAuthoritative;
+        if (source === "run-record" && probeVerdicts.length === 0 && !scorerBypassed) {
+            p.fail(`${label}.probeVerdicts: probes-required`);
+        }
+        // A lint-admitted scenario declares at least one expected claim. commentlint: allow(JUDGE)
+        // `scoreFacts` reports that count on every score other than the aborted false-authoritative FAIL. commentlint: allow(JUDGE)
+        if (expectedClaimsTotal === 0 && !abortedFalseAuthoritative) {
+            p.fail(`${label}.expectedClaimsTotal: integer-invalid`);
+        }
+        if ((verdict === "PASS") !== (failReasons.length === 0)) p.fail(`${label}.verdict: derived-mismatch`);
+        // `assembleScore` turns an unmeasurable probe with no other failure into an ERROR, never a PASS.
+        if (failReasons.length === 0 && probeVerdicts.some((probe) => probe.outcome === "error-trimmed")) {
+            p.fail(`${label}.verdict: derived-mismatch`);
+        }
+        // Null recall over a nonzero expectation count is emitted only by the all-attempts-invalid path.
+        if (recall === null && expectedClaimsTotal > 0 && !allAttemptsInvalid) {
+            p.fail(`${label}.recall: derived-mismatch`);
+        }
+    }
+    return {
+        scenarioId: p.string(value.scenarioId, `${label}.scenarioId`),
+        verdict,
+        failReasons,
+        errorReason,
+        errorDetail,
+        precision,
+        recall,
+        expectedClaimsMatched,
+        expectedClaimsTotal,
+        visibleClaimsMatched,
+        visibleClaimsTotal,
+        falseAuthoritativeMatches,
+        structuralFindings,
+        probeVerdicts,
+        system,
+        source,
+    };
+}
+
+export function parseLaneReport(raw: unknown): LaneReport {
+    const root = p.record(raw, "report");
+    p.exact(root, ["schema", "releaseVersion", "system", "scenarios", "aggregate", "red", "runFatal"], "report");
+    if (root.schema !== LANE_REPORT_SCHEMA) p.fail("report.schema: version-invalid");
+    const aggregate = p.record(root.aggregate, "report.aggregate");
+    p.exact(aggregate, ["total", "scored", "errors", "errorCountsByReason", "failCountsByReason", "precision", "recall", "falseAuthoritativeRate"], "report.aggregate");
+    const report: LaneReport = {
+        schema: LANE_REPORT_SCHEMA,
+        releaseVersion: p.nullableText(root.releaseVersion, "report.releaseVersion"),
+        system: parseSystemVersionTuple(p, root.system, "report.system"),
+        scenarios: p.array(root.scenarios, "report.scenarios")
+            .map((entry, index) => parseScenarioScore(p, entry, `report.scenarios[${index}]`)),
+        aggregate: {
+            total: p.integer(aggregate.total, "report.aggregate.total"),
+            scored: p.integer(aggregate.scored, "report.aggregate.scored"),
+            errors: p.integer(aggregate.errors, "report.aggregate.errors"),
+            errorCountsByReason: p.countRecord(aggregate.errorCountsByReason, "report.aggregate.errorCountsByReason"),
+            failCountsByReason: p.countRecord(aggregate.failCountsByReason, "report.aggregate.failCountsByReason"),
+            precision: parseRatio(p, aggregate.precision, "report.aggregate.precision"),
+            recall: parseRatio(p, aggregate.recall, "report.aggregate.recall"),
+            falseAuthoritativeRate: parseRatio(p, aggregate.falseAuthoritativeRate, "report.aggregate.falseAuthoritativeRate"),
+        },
+        red: p.boolean(root.red, "report.red"),
+        runFatal: p.boolean(root.runFatal, "report.runFatal"),
+    };
+    // A run-record score reaches the scorer only after its record's system passed shape validation, so a
+    // non-error lane score carries a tuple, and `resolveReportSystem` would otherwise fall back to whatever
+    // root the archive supplies.
+    for (const [index, score] of report.scenarios.entries()) {
+        if (score.verdict === "ERROR") continue;
+        requireScoreSystemBinding(p, score, report.system, `report.scenarios[${index}].system`);
+    }
+    // Rebuilding verifies that the scenarios satisfy the builder's admission rules and that the archived derived fields match.
+    let rebuilt: LaneReport;
+    try {
+        rebuilt = buildLaneReport(report.scenarios, {
+            releaseVersion: report.releaseVersion ?? undefined,
+            system: report.system ?? undefined,
+        });
+    } catch (error) {
+        throw new HistorianReportError([`report.scenarios: lane-invalid (${error instanceof Error ? error.message : String(error)})`]);
+    }
+    if (canonicalJson(rebuilt) !== canonicalJson(report)) p.fail("report: derived-mismatch");
+    return report;
 }
 
 /**

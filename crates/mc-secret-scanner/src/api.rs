@@ -5,6 +5,22 @@ use std::fmt;
 /// Hard ceiling for one scanner input, in bytes.
 pub const MAX_INPUT_BYTES: usize = 512 * 1024;
 
+/// The scanner reports findings whose full matches are at most `MAX_MATCH_BYTES` bytes.
+/// Candidates exceeding this byte limit stop scanning with [`LimitExhausted::Match`];
+/// otherwise, rule regexes such as `private-key`'s `[\s\S-]{64,}?` can match unbounded input.
+/// A finding's footprint is at most `MAX_MATCH_BYTES + 2 * MAX_RULE_RADIUS +
+/// 2 * MAX_LOCAL_CONTEXT_BYTES` bytes, so text longer than `MAX_INPUT_BYTES`
+/// can be scanned in windows whose overlap is at least that wide.
+pub const MAX_MATCH_BYTES: usize = 32 * 1024;
+
+/// Largest `radius` or two-phase `full_radius` a rule may declare, in bytes.
+/// Construction rejects a rule set that exceeds it.
+pub const MAX_RULE_RADIUS: usize = 16 * 1024;
+
+/// Largest `lookbehind` or `lookahead` a rule's local context may declare, in
+/// bytes. Construction rejects a rule set that exceeds it.
+pub const MAX_LOCAL_CONTEXT_BYTES: usize = 1024;
+
 /// Selects the active secret-detection rule set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanProfile {
@@ -133,6 +149,8 @@ pub enum LimitExhausted {
     Candidates,
     /// Charged input work reached its configured byte ceiling.
     Work,
+    /// A candidate's full match exceeded [`MAX_MATCH_BYTES`].
+    Match,
 }
 
 impl fmt::Display for LimitExhausted {
@@ -140,6 +158,7 @@ impl fmt::Display for LimitExhausted {
         f.write_str(match self {
             Self::Candidates => "scanner candidate limit reached",
             Self::Work => "scanner work limit reached",
+            Self::Match => "scanner match length limit reached",
         })
     }
 }
@@ -250,7 +269,7 @@ pub enum ScanError {
 
 pub(crate) const REVISION: ScannerRevision = ScannerRevision {
     crate_version: env!("CARGO_PKG_VERSION"),
-    semantic_digest_version: 5,
+    semantic_digest_version: 7,
     upstream_commit: "3d2869011138cd7812a12f893dc93635a961b0d7",
 };
 

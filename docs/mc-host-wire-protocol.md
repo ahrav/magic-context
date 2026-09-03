@@ -589,14 +589,28 @@ block describing the kernel store and its outbox projector:
 
 Sanitization is per field: the whole block is dropped when `kernel_state` is
 missing or outside its closed set, `unavailable_reason` is dropped when it is
-outside its closed set, and each numeric field is dropped when it is not an
-unsigned integer at or below 2^53 (an explicit `null` passes through). A
-missing block, whether from an older daemon or from sanitization, is an
-unknown state: managed clients report kernel readiness as `unavailable` with
-reason `kernel_unavailable`, never as absent or healthy. A `ready` block with
-`lag_threshold_tripped: true` reports `kernel_lagging`, and a `ready` block
-with `required_consumer_count: 0` reports `no_required_consumer`; both are
+outside its closed set or when `kernel_state` is not `unavailable`, and each
+numeric field is dropped when it is not an unsigned integer at or below 2^53
+(an explicit `null` passes through only on the three fields declared
+nullable). A missing block, whether from an older
+daemon or from sanitization, is an unknown state: managed clients report kernel
+readiness as `unavailable` with reason `kernel_unavailable`, never as absent or
+healthy. A `ready` block with `lag_threshold_tripped: true` reports
+`kernel_lagging`; otherwise a `ready` block with `core_file_warn: true` or
+`artifact_warn: true` reports `kernel_capacity_warn`; otherwise a `ready` block
+with `required_consumer_count: 0` reports `no_required_consumer`. All three are
 warn-class, non-failing readiness reasons.
+
+The daemon publishes `kernel_state: ready` only from a sample that carried
+facts. A sample that fails while the store is open publishes
+`kernel_state: unavailable` with `unavailable_reason: store_unavailable` and no
+numeric fields, and the next successful sample restores `ready`; routes keep
+using the store throughout. The daemon's health report and the routed `status`
+method both read that sampled block and apply the same projection to a `ready`
+block published more than five minutes ago on the daemon's monotonic clock, so
+a sampler that has stopped publishing cannot leave a stale `ready` block
+standing; the stale `sampled_at_ms` is preserved on the projected block. No
+request path walks the artifact tree.
 
 The `magic-context` component additionally carries a sanitized
 `metrics.epochs` object holding exactly these five compatibility epochs, in

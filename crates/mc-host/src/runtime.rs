@@ -903,33 +903,34 @@ async fn accept_loop<H: McHostHandler>(shared: &Arc<HostShared<H>>, listener: Un
     }
 }
 
-/// Internal health probes are neither routed requests nor client JSON operations (§9.3); callback failure is host-fatal.
-fn spawn_health_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
-    fn activation_in_progress(report: &HealthReport) -> bool {
-        let components = report
-            .metrics
-            .as_ref()
-            .and_then(|metrics| metrics.get("components"))
-            .and_then(serde_json::Value::as_object);
-        components.is_some_and(|components| {
-            components.values().any(|component| {
-                let metrics = component
-                    .get("metrics")
-                    .and_then(serde_json::Value::as_object);
-                metrics.is_some_and(|metrics| {
-                    metrics
-                        .get("storage_state")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("starting")
-                        || metrics
-                            .get("synapse_state")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("starting")
-                })
+fn activation_in_progress(report: &HealthReport) -> bool {
+    fn is_starting(metrics: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+        metrics.get(key).and_then(serde_json::Value::as_str) == Some("starting")
+    }
+    let components = report
+        .metrics
+        .as_ref()
+        .and_then(|metrics| metrics.get("components"))
+        .and_then(serde_json::Value::as_object);
+    components.is_some_and(|components| {
+        components.values().any(|component| {
+            let metrics = component
+                .get("metrics")
+                .and_then(serde_json::Value::as_object);
+            metrics.is_some_and(|metrics| {
+                is_starting(metrics, "storage_state")
+                    || is_starting(metrics, "synapse_state")
+                    || metrics
+                        .get("kernel")
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(|kernel| is_starting(kernel, "kernel_state"))
             })
         })
-    }
+    })
+}
 
+/// Internal health probes are neither routed requests nor client JSON operations (§9.3); callback failure is host-fatal.
+fn spawn_health_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
     let shared = Arc::clone(shared);
     let shared_outer = Arc::clone(&shared);
     shared_outer.spawn_tracked(async move {
@@ -1169,5 +1170,40 @@ mod tests {
             let frame = queue.try_recv().expect("Goodbye was queued concurrently");
             assert_eq!(frame.frame.bytes[5], crate::wire::FrameType::Goodbye as u8);
         }
+    }
+
+    #[test]
+    fn activation_stays_in_progress_while_any_component_starts() {
+        let report = |metrics: serde_json::Value| HealthReport {
+            status: crate::handler::HealthStatus::Ok,
+            detail: None,
+            metrics: Some(serde_json::json!({
+                "components": { "magic-context": { "status": "ok", "metrics": metrics } }
+            })),
+        };
+        assert!(activation_in_progress(&report(
+            serde_json::json!({ "storage_state": "starting" })
+        )));
+        assert!(activation_in_progress(&report(
+            serde_json::json!({ "synapse_state": "starting" })
+        )));
+        // The kernel store opens after the cache store reports ready.
+        assert!(activation_in_progress(&report(serde_json::json!({
+            "storage_state": "ready",
+            "kernel": { "kernel_state": "starting" },
+        }))));
+        assert!(!activation_in_progress(&report(serde_json::json!({
+            "storage_state": "ready",
+            "kernel": { "kernel_state": "ready" },
+        }))));
+        assert!(!activation_in_progress(&report(serde_json::json!({
+            "storage_state": "unavailable",
+            "kernel": { "kernel_state": "unavailable" },
+        }))));
+        assert!(!activation_in_progress(&HealthReport {
+            status: crate::handler::HealthStatus::Ok,
+            detail: None,
+            metrics: None,
+        }));
     }
 }
