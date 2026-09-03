@@ -13,6 +13,8 @@ import {
 import type { RunHealth } from "./contract";
 
 export const MIN_BOOTSTRAP_RESAMPLES = 2000;
+/** Bounds the work a resample count can demand of a reader that replays the bootstrap; the policy uses 5000. */
+export const MAX_BOOTSTRAP_RESAMPLES = 100_000;
 // `splitmix32` consumes a 32-bit state, so wider seeds would silently alias.
 export const MAX_BOOTSTRAP_SEED = 0xFFFFFFFF;
 export const PRIMARY_ENDPOINTS = ["mc-on-vs-mc-off", "mc-on-vs-compaction"] as const;
@@ -296,11 +298,11 @@ export function estimateFamilyDeltas(input: {
     ) {
         throw new PairedDeltaEstimatorError("bootstrap-seed-invalid");
     }
-    if (
-        !Number.isSafeInteger(input.bootstrapResamples) ||
-        input.bootstrapResamples < MIN_BOOTSTRAP_RESAMPLES
-    ) {
+    if (!Number.isSafeInteger(input.bootstrapResamples) || input.bootstrapResamples < MIN_BOOTSTRAP_RESAMPLES) {
         throw new PairedDeltaEstimatorError("bootstrap-resamples-too-small");
+    }
+    if (input.bootstrapResamples > MAX_BOOTSTRAP_RESAMPLES) {
+        throw new PairedDeltaEstimatorError("bootstrap-resamples-too-large");
     }
     if (!/^[0-9a-f]{64}$/.test(input.lane.poolManifestFingerprint)) {
         throw new PairedDeltaEstimatorError("lane-pool-manifest-fingerprint-invalid");
@@ -329,6 +331,12 @@ export function estimateFamilyDeltas(input: {
         if (observation.runHealth !== "completed") {
             throw new PairedDeltaEstimatorError(
                 `observation: unanalyzable-${observation.coordinateId}`,
+            );
+        }
+        // Both identifiers name report rows the parser admits only as non-blank strings.
+        if (observation.familyId.trim().length === 0 || observation.coordinateId.trim().length === 0) {
+            throw new PairedDeltaEstimatorError(
+                `observation: identifier-blank-${observation.coordinateId}`,
             );
         }
         // A delta is a difference of two values in [0, 1], which is also the bound the report parser applies.

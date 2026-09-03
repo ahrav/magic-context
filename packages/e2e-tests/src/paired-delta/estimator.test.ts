@@ -158,6 +158,11 @@ describe("family-clustered delta estimator", () => {
     });
 
     it("labels estimates when no calibration noise floor exists", () => {
+        // A blank identifier would name a report row the parser refuses.
+        expect(() => estimate({
+            observations: observations.map((row, index) => index === 0 ? { ...row, familyId: " " } : row),
+        })).toThrow(/identifier-blank/);
+        expect(() => estimate({ bootstrapResamples: 10 ** 9 })).toThrow(/bootstrap-resamples-too-large/);
         const result = estimate({ noiseFloors: undefined });
         expect(result.endpoints[0]!.families.every(({ noise }) =>
             noise.label === "no-noise-floor" && noise.floor === null)).toBe(true);

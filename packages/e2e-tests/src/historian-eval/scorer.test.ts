@@ -2529,7 +2529,7 @@ describe("buildLaneReport", () => {
             // A failing probe is its own reason, so `assembleScore` would list both.
             failReasons: ["false-authoritative", "probe"],
             falseAuthoritativeMatches: ["abs-x"],
-            probeVerdicts: [{ probeId: "probe-1", outcome: "fail", expected: "yes", actual: "" }],
+            probeVerdicts: [{ probeId: "probe-1", outcome: "fail", expected: "yes", actual: "no" }],
         };
         // `errorScore` zeroes every count alongside the null ratios, so a partial override is not a real shape.
         const errored: ScenarioScore = {
@@ -2648,12 +2648,13 @@ describe("buildLaneReport", () => {
         skewedRecall.scenarios[0]!.recall = 0.5;
         expect(() => parseLaneReport(skewedRecall))
             .toThrow(/report\.scenarios\[0\]\.recall: derived-mismatch/);
-        // A run whose every attempt failed states a null recall over a nonzero expectation count, so a null
-        // recall stays admissible where a wrong number does not.
+        // A run whose every attempt failed states a null recall over a nonzero expectation count beside empty
+        // facts and no probes, so that shape stays admissible where a wrong number does not.
         const nullRecall = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
-        nullRecall.scenarios[0]!.recall = null;
-        nullRecall.scenarios[0]!.verdict = "FAIL";
-        nullRecall.scenarios[0]!.failReasons = ["invalid-output"];
+        Object.assign(nullRecall.scenarios[0]!, {
+            verdict: "FAIL", failReasons: ["invalid-output"], recall: null, precision: null,
+            expectedClaimsMatched: 0, visibleClaimsMatched: 0, visibleClaimsTotal: 0, probeVerdicts: [],
+        });
         expect(() => parseLaneReport(nullRecall)).toThrow(/^report: derived-mismatch/);
         // Without `invalid-output`, the same null recall is a passing scenario hiding its shortfall.
         const hushedRecall = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
@@ -2675,11 +2676,19 @@ describe("buildLaneReport", () => {
         expect(() => parseLaneReport(trimmedError)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: error-shape-invalid/);
         Object.assign(trimmedError.scenarios[0]!, { errorReason: "trimmed-by-injection-budget", probeVerdicts: [] });
         expect(() => parseLaneReport(trimmedError)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: error-shape-invalid/);
-        // Only the all-attempts-invalid FAIL, whose recall is null, scores without probes; a partially invalid
-        // run keeps its probe evidence.
+        // Only the all-attempts-invalid FAIL, whose facts are all empty, scores without probes; a partially
+        // invalid run keeps its probe evidence, and a null recall alone does not make it the all-invalid shape.
         const partialInvalid = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         Object.assign(partialInvalid.scenarios[0]!, { verdict: "FAIL", failReasons: ["invalid-output"], probeVerdicts: [] });
         expect(() => parseLaneReport(partialInvalid)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: probes-required/);
+        partialInvalid.scenarios[0]!.recall = null;
+        expect(() => parseLaneReport(partialInvalid)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: probes-required/);
+        // A probe verdict names a non-blank expectation, and a blank reply is recorded as a null answer.
+        const blankProbe = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        blankProbe.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "", actual: "" }];
+        expect(() => parseLaneReport(blankProbe)).toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.expected: string-invalid/);
+        blankProbe.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: " " }];
+        expect(() => parseLaneReport(blankProbe)).toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.actual: string-invalid/);
         // A run-record score reports the scenario's expectation count, which is never zero.
         const noExpectations = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         Object.assign(noExpectations.scenarios[0]!, { expectedClaimsMatched: 0, expectedClaimsTotal: 0, recall: null });

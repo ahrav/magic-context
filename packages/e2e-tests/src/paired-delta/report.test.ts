@@ -355,6 +355,9 @@ describe("paired-delta report", () => {
         expect(() => report({
             runSummary: { ...report().body.runSummary, calibrationFingerprint: H1, evidenceComplete: true },
         })).toThrow(/evidence-complete-mismatch/);
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, calibrationFingerprint: "calibration-2026", evidenceComplete: false },
+        })).toThrow(/calibration-fingerprint-invalid/);
         // The parser requires a positive plan, so the builder refuses an empty one too.
         expect(() => report({
             runSummary: { ...report().body.runSummary, plannedCoordinates: 0, healthyCoordinates: 0 },
@@ -1061,6 +1064,9 @@ describe("parsePairedDeltaReport", () => {
             .toThrow(/report\.body\.exclusions: order-invalid/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.limitations = ["b caveat", "a caveat"]; })))
             .toThrow(/report\.body\.limitations: order-invalid/);
+        // The regret estimates are replayed with the archived resample count, so it is bounded above.
+        expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.bootstrapResamples = 10 ** 9; })))
+            .toThrow(/report\.body\.analysis\.bootstrapResamples: integer-invalid/);
         // The estimator emits endpoints, families, and raw records in code-unit order.
         expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.endpoints.reverse(); })))
             .toThrow(/report\.body\.analysis\.endpoints: order-invalid/);

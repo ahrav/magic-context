@@ -1871,8 +1871,10 @@ function parseProbeVerdicts(raw: unknown, label: string): ProbeVerdict[] {
         const probe = p.record(entry, probeLabel);
         p.exact(probe, ["probeId", "outcome", "expected", "actual"], probeLabel);
         const outcome = p.enumeration(probe.outcome, PROBE_OUTCOMES, `${probeLabel}.outcome`);
-        const expected = p.text(probe.expected, `${probeLabel}.expected`);
-        const actual = parseNullableText(probe.actual, `${probeLabel}.actual`);
+        // An authored answer, a public claim id, and the no-injected marker are all non-blank, and
+        // `extractAnswerEnvelope` turns a blank reply into a null answer.
+        const expected = p.string(probe.expected, `${probeLabel}.expected`);
+        const actual = probe.actual === null ? null : p.string(probe.actual, `${probeLabel}.actual`);
         // Splitting `expected` recovers `compareProbeAnswer`'s candidate set for every answer type: the scenario
         // contract forbids the separator in an authored answer and public claim ids never contain it. commentlint: allow(JUDGE)
         // `NO_INJECTED_GOLD_CLAIM` is the empty set, which the contract forbids authoring.
@@ -1981,8 +1983,10 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         // A lint-admitted scenario declares at least one probe and a run yields a verdict for each, so a
         // run-record score with no probe evidence never reached the scorer. The raw-output seam has no probes.
         // The two run-record scores built without scoring carry none: the aborted false-authoritative FAIL, and
-        // the all-attempts-invalid FAIL, which is the only `invalid-output` score with a null recall.
-        const allAttemptsInvalid = failReasons.includes("invalid-output") && recall === null;
+        // the all-attempts-invalid FAIL, whose facts are the empty ones `scoreRunRecord` writes for it.
+        const allAttemptsInvalid = failReasons.includes("invalid-output") && recall === null && precision === null &&
+            expectedClaimsMatched === 0 && visibleClaimsMatched === 0 && visibleClaimsTotal === 0 &&
+            falseAuthoritativeMatches.length === 0 && structuralFindings.length === 0;
         const scorerBypassed = allAttemptsInvalid || abortedFalseAuthoritative;
         if (source === "run-record" && probeVerdicts.length === 0 && !scorerBypassed) {
             p.fail(`${label}.probeVerdicts: probes-required`);
@@ -1997,9 +2001,8 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         if (failReasons.length === 0 && probeVerdicts.some((probe) => probe.outcome === "error-trimmed")) {
             p.fail(`${label}.verdict: derived-mismatch`);
         }
-        // Null recall over a nonzero expectation count is emitted only by the all-attempts-invalid path,
-        // which always carries `invalid-output`.
-        if (recall === null && expectedClaimsTotal > 0 && !failReasons.includes("invalid-output")) {
+        // Null recall over a nonzero expectation count is emitted only by the all-attempts-invalid path.
+        if (recall === null && expectedClaimsTotal > 0 && !allAttemptsInvalid) {
             p.fail(`${label}.recall: derived-mismatch`);
         }
     }

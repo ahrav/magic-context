@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { canonicalFingerprint, canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { publishJsonAtomically } from "../atomic-publish";
 import { compareCodeUnits } from "../code-unit-order";
-import { makeContractPrimitives, vocabulary } from "../contract-primitives";
+import { HEX64_RE, makeContractPrimitives, vocabulary } from "../contract-primitives";
 import type { PairedCaseFact } from "../prospective-holdout/comparison";
 import { parsePolicyOwnerDocument } from "../prospective-holdout/contract";
 import { pairedFactsFingerprint } from "../prospective-holdout/report";
@@ -26,7 +26,7 @@ import type {
     RawRegretRecord,
     RegretEndpoint,
 } from "./estimator";
-import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_SEED, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS, endpointResolution, estimateRegretEndpoint, includesZero, mean, noiseLabel } from "./estimator";
+import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_RESAMPLES, MAX_BOOTSTRAP_SEED, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS, endpointResolution, estimateRegretEndpoint, includesZero, mean, noiseLabel } from "./estimator";
 import { validSuccess } from "./scoring";
 import { tupleKey } from "./tuple-key";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
@@ -288,6 +288,10 @@ export function buildPairedDeltaReport(input: {
         },
         runSummary: input.runSummary,
     };
+    // The parser admits a calibration fingerprint only as a lowercase 64-character digest.
+    if (body.runSummary.calibrationFingerprint !== null && !HEX64_RE.test(body.runSummary.calibrationFingerprint)) {
+        throw new Error("paired-delta-report: calibration-fingerprint-invalid");
+    }
     // The parser admits only the refusal reasons the runner records.
     for (const reason of Object.keys(body.runSummary.refusedRegretLadders)) {
         if (!(REFUSED_REGRET_REASONS as readonly string[]).includes(reason)) {
@@ -525,7 +529,8 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
         policyFingerprint: p.hex64(value.policyFingerprint, `${label}.policyFingerprint`),
         pairedFactsFingerprint: p.hex64(value.pairedFactsFingerprint, `${label}.pairedFactsFingerprint`),
         bootstrapSeed: p.boundedInteger(value.bootstrapSeed, `${label}.bootstrapSeed`, 0, MAX_BOOTSTRAP_SEED),
-        bootstrapResamples: p.integer(value.bootstrapResamples, `${label}.bootstrapResamples`, MIN_BOOTSTRAP_RESAMPLES),
+        // Bounded above as well: the regret estimates are replayed with this count before the fingerprint is read.
+        bootstrapResamples: p.boundedInteger(value.bootstrapResamples, `${label}.bootstrapResamples`, MIN_BOOTSTRAP_RESAMPLES, MAX_BOOTSTRAP_RESAMPLES),
         minimumAnalyzableFamilyCount,
         analyzableFamilyCount,
         evidenceSufficient,
