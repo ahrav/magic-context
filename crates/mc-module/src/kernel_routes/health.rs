@@ -16,6 +16,10 @@ use super::{KernelOpenCoordinator, KernelState, UnavailableReason};
 
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 pub const SAMPLE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// A `Ready` block older than this reads as unavailable: ten steady intervals
+/// leaves room for slow artifact walks while still exposing a sampler that has
+/// stopped publishing.
+pub const SAMPLE_STALE_AFTER: Duration = Duration::from_secs(300);
 
 /// The `kernel` block under `metrics.components.magic-context.metrics`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -98,6 +102,25 @@ impl KernelHealthBlock {
             facts: None,
         }
     }
+
+    /// Whether a `Ready` block is older than [`SAMPLE_STALE_AFTER`] at `now_ms`.
+    pub fn is_stale(&self, now_ms: i64) -> bool {
+        self.kernel_state == KernelState::Ready
+            && self.sampled_at_ms.is_some_and(|sampled_at_ms| {
+                now_ms.saturating_sub(sampled_at_ms) > SAMPLE_STALE_AFTER.as_millis() as i64
+            })
+    }
+
+    /// The block a reader reports in place of a stale `Ready` block: unavailable,
+    /// with the stale sample time preserved so the age stays visible.
+    pub fn stale(sampled_at_ms: Option<i64>) -> Self {
+        Self {
+            kernel_state: KernelState::Unavailable,
+            unavailable_reason: Some(UnavailableReason::StoreUnavailable),
+            sampled_at_ms,
+            facts: None,
+        }
+    }
 }
 
 /// Published projection the sampler writes and `health()` reads.
@@ -156,11 +179,22 @@ impl KernelOpenCoordinator {
                 return false;
             }
         };
-        let block = match sample_facts(store, now_ms, cancel.clone()).await {
-            Ok(Some(facts)) => KernelHealthBlock::ready(now_ms, facts),
-            Ok(None) => return false,
-            Err(error) => {
+        let cancel = cancel.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            store
+                .facts_unless(now_ms, &|| cancel.is_cancelled())
+                .map(|facts| facts.as_ref().map(KernelFactsBlock::from_facts))
+        });
+        let block = match worker.await {
+            Ok(Ok(Some(facts))) => KernelHealthBlock::ready(now_ms, facts),
+            Ok(Ok(None)) => return false,
+            Ok(Err(error)) => {
                 eprintln!("mc-module: kernel facts sample failed: {error:?}");
+                KernelHealthBlock::sample_failed(now_ms)
+            }
+            // A worker panic must not end the sampler; the next tick retries.
+            Err(error) => {
+                eprintln!("mc-module: kernel facts sampler worker failed: {error}");
                 KernelHealthBlock::sample_failed(now_ms)
             }
         };
@@ -186,30 +220,19 @@ impl KernelOpenCoordinator {
             }
         }
     }
-}
 
-/// `Ok(None)` when `cancel` fired during the walk.
-async fn sample_facts(
-    store: Arc<KernelStore>,
-    now_ms: i64,
-    cancel: CancellationToken,
-) -> Result<Option<KernelFactsBlock>, mc_kernel::KernelError> {
-    tokio::task::spawn_blocking(move || {
-        let facts = store.facts_unless(now_ms, &|| cancel.is_cancelled())?;
-        Ok(facts.as_ref().map(KernelFactsBlock::from_facts))
-    })
-    .await
-    .unwrap_or_else(|error| panic!("kernel facts sampler worker failed: {error}"))
-}
-
-/// Live facts for the routed `status` method, which is not bound to the
-/// lock-free health path and may read the store.
-pub(crate) fn live_block(coordinator: &KernelOpenCoordinator, now_ms: i64) -> KernelHealthBlock {
-    match coordinator.kernel_store() {
-        Ok(store) => match store.facts(now_ms) {
-            Ok(facts) => KernelHealthBlock::ready(now_ms, KernelFactsBlock::from_facts(&facts)),
-            Err(_) => KernelHealthBlock::sample_failed(now_ms),
-        },
-        Err(_) => coordinator.phase_block(Some(now_ms)),
+    /// Live facts for the routed `status` method, which is not bound to the
+    /// lock-free health path and may read the store. The read runs on a
+    /// blocking worker so the artifact walk never occupies a route worker.
+    pub(crate) async fn live_block(&self, now_ms: i64) -> KernelHealthBlock {
+        let store = match self.kernel_store() {
+            Ok(store) => store,
+            Err(_) => return self.phase_block(Some(now_ms)),
+        };
+        let worker = tokio::task::spawn_blocking(move || store.facts(now_ms));
+        match worker.await {
+            Ok(Ok(facts)) => KernelHealthBlock::ready(now_ms, KernelFactsBlock::from_facts(&facts)),
+            Ok(Err(_)) | Err(_) => KernelHealthBlock::sample_failed(now_ms),
+        }
     }
 }
