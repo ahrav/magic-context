@@ -725,9 +725,9 @@ pub fn get_smart_notes_needing_compilation(
 
 /// Selects liveness candidates by false-since time, then note ID.
 ///
-/// `now` and stored times use Unix epoch milliseconds. Candidates must exceed the
-/// maximum false duration and liveness recheck interval. A zero `limit` still returns
-/// at most one note.
+/// `now` and stored times use Unix epoch milliseconds.
+/// Both staleness comparisons are inclusive, so a note exactly at the maximum false duration or the liveness recheck interval is already a candidate.
+/// A zero `limit` still returns at most one note.
 pub fn get_stale_compiled_smart_notes(
     notes: &[SmartNoteSelectionSnapshot],
     now: i64,

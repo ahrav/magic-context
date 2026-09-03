@@ -392,6 +392,7 @@ impl ByteBudget {
     /// # Panics
     ///
     /// Panics when the platform-converted count exceeds Tokio's semaphore permit limit.
+    /// A target whose `usize` is narrower than `max_bytes` truncates the value first, so an out-of-range request can yield a smaller capacity, including zero, instead of panicking.
     pub fn new(max_bytes: u64) -> Self {
         let capacity = max_bytes as usize;
         Self {

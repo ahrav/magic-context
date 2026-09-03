@@ -47,7 +47,7 @@ pub struct NativeTestPair {
 
 /// Authenticated setup inputs supplied by JavaScript.
 ///
-/// `timeout_ms` is a wall-clock setup deadline in milliseconds. `key` and `daemon_id` remain opaque bytes.
+/// `timeout_ms` is a setup timeout duration in milliseconds, measured from the call, not an absolute or wall-clock time. `key` and `daemon_id` remain opaque bytes.
 #[napi(object)]
 pub struct NativeSetupOptions {
     pub setup_socket: String,
