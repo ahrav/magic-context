@@ -682,10 +682,32 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
             p.fail("report.body.runSummary.evidenceComplete: derived-mismatch");
         }
     }
-    // Raw regret records are written while iterating the planned coordinates.
+    // A coordinate either refused its ladder or produced raw regret records, never both.
     const rawCoordinates = new Set(body.analysis.rawRegretRecords.map(({ coordinateId }) => coordinateId));
-    if (rawCoordinates.size > body.runSummary.plannedCoordinates) {
+    if (rawCoordinates.size + refusedTotal > body.runSummary.plannedCoordinates) {
         p.fail("report.body.analysis.rawRegretRecords: exceeds-plan");
+    }
+    // A healthy coordinate contributes both primary observations, so healthy evidence implies the paired
+    // endpoint set, at least one family, and every primary arm in each secondary-metric map.
+    if (body.runSummary.healthyCoordinates > 0) {
+        if (body.analysis.endpoints.length === 0 || body.analysis.analyzableFamilyCount === 0) {
+            p.fail("report.body.analysis.endpoints: paired-endpoints-required");
+        }
+        for (const [field, metrics] of Object.entries(body.secondaryMetrics)) {
+            for (const armId of PRIMARY_ARM_IDS) {
+                if (!(armId in metrics)) p.fail(`report.body.secondaryMetrics.${field}.${armId}: arm-required`);
+            }
+        }
+    }
+    // Every primary family in a run that consumed a calibration has a calibrated floor.
+    if (body.runSummary.calibrationFingerprint !== null) {
+        for (const [index, endpoint] of body.analysis.endpoints.entries()) {
+            for (const [familyIndex, family] of endpoint.families.entries()) {
+                if (family.noise.floor === null) {
+                    p.fail(`report.body.analysis.endpoints[${index}].families[${familyIndex}].noise.floor: floor-required`);
+                }
+            }
+        }
     }
     if (canonicalFingerprint(body.regret.raw) !== canonicalFingerprint(rawRegretLadder(body.analysis.rawRegretRecords))) {
         p.fail("report.body.regret.raw: analysis-mismatch");

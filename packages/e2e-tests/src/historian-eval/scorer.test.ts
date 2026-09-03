@@ -2588,6 +2588,10 @@ describe("buildLaneReport", () => {
         const trimmedPass = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         trimmedPass.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "error-trimmed", expected: "yes", actual: null }];
         expect(() => parseLaneReport(trimmedPass)).toThrow(/report\.scenarios\[0\]\.verdict: derived-mismatch/);
+        // A run-record score reports the scenario's expectation count, which is never zero.
+        const noExpectations = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(noExpectations.scenarios[0]!, { expectedClaimsMatched: 0, expectedClaimsTotal: 0, recall: null });
+        expect(() => parseLaneReport(noExpectations)).toThrow(/report\.scenarios\[0\]\.expectedClaimsTotal: integer-invalid/);
         // A run-record score carries the tuple its record was validated with, and it is the lane's tuple.
         const nulledSystems = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         nulledSystems.scenarios[0]!.system = null;

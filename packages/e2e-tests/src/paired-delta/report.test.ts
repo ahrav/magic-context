@@ -103,11 +103,12 @@ function report(overrides: Partial<Parameters<typeof buildPairedDeltaReport>[0]>
             { armId: "mc-off", reasonCode: "provider-unavailable", count: 2 },
             { armId: "compaction", reasonCode: "deadline-exceeded", count: 1 },
         ],
+        // A healthy coordinate completed every primary arm, so each map carries all three.
         secondaryMetrics: {
-            invalidSuccessRateByArm: { "mc-on": 0.1, "mc-off": 0 },
-            finalAttemptTokensByArm: { "mc-on": 1000, "mc-off": 800 },
-            finalAttemptWallClockMsByArm: { "mc-on": 4000, "mc-off": 3000 },
-            finalAttemptTurnsByArm: { "mc-on": 8, "mc-off": 7 },
+            invalidSuccessRateByArm: { "mc-on": 0.1, "mc-off": 0, compaction: 0 },
+            finalAttemptTokensByArm: { "mc-on": 1000, "mc-off": 800, compaction: 900 },
+            finalAttemptWallClockMsByArm: { "mc-on": 4000, "mc-off": 3000, compaction: 3500 },
+            finalAttemptTurnsByArm: { "mc-on": 8, "mc-off": 7, compaction: 7 },
         },
         ...overrides,
     });
@@ -1040,6 +1041,13 @@ describe("parsePairedDeltaReport", () => {
             body.exclusions = [];
             body.runSummary.evidenceComplete = true;
         }))).not.toThrow();
+        // Healthy evidence implies every primary arm appears in each secondary-metric map.
+        expect(() => parsePairedDeltaReport(forge((body) => { delete body.secondaryMetrics.invalidSuccessRateByArm["mc-on"]; })))
+            .toThrow(/report\.body\.secondaryMetrics\.invalidSuccessRateByArm\.mc-on: arm-required/);
+        // Refusals and raw ladders partition the planned coordinates.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.refusedRegretLadders = { "intervention-mismatch": 12 };
+        }))).toThrow(/report\.body\.analysis\.rawRegretRecords: exceeds-plan/);
         // A calibrated floor's interval is exactly [0, value].
         expect(() => parsePairedDeltaReport(forge((body) => {
             const family = body.analysis.endpoints[0]!.families[0]!;

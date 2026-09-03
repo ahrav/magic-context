@@ -1,4 +1,5 @@
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { compareCodeUnits } from "../code-unit-order";
 import { makeContractPrimitives, vocabulary } from "../contract-primitives";
 import type { SystemVersionTuple } from "../historian-eval/runner";
 import { FAIL_REASONS, SCENARIO_VERDICTS, parseScenarioScore, type ScenarioScore } from "../historian-eval/scorer";
@@ -110,17 +111,18 @@ export type TierInvalidReason =
 /** Rejects an array the builder would have emitted in another order, which its own sort makes unreachable. */
 function requireSorted<T>(values: readonly T[], rank: (value: T) => string, label: string): void {
     for (let index = 1; index < values.length; index += 1) {
-        if (rank(values[index - 1]!).localeCompare(rank(values[index]!)) > 0) p.fail(`${label}: order-invalid`);
+        if (compareCodeUnits(rank(values[index - 1]!), rank(values[index]!)) > 0) p.fail(`${label}: order-invalid`);
     }
 }
 
 /** A field-order-independent rank, so the builder's sort and the parser's check cannot disagree. */
 function canaryKey(hit: InjectionCanaryHit): string {
-    return [hit.scenarioId, hit.role, hit.transformId ?? "", hit.transformVersion ?? "", hit.seed ?? ""].join("\u0000");
+    return canonicalJson([hit.scenarioId, hit.role, hit.transformId, hit.transformVersion, hit.seed]);
 }
 
+// Canonical JSON escapes rather than concatenates, so an id containing a separator cannot collide.
 function key(entry: PairKey): string {
-    return `${entry.scenarioId}\u0000${entry.transformId}\u0000${entry.transformVersion}\u0000${entry.seed}`;
+    return canonicalJson([entry.scenarioId, entry.transformId, entry.transformVersion, entry.seed]);
 }
 
 export function buildMetamorphicReport(args: {
@@ -133,10 +135,10 @@ export function buildMetamorphicReport(args: {
     return {
         schema: METAMORPHIC_REPORT_SCHEMA,
         system: args.system ?? null,
-        entries: [...args.entries].sort((left, right) => key(left).localeCompare(key(right))),
-        coverage: [...args.coverage].sort((left, right) => left.scenarioId.localeCompare(right.scenarioId)),
+        entries: [...args.entries].sort((left, right) => compareCodeUnits(key(left), key(right))),
+        coverage: [...args.coverage].sort((left, right) => compareCodeUnits(left.scenarioId, right.scenarioId)),
         injectionCanaryHits: [...args.injectionCanaryHits].sort((left, right) =>
-            canaryKey(left).localeCompare(canaryKey(right)),
+            compareCodeUnits(canaryKey(left), canaryKey(right)),
         ),
         tierInvalidReason: args.tierInvalidReason ?? null,
     };
@@ -523,6 +525,13 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     }
     // Both producers write one coverage row per selected scenario, and `metamorphicExitCode` reads violations
     // only from rows that exist, so a scenario with entries but no row would hide its own violations.
+    // `admitPair` returns exactly one disposition per coordinate, so an inapplicable key never also has an entry.
+    const entryKeys = new Set(report.entries.map(key));
+    for (const [index, row] of report.coverage.entries()) {
+        for (const [innerIndex, pair] of row.inapplicable.entries()) {
+            if (entryKeys.has(key(pair))) p.fail(`report.coverage[${index}].inapplicable[${innerIndex}]: entry-conflict`);
+        }
+    }
     const covered = new Set(report.coverage.map(({ scenarioId }) => scenarioId));
     for (const [index, entry] of report.entries.entries()) {
         if (entry.transformId === CONTROL_TRANSFORM_ID) continue;

@@ -177,6 +177,14 @@ describe("deterministic metamorphic runner", () => {
         zeroRow.applied = 0;
         zeroRow.violations = [];
         expect(() => parseMetamorphicReport(silentZero)).toThrow(/report\.coverage\[0\]\.violations: derived-mismatch/);
+        // A coordinate is inapplicable, rejected, or admitted, never two of those.
+        const doubleBooked = structuredClone(report);
+        const bookedEntry = doubleBooked.entries.find((entry) => entry.kind === "scored")!;
+        doubleBooked.coverage.find(({ scenarioId }) => scenarioId === bookedEntry.scenarioId)!.inapplicable.push({
+            scenarioId: bookedEntry.scenarioId, transformId: bookedEntry.transformId,
+            transformVersion: bookedEntry.transformVersion, seed: bookedEntry.seed, reason: "n/a",
+        });
+        expect(() => parseMetamorphicReport(doubleBooked)).toThrow(/report\.coverage\[\d+\]\.inapplicable\[\d+\]: entry-conflict/);
         const duplicateCoverage = structuredClone(invalid);
         duplicateCoverage.coverage.push(structuredClone(duplicateCoverage.coverage[0]!));
         expect(() => parseMetamorphicReport(duplicateCoverage)).toThrow(/report\.coverage: duplicate/);
