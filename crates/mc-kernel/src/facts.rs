@@ -3,6 +3,7 @@ use std::fs;
 use rusqlite::{Transaction, TransactionBehavior};
 
 use super::open::family_sidecars;
+use super::outbox::published_watermark;
 use super::{KernelError, KernelStore};
 
 /// One-gibibyte main database size used by callers as an operational warning threshold.
@@ -167,13 +168,11 @@ fn outbox_lag_in(
             consumer_count: consumers.count,
         });
     };
+    let watermark = published_watermark(tx)?;
     let position_lag = tx
         .query_row(
-            "SELECT COUNT(*) FROM outbox
-             WHERE commit_seq>?1
-               AND outbox_position<=COALESCE(
-                   (SELECT published_through_position FROM outbox_publication WHERE id=0),0)",
-            [checkpoint],
+            "SELECT COUNT(*) FROM outbox WHERE commit_seq>?1 AND outbox_position<=?2",
+            [checkpoint, watermark],
             |row| row.get::<_, i64>(0),
         )
         .map_err(|_| KernelError::Io)?;

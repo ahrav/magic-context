@@ -5,8 +5,8 @@
 use std::sync::OnceLock;
 
 use mc_core::redaction::{
-    redact_durable_text, redact_windowed_durable_text, RedactionErrorKind, Redactor, DETECTOR_ID,
-    MAX_REDACTION_LABEL_BYTES, WINDOW_OVERLAP_BYTES,
+    detect_windowed_durable_text, redact_durable_text, redact_windowed_durable_text,
+    RedactionErrorKind, Redactor, DETECTOR_ID, MAX_REDACTION_LABEL_BYTES, WINDOW_OVERLAP_BYTES,
 };
 use proptest::prelude::*;
 
@@ -431,7 +431,7 @@ fn text_with_line_at(target_offset: usize, line: &str, total: usize) -> (String,
 }
 
 fn assert_single_windowed_detection(text: &str, secret_line: &str, line_offset: usize) {
-    let redaction = redact_windowed_durable_text(text);
+    let redaction = redact_windowed_durable_text(text, usize::MAX).unwrap();
     assert_eq!(redaction.detections.len(), 1, "{:?}", redaction.detections);
     let value_start = line_offset + secret_line.find('=').unwrap() + 1;
     assert_eq!(redaction.detections[0].offset, value_start);
@@ -452,7 +452,7 @@ fn assert_single_windowed_detection(text: &str, secret_line: &str, line_offset: 
 fn windowed_redaction_matches_direct_redaction_below_the_scan_limit() {
     let input = format!("token={AWS_KEY} and password=hunter-two");
     assert_eq!(
-        redact_windowed_durable_text(&input),
+        redact_windowed_durable_text(&input, usize::MAX).unwrap(),
         redact_durable_text(&input)
     );
 }
@@ -498,9 +498,75 @@ fn windowed_redaction_finds_a_secret_deep_in_a_large_payload() {
 #[test]
 fn windowed_redaction_leaves_a_clean_large_payload_unchanged() {
     let (text, _) = text_with_line_at(0, "first", 3 * mc_secret_scanner::MAX_INPUT_BYTES);
-    let redaction = redact_windowed_durable_text(&text);
+    let redaction = redact_windowed_durable_text(&text, usize::MAX).unwrap();
     assert!(redaction.detections.is_empty());
     assert_eq!(redaction.text, text);
+    assert_eq!(detect_windowed_durable_text(&text), Ok(false));
+}
+
+const PEM_BODY_LINE: &str = "MIIEpAIBAAKCAQEA7bq2k0v9xR3sY1nQ4dJ6fH8zL2mW5cP0uT9eG7iK3oB1aV\n";
+
+/// PEM private key whose body holds at least `body_bytes`.
+fn pem_private_key(body_bytes: usize) -> String {
+    let mut pem = String::from("-----BEGIN RSA PRIVATE KEY-----\n");
+    let body_start = pem.len();
+    while pem.len() - body_start < body_bytes {
+        pem.push_str(PEM_BODY_LINE);
+    }
+    pem.push_str("-----END RSA PRIVATE KEY-----");
+    pem
+}
+
+#[test]
+fn windowed_redaction_redacts_a_private_key_straddling_a_window_edge() {
+    let window = mc_secret_scanner::MAX_INPUT_BYTES;
+    // Longer than the overlap's neighbours would tolerate without the match
+    // bound, shorter than the bound itself, and cut by the first window's end.
+    let pem = pem_private_key(20 * 1024);
+    assert!(pem.len() < mc_secret_scanner::MAX_MATCH_BYTES);
+    let (text, offset) = text_with_line_at(window - pem.len() / 2, &pem, 2 * window);
+    assert!(offset < window && offset + pem.len() > window);
+
+    let redaction = redact_windowed_durable_text(&text, usize::MAX).unwrap();
+    assert_eq!(redaction.detections.len(), 1, "{:?}", redaction.detections);
+    assert!(!redaction.text.contains("BEGIN RSA PRIVATE KEY"));
+    assert!(!redaction.text.contains(PEM_BODY_LINE));
+    assert_eq!(detect_windowed_durable_text(&text), Ok(true));
+}
+
+#[test]
+fn a_match_past_the_scanner_bound_is_not_a_finding_on_either_path() {
+    let pem = pem_private_key(mc_secret_scanner::MAX_MATCH_BYTES);
+    assert!(pem.len() > mc_secret_scanner::MAX_MATCH_BYTES);
+    assert!(pem.len() < mc_secret_scanner::MAX_INPUT_BYTES);
+    let direct = redact_durable_text(&pem);
+    assert!(direct.detections.is_empty());
+    assert_eq!(direct.text, pem);
+
+    let window = mc_secret_scanner::MAX_INPUT_BYTES;
+    let (text, _) = text_with_line_at(window - pem.len() / 2, &pem, 2 * window);
+    let windowed = redact_windowed_durable_text(&text, usize::MAX).unwrap();
+    assert!(windowed.detections.is_empty());
+    assert_eq!(windowed.text, text);
+
+    let short = pem_private_key(4 * 1024);
+    assert_eq!(redact_durable_text(&short).detections.len(), 1);
+}
+
+#[test]
+fn windowed_redaction_stops_at_the_finding_limit_instead_of_replacing() {
+    let window = mc_secret_scanner::MAX_INPUT_BYTES;
+    let mut text = String::new();
+    while text.len() < 2 * window {
+        text.push_str("password=hunter-two-");
+        text.push_str(&text.len().to_string());
+        text.push('\n');
+    }
+    assert_eq!(
+        redact_windowed_durable_text(&text, 8).map_err(|error| error.kind()),
+        Err(RedactionErrorKind::FindingLimit)
+    );
+    assert_eq!(detect_windowed_durable_text(&text), Ok(true));
 }
 
 #[test]

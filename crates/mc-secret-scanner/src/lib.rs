@@ -16,7 +16,8 @@ mod rules;
 
 pub use api::{
     ConstructionError, Finding, LimitExhausted, RuleSource, ScanError, ScanLimits, ScanProfile,
-    ScanReport, ScannerRevision, TextSpan, MAX_INPUT_BYTES,
+    ScanReport, ScannerRevision, TextSpan, MAX_INPUT_BYTES, MAX_LOCAL_CONTEXT_BYTES,
+    MAX_MATCH_BYTES, MAX_RULE_RADIUS,
 };
 pub use rules::{CONSERVATIVE_OVERLAY_SHA256, UPSTREAM_CORPUS_SHA256};
 

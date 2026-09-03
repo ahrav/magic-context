@@ -7,6 +7,7 @@ use crate::rules::{
 };
 use crate::{
     Finding, LimitExhausted, RuleSource, ScanError, ScanLimits, ScanProfile, ScanReport, TextSpan,
+    MAX_MATCH_BYTES,
 };
 
 #[derive(Debug)]
@@ -229,6 +230,9 @@ fn evaluate_candidate_spans(
         value: value_span,
         key: key_span,
     } = spans;
+    if full_span.len() > MAX_MATCH_BYTES {
+        return Ok(None);
+    }
     let value = input
         .as_bytes()
         .get(value_span.start()..value_span.end())
@@ -2107,5 +2111,19 @@ mod tests {
             only_candidate(&rule, "auth_token=Ab3fGh1jKlMnOpQrStUv"),
             Ok(Some(_))
         ));
+    }
+
+    #[test]
+    fn a_full_match_longer_than_the_match_bound_is_not_a_finding() {
+        let rule = alternation_rule(
+            r#"{"name":"t-long","regex":"alpha=(?P<value>[A-Za-z0-9]{20,})","anchors":["alpha"],"radius":16,"value_group":"value"}"#,
+        );
+        let fits = format!("alpha={}", "Ab3fGh1jKl".repeat((MAX_MATCH_BYTES - 6) / 10));
+        assert!(fits.len() <= MAX_MATCH_BYTES);
+        assert!(matches!(only_candidate(&rule, &fits), Ok(Some(_))));
+
+        let too_long = format!("alpha={}", "Ab3fGh1jKl".repeat(MAX_MATCH_BYTES / 10 + 1));
+        assert!(too_long.len() > MAX_MATCH_BYTES);
+        assert!(matches!(only_candidate(&rule, &too_long), Ok(None)));
     }
 }

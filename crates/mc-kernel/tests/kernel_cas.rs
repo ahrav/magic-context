@@ -1141,6 +1141,28 @@ fn detection_dense_payload_is_rejected_before_staging() {
 }
 
 #[test]
+fn detection_dense_payload_past_the_scan_limit_is_rejected_not_replaced() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let mut payload = String::new();
+    while payload.len() < 2 * mc_core::redaction::MAX_REDACTABLE_BYTES {
+        payload.push_str("password=hunter-two-");
+        payload.push_str(&payload.len().to_string());
+        payload.push('\n');
+    }
+
+    let error = store
+        .ingest_artifact(request("windowed-detection-flood", payload.into_bytes()))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::DetectionLimit);
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
+}
+
+#[test]
 fn fifo_at_the_digest_destination_does_not_block_ingest() {
     let root = tempfile::tempdir().unwrap();
     let store = KernelStore::open(root.path()).unwrap();
