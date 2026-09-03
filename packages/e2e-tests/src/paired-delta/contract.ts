@@ -10,6 +10,7 @@ import {
     SCRIPTED_SEARCH_FOLLOW_UP,
     SCRIPTED_SEARCH_PROMPT_PREFIX,
 } from "../oracle-arms/scripted-ctx-search";
+import { MAX_BOOTSTRAP_RESAMPLES, MIN_BOOTSTRAP_RESAMPLES } from "./estimator";
 
 export const ARM_IDS = ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"] as const;
 export type ArmId = (typeof ARM_IDS)[number];
@@ -606,7 +607,8 @@ export function parsePairedDeltaPolicy(raw: unknown): PairedDeltaPolicy {
             "policy.minimumAnalyzableFamilyCount",
             1,
         ),
-        bootstrapResamples: p.integer(root.bootstrapResamples, "policy.bootstrapResamples", 1),
+        // The estimator's bounds, applied before a run spends anything on a policy it would later refuse.
+        bootstrapResamples: p.boundedInteger(root.bootstrapResamples, "policy.bootstrapResamples", MIN_BOOTSTRAP_RESAMPLES, MAX_BOOTSTRAP_RESAMPLES),
         poolManifestFingerprint: p.hex64(
             root.poolManifestFingerprint,
             "policy.poolManifestFingerprint",

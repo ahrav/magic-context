@@ -34,6 +34,9 @@ import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
 export const PAIRED_DELTA_REPORT_SCHEMA = "paired-delta-report/v1";
 export const PAIRED_DELTA_CALIBRATION_SCHEMA = "paired-delta-calibration/v1";
 
+/** The regret rungs in the order the runner climbs them, stopping at the first failure. */
+const REGRET_LADDER = ["retrieval", "formation", "representation"] as const;
+
 const ARM_ID_SET: ReadonlySet<string> = new Set(ARM_IDS);
 const REASON_CODE_SET: ReadonlySet<string> = new Set(REASON_CODES);
 
@@ -213,12 +216,29 @@ export function buildPairedDeltaReport(input: {
         throw new Error("paired-delta-report: analysis-paired-facts-mismatch");
     }
     requirePolicyBoundEstimatorSettings(policy.policy, input.analysis);
-    // `calibrationNoiseFloors` names the endpoint on every floor; the parser admits no other floor shape.
+    // `calibrationNoiseFloors` is the only floor producer: it names the endpoint and writes `{ lower: 0,
+    // upper: value }` for a value under 2, and the parser admits no other floor shape.
     for (const endpoint of input.analysis.endpoints) {
         for (const family of endpoint.families) {
-            if (family.noise.floor !== null && family.noise.floor.endpoint === undefined) {
+            const floor = family.noise.floor;
+            if (floor === null) continue;
+            if (floor.endpoint === undefined) {
                 throw new Error(`paired-delta-report: noise-floor-endpoint-missing-${family.familyId}`);
             }
+            if (floor.value < 0 || floor.value > 2 || floor.interval.lower !== 0 || floor.interval.upper !== floor.value) {
+                throw new Error(`paired-delta-report: noise-floor-shape-invalid-${family.familyId}`);
+            }
+        }
+    }
+    // Rungs run in order and stop at the first failure, so a later regret delta exists only with every earlier one.
+    const rungsByCoordinate = new Map<string, Set<string>>();
+    for (const record of input.analysis.rawRegretRecords) {
+        rungsByCoordinate.set(record.coordinateId, (rungsByCoordinate.get(record.coordinateId) ?? new Set()).add(record.endpoint));
+    }
+    for (const [coordinateId, rungs] of rungsByCoordinate) {
+        const deepest = Math.max(...REGRET_LADDER.map((endpoint, depth) => (rungs.has(endpoint) ? depth : -1)));
+        for (let depth = 0; depth <= deepest; depth += 1) {
+            if (!rungs.has(REGRET_LADDER[depth]!)) throw new Error(`paired-delta-report: ladder-prefix-missing-${coordinateId}`);
         }
     }
     const exclusions = [...input.exclusions].sort((left, right) => compareCodeUnits(
@@ -491,10 +511,9 @@ function parseRawRegretRecords(raw: unknown, label: string): FamilyDeltaAnalysis
     }
     // Rungs run in order and stop at the first failure, so a later delta exists only with every earlier one.
     for (const [coordinateId, endpoints] of endpointsByCoordinate) {
-        const ladder = ["retrieval", "formation", "representation"];
-        const deepest = Math.max(...ladder.map((endpoint, depth) => (endpoints.has(endpoint) ? depth : -1)));
+        const deepest = Math.max(...REGRET_LADDER.map((endpoint, depth) => (endpoints.has(endpoint) ? depth : -1)));
         for (let depth = 0; depth <= deepest; depth += 1) {
-            if (!endpoints.has(ladder[depth]!)) p.fail(`${label}: ladder-prefix-missing-${coordinateId}`);
+            if (!endpoints.has(REGRET_LADDER[depth]!)) p.fail(`${label}: ladder-prefix-missing-${coordinateId}`);
         }
     }
     return records;

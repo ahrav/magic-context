@@ -1794,11 +1794,12 @@ export function buildLaneReport(
     }
     const system = resolveReportSystem(scores, options.system);
     // not exist.
-    const duplicated = [...new Set(
-        scores
-            .map((score) => score.scenarioId)
-            .filter((id, index, ids) => ids.indexOf(id) !== index),
-    )].sort();
+    const seenIds = new Set<string>();
+    const duplicated = [...new Set(scores.map((score) => score.scenarioId).filter((id) => {
+        const repeated = seenIds.has(id);
+        seenIds.add(id);
+        return repeated;
+    }))].sort(compareCodeUnits);
     if (duplicated.length > 0) {
         throw new Error(`historian-eval report: duplicate scenario score(s) [${duplicated.join(", ")}]`);
     }

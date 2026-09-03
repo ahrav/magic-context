@@ -248,6 +248,7 @@ describe("paired-delta report", () => {
                 { coordinateId: "a:b", familyId: "c", endpoint: "mc-on-vs-mc-off", delta: 0.3, runHealth: "completed" },
                 { coordinateId: "a:b", familyId: "c", endpoint: "mc-on-vs-compaction", delta: 0.3, runHealth: "completed" },
                 { coordinateId: "a:b", familyId: "c", endpoint: "retrieval", delta: 0.5, runHealth: "completed" },
+                { coordinateId: "a", familyId: "b:c", endpoint: "retrieval", delta: 0.4, runHealth: "completed" },
                 { coordinateId: "a", familyId: "b:c", endpoint: "formation", delta: 0.7, runHealth: "completed" },
             ],
             minimumAnalyzableFamilyCount: 1,
@@ -263,7 +264,7 @@ describe("paired-delta report", () => {
         const built = report({ policyDocument: policy, analysis });
         expect(built.body.regret.raw.map(({ coordinateId, familyId, retrieval, formation }) =>
             [coordinateId, familyId, retrieval, formation])).toEqual([
-            ["a", "b:c", null, 0.7],
+            ["a", "b:c", 0.4, 0.7],
             ["a:b", "c", 0.5, null],
         ]);
     });
@@ -362,6 +363,15 @@ describe("paired-delta report", () => {
         expect(() => report({
             runSummary: { ...report().body.runSummary, calibrationFingerprint: "calibration-2026", evidenceComplete: false },
         })).toThrow(/calibration-fingerprint-invalid/);
+        // Only a calibration floor shape is publishable: `[0, value]` with a value under 2.
+        const oddFloor = structuredClone(report().body.analysis);
+        const oddFamily = oddFloor.endpoints[0]!.families[0]!;
+        oddFamily.noise = { label: "inside-floor", floor: { endpoint: oddFloor.endpoints[0]!.endpoint as "mc-on-vs-compaction", familyId: oddFamily.familyId, value: 0.2, interval: { lower: 0.1, upper: 0.3 } } };
+        expect(() => report({ analysis: oddFloor })).toThrow(new RegExp(`noise-floor-shape-invalid-${oddFamily.familyId}`));
+        // A regret rung exists only with every earlier one.
+        const skippedRung = structuredClone(report().body.analysis);
+        skippedRung.rawRegretRecords = skippedRung.rawRegretRecords.filter(({ endpoint }) => endpoint !== "retrieval");
+        expect(() => report({ analysis: skippedRung })).toThrow(/ladder-prefix-missing-/);
         // The parser requires a positive plan, so the builder refuses an empty one too.
         expect(() => report({
             runSummary: { ...report().body.runSummary, plannedCoordinates: 0, healthyCoordinates: 0 },
