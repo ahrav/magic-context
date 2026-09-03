@@ -7,7 +7,7 @@
 
 use std::fs::File;
 
-use mc_core::redaction::Detection;
+use mc_core::redaction::{Detection, RedactionError, RedactionErrorKind};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use rustix::fs::{self as rfs, AtFlags, OFlags};
 use serde::Serialize;
@@ -27,7 +27,9 @@ use crate::durable_fs::{
     sync_publish_directories_with, temp_name, write_and_sync, PublishOutcome, StorageError,
 };
 use crate::envelope::{check_fence, commit_with_writer, ObjectRow, PendingChange};
-use crate::redaction::{identity, record, redact_lossy, RedactedField};
+use crate::redaction::{
+    identity, payload_has_secret, record, redact_lossy, redact_payload, RedactedField,
+};
 use crate::{KernelError, KernelStore, Sensitivity};
 
 const RESERVATION_MS: i64 = 60 * 60 * 1_000;
@@ -127,35 +129,22 @@ impl PreparedArtifact {
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
 
-        // Redaction fails closed by replacing text it cannot inspect, so the payload
-        // has to be measured before that happens. Measuring the redacted bytes instead
-        // sees the placeholder's length, which passes any cap and stores the
-        // placeholder in place of the artifact.
-        if request.payload.len() > MAX_PAYLOAD_BYTES
-            || request.payload.len() > mc_core::redaction::MAX_REDACTABLE_BYTES
-        {
-            return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
-        }
-
         let (payload_redaction, bytes, inspected) = match std::str::from_utf8(&request.payload) {
             Ok(text) => {
-                let redaction = redact_lossy(text);
+                let redaction = redact_payload(text, MAX_PAYLOAD_DETECTIONS)
+                    .map_err(|error| ArtifactError::new(scan_failure(error)))?;
                 let bytes = redaction.text.as_bytes().to_vec();
                 (redaction, bytes, true)
             }
             Err(_) => {
-                {
-                    // Each invalid byte widens to a three-byte replacement character, so a
-                    // payload inside the raw limit can still convert to a scan input outside
-                    // it. Measuring the converted text keeps redaction's fail-closed
-                    // placeholder from being read back as proof of a secret.
-                    let inspected_text = String::from_utf8_lossy(&request.payload);
-                    if inspected_text.len() > mc_core::redaction::MAX_REDACTABLE_BYTES {
-                        return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
-                    }
-                    if !redact_lossy(&inspected_text).detections.is_empty() {
+                // Lossy decoding expands invalid bytes to three-byte U+FFFD sequences;
+                // payload_has_secret scans bounded windows to avoid materializing a lossy-decoded payload.
+                match payload_has_secret(&request.payload) {
+                    Ok(false) => {}
+                    Ok(true) => {
                         return Err(ArtifactError::new(ArtifactErrorKind::UnredactableSecret));
                     }
+                    Err(error) => return Err(ArtifactError::new(scan_failure(error))),
                 }
                 (
                     RedactedField {
@@ -170,11 +159,9 @@ impl PreparedArtifact {
         let affirmative_provenance = request.provenance.as_ref().is_some_and(|provenance| {
             !provenance.repository_id.trim().is_empty() && !provenance.revision.trim().is_empty()
         });
+        // A placeholder can be wider than the secret it replaces, so redaction can push the payload past the cap.
         if bytes.len() > MAX_PAYLOAD_BYTES {
             return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
-        }
-        if payload_redaction.detections.len() > MAX_PAYLOAD_DETECTIONS {
-            return Err(ArtifactError::new(ArtifactErrorKind::DetectionLimit));
         }
         // A recognized secret anywhere that is stored verbatim-after-redaction must
         // raise the class, not only one in the payload; otherwise a clean payload
@@ -207,6 +194,24 @@ impl PreparedArtifact {
             artifact_reference,
             redaction_metadata,
         })
+    }
+}
+
+/// A payload is refused when its scan cannot vouch for it. Only a match the
+/// scanner saw but could not describe counts as a secret; every other failure
+/// means the scan did not cover the payload, which is reported as such so an
+/// operator is not told a secret was found when the scan merely stopped.
+fn scan_failure(error: RedactionError) -> ArtifactErrorKind {
+    match error.kind() {
+        RedactionErrorKind::DetectionLimit => ArtifactErrorKind::DetectionLimit,
+        RedactionErrorKind::MatchLimit => ArtifactErrorKind::UnredactableSecret,
+        RedactionErrorKind::Construction
+        | RedactionErrorKind::InputLimit
+        | RedactionErrorKind::CandidateLimit
+        | RedactionErrorKind::WorkLimit
+        | RedactionErrorKind::InvalidSpan
+        | RedactionErrorKind::UnknownRule
+        | RedactionErrorKind::SecretDetected => ArtifactErrorKind::ScanIncomplete,
     }
 }
 

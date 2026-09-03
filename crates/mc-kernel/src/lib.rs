@@ -58,13 +58,14 @@ pub use cas::{
     ArtifactDeletionResult, ArtifactDestination, ArtifactEligibility, ArtifactError,
     ArtifactErrorKind, ArtifactGcResult, ArtifactHandle, ArtifactIngestRequest,
     BarrierConsumerStatus, DeletionBarrierStatus, EligibilityDeniedReason, ProviderEgress,
+    MAX_PAYLOAD_BYTES,
 };
 pub use envelope::{
     AlignmentProjectionSpec, CommitIntent, CommitReceipt, DomainSpec, Envelope, KnownAsOf,
     ObjectRow, RemediationTarget, RepositoryProvenance, Sensitivity, StagingCandidateRow,
     StagingCandidateSpec, OPERATOR_REDACTION_PLACEHOLDER,
 };
-pub use facts::{ArtifactBudgetFacts, KernelFacts, MAIN_FILE_WARN_BYTES};
+pub use facts::{ArtifactBudgetFacts, KernelFacts, OutboxLag, MAIN_FILE_WARN_BYTES};
 #[cfg(feature = "test-support")]
 pub use open::reset_marker_is_valid_for_test;
 pub use open::{KernelError, KernelStore};

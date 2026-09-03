@@ -102,6 +102,7 @@ pub enum RestoreFault {
     RecoveryFailure,
 }
 
+#[cfg(feature = "test-support")]
 impl RestoreFault {
     /// Rollback proofs derive interruption points from this list.
     pub const ALL: &'static [Self] = &[

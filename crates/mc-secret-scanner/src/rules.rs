@@ -11,7 +11,10 @@ use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{ConstructionError, RuleSource, ScanLimits, ScanProfile};
+use crate::{
+    ConstructionError, RuleSource, ScanLimits, ScanProfile, MAX_LOCAL_CONTEXT_BYTES,
+    MAX_RULE_RADIUS,
+};
 
 /// Expected SHA-256 digest of the embedded upstream rule document.
 pub const UPSTREAM_CORPUS_SHA256: &str =
@@ -548,14 +551,16 @@ fn validate_policy(rule: &RuleDeclaration) -> Result<(), ConstructionError> {
         .char_class
         .as_ref()
         .is_some_and(|spec| spec.max_lower_pct > 100 || spec.min_window_len < 16)
+        || rule.radius > MAX_RULE_RADIUS
         || rule.two_phase.as_ref().is_some_and(|spec| {
             spec.seed_radius > spec.full_radius
+                || spec.full_radius > MAX_RULE_RADIUS
                 || spec.confirm_any.is_empty()
                 || spec.confirm_any.iter().any(String::is_empty)
         })
         || rule.local_context.as_ref().is_some_and(|spec| {
-            spec.lookbehind > 1024
-                || spec.lookahead > 1024
+            spec.lookbehind > MAX_LOCAL_CONTEXT_BYTES
+                || spec.lookahead > MAX_LOCAL_CONTEXT_BYTES
                 || spec
                     .key_names_any
                     .as_ref()

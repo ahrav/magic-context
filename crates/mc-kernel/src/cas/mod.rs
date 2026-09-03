@@ -22,9 +22,11 @@ use crate::{KernelError, KernelStore};
 
 /// Default total artifact capacity in bytes.
 pub(super) const DEFAULT_ARTIFACT_CAP: u64 = 4 * 1024 * 1024 * 1024;
-/// Maximum payload accepted by one ingest, in bytes.
-pub(super) const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
-/// Maximum recognized-secret detections accepted in one payload.
+/// Maximum payload accepted by one ingest, in bytes. Ingestion accepts exactly
+/// this many bytes and rejects one more with `PayloadTooLarge`.
+pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum recognized-secret findings accepted in one payload, counted before
+/// overlapping findings merge into detections; the scan stops at the cap.
 pub(super) const MAX_PAYLOAD_DETECTIONS: usize = 4096;
 /// Maximum UTF-8 byte length of each artifact text field.
 pub(super) const MAX_TEXT_FIELD_BYTES: usize = 1024;
@@ -179,6 +181,8 @@ pub enum ArtifactErrorKind {
     AlignmentRebuild,
     ReclaimInProgress,
     UnredactableSecret,
+    /// The secret scan stopped before covering the whole payload, so the payload is refused unscanned rather than stored unproven.
+    ScanIncomplete,
     DetectionLimit,
     TextFieldTooLong,
     InvalidInput,
@@ -279,14 +283,9 @@ fn artifact_error_message<'a>(
 impl fmt::Display for ArtifactErrorMessage<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
-            // Two limits produce this error: what may be stored, and the shorter length
-            // redaction can inspect. Naming only the first tells a caller it broke a
-            // limit it is far below, with no way to find the one it actually broke.
             ArtifactErrorKind::PayloadTooLarge => write!(
                 formatter,
-                "artifact payload exceeds an ingest limit ({MAX_PAYLOAD_BYTES} bytes stored, \
-                 {} bytes inspectable for secrets)",
-                mc_core::redaction::MAX_REDACTABLE_BYTES
+                "artifact payload exceeds {MAX_PAYLOAD_BYTES} bytes"
             ),
             ArtifactErrorKind::Capacity => write!(
                 formatter,
@@ -329,6 +328,9 @@ impl fmt::Display for ArtifactErrorMessage<'_> {
             }
             ArtifactErrorKind::UnredactableSecret => formatter
                 .write_str("artifact payload holds a recognized secret that cannot be redacted"),
+            ArtifactErrorKind::ScanIncomplete => {
+                formatter.write_str("artifact payload could not be fully scanned for secrets")
+            }
             ArtifactErrorKind::TextFieldTooLong => write!(
                 formatter,
                 "artifact text field exceeds {MAX_TEXT_FIELD_BYTES} bytes"
