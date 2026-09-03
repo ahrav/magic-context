@@ -14,7 +14,8 @@ use tokio_util::sync::CancellationToken;
 use super::serving::lag_threshold_tripped;
 use super::{KernelOpenCoordinator, KernelState, UnavailableReason};
 
-pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+pub const SAMPLE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The `kernel` block under `metrics.components.magic-context.metrics`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -145,12 +146,12 @@ impl KernelOpenCoordinator {
         self.health.publish(self.phase_block(sampled_at_ms));
     }
 
-    pub(crate) async fn sample(&self, now_ms: i64) {
+    pub(crate) async fn sample(&self, now_ms: i64) -> bool {
         let store = match self.kernel_store() {
             Ok(store) => store,
             Err(_) => {
                 self.publish_phase();
-                return;
+                return false;
             }
         };
         let block = match sample_facts(store, now_ms).await {
@@ -161,22 +162,31 @@ impl KernelOpenCoordinator {
             }
         };
         // The store may have been replaced while the worker ran; the phase wins.
-        if self.state() == KernelState::Ready {
-            self.health.publish(block);
-        } else {
+        if self.state() != KernelState::Ready {
             self.publish_phase();
+            return false;
         }
+        let sampled = block.facts.is_some();
+        self.health.publish(block);
+        sampled
     }
 
-    /// Samples every `SAMPLE_INTERVAL` until cancelled. Holds the store only for
-    /// the duration of one sample, so a shutdown that clears the slot is not
-    /// delayed by this task.
+    /// Cancellation drops the in-flight sample future so shutdown does not wait
+    /// for the sample; the cancelled future publishes nothing.
     pub(crate) async fn run_sampler(self: Arc<Self>, cancel: CancellationToken) {
         loop {
-            self.sample(crate::now_ms()).await;
+            let sampled = tokio::select! {
+                _ = cancel.cancelled() => return,
+                sampled = self.sample(crate::now_ms()) => sampled,
+            };
+            let interval = if sampled {
+                SAMPLE_INTERVAL
+            } else {
+                SAMPLE_RETRY_INTERVAL
+            };
             tokio::select! {
                 _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(SAMPLE_INTERVAL) => {}
+                _ = tokio::time::sleep(interval) => {}
             }
         }
     }
