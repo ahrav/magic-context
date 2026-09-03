@@ -453,6 +453,9 @@ export function evidenceFailReasons(score: {
     return FAIL_REASONS.filter((reason) => reasons.has(reason));
 }
 
+/** The one ERROR reason `assembleScore` emits; every other ERROR comes from `errorScore` without probe evidence. */
+const TRIMMED_BY_INJECTION_BUDGET = "trimmed-by-injection-budget";
+
 function assembleScore(args: {
     scenarioId: string;
     facts: FactsScore;
@@ -480,7 +483,7 @@ function assembleScore(args: {
         return {
             ...errorScore(
                 scenarioId,
-                "trimmed-by-injection-budget",
+                TRIMMED_BY_INJECTION_BUDGET,
                 `probe ${trimmed.probeId}: gold claim promoted but absent from the injected set`,
                 system,
                 source,
@@ -1956,9 +1959,12 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
             expectedClaimsMatched === 0 && expectedClaimsTotal === 0 &&
             visibleClaimsMatched === 0 && visibleClaimsTotal === 0 &&
             falseAuthoritativeMatches.length === 0 && structuralFindings.length === 0;
-        // The trimmed-probe ERROR keeps the probe verdicts that led to it.
+        // The trimmed-probe ERROR is the one `assembleScore` builds, under its fixed reason, and it is the only
+        // ERROR that keeps the probe verdicts that led to it.
         if (!evidenceless) p.fail(`${label}: error-shape-invalid`);
-        if (probeVerdicts.length > 0 && !probeVerdicts.some((probe) => probe.outcome === "error-trimmed")) {
+        const trimmed = errorReason === TRIMMED_BY_INJECTION_BUDGET;
+        if (trimmed !== probeVerdicts.length > 0) p.fail(`${label}.probeVerdicts: error-shape-invalid`);
+        if (trimmed && !probeVerdicts.some((probe) => probe.outcome === "error-trimmed")) {
             p.fail(`${label}.probeVerdicts: error-shape-invalid`);
         }
     } else {
@@ -1974,8 +1980,10 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         }
         // A lint-admitted scenario declares at least one probe and a run yields a verdict for each, so a
         // run-record score with no probe evidence never reached the scorer. The raw-output seam has no probes.
-        // The two run-record scores built by `errorScore` rather than the scorer carry none.
-        const scorerBypassed = failReasons.includes("invalid-output") || abortedFalseAuthoritative;
+        // The two run-record scores built without scoring carry none: the aborted false-authoritative FAIL, and
+        // the all-attempts-invalid FAIL, which is the only `invalid-output` score with a null recall.
+        const allAttemptsInvalid = failReasons.includes("invalid-output") && recall === null;
+        const scorerBypassed = allAttemptsInvalid || abortedFalseAuthoritative;
         if (source === "run-record" && probeVerdicts.length === 0 && !scorerBypassed) {
             p.fail(`${label}.probeVerdicts: probes-required`);
         }

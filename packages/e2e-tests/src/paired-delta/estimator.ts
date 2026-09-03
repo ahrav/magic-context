@@ -248,6 +248,33 @@ function estimateEndpoint(
     };
 }
 
+/**
+ * Recomputes one regret endpoint's estimate from its archived raw records.
+ *
+ * A regret rung takes no noise floor, and `estimateFamilyDeltas` includes every regret observation, so the
+ * archived records, seed, and resample count determine the estimate exactly.
+ */
+export function estimateRegretEndpoint(
+    endpoint: RegretEndpoint,
+    records: readonly RawRegretRecord[],
+    settings: { minimumAnalyzableFamilyCount: number; bootstrapResamples: number; bootstrapSeed: number },
+): EndpointEstimate {
+    return estimateEndpoint(
+        endpoint,
+        records.filter((record) => record.endpoint === endpoint).map((record) => ({
+            coordinateId: record.coordinateId,
+            familyId: record.familyId,
+            endpoint: record.endpoint,
+            delta: record.delta,
+            runHealth: "completed",
+        })),
+        new Map(),
+        settings.minimumAnalyzableFamilyCount,
+        settings.bootstrapResamples,
+        settings.bootstrapSeed,
+    );
+}
+
 export function estimateFamilyDeltas(input: {
     observations: readonly FamilyDeltaObservation[];
     minimumAnalyzableFamilyCount: number;
@@ -304,7 +331,8 @@ export function estimateFamilyDeltas(input: {
                 `observation: unanalyzable-${observation.coordinateId}`,
             );
         }
-        if (!Number.isFinite(observation.delta)) {
+        // A delta is a difference of two values in [0, 1], which is also the bound the report parser applies.
+        if (!Number.isFinite(observation.delta) || observation.delta < -1 || observation.delta > 1) {
             throw new PairedDeltaEstimatorError(
                 `observation: delta-invalid-${observation.coordinateId}`,
             );

@@ -347,6 +347,14 @@ describe("paired-delta report", () => {
         const floored = unscopedFloor.endpoints[0]!.families[0]!;
         floored.noise = { label: "inside-floor", floor: { familyId: floored.familyId, value: 1.5, interval: { lower: 0, upper: 1.5 } } };
         expect(() => report({ analysis: unscopedFloor })).toThrow(new RegExp(`noise-floor-endpoint-missing-${floored.familyId}`));
+        // The parser admits only the runner's refusal reasons and derives completeness outside calibration, so
+        // the builder refuses the shapes it would reject.
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, refusedRegretLadders: { vibes: 1 } },
+        })).toThrow(/refusal-reason-invalid-vibes/);
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, calibrationFingerprint: H1, evidenceComplete: true },
+        })).toThrow(/evidence-complete-mismatch/);
         // The parser requires a positive plan, so the builder refuses an empty one too.
         expect(() => report({
             runSummary: { ...report().body.runSummary, plannedCoordinates: 0, healthyCoordinates: 0 },
@@ -1104,14 +1112,20 @@ describe("parsePairedDeltaReport", () => {
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.analysis.rawRegretRecords = body.analysis.rawRegretRecords.filter(({ endpoint }) => endpoint !== "retrieval");
         }))).toThrow(/report\.body\.analysis\.rawRegretRecords: ladder-prefix-missing-/);
-        // A regret family's point estimate is the mean of its raw deltas.
+        // A regret estimate is recomputed whole from its archived raw deltas and bootstrap settings, so neither a
+        // family's mean nor its interval and resolution can be rewritten.
         expect(() => parsePairedDeltaReport(forge((body) => {
             const estimate = body.analysis.providerMixedRegret[0]!;
             const family = estimate.families[0]!;
             family.pointEstimate += 0.05;
             estimate.pointEstimate = estimate.families.reduce((sum, { pointEstimate }) => sum + pointEstimate, 0) / estimate.families.length;
             body.regret.providerMixed = body.analysis.providerMixedRegret;
-        }))).toThrow(/report\.body\.analysis\.providerMixedRegret\[0\]\.families\[0\]\.pointEstimate: derived-mismatch/);
+        }))).toThrow(/report\.body\.analysis\.providerMixedRegret\[0\]: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const family = body.analysis.providerMixedRegret[0]!.families[0]!;
+            family.interval = { lower: family.pointEstimate - 0.01, upper: family.pointEstimate + 0.01 };
+            body.regret.providerMixed = body.analysis.providerMixedRegret;
+        }))).toThrow(/report\.body\.analysis\.providerMixedRegret\[0\]: derived-mismatch/);
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.runSummary.status = "usage-unmeasured";
             body.runSummary.estimatedCostRollouts = 0;

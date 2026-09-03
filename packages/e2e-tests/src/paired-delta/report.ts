@@ -24,8 +24,9 @@ import type {
     Interval,
     NoiseComparison,
     RawRegretRecord,
+    RegretEndpoint,
 } from "./estimator";
-import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_SEED, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS, endpointResolution, includesZero, mean, noiseLabel } from "./estimator";
+import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_SEED, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS, endpointResolution, estimateRegretEndpoint, includesZero, mean, noiseLabel } from "./estimator";
 import { validSuccess } from "./scoring";
 import { tupleKey } from "./tuple-key";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
@@ -287,6 +288,18 @@ export function buildPairedDeltaReport(input: {
         },
         runSummary: input.runSummary,
     };
+    // The parser admits only the refusal reasons the runner records.
+    for (const reason of Object.keys(body.runSummary.refusedRegretLadders)) {
+        if (!(REFUSED_REGRET_REASONS as readonly string[]).includes(reason)) {
+            throw new Error(`paired-delta-report: refusal-reason-invalid-${reason}`);
+        }
+    }
+    // Outside calibration, completeness is the estimator's sufficiency over a fully healthy matrix.
+    if (body.runSummary.calibrationFingerprint !== null &&
+        body.runSummary.evidenceComplete !==
+            (body.analysis.evidenceSufficient && body.runSummary.healthyCoordinates >= body.runSummary.plannedCoordinates)) {
+        throw new Error("paired-delta-report: evidence-complete-mismatch");
+    }
     // A healthy coordinate completed every primary arm, so each metric map carries a value for each of them.
     if (body.runSummary.healthyCoordinates > 0) {
         for (const [field, metrics] of Object.entries(body.secondaryMetrics)) {
@@ -733,29 +746,17 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     for (const endpoint of aggregateEndpoints) {
         if (!rawEndpoints.has(endpoint)) p.fail(`report.body.analysis: aggregate-without-raw-${endpoint}`);
     }
-    // A regret family's point estimate is the mean of its raw deltas at that endpoint, and its families are
-    // exactly the families observed there. The interval is a bootstrap and stays unchecked here.
-    const rawByEndpointFamily = new Map<string, number[]>();
-    const rawFamiliesByEndpoint = new Map<string, Set<string>>();
-    for (const record of body.analysis.rawRegretRecords) {
-        const bucket = tupleKey(record.endpoint, record.familyId);
-        const deltas = rawByEndpointFamily.get(bucket);
-        if (deltas === undefined) rawByEndpointFamily.set(bucket, [record.delta]);
-        else deltas.push(record.delta);
-        rawFamiliesByEndpoint.set(record.endpoint, (rawFamiliesByEndpoint.get(record.endpoint) ?? new Set()).add(record.familyId));
-    }
+    // Every regret observation is archived with the bootstrap settings, so each regret estimate is recomputed
+    // whole: families, means, intervals, and resolutions.
     for (const [view, estimates] of [["liveRegret", body.analysis.liveRegret], ["providerMixedRegret", body.analysis.providerMixedRegret]] as const) {
         for (const [index, estimate] of estimates.entries()) {
-            const observedFamilies = rawFamiliesByEndpoint.get(estimate.endpoint) ?? new Set<string>();
-            if (observedFamilies.size !== estimate.families.length ||
-                estimate.families.some(({ familyId }) => !observedFamilies.has(familyId))) {
-                p.fail(`report.body.analysis.${view}[${index}].families: raw-family-mismatch`);
-            }
-            for (const [familyIndex, family] of estimate.families.entries()) {
-                const deltas = rawByEndpointFamily.get(tupleKey(estimate.endpoint, family.familyId)) ?? [];
-                if (family.pointEstimate !== mean(deltas)) {
-                    p.fail(`report.body.analysis.${view}[${index}].families[${familyIndex}].pointEstimate: derived-mismatch`);
-                }
+            const recomputed = estimateRegretEndpoint(
+                estimate.endpoint as RegretEndpoint,
+                body.analysis.rawRegretRecords,
+                body.analysis,
+            );
+            if (canonicalJson(recomputed) !== canonicalJson(estimate)) {
+                p.fail(`report.body.analysis.${view}[${index}]: derived-mismatch`);
             }
         }
     }

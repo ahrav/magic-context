@@ -368,7 +368,7 @@ describe("bound prospective estimator adapter", () => {
         /** Shifted clear of every family floor: a delta inside its floor is not separable from measured noise, so it must not project a direction. */
         const positive = adapter(estimate({
             minimumAnalyzableFamilyCount: 1,
-            observations: observations.map((row) => ({ ...row, delta: Math.abs(row.delta) + 0.7 })),
+            observations: observations.map((row) => ({ ...row, delta: Math.min(1, Math.abs(row.delta) + 0.7) })),
         })).analyze(pairs, H3);
         expect(positive.direction).toBe("improvement");
         const insideFloor = adapter(estimate({
@@ -379,7 +379,7 @@ describe("bound prospective estimator adapter", () => {
 
         const negative = adapter(estimate({
             minimumAnalyzableFamilyCount: 1,
-            observations: observations.map((row) => ({ ...row, delta: -Math.abs(row.delta) - 0.7 })),
+            observations: observations.map((row) => ({ ...row, delta: Math.max(-1, -Math.abs(row.delta) - 0.7) })),
         })).analyze(pairs, H3);
         expect(negative.direction).toBe("regression");
 
@@ -388,8 +388,8 @@ describe("bound prospective estimator adapter", () => {
             observations: observations.map((row) => ({
                 ...row,
                 delta: row.endpoint === "mc-on-vs-mc-off"
-                    ? Math.abs(row.delta) + 0.7
-                    : -Math.abs(row.delta) - 0.7,
+                    ? Math.min(1, Math.abs(row.delta) + 0.7)
+                    : Math.max(-1, -Math.abs(row.delta) - 0.7),
             })),
         })).analyze(pairs, H3);
         expect(mixed.direction).toBe("no-change");
