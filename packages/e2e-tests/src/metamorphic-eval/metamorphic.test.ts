@@ -199,12 +199,30 @@ describe("deterministic metamorphic runner", () => {
         inflatedApplied.coverage[0]!.applied += 1;
         expect(metamorphicExitCode(inflatedApplied)).toBe(metamorphicExitCode(report));
         expect(() => parseMetamorphicReport(inflatedApplied)).toThrow(/report\.coverage\[0\]\.applied: derived-mismatch/);
-        // A transform that throws during admission leaves an error entry without counting as applied, so a
-        // lower applied count is a shape the producer can emit.
+        // A transform that throws during admission leaves an error entry without counting as applied, so an
+        // applied count one below the entry count is a shape the producer can emit once one entry is an error.
         const deflatedApplied = structuredClone(report);
-        deflatedApplied.coverage[0]!.applied -= 1;
-        if (deflatedApplied.coverage[0]!.applied === 0) deflatedApplied.coverage[0]!.violations = ["no transforms applied"];
+        const deflatedRow = deflatedApplied.coverage[0]!;
+        const executedIndex = deflatedApplied.entries.findIndex((entry) =>
+            entry.scenarioId === deflatedRow.scenarioId && (entry.kind === "scored" || entry.kind === "stage-not-scored"));
+        expect(executedIndex).toBeGreaterThanOrEqual(0);
+        const executedKey = deflatedApplied.entries[executedIndex]!;
+        deflatedApplied.entries[executedIndex] = {
+            scenarioId: executedKey.scenarioId,
+            transformId: executedKey.transformId,
+            transformVersion: executedKey.transformVersion,
+            seed: executedKey.seed,
+            kind: "error",
+            error: "admission threw",
+        };
+        deflatedRow.applied -= 1;
+        if (deflatedRow.applied === 0) deflatedRow.violations = ["no transforms applied"];
         expect(() => parseMetamorphicReport(deflatedApplied)).not.toThrow();
+        // Only an applied pair executes, so the applied count never drops below the executed entries.
+        const underApplied = structuredClone(report);
+        underApplied.coverage[0]!.applied -= 1;
+        if (underApplied.coverage[0]!.applied === 0) underApplied.coverage[0]!.violations = ["no transforms applied"];
+        expect(() => parseMetamorphicReport(underApplied)).toThrow(/report\.coverage\[0\]\.applied: executed-shortfall/);
         // A scenario nothing applied to records that as a violation.
         const silentZero = structuredClone(report);
         const zeroRow = silentZero.coverage[0]!;

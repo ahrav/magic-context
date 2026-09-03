@@ -590,10 +590,17 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     // is backed by at least that many. The bound is not an equality: a transform that throws during admission
     // also leaves an `error` entry without counting as applied, and the archive does not say which errors
     // were those. A tier-invalid run keeps its scheduled coverage over a partial entry set.
+    // Both producers count a pair as applied before they execute it, and only an executed pair leaves a
+    // `scored` or `stage-not-scored` entry, so those entries bound the applied count from below on every run.
     const backed = new Map<string, number>();
+    const executed = new Map<string, number>();
     for (const entry of report.entries) {
         if (entry.kind === "lint-red" || isControl(entry)) continue;
         backed.set(entry.scenarioId, (backed.get(entry.scenarioId) ?? 0) + 1);
+        if (entry.kind !== "error") executed.set(entry.scenarioId, (executed.get(entry.scenarioId) ?? 0) + 1);
+    }
+    for (const [index, row] of report.coverage.entries()) {
+        if (row.applied < (executed.get(row.scenarioId) ?? 0)) p.fail(`report.coverage[${index}].applied: executed-shortfall`);
     }
     if (report.tierInvalidReason === null) {
         for (const [index, row] of report.coverage.entries()) {

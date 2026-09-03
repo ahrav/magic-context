@@ -243,12 +243,6 @@ export function buildPairedDeltaReport(input: {
     if (input.runSummary.status === "usage-unmeasured" && input.runSummary.estimatedCostRollouts === 0) {
         throw new Error("paired-delta-report: status-evidence-required");
     }
-    // A run ends `completed` only if every planned coordinate stored every primary arm.
-    if (input.runSummary.status === "completed" &&
-        input.runSummary.observedCostRollouts + input.runSummary.estimatedCostRollouts <
-            input.runSummary.plannedCoordinates * PRIMARY_ARM_IDS.length) {
-        throw new Error("paired-delta-report: completed-run-shortfall");
-    }
     // Rungs run in order and stop at the first failure, so a later regret delta exists only with every earlier one.
     const rungsByCoordinate = new Map<string, Set<string>>();
     for (const record of input.analysis.rawRegretRecords) {
@@ -300,6 +294,9 @@ export function buildPairedDeltaReport(input: {
     ) {
         throw new Error("paired-delta-report: run-summary-invalid");
     }
+    // The parser rejects any rollout accounting these rules reject.
+    const accounting = rolloutAccountingViolation(input.runSummary, exclusions, input.analysis.analyzableFamilyCount);
+    if (accounting !== null) throw new Error(`paired-delta-report: ${accounting.code} (${accounting.path})`);
     if (input.limitations.some((line) => line.trim().length === 0)) {
         throw new Error("paired-delta-report: limitation-invalid");
     }
@@ -633,6 +630,59 @@ function parseRefusedRegretLadders(raw: unknown, label: string): Record<string, 
 }
 
 /** Strict consumer parser: rejects unknown fields at every level and a `reportFingerprint` that does not match the body. */
+/**
+ * Relates the run summary's rollout counters, exclusions, and the analyzed family count to each other.
+ *
+ * The two cost counters partition the final record array, which holds at most one record per arm per planned
+ * coordinate; exclusions count the non-completed records of that same array; and a healthy coordinate is one
+ * whose every primary arm completed with observed usage. Returns the first rule the inputs break, or null.
+ */
+function rolloutAccountingViolation(
+    summary: PairedDeltaReportBody["runSummary"],
+    exclusions: readonly ExclusionCount[],
+    analyzableFamilyCount: number,
+): { path: string; code: string } | null {
+    const { plannedCoordinates, healthyCoordinates, observedCostRollouts, estimatedCostRollouts, status } = summary;
+    const unhealthy = plannedCoordinates - healthyCoordinates;
+    // Each coordinate carries one family, analyzed only when every primary arm completed.
+    if (analyzableFamilyCount > healthyCoordinates) {
+        return { path: "analysis.analyzableFamilyCount", code: "healthy-coordinate-shortfall" };
+    }
+    const exclusionsByArm = new Map<string, number>();
+    for (const { armId, count } of exclusions) exclusionsByArm.set(armId, (exclusionsByArm.get(armId) ?? 0) + count);
+    for (const [armId, total] of exclusionsByArm) {
+        // A completed cell carries no exclusion, so a primary arm's exclusions fit in the unhealthy remainder.
+        const ceiling = (PRIMARY_ARM_IDS as readonly string[]).includes(armId) ? unhealthy : plannedCoordinates;
+        if (total > ceiling) return { path: "exclusions", code: `${armId}-exceeds-plan` };
+    }
+    const rollouts = observedCostRollouts + estimatedCostRollouts;
+    // A run ends `completed` only if every planned coordinate stored every primary arm.
+    if (status === "completed" && rollouts < plannedCoordinates * PRIMARY_ARM_IDS.length) {
+        return { path: "runSummary.observedCostRollouts", code: "completed-run-shortfall" };
+    }
+    if (rollouts > plannedCoordinates * ARM_IDS.length) {
+        return { path: "runSummary.observedCostRollouts", code: "exceeds-plan" };
+    }
+    // The runner refuses a completed cell priced as an estimate.
+    if (observedCostRollouts < PRIMARY_ARM_IDS.length * healthyCoordinates) {
+        return { path: "runSummary.observedCostRollouts", code: "healthy-coordinate-shortfall" };
+    }
+    // An excluded record is never one of a healthy coordinate's primary records.
+    const excludedRecords = exclusions.reduce((sum, { count }) => sum + count, 0);
+    if (rollouts < PRIMARY_ARM_IDS.length * healthyCoordinates + excludedRecords) {
+        return { path: "runSummary.observedCostRollouts", code: "exclusion-shortfall" };
+    }
+    // An estimated cost means no usage came back, which leaves the cell non-completed and therefore excluded.
+    if (estimatedCostRollouts > excludedRecords) {
+        return { path: "runSummary.estimatedCostRollouts", code: "exclusion-shortfall" };
+    }
+    // On a completed run every unhealthy coordinate has a non-completed primary cell, so each contributes an exclusion.
+    if (status === "completed" && excludedRecords < unhealthy) {
+        return { path: "exclusions", code: "unhealthy-coordinate-shortfall" };
+    }
+    return null;
+}
+
 export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     const root = p.record(raw, "report");
     p.exact(root, ["schema", "body", "reportFingerprint"], "report");
@@ -728,57 +778,8 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     if (body.runSummary.healthyCoordinates > body.runSummary.plannedCoordinates) {
         p.fail("report.body.runSummary.healthyCoordinates: integer-invalid");
     }
-    // A primary observation is recorded only for a coordinate whose every primary arm completed, which is the
-    // predicate `healthyCoordinates` counts, and each coordinate carries one family.
-    if (body.analysis.analyzableFamilyCount > body.runSummary.healthyCoordinates) {
-        p.fail("report.body.analysis.analyzableFamilyCount: healthy-coordinate-shortfall");
-    }
-    // Exclusions count final rollout records, at most one per arm per planned coordinate.
-    const exclusionsByArm = new Map<string, number>();
-    for (const { armId, count } of body.exclusions) exclusionsByArm.set(armId, (exclusionsByArm.get(armId) ?? 0) + count);
-    for (const [armId, total] of exclusionsByArm) {
-        // A healthy coordinate completed every primary arm, and a completed cell carries no exclusion, so a
-        // primary arm's exclusions fit in the unhealthy remainder.
-        const ceiling = (PRIMARY_ARM_IDS as readonly string[]).includes(armId)
-            ? body.runSummary.plannedCoordinates - body.runSummary.healthyCoordinates
-            : body.runSummary.plannedCoordinates;
-        if (total > ceiling) p.fail(`report.body.exclusions: ${armId}-exceeds-plan`);
-    }
-    // A run ends `completed` only if every planned coordinate ran and stored every primary arm; any other exit
-    // changes the status.
-    if (body.runSummary.status === "completed" &&
-        body.runSummary.observedCostRollouts + body.runSummary.estimatedCostRollouts <
-            body.runSummary.plannedCoordinates * PRIMARY_ARM_IDS.length) {
-        p.fail("report.body.runSummary.observedCostRollouts: completed-run-shortfall");
-    }
-    // The two counters partition the final record array, which holds at most one record per arm per coordinate.
-    if (body.runSummary.observedCostRollouts + body.runSummary.estimatedCostRollouts >
-        body.runSummary.plannedCoordinates * ARM_IDS.length) {
-        p.fail("report.body.runSummary.observedCostRollouts: exceeds-plan");
-    }
-    // A healthy coordinate completed every primary arm, and the runner refuses a completed cell priced as an
-    // estimate, so each one carries at least one observed rollout per primary arm.
-    if (body.runSummary.observedCostRollouts < PRIMARY_ARM_IDS.length * body.runSummary.healthyCoordinates) {
-        p.fail("report.body.runSummary.observedCostRollouts: healthy-coordinate-shortfall");
-    }
-    // Exclusions are counted from the same final record array the two cost counters partition, and an excluded
-    // record is never one of a healthy coordinate's primary records.
-    const excludedRecords = body.exclusions.reduce((sum, { count }) => sum + count, 0);
-    if (body.runSummary.observedCostRollouts + body.runSummary.estimatedCostRollouts <
-        PRIMARY_ARM_IDS.length * body.runSummary.healthyCoordinates + excludedRecords) {
-        p.fail("report.body.runSummary.observedCostRollouts: exclusion-shortfall");
-    }
-    // An estimated cost means no usage came back, which leaves the cell non-completed with a reason code. commentlint: allow(JUDGE)
-    // `exclusionCountsOf` counts every such cell, so the estimated rollouts are a subset of the exclusions. commentlint: allow(JUDGE)
-    if (body.runSummary.estimatedCostRollouts > excludedRecords) {
-        p.fail("report.body.runSummary.estimatedCostRollouts: exclusion-shortfall");
-    }
-    // A completed run stored every primary arm of every coordinate, and an unhealthy coordinate has at least one
-    // primary cell that did not complete, so each one contributes an exclusion. commentlint: allow(JUDGE)
-    if (body.runSummary.status === "completed" &&
-        excludedRecords < body.runSummary.plannedCoordinates - body.runSummary.healthyCoordinates) {
-        p.fail("report.body.exclusions: unhealthy-coordinate-shortfall");
-    }
+    const accounting = rolloutAccountingViolation(body.runSummary, body.exclusions, body.analysis.analyzableFamilyCount);
+    if (accounting !== null) p.fail(`report.body.${accounting.path}: ${accounting.code}`);
     // A refusal is counted at most once per planned coordinate.
     const refusedTotal = Object.values(body.runSummary.refusedRegretLadders).reduce((sum, count) => sum + count, 0);
     if (refusedTotal > body.runSummary.plannedCoordinates) p.fail("report.body.runSummary.refusedRegretLadders: exceeds-plan");

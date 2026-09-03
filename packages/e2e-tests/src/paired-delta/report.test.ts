@@ -372,6 +372,13 @@ describe("paired-delta report", () => {
         expect(() => report({
             runSummary: { ...report().body.runSummary, observedCostRollouts: 27, estimatedCostRollouts: 0 },
         })).toThrow(/completed-run-shortfall/);
+        // Each coordinate records at most one entry per arm; healthy coordinates use every primary arm.
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, observedCostRollouts: 70, estimatedCostRollouts: 3 },
+        })).toThrow(/exceeds-plan \(runSummary\.observedCostRollouts\)/);
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, observedCostRollouts: 26, estimatedCostRollouts: 10 },
+        })).toThrow(/healthy-coordinate-shortfall \(runSummary\.observedCostRollouts\)/);
         // A calibration run is complete only over a completed, fully healthy matrix.
         expect(() => report({
             runSummary: { ...report().body.runSummary, evidenceComplete: true },
