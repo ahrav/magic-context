@@ -1921,8 +1921,14 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         // Every ERROR is built by `errorScore`, which always names its reason.
         if (errorReason === null) p.fail(`${label}.errorReason: derived-mismatch`);
     } else {
-        // `assembleScore` clears both on any non-error score.
-        if (errorReason !== null || errorDetail !== null) p.fail(`${label}.errorReason: derived-mismatch`);
+        // `assembleScore` clears both on any non-error score. The one exception is an aborted record whose
+        // claims still matched an expected-absent predicate: `scoreRunRecord` keeps the abort's reason on
+        // that FAIL, and its reasons are exactly `false-authoritative`.
+        const abortedFalseAuthoritative = verdict === "FAIL" &&
+            failReasons.length === 1 && failReasons[0] === "false-authoritative";
+        if ((errorReason !== null || errorDetail !== null) && !abortedFalseAuthoritative) {
+            p.fail(`${label}.errorReason: derived-mismatch`);
+        }
         if ((verdict === "PASS") !== (failReasons.length === 0)) p.fail(`${label}.verdict: derived-mismatch`);
         // `assembleScore` turns an unmeasurable probe with no other failure into an ERROR, never a PASS.
         if (failReasons.length === 0 && probeVerdicts.some((probe) => probe.outcome === "error-trimmed")) {

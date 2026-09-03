@@ -533,8 +533,10 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     }
     // One producer writes a report, and each producer scores through one seam.
     if (sources.size > 1) p.fail("report.entries: source-mismatch");
-    // The raw-output path scores without a system tuple and publishes none at the root.
+    // The raw-output path scores without a system tuple and publishes none at the root; the live entry point
+    // resolves its tuple before running and exits without a report when it cannot.
     if (sources.has("raw-output") && report.system !== null) p.fail("report.system: report-system-mismatch");
+    if (sources.has("run-record") && report.system === null) p.fail("report.system: report-system-mismatch");
     if (report.system !== null) {
         const rootSystem = canonicalJson(report.system);
         for (const [index, entry] of report.entries.entries()) {

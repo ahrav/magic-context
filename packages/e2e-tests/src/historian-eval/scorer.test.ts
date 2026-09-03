@@ -2508,6 +2508,12 @@ describe("buildLaneReport", () => {
         const reasonlessError = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         reasonlessError.scenarios[2]!.errorReason = null;
         expect(() => parseLaneReport(reasonlessError)).toThrow(/report\.scenarios\[2\]\.errorReason: derived-mismatch/);
+        // An aborted record whose claims matched an expected-absent predicate keeps the abort's reason on its FAIL.
+        const abortedFa = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(abortedFa.scenarios[1]!, {
+            failReasons: ["false-authoritative"], probeVerdicts: [], errorReason: "harness-crash", errorDetail: "boom",
+        });
+        expect(() => parseLaneReport(abortedFa)).toThrow(/^report: derived-mismatch/);
         const doubledProbe = structuredClone(report) as unknown as { scenarios: Record<string, unknown[]>[] };
         doubledProbe.scenarios[1]!.probeVerdicts!.push(structuredClone(doubledProbe.scenarios[1]!.probeVerdicts![0]!));
         expect(() => parseLaneReport(doubledProbe)).toThrow(/report\.scenarios\[1\]\.probeVerdicts: duplicate/);

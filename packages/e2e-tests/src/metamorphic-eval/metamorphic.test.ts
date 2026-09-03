@@ -341,6 +341,15 @@ describe("deterministic metamorphic runner", () => {
         rootMismatch.entries.sort((left, right) =>
             `${left.scenarioId}\u0000${left.transformId}`.localeCompare(`${right.scenarioId}\u0000${right.transformId}`));
         expect(() => parseMetamorphicReport(rootMismatch)).toThrow(/report\.entries\[\d+\]: report-system-mismatch/);
+        // A live report always names the system it ran.
+        const identityless = structuredClone(rootMismatch);
+        identityless.system = null;
+        for (const entry of identityless.entries) {
+            if (entry.kind !== "scored") continue;
+            entry.baselineScore.system = systemTuple();
+            entry.derivativeScore.system = systemTuple();
+        }
+        expect(() => parseMetamorphicReport(identityless)).toThrow(/report\.system: report-system-mismatch/);
         // Every scenario with entries has its coverage row, or its violations could vanish with it.
         const uncovered = structuredClone(report);
         const dropped = uncovered.coverage.shift()!;
