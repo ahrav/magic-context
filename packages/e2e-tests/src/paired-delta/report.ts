@@ -530,14 +530,19 @@ function parseAnalysis(raw: unknown, label: string): FamilyDeltaAnalysis {
     };
 }
 
-function parseArmMetrics(raw: unknown, label: string, maximum = Number.POSITIVE_INFINITY): ArmMetrics {
+function parseArmMetrics(
+    raw: unknown,
+    label: string,
+    shape: { maximum?: number; integer?: boolean } = {},
+): ArmMetrics {
     const value = p.record(raw, label);
     const metrics: ArmMetrics = {};
     for (const [armId, metric] of Object.entries(value)) {
         const arm = p.enumeration(armId, ARM_IDS, `${label}.${armId}`);
-        const result = nonNegativeNumber(metric, `${label}.${armId}`);
-        if (result > maximum) p.fail(`${label}.${armId}: number-invalid`);
-        metrics[arm] = result;
+        // Token and turn totals sum per-rollout counters the runner admits only as safe integers.
+        metrics[arm] = shape.integer
+            ? p.integer(metric, `${label}.${armId}`)
+            : p.number(metric, `${label}.${armId}`, { minimum: 0, maximum: shape.maximum });
     }
     return metrics;
 }
@@ -601,10 +606,10 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
             };
         }),
         secondaryMetrics: {
-            invalidSuccessRateByArm: parseArmMetrics(secondary.invalidSuccessRateByArm, "report.body.secondaryMetrics.invalidSuccessRateByArm", 1),
-            finalAttemptTokensByArm: parseArmMetrics(secondary.finalAttemptTokensByArm, "report.body.secondaryMetrics.finalAttemptTokensByArm"),
+            invalidSuccessRateByArm: parseArmMetrics(secondary.invalidSuccessRateByArm, "report.body.secondaryMetrics.invalidSuccessRateByArm", { maximum: 1 }),
+            finalAttemptTokensByArm: parseArmMetrics(secondary.finalAttemptTokensByArm, "report.body.secondaryMetrics.finalAttemptTokensByArm", { integer: true }),
             finalAttemptWallClockMsByArm: parseArmMetrics(secondary.finalAttemptWallClockMsByArm, "report.body.secondaryMetrics.finalAttemptWallClockMsByArm"),
-            finalAttemptTurnsByArm: parseArmMetrics(secondary.finalAttemptTurnsByArm, "report.body.secondaryMetrics.finalAttemptTurnsByArm"),
+            finalAttemptTurnsByArm: parseArmMetrics(secondary.finalAttemptTurnsByArm, "report.body.secondaryMetrics.finalAttemptTurnsByArm", { integer: true }),
         },
         regret: {
             // The builder publishes the analysis arrays here verbatim, so the raw views are compared against the
@@ -669,6 +674,13 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
             ? body.runSummary.plannedCoordinates - body.runSummary.healthyCoordinates
             : body.runSummary.plannedCoordinates;
         if (total > ceiling) p.fail(`report.body.exclusions: ${armId}-exceeds-plan`);
+    }
+    // A run ends `completed` only if every planned coordinate ran and stored every primary arm; any other exit
+    // changes the status.
+    if (body.runSummary.status === "completed" &&
+        body.runSummary.observedCostRollouts + body.runSummary.estimatedCostRollouts <
+            body.runSummary.plannedCoordinates * PRIMARY_ARM_IDS.length) {
+        p.fail("report.body.runSummary.observedCostRollouts: completed-run-shortfall");
     }
     // The two counters partition the final record array, which holds at most one record per arm per coordinate.
     if (body.runSummary.observedCostRollouts + body.runSummary.estimatedCostRollouts >

@@ -1857,13 +1857,22 @@ function parseProbeVerdicts(raw: unknown, label: string): ProbeVerdict[] {
         const probe = p.record(entry, probeLabel);
         p.exact(probe, ["probeId", "outcome", "expected", "actual"], probeLabel);
         const outcome = p.enumeration(probe.outcome, PROBE_OUTCOMES, `${probeLabel}.outcome`);
+        const expected = p.text(probe.expected, `${probeLabel}.expected`);
         const actual = parseNullableText(probe.actual, `${probeLabel}.actual`);
-        // `compareProbeAnswer` passes only a non-null answer.
-        if (outcome === "pass" && actual === null) p.fail(`${probeLabel}.outcome: derived-mismatch`);
+        // `compareProbeAnswer` passes only a non-null answer that matches: for an exact probe, `expected`
+        // itself after entity decoding and normalization; for a claim-id probe, one of the ` | `-joined ids in
+        // `expected`. The answer type is not archived, so a pass must satisfy one of the two.
+        if (outcome === "pass") {
+            if (actual === null) p.fail(`${probeLabel}.outcome: derived-mismatch`);
+            const answer = normalizeContent(decodeXmlEntities(actual as string));
+            const exactMatch = answer === normalizeContent(decodeXmlEntities(expected));
+            const claimMatch = expected.split(" | ").some((id) => normalizeContent(id) === normalizeContent(actual as string));
+            if (!exactMatch && !claimMatch) p.fail(`${probeLabel}.outcome: derived-mismatch`);
+        }
         return {
             probeId: p.string(probe.probeId, `${probeLabel}.probeId`),
             outcome,
-            expected: p.text(probe.expected, `${probeLabel}.expected`),
+            expected,
             actual,
         };
     });

@@ -88,10 +88,10 @@ function report(overrides: Partial<Parameters<typeof buildPairedDeltaReport>[0]>
         runSummary: {
             status: "completed" as const,
             spentUsd: 12.5,
-            // Nine healthy coordinates each completed three primary arms, so the runner observed at least 27 rollouts;
-            // the three unhealthy coordinates hold the primary-arm exclusions below.
+            // A completed run stored every primary arm for all twelve coordinates: 27 observed for the nine healthy
+            // ones and nine estimated for the three unhealthy ones, which hold the primary-arm exclusions below.
             observedCostRollouts: 27,
-            estimatedCostRollouts: 3,
+            estimatedCostRollouts: 9,
             refusedRegretLadders: { "intervention-mismatch": 2 },
             plannedCoordinates: 12,
             healthyCoordinates: 9,
@@ -976,7 +976,7 @@ describe("parsePairedDeltaReport", () => {
         expect(() => parsePairedDeltaReport(forge((body) => { body.secondaryMetrics.invalidSuccessRateByArm["mc-on"] = 1.5; })))
             .toThrow(/invalidSuccessRateByArm\.mc-on: number-invalid/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.secondaryMetrics.finalAttemptTokensByArm["mc-on"] = -1; })))
-            .toThrow(/finalAttemptTokensByArm\.mc-on: number-invalid/);
+            .toThrow(/finalAttemptTokensByArm\.mc-on: integer-invalid/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.spentUsd = -1; })))
             .toThrow(/report\.body\.runSummary\.spentUsd: number-invalid/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.healthyCoordinates = 13; })))
@@ -1015,8 +1015,10 @@ describe("parsePairedDeltaReport", () => {
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.analysis.endpoints[1]!.families[0]!.familyId = "fam-elsewhere";
         }))).toThrow(/report\.body\.analysis\.endpoints: family-set-mismatch/);
-        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.observedCostRollouts = 0; })))
-            .toThrow(/report\.body\.runSummary\.observedCostRollouts: healthy-coordinate-shortfall/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.status = "cost-cap-reached";
+            body.runSummary.observedCostRollouts = 0;
+        }))).toThrow(/report\.body\.runSummary\.observedCostRollouts: healthy-coordinate-shortfall/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.exclusions[0]!.count = 99; })))
             .toThrow(/report\.body\.exclusions: [a-z-]+-exceeds-plan/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.refusedRegretLadders = { vibes: 1 }; })))
@@ -1070,9 +1072,15 @@ describe("parsePairedDeltaReport", () => {
             .toThrow(/report\.body\.analysis\.endpoints\[0\]\.families\[0\]\.pointEstimate: number-invalid/);
         // Every exclusion is a final record the two cost counters also count.
         expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.status = "cost-cap-reached";
             body.runSummary.observedCostRollouts = 27;
             body.runSummary.estimatedCostRollouts = 0;
         }))).toThrow(/report\.body\.runSummary\.observedCostRollouts: exclusion-shortfall/);
+        // A completed run stored every primary arm for every planned coordinate.
+        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.estimatedCostRollouts = 3; })))
+            .toThrow(/report\.body\.runSummary\.observedCostRollouts: completed-run-shortfall/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.secondaryMetrics.finalAttemptTokensByArm["mc-on"] = 0.5; })))
+            .toThrow(/finalAttemptTokensByArm\.mc-on: integer-invalid/);
         // A primary arm's exclusions fit within the unhealthy coordinates.
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.exclusions.find(({ armId }) => armId === "compaction")!.count = 4;

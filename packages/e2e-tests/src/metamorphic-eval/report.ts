@@ -559,6 +559,12 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
         if (entry.transformId === CONTROL_TRANSFORM_ID) continue;
         if (!covered.has(entry.scenarioId)) p.fail(`report.entries[${index}]: coverage-row-required`);
     }
+    // Both runners build a scenario's coverage row around its canary collection, so a hit names a covered
+    // scenario; the control roles are the exception, since the control scenario has no row.
+    for (const [index, hit] of report.injectionCanaryHits.entries()) {
+        if (hit.role === "control-a" || hit.role === "control-b") continue;
+        if (!covered.has(hit.scenarioId)) p.fail(`report.injectionCanaryHits[${index}]: coverage-row-required`);
+    }
     const sources = new Set(report.entries.flatMap((entry) => entry.kind === "scored" ? [entry.baselineScore.source] : []));
     // The live runner completes and validates its control pair before any product pair, so a tier-valid
     // run-record report carries exactly one scored control.

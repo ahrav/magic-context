@@ -2605,6 +2605,11 @@ describe("buildLaneReport", () => {
         const probeless = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         probeless.scenarios[0]!.probeVerdicts = [];
         expect(() => parseLaneReport(probeless)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: probes-required/);
+        // A passing probe's answer matches its expectation.
+        const wrongPass = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        wrongPass.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: "no" }];
+        expect(() => parseLaneReport(wrongPass))
+            .toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.outcome: derived-mismatch/);
         // A probe passes only on a non-null answer.
         const answerlessPass = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         answerlessPass.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: null }];

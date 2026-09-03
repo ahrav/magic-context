@@ -390,6 +390,10 @@ describe("deterministic metamorphic runner", () => {
             entry.derivativeScore.system = systemTuple();
         }
         expect(() => parseMetamorphicReport(identityless)).toThrow(/report\.system: report-system-mismatch/);
+        // A canary hit names a covered scenario.
+        const strayHit = structuredClone(report);
+        strayHit.injectionCanaryHits.push({ scenarioId: "hse-nowhere", role: "baseline", transformId: null, transformVersion: null, seed: 1 });
+        expect(() => parseMetamorphicReport(strayHit)).toThrow(/report\.injectionCanaryHits\[0\]: coverage-row-required/);
         // Every scenario with entries has its coverage row, or its violations could vanish with it.
         const uncovered = structuredClone(report);
         const dropped = uncovered.coverage.shift()!;
