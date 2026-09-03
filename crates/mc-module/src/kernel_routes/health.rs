@@ -3,7 +3,7 @@
 //! and never touches the store.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use mc_kernel::{KernelFacts, MAIN_FILE_WARN_BYTES};
@@ -16,9 +16,10 @@ use super::{KernelOpenCoordinator, KernelState, UnavailableReason};
 
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 pub const SAMPLE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
-/// A `Ready` block older than this reads as unavailable: ten steady intervals
-/// leaves room for slow artifact walks while still exposing a sampler that has
-/// stopped publishing.
+/// A `Ready` block published longer ago than this reads as unavailable: ten
+/// steady intervals leaves room for slow artifact walks while still exposing a
+/// sampler that has stopped publishing. Measured on the monotonic clock, so a
+/// wall-clock step neither hides nor fakes a stall.
 pub const SAMPLE_STALE_AFTER: Duration = Duration::from_secs(300);
 
 /// The `kernel` block under `metrics.components.magic-context.metrics`.
@@ -103,14 +104,6 @@ impl KernelHealthBlock {
         }
     }
 
-    /// Whether a `Ready` block is older than [`SAMPLE_STALE_AFTER`] at `now_ms`.
-    pub fn is_stale(&self, now_ms: i64) -> bool {
-        self.kernel_state == KernelState::Ready
-            && self.sampled_at_ms.is_some_and(|sampled_at_ms| {
-                now_ms.saturating_sub(sampled_at_ms) > SAMPLE_STALE_AFTER.as_millis() as i64
-            })
-    }
-
     /// The block a reader reports in place of a stale `Ready` block: unavailable,
     /// with the stale sample time preserved so the age stays visible.
     pub fn stale(sampled_at_ms: Option<i64>) -> Self {
@@ -123,29 +116,58 @@ impl KernelHealthBlock {
     }
 }
 
+/// One published block plus the monotonic instant after which a `Ready` block
+/// is stale.
+pub(crate) struct PublishedBlock {
+    pub(crate) block: KernelHealthBlock,
+    stale_at: Instant,
+}
+
+impl PublishedBlock {
+    fn now(block: KernelHealthBlock) -> Self {
+        Self {
+            block,
+            stale_at: Instant::now() + SAMPLE_STALE_AFTER,
+        }
+    }
+
+    pub(crate) fn is_stale(&self) -> bool {
+        self.block.kernel_state == KernelState::Ready && Instant::now() >= self.stale_at
+    }
+}
+
 /// Published projection the sampler writes and `health()` reads.
 pub(crate) struct KernelHealthProjection {
-    snapshot: ArcSwap<KernelHealthBlock>,
+    snapshot: ArcSwap<PublishedBlock>,
 }
 
 impl KernelHealthProjection {
     pub(crate) fn new() -> Self {
         Self {
-            snapshot: ArcSwap::from_pointee(KernelHealthBlock {
+            snapshot: ArcSwap::from_pointee(PublishedBlock::now(KernelHealthBlock {
                 kernel_state: KernelState::Starting,
                 unavailable_reason: None,
                 sampled_at_ms: None,
                 facts: None,
-            }),
+            })),
         }
     }
 
-    pub(crate) fn load(&self) -> Arc<KernelHealthBlock> {
+    pub(crate) fn load(&self) -> Arc<PublishedBlock> {
         self.snapshot.load_full()
     }
 
     pub(crate) fn publish(&self, block: KernelHealthBlock) {
-        self.snapshot.store(Arc::new(block));
+        self.snapshot.store(Arc::new(PublishedBlock::now(block)));
+    }
+
+    /// Moves the current block's stale deadline to now.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn expire(&self) {
+        self.snapshot.rcu(|current| PublishedBlock {
+            block: current.block.clone(),
+            stale_at: Instant::now(),
+        });
     }
 }
 
@@ -165,7 +187,7 @@ impl KernelOpenCoordinator {
     /// Republishes the phase with no facts, for transitions that happen
     /// between samples such as open failure or shutdown.
     pub(crate) fn publish_phase(&self) {
-        let sampled_at_ms = self.health.load().sampled_at_ms;
+        let sampled_at_ms = self.health.load().block.sampled_at_ms;
         self.health.publish(self.phase_block(sampled_at_ms));
     }
 

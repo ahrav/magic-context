@@ -11803,14 +11803,12 @@ impl CompositeComponent for McHandler {
         // One atomic load; only the sampler task reads the store for this block.
         // A sampler that stopped publishing must not leave its last `Ready`
         // block standing, so an old sample reads as unavailable.
-        let sampled = self.kernel.health_block();
-        let stale = sampled.is_stale(now as i64);
+        let published = self.kernel.health_block();
+        let stale = published.is_stale();
         let kernel = if stale {
-            Arc::new(kernel_routes::health::KernelHealthBlock::stale(
-                sampled.sampled_at_ms,
-            ))
+            kernel_routes::health::KernelHealthBlock::stale(published.block.sampled_at_ms)
         } else {
-            sampled
+            published.block.clone()
         };
         if storage_state == "ready" && kernel.degrades_health() {
             report.status = HealthStatus::Degraded;
@@ -12057,6 +12055,12 @@ impl McHandler {
     #[cfg(feature = "test-support")]
     pub fn disable_kernel_sampler_for_test(&self) {
         self.kernel.disable_background_sampler();
+    }
+
+    /// Ages the published kernel health block past `SAMPLE_STALE_AFTER`.
+    #[cfg(feature = "test-support")]
+    pub fn expire_kernel_health_for_test(&self) {
+        self.kernel.expire_health_for_test();
     }
 
     #[cfg(feature = "test-support")]

@@ -68,31 +68,36 @@ impl KernelStore {
         if now_ms < 0 {
             return Err(KernelError::InvalidInput);
         }
-        let mut reader = self.lock_reader()?;
-        let tx = reader
-            .transaction_with_behavior(TransactionBehavior::Deferred)
-            .map_err(|_| KernelError::Io)?;
-        let commit_seq = tx
-            .query_row(
-                "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|_| KernelError::Io)?;
-        let consumers = consumer_horizon(&tx)?;
+        // The pooled reader is released before the file and artifact walks so
+        // those do not hold one of the two read slots.
+        let (commit_seq, consumers, lag, retained_outbox_rows) = {
+            let mut reader = self.lock_reader()?;
+            let tx = reader
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(|_| KernelError::Io)?;
+            let commit_seq = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|_| KernelError::Io)?;
+            let consumers = consumer_horizon(&tx)?;
+            let lag = outbox_lag_in(&tx, &consumers, now_ms)?;
+            let retained_outbox_rows: u64 = tx
+                .query_row("SELECT COUNT(*) FROM outbox", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|_| KernelError::Io)?
+                .try_into()
+                .unwrap_or(0);
+            tx.commit().map_err(|_| KernelError::Io)?;
+            (commit_seq, consumers, lag, retained_outbox_rows)
+        };
         // `None` distinguishes no registered consumer from a caught-up consumer.
         let commit_lag = consumers
             .minimum_checkpoint
             .map(|checkpoint| commit_seq.saturating_sub(checkpoint));
-        let lag = outbox_lag_in(&tx, &consumers, now_ms)?;
-        let retained_outbox_rows = tx
-            .query_row("SELECT COUNT(*) FROM outbox", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map_err(|_| KernelError::Io)?
-            .try_into()
-            .unwrap_or(0);
-        tx.commit().map_err(|_| KernelError::Io)?;
         let main_file_bytes = file_len(&self.db_path)?;
         let family_bytes = family_sidecars(&self.db_path)
             .iter()

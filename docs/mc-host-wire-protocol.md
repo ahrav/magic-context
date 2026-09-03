@@ -605,9 +605,10 @@ facts. A sample that fails while the store is open publishes
 `kernel_state: unavailable` with `unavailable_reason: store_unavailable` and no
 numeric fields, and the next successful sample restores `ready`; routes keep
 using the store throughout. The daemon's health report applies the same
-projection to a `ready` block whose `sampled_at_ms` is more than five minutes
-old, so a sampler that has stopped publishing cannot leave a stale `ready`
-block standing; the stale `sampled_at_ms` is preserved on the projected block.
+projection to a `ready` block published more than five minutes ago on the
+daemon's monotonic clock, so a sampler that has stopped publishing cannot
+leave a stale `ready` block standing; the stale `sampled_at_ms` is preserved
+on the projected block.
 
 The `magic-context` component additionally carries a sanitized
 `metrics.epochs` object holding exactly these five compatibility epochs, in

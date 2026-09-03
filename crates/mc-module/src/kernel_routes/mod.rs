@@ -130,8 +130,13 @@ impl KernelOpenCoordinator {
     }
 
     /// The last published health block; reads one atomic pointer.
-    pub(crate) fn health_block(&self) -> Arc<health::KernelHealthBlock> {
+    pub(crate) fn health_block(&self) -> Arc<health::PublishedBlock> {
         self.health.load()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn expire_health_for_test(&self) {
+        self.health.expire();
     }
 
     /// Publishes `block` only while the phase is still `Ready`, under the same

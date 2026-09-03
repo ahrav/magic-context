@@ -10,7 +10,6 @@ use cortexkit_store_types::{StorageBackend, StorageDescriptor};
 use mc_host::{
     BindOutcome, CompositeComponent, HostInit, PrimaryComponent, RouteHandle, RouteIdentity,
 };
-use mc_module::kernel_routes::health::SAMPLE_STALE_AFTER;
 use mc_module::kernel_routes::KernelState;
 use mc_module::{dev_descriptor_at, McHandler};
 
@@ -34,8 +33,7 @@ fn init(descriptor: &StorageDescriptor) -> HostInit {
     }
 }
 
-/// Wall-clock milliseconds; health treats a sample older than
-/// `SAMPLE_STALE_AFTER` as unavailable, so manual samples use real time.
+/// Wall-clock milliseconds, so manual samples carry realistic timestamps.
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -481,8 +479,15 @@ async fn a_failed_facts_sample_reports_the_kernel_unavailable_until_one_succeeds
 #[tokio::test]
 async fn a_stale_ready_sample_reads_as_unavailable_until_a_fresh_one_lands() {
     let daemon = Daemon::start().await;
-    let stale_at = now_ms() - SAMPLE_STALE_AFTER.as_millis() as i64 - 1_000;
+    let stale_at = now_ms();
     daemon.handler.sample_kernel_health_for_test(stale_at).await;
+    assert_eq!(
+        daemon.handler.health().await.status,
+        mc_host::HealthStatus::Ok
+    );
+    // Staleness is measured on the monotonic clock from the publish, not from
+    // `sampled_at_ms`, so the block is aged rather than backdated.
+    daemon.handler.expire_kernel_health_for_test();
     let health = daemon.handler.health().await;
     assert_eq!(health.status, mc_host::HealthStatus::Degraded, "{health:?}");
     assert!(health
