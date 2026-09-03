@@ -379,6 +379,12 @@ describe("paired-delta report", () => {
         expect(() => report({
             runSummary: { ...report().body.runSummary, observedCostRollouts: 26, estimatedCostRollouts: 10 },
         })).toThrow(/healthy-coordinate-shortfall \(runSummary\.observedCostRollouts\)/);
+        // A coordinate refuses its ladder or produces raw regret records, never both, and at most once each.
+        const rawCoordinates = new Set(report().body.analysis.rawRegretRecords.map(({ coordinateId }) => coordinateId)).size;
+        expect(rawCoordinates).toBeGreaterThan(0);
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, refusedRegretLadders: { "intervention-mismatch": 12 - rawCoordinates + 1 } },
+        })).toThrow(/exceeds-plan \(analysis\.rawRegretRecords\)/);
         // A calibration run is complete only over a completed, fully healthy matrix.
         expect(() => report({
             runSummary: { ...report().body.runSummary, evidenceComplete: true },

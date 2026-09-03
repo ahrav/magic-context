@@ -295,7 +295,7 @@ export function buildPairedDeltaReport(input: {
         throw new Error("paired-delta-report: run-summary-invalid");
     }
     // The parser rejects any rollout accounting these rules reject.
-    const accounting = rolloutAccountingViolation(input.runSummary, exclusions, input.analysis.analyzableFamilyCount);
+    const accounting = rolloutAccountingViolation(input.runSummary, exclusions, input.analysis);
     if (accounting !== null) throw new Error(`paired-delta-report: ${accounting.code} (${accounting.path})`);
     if (input.limitations.some((line) => line.trim().length === 0)) {
         throw new Error("paired-delta-report: limitation-invalid");
@@ -640,12 +640,12 @@ function parseRefusedRegretLadders(raw: unknown, label: string): Record<string, 
 function rolloutAccountingViolation(
     summary: PairedDeltaReportBody["runSummary"],
     exclusions: readonly ExclusionCount[],
-    analyzableFamilyCount: number,
+    analysis: FamilyDeltaAnalysis,
 ): { path: string; code: string } | null {
     const { plannedCoordinates, healthyCoordinates, observedCostRollouts, estimatedCostRollouts, status } = summary;
     const unhealthy = plannedCoordinates - healthyCoordinates;
     // Each coordinate carries one family, analyzed only when every primary arm completed.
-    if (analyzableFamilyCount > healthyCoordinates) {
+    if (analysis.analyzableFamilyCount > healthyCoordinates) {
         return { path: "analysis.analyzableFamilyCount", code: "healthy-coordinate-shortfall" };
     }
     const exclusionsByArm = new Map<string, number>();
@@ -679,6 +679,26 @@ function rolloutAccountingViolation(
     // On a completed run every unhealthy coordinate has a non-completed primary cell, so each contributes an exclusion.
     if (status === "completed" && excludedRecords < unhealthy) {
         return { path: "exclusions", code: "unhealthy-coordinate-shortfall" };
+    }
+    // A refusal is counted at most once per planned coordinate, and a coordinate either refused its ladder or
+    // produced raw regret records, never both.
+    const refusedTotal = Object.values(summary.refusedRegretLadders).reduce((sum, count) => sum + count, 0);
+    if (refusedTotal > plannedCoordinates) {
+        return { path: "runSummary.refusedRegretLadders", code: "exceeds-plan" };
+    }
+    const rawCoordinates = new Set(analysis.rawRegretRecords.map(({ coordinateId }) => coordinateId));
+    if (rawCoordinates.size + refusedTotal > plannedCoordinates) {
+        return { path: "analysis.rawRegretRecords", code: "exceeds-plan" };
+    }
+    // The ladder fires only after a completed, observed mc-on cell, so every refused or raw regret coordinate
+    // implies at least one observed rollout. It may also be a healthy coordinate, so the two bounds do not add.
+    if (observedCostRollouts < rawCoordinates.size + refusedTotal) {
+        return { path: "runSummary.observedCostRollouts", code: "regret-coordinate-shortfall" };
+    }
+    // A healthy coordinate contributes both primary observations, so healthy evidence implies the paired
+    // endpoint set and at least one family.
+    if (healthyCoordinates > 0 && (analysis.endpoints.length === 0 || analysis.analyzableFamilyCount === 0)) {
+        return { path: "analysis.endpoints", code: "paired-endpoints-required" };
     }
     return null;
 }
@@ -778,11 +798,6 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     if (body.runSummary.healthyCoordinates > body.runSummary.plannedCoordinates) {
         p.fail("report.body.runSummary.healthyCoordinates: integer-invalid");
     }
-    const accounting = rolloutAccountingViolation(body.runSummary, body.exclusions, body.analysis.analyzableFamilyCount);
-    if (accounting !== null) p.fail(`report.body.${accounting.path}: ${accounting.code}`);
-    // A refusal is counted at most once per planned coordinate.
-    const refusedTotal = Object.values(body.runSummary.refusedRegretLadders).reduce((sum, count) => sum + count, 0);
-    if (refusedTotal > body.runSummary.plannedCoordinates) p.fail("report.body.runSummary.refusedRegretLadders: exceeds-plan");
     // Outside calibration, completeness is the estimator's sufficiency over a fully healthy matrix.
     if (body.runSummary.calibrationFingerprint !== null) {
         const derived = body.analysis.evidenceSufficient && body.runSummary.healthyCoordinates >= body.runSummary.plannedCoordinates;
@@ -811,6 +826,8 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     if (body.analysis.rawRegretRecords.length * body.analysis.bootstrapResamples > MAX_BOOTSTRAP_WORK) {
         p.fail("report.body.analysis.rawRegretRecords: bootstrap-work-too-large");
     }
+    const accounting = rolloutAccountingViolation(body.runSummary, body.exclusions, body.analysis);
+    if (accounting !== null) p.fail(`report.body.${accounting.path}: ${accounting.code}`);
     // Every regret observation is archived with the bootstrap settings, so each regret estimate is recomputed
     // whole: families, means, intervals, and resolutions.
     for (const [view, estimates] of [["liveRegret", body.analysis.liveRegret], ["providerMixedRegret", body.analysis.providerMixedRegret]] as const) {
@@ -829,22 +846,8 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     if (body.runSummary.status === "usage-unmeasured" && body.runSummary.estimatedCostRollouts === 0) {
         p.fail("report.body.runSummary.estimatedCostRollouts: status-evidence-required");
     }
-    // A coordinate either refused its ladder or produced raw regret records, never both.
-    const rawCoordinates = new Set(body.analysis.rawRegretRecords.map(({ coordinateId }) => coordinateId));
-    if (rawCoordinates.size + refusedTotal > body.runSummary.plannedCoordinates) {
-        p.fail("report.body.analysis.rawRegretRecords: exceeds-plan");
-    }
-    // The ladder fires only after a completed, observed mc-on cell, so every refused or raw regret coordinate
-    // implies at least one observed rollout. It may also be a healthy coordinate, so the two bounds do not add.
-    if (body.runSummary.observedCostRollouts < rawCoordinates.size + refusedTotal) {
-        p.fail("report.body.runSummary.observedCostRollouts: regret-coordinate-shortfall");
-    }
-    // A healthy coordinate contributes both primary observations, so healthy evidence implies the paired
-    // endpoint set, at least one family, and every primary arm in each secondary-metric map.
+    // A healthy coordinate completed every primary arm, so each metric map carries a value for each of them.
     if (body.runSummary.healthyCoordinates > 0) {
-        if (body.analysis.endpoints.length === 0 || body.analysis.analyzableFamilyCount === 0) {
-            p.fail("report.body.analysis.endpoints: paired-endpoints-required");
-        }
         for (const [field, metrics] of Object.entries(body.secondaryMetrics)) {
             for (const armId of PRIMARY_ARM_IDS) {
                 if (!(armId in metrics)) p.fail(`report.body.secondaryMetrics.${field}.${armId}: arm-required`);
