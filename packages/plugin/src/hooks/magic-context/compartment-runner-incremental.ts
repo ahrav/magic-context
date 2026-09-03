@@ -7,10 +7,9 @@ import {
 } from "../../features/magic-context/compartment-storage";
 import { promoteSessionFactsDurable } from "../../features/magic-context/memory";
 import {
-    readAuthorizedClaimMemorySnapshot,
-    renderClaimMemoryBlock,
-} from "../../features/magic-context/memory/claim-memory-render";
-import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+    resolveProjectIdentity,
+    resolveProjectRootDirectory,
+} from "../../features/magic-context/memory/project-identity";
 import {
     clearEmergencyDrainLatch,
     clearEmergencyRecovery,
@@ -36,6 +35,7 @@ import { insertPrimerCandidates } from "../../features/magic-context/storage-pri
 import { getLatestHistorianInvocationId } from "../../features/magic-context/storage-subagent-invocations";
 import { insertUserMemoryCandidates } from "../../features/magic-context/user-memory/storage-user-memory";
 import { describeError } from "../../shared/error-message";
+import { isAvailable, stateKey } from "../../shared/kernel-client";
 import { sessionLog } from "../../shared/logger";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
@@ -52,6 +52,7 @@ import {
 } from "./compartment-runner-validation";
 import { cleanupHistorianStateFile } from "./historian-state-file";
 import { clearInjectionCache } from "./inject-compartments";
+import { memoryRows, renderKernelMemoryBlock } from "./kernel-memory-render";
 import { onNoteTrigger } from "./note-nudger";
 import {
     createDefaultBoundarySnapshotForTests,
@@ -371,7 +372,6 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         //     compartments.
         // `<project-memory>` deduplicates facts.
         // serialization limits.
-        const projectPath = resolveProjectIdentity(directory ?? process.cwd());
 
         const references = buildReferenceBlocks({
             sessionId,
@@ -381,16 +381,29 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
 
         const sessionDirectory = await resolveSessionDirectory(client, sessionId, directory);
 
-        const memorySnapshot = readAuthorizedClaimMemorySnapshot(db, {
-            authorizedIdentities: [projectPath],
-            ownIdentities: [projectPath],
-            sharedCategories: [],
-            workspaceEpoch: `historian:${sessionId}:${chunk.startIndex}-${chunk.endIndex}`,
-        });
-        if (!memorySnapshot) {
-            sessionLog(sessionId, "historian claim snapshot remained stale; omitting memories");
+        // The historian sees the same baseline the model saw so it does not
+        // re-derive facts already held as project memory. A non-available
+        // read omits the block; the marker line is for the model, not the historian.
+        let projectMemory = "";
+        if (deps.memoryEnabled !== false && deps.kernelClient) {
+            const read = await deps
+                .kernelClient({
+                    sessionId,
+                    projectRoot: resolveProjectRootDirectory(sessionDirectory ?? directory),
+                })
+                .read({ surface: "auto_inject", gated: false });
+            if (isAvailable(read)) {
+                projectMemory = renderKernelMemoryBlock(
+                    memoryRows({ state: read.state, rows: read.rows, knownAsOf: read.known_as_of }),
+                    read.state,
+                );
+            } else {
+                sessionLog(
+                    sessionId,
+                    `historian memory read answered ${stateKey(read.state)}; omitting memories`,
+                );
+            }
         }
-        const projectMemory = renderClaimMemoryBlock(memorySnapshot?.items ?? []) ?? "";
 
         const prompt = buildCompartmentAgentPrompt({
             seedExamples: references.seedExamples,

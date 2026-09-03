@@ -3,6 +3,7 @@ import type {
     UnifiedSearchResult,
 } from "../../features/magic-context/search";
 import { unifiedSearch } from "../../features/magic-context/search";
+import type { KernelMemorySnapshot } from "../../shared/kernel-client";
 import type { Database } from "../../shared/sqlite";
 
 /** Hard cap on how long the transform hot path waits for unified search to finish.
@@ -10,9 +11,18 @@ import type { Database } from "../../shared/sqlite";
  *  turn and let the next user turn try again. Transform must never hang on auto-search. */
 export const AUTO_SEARCH_TIMEOUT_MS = 3_000;
 
-/** Race `unifiedSearch` against a timer. Resolves with results on success, or `null` on timeout.
- *  On timeout, the AbortController fires so the underlying HTTP embed request is cancelled —
- *  this prevents dangling fetches from piling up at the provider (e.g. LMStudio saturation). */
+export interface TimedAutoSearch {
+    results: UnifiedSearchResult[];
+    /** `null` when the caller supplied no memory reader. */
+    memory: KernelMemorySnapshot | null;
+}
+
+/**
+ * Races `unifiedSearch` and the optional kernel memory read against one timer.
+ * Resolves with both on success, or `null` on timeout. The one `AbortController`
+ * cancels the embed request and the kernel call together, so neither outlives
+ * the turn that asked for them.
+ */
 export async function unifiedSearchWithTimeout(
     db: Database,
     sessionId: string,
@@ -20,7 +30,8 @@ export async function unifiedSearchWithTimeout(
     prompt: string,
     options: UnifiedSearchOptions,
     timeoutMs: number,
-): Promise<UnifiedSearchResult[] | null> {
+    readMemory?: (signal: AbortSignal, deadlineMs: number) => Promise<KernelMemorySnapshot>,
+): Promise<TimedAutoSearch | null> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<null>((resolve) => {
@@ -29,8 +40,8 @@ export async function unifiedSearchWithTimeout(
             resolve(null);
         }, timeoutMs);
     });
-    try {
-        return await Promise.race([
+    const search = async (): Promise<TimedAutoSearch> => {
+        const [results, memory] = await Promise.all([
             unifiedSearch(db, sessionId, projectPath, prompt, {
                 ...options,
                 signal: controller.signal,
@@ -41,8 +52,12 @@ export async function unifiedSearchWithTimeout(
                 countRetrievals: false,
                 memoryPolicySurface: "auto_search",
             }),
-            timeoutPromise,
+            readMemory ? readMemory(controller.signal, timeoutMs) : Promise.resolve(null),
         ]);
+        return { results, memory };
+    };
+    try {
+        return await Promise.race([search(), timeoutPromise]);
     } finally {
         if (timer !== undefined) clearTimeout(timer);
     }

@@ -9,6 +9,7 @@ import { writeDumpJsonFile } from "./write-dump-json"
 import type { DumpMessage, DumpMessageCacheEntry, PendingOpRow, TransformDiagnostics } from "./types"
 import { prepareCompartmentInjection, renderCompartmentInjection } from "../../src/hooks/magic-context/inject-compartments"
 import type { MessageLike } from "../../src/hooks/magic-context/tag-messages"
+import { disabled } from "../../src/shared/kernel-client"
 
 const HISTORIAN_BUST_WINDOW_MS = 5 * 60 * 1000
 
@@ -147,7 +148,14 @@ export async function runContextDump(sessionId: string): Promise<ContextDumpResu
 	try {
 		const preparedCompartmentInjection = isSubagent
 			? null
-			: prepareCompartmentInjection(contextDb, sessionId, transformedMessages as unknown as MessageLike[], true)
+			: prepareCompartmentInjection({
+					db: contextDb,
+					sessionId,
+					messages: transformedMessages as unknown as MessageLike[],
+					isCacheBusting: true,
+					// The dump renders history only; without a project path the memory block is never rendered.
+					memory: { state: disabled(), rows: [], knownAsOf: null },
+				})
 		const compartmentInjection = preparedCompartmentInjection
 			? renderCompartmentInjection(sessionId, transformedMessages as unknown as MessageLike[], preparedCompartmentInjection)
 			: { injected: false, compartmentEndMessage: -1, compartmentCount: 0, skippedVisibleMessages: 0 }

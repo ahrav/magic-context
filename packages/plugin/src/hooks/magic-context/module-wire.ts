@@ -1585,7 +1585,18 @@ export type ModuleMethod =
     | "transform.ack"
     | "transform.nack"
     | "dreamer.run_task"
-    | "memory.set_classification";
+    | "memory.set_classification"
+    | KernelMethod;
+
+/** The daemon's `kernel.*` routes, issued only through the shared kernel client. */
+export type KernelMethod =
+    | "kernel.read"
+    | "kernel.commit"
+    | "kernel.eligibility.batch"
+    | "kernel.egress.decide"
+    | "kernel.artifact.ingest.begin"
+    | "kernel.artifact.ingest.page"
+    | "kernel.artifact.ingest.finish";
 
 /**
  * Subset a state-sync client may issue. `Extract` ties each member to

@@ -25,6 +25,7 @@ import {
     parseKernelResponse,
     parseReadResponse,
     type ReadPayload,
+    type ReadRow,
     type Sensitivity,
 } from "./wire";
 
@@ -111,7 +112,12 @@ export interface IntentArgs {
 
 export interface CommitArgs extends CallOptions, IntentArgs {
     operations: CommitOperation[];
-    /** Explicit tokens win over cached ones for the same object. */
+    /**
+     * The complete token set for the envelope. When omitted, the cache supplies
+     * one token per replaced or retired object and a missing one triggers a
+     * read; when given (even empty), no cache lookup happens, which is how a
+     * restore supersedes a retired object no live token can describe.
+     */
     tokens?: MutationToken[];
     sourceKind?: SourceKind;
     assertedSourceClass?: string;
@@ -161,6 +167,29 @@ export function isAvailable<P>(result: KernelResult<P>): result is { state: Avai
 }
 
 export type ReadResult = KernelResult<ReadPayload>;
+
+/**
+ * A read projected to the value injectors and status surfaces carry: the
+ * state, the rows (empty unless `available`), and the snapshot position the
+ * rows were read at (`null` unless `available`).
+ */
+export interface KernelMemorySnapshot {
+    state: MemoryState;
+    rows: ReadRow[];
+    knownAsOf: number | null;
+}
+
+/** Resolves the client bound to one session and filesystem project root. */
+export type KernelClientResolver = (args: {
+    sessionId: string;
+    projectRoot: string;
+}) => KernelClient;
+
+export function kernelMemorySnapshotFrom(result: ReadResult): KernelMemorySnapshot {
+    return isAvailable(result)
+        ? { state: result.state, rows: result.rows, knownAsOf: result.known_as_of }
+        : { state: result.state, rows: [], knownAsOf: null };
+}
 export type CommitResult = KernelResult<CommitPayload>;
 export type EligibilityResult = KernelResult<EligibilityPayload>;
 export type EgressResult = KernelResult<EgressPayload>;
@@ -437,11 +466,10 @@ export class KernelClient {
     }
 
     private collectTokens(args: CommitArgs): { tokens: MutationToken[]; missing: string[] } {
-        const explicit = new Map((args.tokens ?? []).map((token) => [token.object_id, token]));
-        const tokens = [...explicit.values()];
+        if (args.tokens !== undefined) return { tokens: [...args.tokens], missing: [] };
+        const tokens: MutationToken[] = [];
         const missing: string[] = [];
         for (const objectId of this.targetIds(args.operations)) {
-            if (explicit.has(objectId)) continue;
             const cached = this.tokens.get(this.projectRoot, objectId);
             if (cached) tokens.push(cached);
             else missing.push(objectId);
@@ -482,7 +510,7 @@ export class KernelClient {
         const first = await this.commitOnce(args, deadline);
         if (!isSnapshotDiverged(first.state)) return first;
         this.tokens.dropProject(this.projectRoot);
-        const retried = await this.commitOnce({ ...args, tokens: undefined }, deadline);
+        const retried = await this.commitOnce(args, deadline);
         if (isSnapshotDiverged(retried.state)) this.tokens.dropProject(this.projectRoot);
         return retried;
     }
@@ -521,9 +549,18 @@ export class KernelClient {
         });
     }
 
-    /** A retired object is restored by superseding it with a live replacement. */
+    /**
+     * A retired object is restored by superseding it with a live replacement.
+     * The envelope carries no token: the daemon rejects any token for an
+     * invalidated object as `conflict(retracted)`, so the restore's freshness
+     * claim is the retirement itself.
+     */
     restore(objectId: string, spec: DecisionSpecInput, args: MutationArgs): Promise<CommitResult> {
-        return this.revise(objectId, spec, args);
+        return this.commit({
+            ...args,
+            operations: [{ op: "supersede_decision", replaced_object_id: objectId, spec }],
+            tokens: [],
+        });
     }
 
     async eligibilityBatch(args: EligibilityArgs): Promise<EligibilityResult> {

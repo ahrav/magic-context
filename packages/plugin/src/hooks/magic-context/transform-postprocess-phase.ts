@@ -1,4 +1,3 @@
-import { autoSearchHintFragmentsStillEligible } from "../../features/magic-context/memory/storage-claim-visibility";
 import {
     addProcessedImageStrippedIds,
     addStaleReduceStrippedIds,
@@ -45,9 +44,10 @@ import type { SessionMeta, TagEntry } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
+import type { KernelClientResolver, KernelMemorySnapshot } from "../../shared/kernel-client";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
-import { runAutoSearchHint } from "./auto-search-runner";
+import { autoSearchHintReplayable, runAutoSearchHint } from "./auto-search-runner";
 import {
     rearmChannel2AfterCoverageAdvancingHardFold,
     rearmChannel2AfterMeasuredCollapse,
@@ -387,11 +387,7 @@ export function runRustModePostprocess(args: {
     }
     for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
         // Anti-memory warnings require a fresh search; they never replay stored hint text.
-        // Anti-memory decisions without warning fragments can replay.
-        if (
-            decision.decision === "hint" &&
-            autoSearchHintFragmentsStillEligible(args.db, decision.memoryFragments)
-        ) {
+        if (decision.decision === "hint" && autoSearchHintReplayable(decision)) {
             appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
         }
     }
@@ -614,6 +610,7 @@ interface RunPostTransformPhaseArgs {
         minPromptChars: number;
         directory?: string;
         ensureProjectRegistered?: (directory: string, db: ContextDatabase) => Promise<void>;
+        kernelClient?: KernelClientResolver;
     };
     /**
      */
@@ -630,6 +627,8 @@ interface RunPostTransformPhaseArgs {
     passOutcome?: PassOutcome;
     historyRefreshSessions?: Set<string>;
     m0M1?: {
+        /** The memory read taken before the transform's first `await`. */
+        memory: KernelMemorySnapshot;
         projectPath?: string;
         projectDirectory?: string;
         injectDocs?: boolean;
@@ -851,6 +850,7 @@ export async function runPostTransformPhase(
                   db: args.db,
                   sessionId: args.sessionId,
                   state: args.sessionMeta as M0M1State,
+                  memory: args.m0M1.memory,
                   projectPath: args.m0M1.projectPath,
                   projectDirectory: args.m0M1.projectDirectory,
                   injectDocs: args.m0M1.injectDocs,
@@ -871,6 +871,7 @@ export async function runPostTransformPhase(
                 db: args.db,
                 sessionId: args.sessionId,
                 state: args.sessionMeta as M0M1State,
+                memory: args.m0M1.memory,
                 projectPath: args.m0M1.projectPath,
                 projectDirectory: args.m0M1.projectDirectory,
                 injectDocs: args.m0M1.injectDocs,
@@ -1327,6 +1328,7 @@ export async function runPostTransformPhase(
                 sessionId: args.sessionId,
                 messages: args.messages,
                 state: args.sessionMeta as M0M1State,
+                memory: args.m0M1.memory,
                 projectPath: args.m0M1.projectPath,
                 projectDirectory: args.m0M1.projectDirectory,
                 injectDocs: args.m0M1.injectDocs,
@@ -1466,10 +1468,7 @@ export async function runPostTransformPhase(
             appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
         }
         for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
-            if (
-                decision.decision === "hint" &&
-                autoSearchHintFragmentsStillEligible(args.db, decision.memoryFragments)
-            ) {
+            if (decision.decision === "hint" && autoSearchHintReplayable(decision)) {
                 appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
             }
         }
@@ -1683,6 +1682,7 @@ export async function runPostTransformPhase(
                     directory: args.autoSearch.directory ?? args.sessionDirectory,
                     projectPath: args.projectPath,
                     ensureProjectRegistered: args.autoSearch.ensureProjectRegistered,
+                    kernelClient: args.autoSearch.kernelClient,
                 },
             });
             if (!autoSearchOutcome.ok) {

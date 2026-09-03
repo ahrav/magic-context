@@ -1,10 +1,5 @@
-import {
-    renderClaimMemoryBlock,
-    trimClaimSnapshotsToBudget,
-} from "../../features/magic-context/memory/claim-memory-render";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { extractM0Block } from "./decay-render";
-import { readProjectClaimLaneSnapshot } from "./inject-compartments";
 import { estimateTokens } from "./read-session-formatting";
 
 /**
@@ -27,14 +22,11 @@ export function computeM0BlockTokens(
     sessionId: string,
     args: {
         m0Text: string;
-        projectIdentity: string | undefined;
-        injectionBudgetTokens: number | undefined;
-        memoryBlockCount: number;
         /* */
         compartmentTokensOverride?: number;
     },
 ): M0BlockTokens {
-    const { m0Text, projectIdentity, injectionBudgetTokens, compartmentTokensOverride } = args;
+    const { m0Text, compartmentTokensOverride } = args;
 
     const docsBlock = extractM0Block(m0Text, "project-docs");
     const docsTokens = docsBlock ? estimateTokens(docsBlock) : 0;
@@ -42,26 +34,10 @@ export function computeM0BlockTokens(
     const profileBlock = extractM0Block(m0Text, "user-profile");
     const profileTokens = profileBlock ? estimateTokens(profileBlock) : 0;
 
+    // The rendered `<project-memory>` block is the only memory this pass paid for;
+    // an absent block means the kernel rendered nothing, so it costs nothing.
     const memoryBlock = extractM0Block(m0Text, "project-memory");
-    let memoryTokens = memoryBlock ? estimateTokens(memoryBlock) : 0;
-    if (!memoryBlock && projectIdentity) {
-        try {
-            const snapshot = readProjectClaimLaneSnapshot(db, projectIdentity);
-            if (snapshot) {
-                const selected = trimClaimSnapshotsToBudget(
-                    snapshot.items,
-                    injectionBudgetTokens ?? 8_000,
-                    { sourceNameByClaimId: snapshot.sourceNameByClaimId },
-                ).selected;
-                const rendered = renderClaimMemoryBlock(selected, "project-memory", {
-                    sourceNameByClaimId: snapshot.sourceNameByClaimId,
-                });
-                memoryTokens = rendered ? estimateTokens(rendered) : 0;
-            }
-        } catch {
-            memoryTokens = 0;
-        }
-    }
+    const memoryTokens = memoryBlock ? estimateTokens(memoryBlock) : 0;
 
     const muralTokens = m0Text.includes("<memory-mural>") ? 1_521 : 0;
 

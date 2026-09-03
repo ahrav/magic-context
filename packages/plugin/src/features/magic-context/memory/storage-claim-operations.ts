@@ -32,6 +32,7 @@ import {
     CLAIM_REQUEST_ENCODING_VERSION,
     CLAIM_RESULT_ENCODING_VERSION,
     type ClaimMutationToken,
+    ClaimOperationInputError,
     type ClaimOperationResult,
     type ClaimOperationResultEffect,
     canonicalJsonEncode,
@@ -90,14 +91,7 @@ export class ClaimOperationKeyReuseError extends Error {
     }
 }
 
-/** ClaimOperationInputError reports unknown claims, duplicate collisions, and malformed input.
- * ClaimOperationInputError is thrown before any receipt exists, so the transaction rolls back entirely. */
-export class ClaimOperationInputError extends Error {
-    constructor(message: string) {
-        super(message);
-        this.name = "ClaimOperationInputError";
-    }
-}
+export { ClaimOperationInputError };
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------

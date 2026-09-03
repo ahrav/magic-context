@@ -1,10 +1,11 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { setProjectMemoryClaimLifecycle } from "../../features/magic-context/memory/storage-claim-operations";
+import { queueM0Mutation } from "../../features/magic-context/storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta-session";
-import { seedProjectMemoryClaim } from "../../features/magic-context/test-claim-database";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import type { KernelMemorySnapshot } from "../../shared/kernel-client";
+import { FakeKernel } from "../../shared/kernel-client-testing/fake-kernel";
 import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { injectM0M1, type M0M1State } from "./inject-compartments";
@@ -13,10 +14,18 @@ import type { MessageLike } from "./tag-messages";
 const SESSION_ID = "ses_mural_inject";
 const PROJECT_ID = "git:mural-project";
 
+/** The kernel every pass in this file reads from; `makeDb` starts each test from an empty one. */
+let kernel = new FakeKernel();
+
 function makeDb(): Database {
     const db = createDirectTestDatabase().db;
     getOrCreateSessionMeta(db, SESSION_ID);
+    kernel = new FakeKernel();
     return db;
+}
+
+function memoryFor(_db: Database): KernelMemorySnapshot {
+    return kernel.snapshot();
 }
 
 // FAKE_MURAL_DATA_URL is a 1x1 transparent PNG data URL used as a rendered mural.
@@ -69,6 +78,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             const hardMessages: MessageLike[] = [];
             const first = injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages: hardMessages,
                 state,
@@ -91,6 +101,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             const deferMessages: MessageLike[] = [];
             const second = injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages: deferMessages,
                 state,
@@ -114,6 +125,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             const firstMessages: MessageLike[] = [];
             injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages: firstMessages,
                 state,
@@ -129,6 +141,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             const disabledMessages: MessageLike[] = [];
             const disabled = injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages: disabledMessages,
                 state,
@@ -146,6 +159,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             const deferMessages: MessageLike[] = [];
             const defer = injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages: deferMessages,
                 state,
@@ -169,6 +183,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             const state = getOrCreateSessionMeta(db, SESSION_ID) as unknown as M0M1State;
             injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages: [],
                 state,
@@ -180,6 +195,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             });
             const changed = injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages: [],
                 state,
@@ -194,6 +210,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
 
             const unchanged = injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages: [],
                 state,
@@ -217,6 +234,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             const hardMessages: MessageLike[] = [];
             injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages: hardMessages,
                 state: hardState,
@@ -233,6 +251,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             const deferMessages: MessageLike[] = [];
             injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages: deferMessages,
                 state: restartedState,
@@ -253,6 +272,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             const state = getOrCreateSessionMeta(db, SESSION_ID) as unknown as M0M1State;
             injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages: [],
                 state,
@@ -272,6 +292,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             const messages: MessageLike[] = [];
             injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages,
                 state,
@@ -292,6 +313,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             const state = getOrCreateSessionMeta(db, SESSION_ID) as unknown as M0M1State;
             injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages: [],
                 state,
@@ -310,6 +332,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             const messages: MessageLike[] = [];
             injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages,
                 state: restartedState,
@@ -326,20 +349,21 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
         }
     });
 
-    it("publishes no mural image and no marker when the claim snapshot went stale", () => {
+    it("publishes no mural image and no marker when the fold cannot commit", () => {
         const db = makeDb();
         try {
             const state = getOrCreateSessionMeta(db, SESSION_ID) as unknown as M0M1State;
-            const claim = seedProjectMemoryClaim(db, {
-                projectIdentity: PROJECT_ID,
-                content: "Claim whose cue the mural draws.",
-                category: "ARCHITECTURE",
+            const seeded = kernel.seedDecision({
+                object_id: `mem_${"c".repeat(32)}`,
+                decision_kind: "ARCHITECTURE",
+                summary: "Claim whose cue the mural draws.",
             });
 
-            // The hard fold caches the marker and image payload for this claim snapshot.
+            // The hard fold caches the marker and image payload for this memory snapshot.
             const foldMessages: MessageLike[] = [];
             injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages: foldMessages,
                 state,
@@ -353,18 +377,14 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             expect(headText(foldMessages)).toContain("<memory-mural>");
             expect(headText(foldMessages)).toContain("<project-memory>");
 
-            // Withdrawing the cached claim forces the next pass to fold.
-            setProjectMemoryClaimLifecycle(
-                db,
-                { producer: "test", operationKey: "mural-stale-archive" },
-                { token: claim.token, state: "archived", actor: "user:test" },
-            );
+            // A kernel change forces the next pass to fold.
+            kernel.touch(seeded.object_id);
 
-            // A sibling writer makes every materialize attempt fail its staleness check, so the pass replays cached m[0], including the mural marker and image payload.
-            let concurrentClaims = 0;
+            // A sibling writer makes every materialize attempt fail its staleness check, so the pass falls back without a cached payload for this snapshot.
             const staleMessages: MessageLike[] = [];
             const stale = injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages: staleMessages,
                 state,
@@ -374,17 +394,15 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
                 memoryInjectionBudgetTokens: 8_000,
                 historyBudgetTokens: 60_000,
                 beforePhase3ForTest: () => {
-                    concurrentClaims += 1;
-                    seedProjectMemoryClaim(db, {
-                        projectIdentity: PROJECT_ID,
-                        content: `Concurrent claim ${concurrentClaims}.`,
-                        category: "ARCHITECTURE",
+                    queueM0Mutation(db, {
+                        sessionId: SESSION_ID,
+                        mutationType: "compartment_merge",
                     });
                 },
             });
             expect(stale.materializationContentionRetryExhausted).toBe(true);
 
-            // The publication fence suppresses all claim-derived representations: the image part, mural marker, and cached replay payload.
+            // The publication fence suppresses all memory-derived representations: the image part, mural marker, and cached replay payload.
             const staleText = headText(staleMessages);
             expect(staleText).not.toContain("<project-memory>");
             expect(staleText).not.toContain("<memory-mural>");
@@ -403,6 +421,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             const messages: MessageLike[] = [];
             const result = injectM0M1({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 messages,
                 state,

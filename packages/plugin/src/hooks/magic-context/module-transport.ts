@@ -1201,6 +1201,22 @@ export class McHostModuleTransport {
         }
     }
 
+    /** The connection file the transport dials; its absence means no daemon can be reached. */
+    get connectionFilePath(): string {
+        return this.connectionFile;
+    }
+
+    /**
+     * Evicts the cached route for one `(session, root)` so the next call opens
+     * a fresh one. Used after the daemon reports the route unbound: the cached
+     * handle would otherwise be reused until the connection generation turns.
+     */
+    forgetRoute(sessionId: string, rawProjectRoot: string): void {
+        const routeKey = `${sessionId}\0${this.canonicalRoot(rawProjectRoot)}`;
+        this.routes.delete(routeKey);
+        this.routeOpenings.delete(routeKey);
+    }
+
     private dropRoute(routeKey: string, route?: RouteHandle): void {
         const existing = this.routes.get(routeKey);
         if (!existing || (route && existing.route !== route)) return;

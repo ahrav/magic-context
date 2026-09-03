@@ -1164,15 +1164,15 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 | `tool-all-active` | **compressed** |
 | `tool-memory-disabled` | **compressed** |
 
-### T-013 — ctx_memory stores durable project claims
+### T-013 — ctx_memory stores durable project memories
 
 - **Source fragment:** `tool-ctx-memory`
 - **Scope:** ctx_memory tool users
 - **Polarity:** contract
 - **Operative condition:** A fact must survive this session.
-- **Mechanism:** Create one durable project claim: content plus a positive category, or category REJECTED_APPROACH plus an antiMemory payload and no content.
+- **Mechanism:** Create one durable project memory: content plus a positive category, or category REJECTED_APPROACH plus an antiMemory payload and no content.
 - **Consequence:** Future sessions can use the memory without reconstructing this conversation.
-- **Source evidence:** `create a claim (content + category, or antiMemory)`
+- **Source evidence:** `create: content + category, or antiMemory.`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1196,7 +1196,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A memory must be changed or fetched.
 - **Mechanism:** Use create, get, revise, archive, restore, or merge; list remains dreamer-only.
 - **Consequence:** Primary agents cannot assume the dreamer-only list action is available.
-- **Source evidence:** `list: enumerate visible active claims (dreamer maintenance only)`
+- **Source evidence:** `list: visible memories (dreamer maintenance only).`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1236,15 +1236,15 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 | `tool-all-active` | **compressed** |
 | `tool-memory-disabled` | **compressed** |
 
-### T-016 — ctx_memory identity and mutation boundary
+### T-016 — ctx_memory addresses memories by object id
 
 - **Source fragment:** `tool-ctx-memory`
 - **Scope:** ctx_memory tool users
 - **Polarity:** contract
-- **Operative condition:** A known claim must be fetched or changed.
-- **Mechanism:** Use get with opaque public IDs and the current mutation token for changes; list remains dreamer-only.
-- **Consequence:** Primary agents use canonical claim identities and cannot assume dreamer browsing privileges.
-- **Source evidence:** `Reuse the exact token returned by create/get/list`
+- **Operative condition:** A memory must be fetched or changed.
+- **Mechanism:** Use get, revise, archive, restore, or merge with object ids; supersession returns the survivor's id and no token is passed.
+- **Consequence:** Primary agents use canonical object identities and never carry mutation tokens.
+- **Source evidence:** `revise, merge, and restore supersede their targets with one new object and return its id; no token is passed`
 
 | Variant | Applicability status |
 | --- | --- |

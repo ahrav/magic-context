@@ -2,16 +2,16 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
-import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
 import { FORK_MIGRATION_VERSION_FLOOR } from "../features/magic-context/migrations";
 import {
     getPersistedSchemaVersion,
     LATEST_SUPPORTED_VERSION,
 } from "../features/magic-context/storage-db";
-import { seedProjectMemoryClaim } from "../features/magic-context/test-claim-database";
 import { createDirectTestDatabase } from "../features/magic-context/test-database";
 import { createLiveSessionState } from "../hooks/magic-context/live-session-state";
 import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
+import { unavailable } from "../shared/kernel-client";
+import { FakeKernel } from "../shared/kernel-client-testing/fake-kernel";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models-dev-cache";
 import type { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
@@ -179,27 +179,21 @@ describe("buildSidebarSnapshot — persisted tail hygiene", () => {
 });
 
 describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
-    test("computes memoryTokens on-demand when memory_block_cache is empty but memory_block_count > 0", () => {
+    test("reports the kernel's row count and state next to the rendered block count", () => {
         const db = createTestDb();
         try {
             const sessionId = "ses-test-1";
-            // getMemoriesByProject keys memories by the resolved project identity.
             const directory = process.cwd();
-            const projectIdentity = resolveProjectIdentity(directory);
-
-            // The test seeds memories for the resolved project identity so renderMemoryBlock has content to tokenize.
-            // Without seeded memories, renderMemoryBlock returns an empty block and its token count is 0.
-            // renderMemoryBlock returns an empty block when no memories are seeded, so its token count is 0.
-            seedProjectMemoryClaim(db, {
-                projectIdentity,
-                category: "PROJECT_RULES",
-                content: "Always use Bun for builds",
+            const kernel = new FakeKernel();
+            kernel.seedDecision({
+                object_id: `mem_${"a".repeat(32)}`,
+                decision_kind: "PROJECT_RULES",
+                summary: "Always use Bun for builds",
             });
-            seedProjectMemoryClaim(db, {
-                projectIdentity,
-                category: "ARCHITECTURE",
-                content:
-                    "OpenCode source lives at ~/Work/OSS/opencode (cloned for cross-reference, not a workspace package).",
+            kernel.seedDecision({
+                object_id: `mem_${"b".repeat(32)}`,
+                decision_kind: "ARCHITECTURE",
+                summary: "OpenCode source lives at ~/Work/OSS/opencode.",
             });
 
             db.prepare(
@@ -214,13 +208,21 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
                 sessionId,
                 directory,
                 undefined,
-                4000, // injection budget tokens, matching default config
+                kernel.snapshot("explicit_search"),
             );
-
-            // When memory_block_cache is empty and memory_block_count is positive, memoryTokens derives from the rendered memories block.
-            // With seeded memories and an empty memory_block_cache, memoryTokens comes from the rendered memories block.
             expect(snapshot.memoryBlockCount).toBe(2);
-            expect(snapshot.memoryTokens).toBeGreaterThan(0);
+            expect(snapshot.memoryCount).toBe(2);
+            expect(snapshot.memoryState).toBe("available");
+            // Without a rendered m[0], no memory block was paid for this pass.
+            expect(snapshot.memoryTokens).toBe(0);
+
+            const absent = buildSidebarSnapshot(db, sessionId, directory, undefined, {
+                state: unavailable("daemon_absent"),
+                rows: [],
+                knownAsOf: null,
+            });
+            expect(absent.memoryCount).toBe(0);
+            expect(absent.memoryState).toBe("unavailable:daemon_absent");
         } finally {
             closeQuietly(db);
         }
@@ -239,7 +241,7 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
                 ) VALUES (?, 0, 0, 0, '', 0)`,
             ).run(sessionId);
 
-            const snapshot = buildSidebarSnapshot(db, sessionId, directory, undefined, 4000);
+            const snapshot = buildSidebarSnapshot(db, sessionId, directory, undefined, undefined);
             expect(snapshot.memoryBlockCount).toBe(0);
             expect(snapshot.memoryTokens).toBe(0);
         } finally {
@@ -259,7 +261,7 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
                 ) VALUES (?, 50000, 25, 5000, '', 0)`,
             ).run(sessionId);
 
-            const snapshot = buildSidebarSnapshot(db, sessionId, directory, undefined, 4000);
+            const snapshot = buildSidebarSnapshot(db, sessionId, directory, undefined, undefined);
             expect(Object.hasOwn(snapshot as object, "factCount")).toBe(false);
         } finally {
             closeQuietly(db);
@@ -286,7 +288,7 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
                 ) VALUES (?, 50000, 25, 5000, ?, 1, ?)`,
             ).run(sessionId, v1Cache, Buffer.from(m0, "utf8"));
 
-            const snapshot = buildSidebarSnapshot(db, sessionId, directory, undefined, 4000);
+            const snapshot = buildSidebarSnapshot(db, sessionId, directory, undefined, undefined);
             expect(snapshot.memoryBlockCount).toBe(1);
             // Tokens come from the actual m[0] v2 slice, not the stale cache.
             const v2SliceTokens = snapshot.memoryTokens;
@@ -336,7 +338,7 @@ describe("buildSidebarSnapshot — context limit", () => {
                 modelID: "reserved-model",
             });
 
-            const snapshot = buildSidebarSnapshot(db, sessionId, process.cwd(), live, 4000);
+            const snapshot = buildSidebarSnapshot(db, sessionId, process.cwd(), live, undefined);
 
             // Output reserve is capped at 25%: 200K raw -> 150K safe input.
             expect(snapshot.contextLimit).toBe(150_000);
@@ -381,7 +383,7 @@ describe("buildSidebarSnapshot — context limit", () => {
                 modelID: "test-model",
             });
 
-            const snapshot = buildSidebarSnapshot(db, sessionId, directory, live, 4000);
+            const snapshot = buildSidebarSnapshot(db, sessionId, directory, live, undefined);
 
             expect(snapshot.contextLimit).toBe(200_000);
         } finally {
@@ -407,7 +409,7 @@ describe("buildSidebarSnapshot — Rust module status merge", () => {
                 sessionId,
                 process.cwd(),
                 undefined,
-                4000,
+                undefined,
                 undefined,
                 {
                     usage: {
@@ -469,7 +471,7 @@ describe("compaction-off sidebar RPC data", () => {
                 sessionId,
                 process.cwd(),
                 undefined,
-                4000,
+                undefined,
                 { execute_threshold_percentage: 65 },
                 {
                     usage: {
@@ -486,7 +488,7 @@ describe("compaction-off sidebar RPC data", () => {
                 undefined,
                 { execute_threshold_percentage: 65 },
                 undefined,
-                4000,
+                undefined,
                 {
                     usage: {
                         current_total_input_tokens: 41_000,

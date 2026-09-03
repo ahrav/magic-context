@@ -62,12 +62,24 @@ export interface MutationToken {
     known_as_of: number;
 }
 
+export interface DecisionPayload {
+    summary: string;
+    rationale: string;
+}
+
+/** The decision row a `decision` object carries; other object kinds carry none. */
+export interface ReadDecision {
+    decision_kind: string;
+    payload: DecisionPayload;
+}
+
 export interface ReadRow {
     object: ObjectRow;
     visibility: Visibility;
     labeled: boolean;
     scope_id: string | null;
     token: MutationToken;
+    decision?: ReadDecision;
 }
 
 export interface ReadPayload {
@@ -213,6 +225,19 @@ function parseObjectRow(raw: unknown): ObjectRow | null {
     };
 }
 
+/** `undefined` for an absent or null decision; `null` for a malformed one. */
+function parseReadDecision(raw: unknown): ReadDecision | undefined | null {
+    if (raw === undefined || raw === null) return undefined;
+    if (!isRecord(raw) || typeof raw.decision_kind !== "string") return null;
+    const payload = raw.payload;
+    if (!isRecord(payload)) return null;
+    if (typeof payload.summary !== "string" || typeof payload.rationale !== "string") return null;
+    return {
+        decision_kind: raw.decision_kind,
+        payload: { summary: payload.summary, rationale: payload.rationale },
+    };
+}
+
 function parseReadRow(raw: unknown): ReadRow | null {
     if (!isRecord(raw)) return null;
     const object = parseObjectRow(raw.object);
@@ -221,12 +246,15 @@ function parseReadRow(raw: unknown): ReadRow | null {
     if (!oneOf(VISIBILITIES, raw.visibility) || typeof raw.labeled !== "boolean") return null;
     if (raw.scope_id !== null && typeof raw.scope_id !== "string") return null;
     if (token.object_id !== object.object_id) return null;
+    const decision = parseReadDecision(raw.decision);
+    if (decision === null) return null;
     return {
         object,
         visibility: raw.visibility,
         labeled: raw.labeled,
         scope_id: raw.scope_id,
         token,
+        ...(decision === undefined ? {} : { decision }),
     };
 }
 

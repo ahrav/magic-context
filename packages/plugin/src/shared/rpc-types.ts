@@ -7,7 +7,6 @@ import type {
     DreamTaskBacklogMap,
     DreamTaskProgress,
 } from "../features/magic-context/dreamer/task-registry";
-import type { SnapshotVector } from "../features/magic-context/memory/claim-operation-contract";
 import type { LoggerDiagnostics } from "./logger";
 
 export interface TailHygieneStatus {
@@ -42,9 +41,10 @@ export interface SidebarSnapshot {
     compartmentCount: number;
     /** Historical compartment rows retained while native compaction owns the window. */
     archivedCompartmentCount?: number;
+    /** Rows the kernel serves this project on the `explicit_search` surface. */
     memoryCount: number;
-    memoryClaims: Array<{ publicClaimId: string; revisionLocator: string }>;
-    memorySnapshotVector: SnapshotVector | null;
+    /** The kernel's state key for that read, such as `available` or `unavailable:daemon_absent`. */
+    memoryState: string | null;
     memoryBlockCount: number;
     pendingOpsCount: number;
     historianRunning: boolean;

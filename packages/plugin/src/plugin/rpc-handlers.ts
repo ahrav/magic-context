@@ -8,7 +8,10 @@ import {
     CANONICAL_DREAM_TASKS,
     type DreamTaskBacklogMap,
 } from "../features/magic-context/dreamer/task-registry";
-import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
+import {
+    resolveProjectIdentity,
+    resolveProjectRootDirectory,
+} from "../features/magic-context/memory/project-identity";
 import { getMural } from "../features/magic-context/mural/storage-mural";
 import { getEmbeddingCoverageStatus } from "../features/magic-context/project-embedding-registry";
 import { parseCacheTtl } from "../features/magic-context/scheduler";
@@ -35,7 +38,7 @@ import {
 } from "../hooks/magic-context/event-resolvers";
 import { formatEmbedStatusText } from "../hooks/magic-context/format-embed-status";
 import { getLiveNotificationParams } from "../hooks/magic-context/hook-handlers";
-import { readProjectClaimLaneSnapshot } from "../hooks/magic-context/inject-compartments";
+import { kernelClientResolver } from "../hooks/magic-context/kernel-transport";
 import type { LiveSessionState } from "../hooks/magic-context/live-session-state";
 import { computeM0BlockTokens } from "../hooks/magic-context/m0-token-breakdown";
 import {
@@ -56,6 +59,12 @@ import {
     markAnnouncementSeen,
     shouldShowAnnouncement,
 } from "../shared/announcement";
+import {
+    disabled,
+    type KernelMemorySnapshot,
+    kernelMemorySnapshotFrom,
+    stateKey,
+} from "../shared/kernel-client";
 import { getLoggerDiagnostics, log } from "../shared/logger";
 import type { MagicContextRpcServer } from "../shared/rpc-server";
 import type { EmbedDetail, SidebarSnapshot, StatusDetail } from "../shared/rpc-types";
@@ -190,7 +199,7 @@ export function buildSidebarSnapshot(
     sessionId: string,
     directory: string,
     liveSessionState?: LiveSessionState,
-    injectionBudgetTokens?: number,
+    memory?: KernelMemorySnapshot,
     // The optional execute-threshold config lets the sidebar display the effective threshold with usagePercentage.
     // If the execute-threshold config is omitted, the snapshot uses the 65% runtime default.
     config?: Record<string, unknown>,
@@ -256,15 +265,8 @@ export function buildSidebarSnapshot(
                 ? moduleStatus.compartment_count
                 : archivedCompartmentCount;
 
-        const claimLane = projectIdentity
-            ? readProjectClaimLaneSnapshot(db, projectIdentity)
-            : null;
-        const memoryClaims = (claimLane?.items ?? []).map((item) => ({
-            publicClaimId: item.publicClaimId,
-            revisionLocator: item.revisionLocator,
-        }));
-        const memoryCount = memoryClaims.length;
-        const memorySnapshotVector = claimLane?.snapshotVector ?? null;
+        const memoryCount = memory?.rows.length ?? 0;
+        const memoryState = memory ? stateKey(memory.state) : null;
 
         let pendingOpsCount = 0;
         try {
@@ -314,9 +316,6 @@ export function buildSidebarSnapshot(
                   : "";
         const m0Blocks = computeM0BlockTokens(db, sessionId, {
             m0Text,
-            projectIdentity,
-            injectionBudgetTokens,
-            memoryBlockCount,
             compartmentTokensOverride: moduleStatus?.compartment_tokens,
         });
         const compartmentTokens = m0Blocks.compartmentTokens;
@@ -468,8 +467,7 @@ export function buildSidebarSnapshot(
             compartmentCount,
             archivedCompartmentCount,
             memoryCount,
-            memoryClaims,
-            memorySnapshotVector,
+            memoryState,
             memoryBlockCount,
             pendingOpsCount,
             historianRunning: moduleStatus?.wrapup_active === true || compartmentInProgress,
@@ -529,7 +527,7 @@ export function buildSidebarSnapshotRpcResponse(
     sessionId: string,
     directory: string,
     liveSessionState?: LiveSessionState,
-    injectionBudgetTokens?: number,
+    memory?: KernelMemorySnapshot,
     config?: Record<string, unknown>,
     moduleStatus?: RustSessionStatus,
     compactionEnabled = true,
@@ -541,7 +539,7 @@ export function buildSidebarSnapshotRpcResponse(
             sessionId,
             directory,
             liveSessionState,
-            injectionBudgetTokens,
+            memory,
             config,
             moduleStatus,
             compactionEnabled,
@@ -558,7 +556,7 @@ export function buildStatusDetail(
     modelKey?: string,
     config?: Record<string, unknown>,
     liveSessionState?: LiveSessionState,
-    injectionBudgetTokens?: number,
+    memory?: KernelMemorySnapshot,
     moduleStatus?: RustSessionStatus,
     compactionEnabled = true,
 ): StatusDetail {
@@ -567,7 +565,7 @@ export function buildStatusDetail(
         sessionId,
         directory,
         liveSessionState,
-        injectionBudgetTokens,
+        memory,
         config,
         moduleStatus,
         compactionEnabled,
@@ -817,7 +815,18 @@ export function registerRpcHandlers(
             config.toast_duration_ms,
         );
 
-    const injectionBudgetTokens = config.memory?.injection_budget_tokens;
+    // The status surface reports what an explicit search would see, lag included,
+    // so the sidebar shows `stale` when the projector is behind.
+    const kernelClient = kernelClientResolver(config);
+    const readMemory = async (sessionId: string, dir: string): Promise<KernelMemorySnapshot> => {
+        if (config.memory?.enabled === false) {
+            return { state: disabled(), rows: [], knownAsOf: null };
+        }
+        const client = kernelClient({ sessionId, projectRoot: resolveProjectRootDirectory(dir) });
+        return kernelMemorySnapshotFrom(
+            await client.read({ surface: "explicit_search", gated: true }),
+        );
+    };
 
     rpcServer.handle("sidebar-snapshot", async (params) => {
         const sessionId = String(params.sessionId ?? "");
@@ -833,7 +842,7 @@ export function registerRpcHandlers(
             sessionId,
             dir,
             liveSessionState,
-            injectionBudgetTokens,
+            await readMemory(sessionId, dir),
             rawConfig,
             moduleStatus,
             compactionEnabled,
@@ -857,7 +866,7 @@ export function registerRpcHandlers(
             modelKey,
             rawConfig,
             liveSessionState,
-            injectionBudgetTokens,
+            await readMemory(sessionId, dir),
             moduleStatus,
             compactionEnabled,
         ) as unknown as Record<string, unknown>;

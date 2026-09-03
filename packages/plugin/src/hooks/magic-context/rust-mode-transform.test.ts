@@ -9,6 +9,7 @@ import {
     type AuthorityStatus,
     getAuthorityManagedMarker,
 } from "../../features/magic-context/context-authority";
+import { readProjectMemorySnapshotVector } from "../../features/magic-context/memory/storage-claim-current-state";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/magic-context/storage";
 import { openDatabase } from "../../features/magic-context/storage-db";
@@ -26,8 +27,11 @@ import {
     scheduleOpenCodeTransformDecisionWrite,
     __test as transformDecisionTest,
 } from "../../features/magic-context/transform-decision-log";
+import { computeWorkspaceEpochFingerprint } from "../../features/magic-context/workspaces";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { ABSOLUTE_EMERGENCY_PERCENTAGE } from "../../shared/escalation-bands";
+import { KernelClient } from "../../shared/kernel-client";
+import { FakeKernel, FakeKernelTransport } from "../../shared/kernel-client-testing/fake-kernel";
 import * as logger from "../../shared/logger";
 import { McHostCallError } from "../../shared/mc-host-client";
 import { promptSurfaceConfigIdentity } from "../../shared/prompt-surface";
@@ -36,7 +40,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { deriveWindowGeometry } from "../../shared/window-geometry";
 import { createCtxSearchTools } from "../../tools/ctx-search/tools";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
-import { getVisibleRevisionLocators, readProjectClaimLaneSnapshot } from "./inject-compartments";
+import { getVisibleRevisionLocators } from "./inject-compartments";
 import { getSlot } from "./lkg-slot";
 import { MODULE_PAGE_MAX_BYTES } from "./module-wire";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
@@ -1250,8 +1254,15 @@ describe("Rust mode authority adapter", () => {
             category: "ARCHITECTURE",
             content: "The rust-rendered claim must not be returned twice.",
         });
-        const firstLane = readProjectClaimLaneSnapshot(db, "dir:/tmp/project");
-        if (!firstLane) throw new Error("missing first claim lane");
+        // The mirror runs on the claim lane; its vector is the lane's own read.
+        const claimLane = () => ({
+            snapshotVector: readProjectMemorySnapshotVector(
+                db,
+                [firstClaim.projectId],
+                computeWorkspaceEpochFingerprint(db, ["dir:/tmp/project"]),
+            ),
+        });
+        const firstLane = claimLane();
         const meta = makeMeta(db, sessionId);
         db.exec(`
             CREATE TABLE memory_manifest_updates (count INTEGER NOT NULL);
@@ -1307,8 +1318,17 @@ describe("Rust mode authority adapter", () => {
         expect(getVisibleRevisionLocators(db, sessionId)).toEqual(
             new Set([firstClaim.revisionLocator]),
         );
+        // The `memory` source reads the kernel, which holds none of the mirrored claims.
+        const kernelTransport = new FakeKernelTransport(new FakeKernel());
         const tools = createCtxSearchTools({
             db,
+            kernelClient: ({ sessionId: kernelSession, projectRoot }) =>
+                new KernelClient({
+                    transport: kernelTransport,
+                    enabled: true,
+                    sessionId: kernelSession,
+                    projectRoot,
+                }),
             resolveProjectPath: () => "dir:/tmp/project",
             memoryEnabled: true,
             embeddingEnabled: false,
@@ -1330,8 +1350,7 @@ describe("Rust mode authority adapter", () => {
             category: "ARCHITECTURE",
             content: "A new rust-rendered claim replaces the host manifest.",
         });
-        const secondLane = readProjectClaimLaneSnapshot(db, "dir:/tmp/project");
-        if (!secondLane) throw new Error("missing second claim lane");
+        const secondLane = claimLane();
         renderedRevisionLocators = [secondClaim.revisionLocator];
         memorySnapshotVector = secondLane.snapshotVector;
         await run();

@@ -39,23 +39,37 @@ import {
     setCompactionModeRecord,
 } from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
-import { seedProjectMemoryClaim } from "../../features/magic-context/test-claim-database";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import type { PluginContext } from "../../plugin/types";
+import { KernelClient, type KernelClientResolver } from "../../shared/kernel-client";
+import { FakeKernel, FakeKernelTransport } from "../../shared/kernel-client-testing/fake-kernel";
 import { clearModelsDevCache } from "../../shared/models-dev-cache";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { createTransform } from "./transform";
 
+/** The daemon stand-in every transform in this file reads memory from. */
+let kernel = new FakeKernel();
+let seededMemories = 0;
+
+const kernelClient: KernelClientResolver = ({ sessionId, projectRoot }) =>
+    new KernelClient({
+        transport: new FakeKernelTransport(kernel),
+        enabled: true,
+        sessionId,
+        projectRoot,
+    });
+
 function insertMemory(
-    db: Database,
+    _db: Database,
     input: { projectPath: string; category: string; content: string },
 ): void {
-    seedProjectMemoryClaim(db, {
-        projectIdentity: input.projectPath,
-        category: [
+    seededMemories += 1;
+    kernel.seedDecision({
+        object_id: `mem_${seededMemories.toString(16).padStart(32, "0")}`,
+        decision_kind: [
             "PROJECT_RULES",
             "ARCHITECTURE",
             "CONSTRAINTS",
@@ -64,7 +78,7 @@ function insertMemory(
         ].includes(input.category)
             ? input.category
             : "PROJECT_RULES",
-        content: input.content,
+        summary: input.content,
     });
 }
 
@@ -85,6 +99,7 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 afterEach(() => {
+    kernel = new FakeKernel();
     __resetMessageIndexAsyncForTests();
     __resetProjectIdentityForTests();
     closeDatabase();
@@ -186,6 +201,7 @@ function makeOffTransform(args: {
         protectedTags: 0,
         directory: "/repo/project",
         memoryConfig: { enabled: true, injectionBudgetTokens: 500, autoPromote: true },
+        kernelClient,
         compactionOff: args.compactionOff ?? true,
         client: args.client,
         maybeAutoEmbedSession: args.maybeAutoEmbedSession,

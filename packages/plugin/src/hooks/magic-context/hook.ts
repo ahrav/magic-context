@@ -15,7 +15,6 @@ import type { createCompactionHandler } from "../../features/magic-context/compa
 import {
     applyMirrorPage,
     chainMirrorDomainSync,
-    commitModuleClaimIntent,
     disposeModuleNoteEvaluationBridges,
     ensureContextStoreUuid,
     getMirrorCursor,
@@ -66,7 +65,6 @@ import {
     getSchemaFenceRejection,
     openDatabaseAsync,
 } from "../../features/magic-context/storage-db";
-import { readDirectFormatMarker } from "../../features/magic-context/storage-format-epoch";
 import type { Tagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
@@ -99,14 +97,9 @@ import {
 } from "./event-resolvers";
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
+import { kernelClientResolver } from "./kernel-transport";
 import { dropSlot } from "./lkg-slot";
-import {
-    drainClaimEffectPrefix,
-    MODULE_CLAIM_EFFECTS_CONSUMER,
-    proveClaimOperationDurable,
-} from "./module-state-sync";
 import { McHostModuleTransport } from "./module-transport";
-import { CLAIM_INTENT_PROTOCOL_VERSION, CLAIM_REQUEST_ENCODING_VERSION } from "./module-wire";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import {
@@ -857,90 +850,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       await syncModuleNotes();
                       return response;
                   },
-                  memory: async ({
-                      sessionId,
-                      projectRoot,
-                      projectPath,
-                      producer,
-                      operationKey,
-                      intentRequest,
-                      commitContext,
-                  }) => {
-                      const marker = readDirectFormatMarker(db);
-                      if (marker.status !== "present") {
-                          throw new Error("claim intent requires a valid context format marker");
-                      }
-                      if (!rustModeModuleClient.authorityStatus) {
-                          throw new Error("claim intent requires memory authority status");
-                      }
-                      const status = await rustModeModuleClient.authorityStatus({
-                          context_store_uuid: ensureContextStoreUuid(db),
-                          project: projectPath,
-                          projectRoot,
-                          domain: "memories",
-                      });
-                      if (status.authority?.state !== "MODULE") {
-                          throw Object.assign(
-                              new Error("memory authority is not accepting intents"),
-                              {
-                                  code: "authority_draining",
-                              },
-                          );
-                      }
-                      const claimIntentStage = rustModeModuleClient.claimIntentStage;
-                      const claimIntentInspect = rustModeModuleClient.claimIntentInspect;
-                      const claimIntentAck = rustModeModuleClient.claimIntentAck;
-                      const claimEffectsApply = rustModeModuleClient.claimEffectsApply;
-                      if (
-                          !claimIntentStage ||
-                          !claimIntentInspect ||
-                          !claimIntentAck ||
-                          !claimEffectsApply
-                      ) {
-                          throw new Error("module claim intent protocol is unavailable");
-                      }
-                      return commitModuleClaimIntent({
-                          client: { claimIntentStage, claimIntentInspect, claimIntentAck },
-                          sessionId,
-                          projectRoot,
-                          request: {
-                              protocolVersion: CLAIM_INTENT_PROTOCOL_VERSION,
-                              requestEncodingVersion: CLAIM_REQUEST_ENCODING_VERSION,
-                              binding: {
-                                  databaseIncarnationId: marker.marker.databaseIncarnationId,
-                                  formatEpoch: marker.marker.formatEpoch,
-                                  authorityProject: projectPath,
-                                  authorityGeneration: status.authority.generation,
-                              },
-                              command: { producer, operationKey },
-                              request: intentRequest,
-                          },
-                          commitContext,
-                          settleContext: async (commit) => {
-                              const proof = proveClaimOperationDurable({
-                                  db,
-                                  producer: commit.producer,
-                                  operationKey: commit.operationKey,
-                                  resultJson: commit.resultJson,
-                              });
-                              await drainClaimEffectPrefix({
-                                  db,
-                                  consumer: MODULE_CLAIM_EFFECTS_CONSUMER,
-                                  throughReceiptId: proof.receiptId,
-                                  deliver: (receipt) =>
-                                      claimEffectsApply({
-                                          sessionId,
-                                          projectRoot,
-                                          request: {
-                                              protocolVersion: CLAIM_INTENT_PROTOCOL_VERSION,
-                                              consumer: MODULE_CLAIM_EFFECTS_CONSUMER,
-                                              receipt,
-                                          },
-                                      }),
-                              });
-                          },
-                      });
-                  },
                   noteEvaluationAvailable: (evaluationProjectPath: string) =>
                       getModuleNoteEvaluationBridge(evaluationProjectPath)?.available() === true,
               }
@@ -1184,6 +1093,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         directory: deps.directory,
         allowHomeProject: deps.config.allow_home_project,
         injectDocs: deps.config.dreamer?.inject_docs !== false,
+        kernelClient: kernelClientResolver(deps.config),
         memoryConfig: deps.config.memory
             ? {
                   enabled: deps.config.memory.enabled,

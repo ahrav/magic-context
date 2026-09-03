@@ -56,6 +56,12 @@ import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
+import {
+    disabled,
+    type KernelClientResolver,
+    type KernelMemorySnapshot,
+    kernelMemorySnapshotFrom,
+} from "../../shared/kernel-client";
 import { log, sessionLog } from "../../shared/logger";
 import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
@@ -92,6 +98,7 @@ import {
     type PreparedCompartmentInjection,
     prepareCompartmentInjection,
 } from "./inject-compartments";
+import { daemonAbsentSnapshot } from "./kernel-memory-render";
 import { captureLkgSlot, projectLkgEntry, resolveLkgModelKeys } from "./lkg-replay";
 import { dropSlot } from "./lkg-slot";
 import { onNoteTrigger } from "./note-nudger";
@@ -452,6 +459,28 @@ export function scheduleTsAuthorityRecovery(args: {
         });
 }
 
+/**
+ * The m[0] memory read. `auto_inject` is ungated, so lag never withholds
+ * baseline memory; a session without a memory-enabled project identity has no
+ * scope to bind, so its snapshot is `disabled` and renders nothing.
+ */
+async function readInjectionMemory(args: {
+    deps: Pick<TransformDeps, "kernelClient" | "memoryConfig">;
+    sessionId: string;
+    projectIdentity: string | undefined;
+    projectRoot: string;
+}): Promise<KernelMemorySnapshot> {
+    if (!args.deps.memoryConfig?.enabled || args.projectIdentity === undefined) {
+        return { state: disabled(), rows: [], knownAsOf: null };
+    }
+    if (!args.deps.kernelClient) return daemonAbsentSnapshot();
+    const client = args.deps.kernelClient({
+        sessionId: args.sessionId,
+        projectRoot: args.projectRoot,
+    });
+    return kernelMemorySnapshotFrom(await client.read({ surface: "auto_inject", gated: false }));
+}
+
 export interface TransformDeps {
     tagger: Tagger;
     scheduler: Scheduler;
@@ -497,6 +526,11 @@ export interface TransformDeps {
     directory?: string;
     /* */
     allowHomeProject?: boolean;
+    /**
+     * Serves the m[0] memory read. Absent when no daemon transport exists, in
+     * which case injection renders the `daemon_absent` marker.
+     */
+    kernelClient?: KernelClientResolver;
     memoryConfig?: {
         enabled: boolean;
         injectionBudgetTokens: number;
@@ -1281,6 +1315,7 @@ export function createTransform(deps: TransformDeps) {
                 // Gate historian-driven memory promotion so users
                 // who disable the feature actually see no memories created.
                 memoryEnabled: deps.memoryConfig?.enabled,
+                kernelClient: deps.kernelClient,
                 autoPromote: deps.memoryConfig?.autoPromote,
                 ensureProjectRegistered: deps.ensureProjectRegistered,
                 // Historian publication invalidates the injection cache because it changes the compartments and facts rendered into message[0].
@@ -1480,21 +1515,33 @@ export function createTransform(deps: TransformDeps) {
             logTransformTiming(sessionId, "compartmentTrigger", tTrigger);
         }
 
+        // One read serves this pass's m[0]/m[1] render; the compartment and
+        // postprocess phases take it as a value and issue no memory RPC.
+        const tMemoryRead = performance.now();
+        const memory = await readInjectionMemory({
+            deps,
+            sessionId,
+            projectIdentity,
+            projectRoot: resolveProjectRootDirectory(memoryProjectDirectory),
+        });
+        logTransformTiming(sessionId, "kernelMemoryRead", tMemoryRead);
+
         let pendingCompartmentInjection: PreparedCompartmentInjection | null = null;
         let rebuiltHistoryFromInitialPrepare = false;
         // Compaction-off skips preparation even when historical compartment rows exist.
         // Compaction-off renders no `<session-history>`, trims no raw tail, splices no boundary, and writes no marker.
         if (fullFeatureMode && !compactionOff) {
             const tInj = performance.now();
-            pendingCompartmentInjection = prepareCompartmentInjection(
+            pendingCompartmentInjection = prepareCompartmentInjection({
                 db,
                 sessionId,
                 messages,
                 isCacheBusting,
-                projectIdentity,
-                deps.memoryConfig?.injectionBudgetTokens,
-                deps.experimentalTemporalAwareness,
-            );
+                memory,
+                projectPath: projectIdentity,
+                injectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
+                temporalAwareness: deps.experimentalTemporalAwareness,
+            });
             logTransformTiming(sessionId, "prepareCompartmentInjection", tInj);
 
             // The transform consumes each `historyRefreshSessions` entry once.
@@ -1730,6 +1777,7 @@ export function createTransform(deps: TransformDeps) {
             compartmentDirectory,
             messages,
             pendingCompartmentInjection,
+            memory,
             fallbackModelId,
             projectPath: projectIdentity,
             injectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
@@ -1748,6 +1796,7 @@ export function createTransform(deps: TransformDeps) {
             // (not just the recovery path above) honors memory.enabled and
             // memory.auto_promote.
             memoryEnabled: deps.memoryConfig?.enabled,
+            kernelClient: deps.kernelClient,
             autoPromote: deps.memoryConfig?.autoPromote,
             ensureProjectRegistered: deps.ensureProjectRegistered,
             onCompartmentStatePublished: (sid) => {
@@ -1858,7 +1907,9 @@ export function createTransform(deps: TransformDeps) {
             // Note-nudge and auto-search must use sessionProjectIdentity to target the resumed session's project.
             projectPath: sessionProjectIdentity,
             sessionDirectory,
-            autoSearch: deps.autoSearch,
+            autoSearch: deps.autoSearch
+                ? { ...deps.autoSearch, kernelClient: deps.kernelClient }
+                : undefined,
             // Subagents must not receive cavemanTextCompression because the spawning primary agent already curates their context.
             cavemanTextCompression: !reducedMode ? deps.cavemanTextCompression : undefined,
             smartDrops: deps.smartDrops === true,
@@ -1869,6 +1920,7 @@ export function createTransform(deps: TransformDeps) {
             passOutcome,
             historyRefreshSessions: deps.historyRefreshSessions,
             m0M1: {
+                memory,
                 // m0M1.projectPath must remain undefined when memory.enabled=false.
                 // materializeM0 must not fall back to deps.projectPath because any projectPath injects memory.
                 // projectDirectory independently drives docs, key files, and history.

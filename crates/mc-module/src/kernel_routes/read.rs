@@ -1,9 +1,12 @@
 //! `kernel.read`: the visible rows of one surface at one snapshot, filtered
 //! to the bound project, each carrying the mutation token `kernel.commit`
-//! checks.
+//! checks. Decision objects also carry their decision row, so a client can
+//! render the decision text without a second route.
+
+use std::collections::HashMap;
 
 use mc_host::RouteHandle;
-use mc_kernel::{KernelError, KernelStore, Surface, SurfaceVisibility, VisibleRow};
+use mc_kernel::{DecisionRow, KernelError, KernelStore, Surface, SurfaceVisibility, VisibleRow};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -47,6 +50,9 @@ pub(crate) struct ReadResponse {
     known_as_of: i64,
     tip: i64,
     rows: Vec<VisibleRow>,
+    /// Decision rows keyed by `object_id`, loaded at `known_as_of` only when
+    /// at least one visible row is a decision object.
+    decisions: HashMap<String, DecisionRow>,
 }
 
 pub(crate) fn read_visible(
@@ -67,14 +73,25 @@ pub(crate) fn read_visible(
             rows.push(row);
         }
     }
+    let decisions = if rows.iter().any(|row| row.object.object_kind == "decision") {
+        store
+            .slice_as_of(visible.known_as_of)?
+            .decisions
+            .into_iter()
+            .map(|decision| (decision.object_id.clone(), decision))
+            .collect()
+    } else {
+        HashMap::new()
+    };
     Ok(ReadResponse {
         known_as_of: visible.known_as_of,
         tip: visible.tip,
         rows,
+        decisions,
     })
 }
 
-fn row_json(row: &VisibleRow, known_as_of: i64) -> Value {
+fn row_json(row: &VisibleRow, decision: Option<&DecisionRow>, known_as_of: i64) -> Value {
     json!({
         "object": row.object,
         "visibility": match row.visibility {
@@ -85,6 +102,10 @@ fn row_json(row: &VisibleRow, known_as_of: i64) -> Value {
         "labeled": row.labeled,
         "scope_id": row.scope_id,
         "token": {"object_id": row.object.object_id, "known_as_of": known_as_of},
+        "decision": decision.map(|decision| json!({
+            "decision_kind": decision.decision_kind,
+            "payload": decision.payload,
+        })),
     })
 }
 
@@ -133,7 +154,13 @@ impl McHandler {
         let rows: Vec<Value> = response
             .rows
             .iter()
-            .map(|row| row_json(row, response.known_as_of))
+            .map(|row| {
+                row_json(
+                    row,
+                    response.decisions.get(&row.object.object_id),
+                    response.known_as_of,
+                )
+            })
             .collect();
         kernel_response(
             &KernelOutcome::Available,

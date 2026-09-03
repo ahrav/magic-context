@@ -1,7 +1,4 @@
-import {
-    ANTI_MEMORY_CATEGORY,
-    WRITABLE_MEMORY_CATEGORIES,
-} from "../../features/magic-context/memory";
+import { ANTI_MEMORY_CATEGORY } from "../../features/magic-context/memory";
 import {
     type CanonicalJsonValue,
     type ClaimMutationToken,
@@ -38,7 +35,10 @@ import {
 } from "../../features/magic-context/workspaces";
 import type { Database } from "../../shared/sqlite";
 import { DEFAULT_SEARCH_LIMIT, GET_MAX_CLAIMS } from "./constants";
-import { CTX_MEMORY_DREAMER_ACTIONS, type CtxMemoryAction, type CtxMemoryArgs } from "./types";
+import { CTX_MEMORY_DREAMER_ACTIONS, type CtxMemoryAction, type CtxMemoryClaimArgs } from "./types";
+import { assertCtxMemoryWriteShape, requireTaxonomyCategory } from "./write-shape";
+
+export { assertCtxMemoryWriteShape };
 
 export type CtxMemoryHarness = "opencode" | "pi";
 
@@ -74,7 +74,7 @@ export function createCtxMemoryProducerIdentity(
 
 export interface ExecuteCtxMemoryClaimActionArgs {
     db: Database;
-    args: CtxMemoryArgs;
+    args: CtxMemoryClaimArgs;
     projectIdentity: string;
     identity: CtxMemoryCallIdentity;
     actor: string;
@@ -133,7 +133,7 @@ function uniquePublicClaimIds(ids: readonly string[] | undefined): string[] {
     return [...new Set(ids ?? [])];
 }
 
-function requireSingleMutationTarget(args: CtxMemoryArgs): {
+function requireSingleMutationTarget(args: CtxMemoryClaimArgs): {
     publicClaimId: string;
     token: ClaimMutationToken;
 } {
@@ -173,41 +173,6 @@ function authorizeOwnClaims(
     });
     if (visible.length !== new Set(publicClaimIds).size) {
         throw new ClaimOperationInputError("claim not found or not visible from this project");
-    }
-}
-
-/**
- *
- */
-function requireTaxonomyCategory(category: string | undefined): string | undefined {
-    if (category === undefined || category === "") return undefined;
-    if (!(WRITABLE_MEMORY_CATEGORIES as readonly string[]).includes(category)) {
-        throw new ClaimOperationInputError(
-            `unknown claim category: ${category} (expected one of ${WRITABLE_MEMORY_CATEGORIES.join(", ")})`,
-        );
-    }
-    return category;
-}
-
-export function assertCtxMemoryWriteShape(args: CtxMemoryArgs): void {
-    if (args.action !== "create" && args.action !== "revise") return;
-    const category = requireTaxonomyCategory(args.category?.trim());
-    const antiArm = category === ANTI_MEMORY_CATEGORY || args.antiMemory !== undefined;
-    if (antiArm) {
-        if (category !== ANTI_MEMORY_CATEGORY || !args.antiMemory || args.content !== undefined) {
-            throw new ClaimOperationInputError(
-                `${args.action} anti-memory requires category ${ANTI_MEMORY_CATEGORY}, antiMemory payload, and no content`,
-            );
-        }
-        return;
-    }
-    if (args.antiMemory !== undefined) {
-        throw new ClaimOperationInputError(
-            `${args.action} positive memory cannot carry antiMemory`,
-        );
-    }
-    if (args.action === "create" && (!category || !args.content?.trim())) {
-        throw new ClaimOperationInputError("create requires non-empty content and category");
     }
 }
 

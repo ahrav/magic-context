@@ -4,19 +4,16 @@ import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
-import { recordDeliveredAntiMemoryUsage } from "../../features/magic-context/memory/storage-claim-operations";
-import {
-    parseLocatorShapedQuery,
-    resolveClaimsByLocatorsForSearch,
-    type UnifiedSearchResult,
-    unifiedSearch,
-} from "../../features/magic-context/search";
+import { resolveProjectRootDirectory } from "../../features/magic-context/memory/project-identity";
+import { type UnifiedSearchResult, unifiedSearch } from "../../features/magic-context/search";
 import {
     describeQueryBoundsViolation,
     normalizeSearchResultLimit,
 } from "../../features/magic-context/search-bounds";
 import { getVisibleRevisionLocators } from "../../hooks/magic-context/inject-compartments";
+import { isAvailable, renderToolStateText } from "../../shared/kernel-client";
 import { CTX_SEARCH_DESCRIPTION, CTX_SEARCH_TOOL_NAME } from "./constants";
+import { parseObjectIdQuery, searchKernelMemoryRows } from "./kernel-memory-search";
 import { normalizeCtxSearchArgs, prepareQueryFromNormalizedArgs } from "./query-input";
 import { type ExplicitDeliveryReason, packSearchResults } from "./render";
 import type { CtxSearchArgs, CtxSearchSource, CtxSearchToolDeps } from "./types";
@@ -55,14 +52,14 @@ const ctxSearchArgsShape = {
         .string()
         .optional()
         .describe(
-            "Search query. Matches rejected-approach warnings, Primers, git commit messages, notes, and raw user/assistant message text. Positive project-memory claims require an opaque public claim id (mcm_<32hex>) or full revision locator.",
+            "Search query. Matches project memories, Primers, git commit messages, notes, and raw user/assistant message text. A query made only of memory object ids (mem_<32hex>) resolves those memories directly.",
         ),
     limit: tool.schema.number().optional().describe("Maximum results to return (default: 10)"),
     sources: tool.schema
         .array(tool.schema.enum(["memory", "message", "git_commit", "primer", "note"]))
         .optional()
         .describe(
-            'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. ["memory"] searches rejected-approach warnings and resolves exact positive-memory locators; broad positive-memory text retrieval remains disabled. Omit for all enabled sources; pass [] to search no sources.',
+            'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. ["memory"] searches the project memories served by the memory daemon. Omit for all enabled sources; pass [] to search no sources.',
         ),
 };
 // The tool definition exposes only the documented argument shape to the model
@@ -117,9 +114,9 @@ export async function executeCtxSearch(
     const lastCompartmentEnd = getLastCompartmentEndMessage(deps.db, toolContext.sessionID);
     const messageOrdinalCutoff = lastCompartmentEnd >= 0 ? lastCompartmentEnd : 0;
 
-    // The search hard-filters claims already rendered in the injected baseline.
-    // Claims in `message[0]` are already visible, so excluding them preserves tokens for raw-history hits.
-    const visibleRevisionLocators = getVisibleRevisionLocators(deps.db, toolContext.sessionID);
+    // Memories already rendered in the injected baseline are excluded from the `memory` source.
+    // A hit in `message[0]` is already visible, so excluding it preserves tokens for unseen results.
+    const visibleObjectIds = getVisibleRevisionLocators(deps.db, toolContext.sessionID);
 
     const projectPath = deps.resolveProjectPath(toolContext.directory);
     if (!projectPath) {
@@ -134,12 +131,14 @@ export async function executeCtxSearch(
     const gitCommitsEnabled =
         embeddingSnapshot?.gitCommitEnabled ?? deps.gitCommitsEnabled ?? false;
 
-    const completeFrom = (results: UnifiedSearchResult[]): CtxSearchExecution => {
+    const completeFrom = (
+        results: UnifiedSearchResult[],
+        memoryNote?: string,
+    ): CtxSearchExecution => {
         const packed = packSearchResults(query, results, toolContext.sessionID);
-        recordDeliveredAntiMemoryUsage(deps.db, packed.delivered);
         return {
             status: "complete",
-            text: packed.text,
+            text: memoryNote ? `${memoryNote}\n\n${packed.text}` : packed.text,
             prePack: results,
             delivered: packed.delivered,
             tokenCount: packed.tokenCount,
@@ -148,30 +147,41 @@ export async function executeCtxSearch(
         };
     };
 
-    // `parseLocatorShapedQuery` accepts locator lists only when they occupy the whole query.
-    // `parseLocatorShapedQuery` returns null for ordinary text, allowing `unifiedSearch` to search the corpus.
-    // If no locator resolves, the call falls through to `unifiedSearch`.
-    //
-    // The locator path must honor `args.sources`.
-    // `sources: []` must not return claim content.
-    // `sources: []` must not return claim content.
-    // `sources: []` must not return claim content.
+    // The `memory` source is served by the daemon through the kernel client, gated on
+    // freshness: a lagging projector answers `stale` and the search says so instead of
+    // ranking rows that may miss recent writes. Every other source reads the local database,
+    // so `memory` leaves the source list handed to `unifiedSearch`.
     const requestedSources = normalizeSources(args.sources);
     const memorySourceAllowed =
         requestedSources === undefined || requestedSources.includes("memory");
-    const locatorShape = parseLocatorShapedQuery(query);
-    if (locatorShape && memoryEnabled && memorySourceAllowed) {
-        const locatorResults = resolveClaimsByLocatorsForSearch({
-            db: deps.db,
-            projectPath,
-            locators: locatorShape,
-            // `limit: 1` must return at most one locator result.
-            // `limit: 1` must return at most one locator result.
-            limit: normalizeSearchResultLimit(args.limit),
-            visibleRevisionLocators,
+    const memoryOnly = requestedSources?.length === 1 && requestedSources[0] === "memory";
+    const localSources = (requestedSources ?? [...VALID_SOURCES]).filter(
+        (source) => source !== "memory",
+    );
+    let memoryNote: string | undefined;
+    let memoryResults: UnifiedSearchResult[] = [];
+    if (memoryEnabled && memorySourceAllowed) {
+        const client = deps.kernelClient({
+            sessionId: toolContext.sessionID,
+            projectRoot: resolveProjectRootDirectory(toolContext.directory),
         });
-        if (locatorResults !== null) {
-            return completeFrom(locatorResults);
+        const read = await client.read({ surface: "explicit_search", gated: true });
+        if (isAvailable(read)) {
+            const hits = searchKernelMemoryRows({
+                rows: read.rows,
+                query,
+                limit: normalizeSearchResultLimit(args.limit),
+                excludeObjectIds: visibleObjectIds,
+            });
+            if (hits) {
+                // An object-id query is answered by the daemon alone.
+                if (parseObjectIdQuery(query)) return completeFrom(hits);
+                memoryResults = hits;
+            }
+        } else {
+            const text = renderToolStateText(read.state);
+            if (memoryOnly) return { status: "invalid", text: `Error: ${text}` };
+            memoryNote = `Memory: ${text}`;
         }
     }
 
@@ -187,11 +197,15 @@ export async function executeCtxSearch(
         readMessages: deps.readMessages,
         maxMessageOrdinal: messageOrdinalCutoff,
         gitCommitsEnabled,
-        sources: requestedSources,
+        sources: localSources,
         explicitSearch: true,
     });
 
-    return completeFrom(results);
+    if (memoryResults.length === 0) return completeFrom(results, memoryNote);
+    const merged = [...memoryResults, ...results]
+        .sort((left, right) => right.score - left.score)
+        .slice(0, normalizeSearchResultLimit(args.limit));
+    return completeFrom(merged, memoryNote);
 }
 
 function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {

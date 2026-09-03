@@ -27,6 +27,14 @@ export type CanonicalJsonValue =
     | CanonicalJsonValue[]
     | { [key: string]: CanonicalJsonValue };
 
+/** Reports unknown claims, duplicate collisions, and malformed input before any receipt exists, so a transaction rolls back entirely. */
+export class ClaimOperationInputError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "ClaimOperationInputError";
+    }
+}
+
 export class CanonicalEncodingError extends Error {
     constructor(message: string) {
         super(message);

@@ -864,6 +864,15 @@ async fn a_plugin_route_cannot_declare_a_class_above_the_derived_one() {
     // Inference-class writes serve labeled on explicit search and never on
     // the automatic surfaces.
     assert_eq!(read["rows"][0]["labeled"], true);
+    // A decision object carries its decision row so the client can render
+    // the text from the read alone.
+    assert_eq!(
+        read["rows"][0]["decision"],
+        json!({
+            "decision_kind": "memory",
+            "payload": {"summary": "decision 1", "rationale": "because 1"},
+        })
+    );
     assert!(object_ids(&daemon.read("auto_inject", None).await).is_empty());
     assert!(object_ids(&daemon.read("auto_search", None).await).is_empty());
     daemon.handler.shutdown().await.unwrap();

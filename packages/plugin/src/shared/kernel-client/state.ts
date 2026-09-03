@@ -221,3 +221,5 @@ export const conflict = (reason: ConflictReason): MemoryState => ({ kind: "confl
 export const invalid = (reason: InvalidReason): MemoryState => ({ kind: "invalid", reason });
 export const disabled = (): MemoryState => ({ kind: "disabled" });
 export const cancelled = (): MemoryState => ({ kind: "cancelled" });
+export const stale = (lag: LagFacts): MemoryState => ({ kind: "stale", ...lag });
+export const abstained = (lag: LagFacts): MemoryState => ({ kind: "abstained", ...lag });

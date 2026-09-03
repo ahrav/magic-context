@@ -1,17 +1,36 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import {
-    createAntiMemory,
-    readAntiMemory,
-} from "../../features/magic-context/memory/storage-anti-memory";
-import { ensureProject } from "../../features/magic-context/memory/storage-claims";
 import * as searchModule from "../../features/magic-context/search";
 import { getAutoSearchHintDecisions } from "../../features/magic-context/storage-meta-persisted";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import {
+    abstained,
+    KernelClient,
+    type KernelClientResolver,
+    unavailable,
+} from "../../shared/kernel-client";
+import { FakeKernel, FakeKernelTransport } from "../../shared/kernel-client-testing/fake-kernel";
 import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { extractBoundedAutoSearchQuery } from "./auto-search-prompt";
 import { executeAutoSearchDelivery, runAutoSearchHint } from "./auto-search-runner";
 import type { MessageLike } from "./transform-operations";
+
+const OBJECT_A = `mem_${"a".repeat(32)}`;
+
+/** A kernel client over an in-memory fake; `transport.calls` records every daemon round trip. */
+function kernelHarness(kernel = new FakeKernel()): {
+    kernel: FakeKernel;
+    transport: FakeKernelTransport;
+    kernelClient: KernelClientResolver;
+} {
+    const transport = new FakeKernelTransport(kernel);
+    return {
+        kernel,
+        transport,
+        kernelClient: ({ sessionId, projectRoot }) =>
+            new KernelClient({ transport, enabled: true, sessionId, projectRoot }),
+    };
+}
 
 function makeUserMsg(id: string, text: string): MessageLike {
     return {
@@ -83,85 +102,68 @@ describe("auto-search-runner", () => {
         }
     });
 
-    test("bumps anti-memory usage once after the hint decision commits", async () => {
-        const created = createAntiMemory(
-            db,
-            { producer: "runner-test", operationKey: "anti-warning" },
-            {
-                projectId: ensureProject(db, baseOptions.projectPath),
-                payload: {
-                    trigger: "session caching",
-                    rejectedStrategy: "Redis",
-                    rejectionReason: "split ownership",
-                    saferAlternative: "use SQLite",
-                },
-                provenance: {
-                    sourceLocator: "test://runner/anti",
-                    sourceContent: "Redis rejected",
-                    extractor: "test",
-                    extractorVersion: "1",
-                    extractorRunId: "seed",
-                    independenceKey: "anti",
-                    sourceTrustClass: "explicit_user",
-                },
-                actor: "user:test",
-            },
-        );
-        const publicClaimId = (created.result.payload as { claim: { publicClaimId: string } }).claim
-            .publicClaimId;
-        const anti = readAntiMemory(db, publicClaimId);
-        if (anti === null) throw new Error("missing anti-memory");
-        const warning = {
-            source: "anti_memory" as const,
-            score: 0.95,
-            publicClaimId,
-            revisionLocator: anti.revisionLocator,
-            contentDigest: anti.contentDigest,
-            claimId: anti.claimId,
-            normalizedHash: anti.normalizedHash,
-            trigger: anti.payload.trigger,
-            rejectedStrategy: anti.payload.rejectedStrategy,
-            rejectionReason: anti.payload.rejectionReason,
-            saferAlternative: anti.payload.saferAlternative,
-            matchType: "lexical" as const,
-        };
-        const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([warning]);
+    test("a kernel memory row that matches the prompt becomes the hint", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const { kernel, transport, kernelClient } = kernelHarness();
+        kernel.seedDecision({
+            object_id: OBJECT_A,
+            decision_kind: "PROJECT_RULES",
+            summary: "the historian decides to run when context passes the execute threshold",
+        });
         try {
-            const messages = [makeUserMsg("u-warning", "please add Redis backed session caching")];
+            const messages = [
+                makeUserMsg("u-kernel", "please explain how the historian decides when to run"),
+            ];
             expect(
                 await runAutoSearchHint({
-                    sessionId: "s-warning",
+                    sessionId: "s-kernel",
                     db,
                     messages,
-                    options: baseOptions,
+                    options: { ...baseOptions, directory: "/tmp/auto-search", kernelClient },
                 }),
             ).toEqual({ ok: true });
-            expect(findUserPromptText(messages[0])).toContain("⚠ Previously rejected: Redis");
-            expect(
-                db
-                    .prepare(
-                        `SELECT usage.retrieval_count AS count FROM claim_usage_stats usage
-                         JOIN claim_public_ids public ON public.claim_id = usage.claim_id
-                         WHERE public.public_id = ?`,
-                    )
-                    .get(publicClaimId),
-            ).toEqual({ count: 1 });
+            expect(findUserPromptText(messages[0])).toContain("<ctx-search-hint>");
+            expect(transport.calls.map((call) => call.method)).toEqual(["kernel.read"]);
+            expect(transport.calls[0]?.body).toMatchObject({ surface: "auto_search", gated: true });
+            const decision = getAutoSearchHintDecisions(db, "s-kernel")[0];
+            expect(decision?.decision).toBe("hint");
+        } finally {
+            spy.mockRestore();
+        }
+    });
 
-            await runAutoSearchHint({
-                sessionId: "s-warning",
-                db,
-                messages,
-                options: baseOptions,
-            });
+    test.each([
+        [
+            "abstained",
+            abstained({ lag_positions: 3, oldest_unconsumed_age_ms: 500 }),
+            "memory-abstained",
+        ],
+        ["unavailable", unavailable("store_busy"), "memory-unavailable"],
+    ] as const)("a %s kernel persists a typed no-hint reason and appends nothing", async (_label, state, reason) => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const { kernel, kernelClient } = kernelHarness();
+        kernel.seedDecision({
+            object_id: OBJECT_A,
+            decision_kind: "PROJECT_RULES",
+            summary: "the historian decides to run when context passes the execute threshold",
+        });
+        kernel.surfaceStates.set("auto_search", state);
+        try {
+            const messages = [
+                makeUserMsg("u-typed", "please explain how the historian decides when to run"),
+            ];
             expect(
-                db
-                    .prepare(
-                        `SELECT usage.retrieval_count AS count FROM claim_usage_stats usage
-                         JOIN claim_public_ids public ON public.claim_id = usage.claim_id
-                         WHERE public.public_id = ?`,
-                    )
-                    .get(publicClaimId),
-            ).toEqual({ count: 1 });
+                await runAutoSearchHint({
+                    sessionId: `s-${reason}`,
+                    db,
+                    messages,
+                    options: { ...baseOptions, directory: "/tmp/auto-search", kernelClient },
+                }),
+            ).toEqual({ ok: true });
+            expect(findUserPromptText(messages[0])).not.toContain("<ctx-search-hint>");
+            expect(getAutoSearchHintDecisions(db, `s-${reason}`)).toMatchObject([
+                { decision: "no-hint", reason },
+            ]);
         } finally {
             spy.mockRestore();
         }
@@ -185,7 +187,7 @@ describe("auto-search-runner", () => {
             });
 
             const options = spy.mock.calls[0]?.[4];
-            expect(options?.sources).toEqual(["memory", "message", "git_commit"]);
+            expect(options?.sources).toEqual(["message", "git_commit"]);
             expect(options?.memoryPolicySurface).toBe("auto_search");
         } finally {
             spy.mockRestore();

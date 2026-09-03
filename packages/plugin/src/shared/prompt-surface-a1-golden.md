@@ -325,22 +325,22 @@ Example: ctx_note(action="write", content="Re-run the perf benchmark once the bo
 }
 ```
 
-### ctx_memory — description ~200 tokens, params ~620 tokens (total ~820)
+### ctx_memory — description ~186 tokens, params ~382 tokens (total ~568)
 
 **Description:**
 
 ```
-Durable project claims shared across sessions.
+Durable project memories shared across sessions, served by the memory daemon.
 
-Claims use public IDs (mcm_<32hex>), immutable revision locators, and claim-local mutation tokens. Reuse the exact token returned by create/get/list when revising or changing lifecycle state.
+Memories are addressed by object id (mem_<32hex>). revise, merge, and restore supersede their targets with one new object and return its id; no token is passed. A result starting with "Error:" names the memory state and what to do next.
 
 Actions:
-- create: create a claim (content + category, or antiMemory).
-- get: fetch up to 20 public claim IDs; hidden and missing claims have the same result.
-- list: enumerate visible active claims (dreamer maintenance only).
-- revise: append a revision (publicClaimId + mutationToken + content/category or antiMemory).
-- archive / restore: append lifecycle state (publicClaimId + mutationToken).
-- merge: same-project merge; mutationTokens are ordered [target, ...sources].
+- create: content + category, or antiMemory.
+- get: up to 20 object ids; hidden and missing objects read the same.
+- list: visible memories (dreamer maintenance only).
+- revise: objectId + content/category or antiMemory.
+- archive / restore: objectId.
+- merge: objectIds into one survivor + content/category or antiMemory.
 
 Approval and enforcement are human-owned /ctx-approve and /ctx-enforce commands. Agent calls to approve/enforce are rejected.
 ```
@@ -363,11 +363,11 @@ Approval and enforcement are human-owned /ctx-approve and /ctx-enforce commands.
     ]
   },
   "content": {
-    "description": "Claim content for create/revise/merge",
+    "description": "Memory content for create/revise/merge",
     "type": "string"
   },
   "category": {
-    "description": "Claim category for create/revise or list filter",
+    "description": "Memory category for create/revise/merge or list filter",
     "type": "string",
     "enum": [
       "PROJECT_RULES",
@@ -469,92 +469,15 @@ Approval and enforcement are human-owned /ctx-approve and /ctx-enforce commands.
     ],
     "additionalProperties": false
   },
-  "publicClaimId": {
-    "description": "Public claim ID for revise/archive/restore",
+  "objectId": {
+    "description": "Object id for revise/archive/restore",
     "type": "string"
   },
-  "publicClaimIds": {
-    "description": "Public claim IDs for get",
+  "objectIds": {
+    "description": "Object ids for get, or the objects merge folds into one survivor",
     "type": "array",
     "items": {
       "type": "string"
-    }
-  },
-  "mutationToken": {
-    "description": "Exact token returned by create/get/list",
-    "type": "object",
-    "properties": {
-      "tokenVersion": {
-        "type": "number"
-      },
-      "publicClaimId": {
-        "type": "string"
-      },
-      "revision": {
-        "type": "number"
-      },
-      "contentDigest": {
-        "type": "string"
-      },
-      "lifecycleSeq": {
-        "type": "number"
-      },
-      "applicabilityHeadsDigest": {
-        "type": "string"
-      },
-      "policyHeadsDigest": {
-        "type": "string"
-      }
-    },
-    "required": [
-      "tokenVersion",
-      "publicClaimId",
-      "revision",
-      "contentDigest",
-      "lifecycleSeq",
-      "applicabilityHeadsDigest",
-      "policyHeadsDigest"
-    ],
-    "additionalProperties": false
-  },
-  "mutationTokens": {
-    "description": "Merge tokens ordered [target, ...sources]",
-    "type": "array",
-    "items": {
-      "type": "object",
-      "properties": {
-        "tokenVersion": {
-          "type": "number"
-        },
-        "publicClaimId": {
-          "type": "string"
-        },
-        "revision": {
-          "type": "number"
-        },
-        "contentDigest": {
-          "type": "string"
-        },
-        "lifecycleSeq": {
-          "type": "number"
-        },
-        "applicabilityHeadsDigest": {
-          "type": "string"
-        },
-        "policyHeadsDigest": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "tokenVersion",
-        "publicClaimId",
-        "revision",
-        "contentDigest",
-        "lifecycleSeq",
-        "applicabilityHeadsDigest",
-        "policyHeadsDigest"
-      ],
-      "additionalProperties": false
     }
   },
   "limit": {
@@ -568,27 +491,27 @@ Approval and enforcement are human-owned /ctx-approve and /ctx-enforce commands.
 }
 ```
 
-### ctx_search — description ~335 tokens, params ~226 tokens (total ~561)
+### ctx_search — description ~328 tokens, params ~207 tokens (total ~535)
 
 **Description:**
 
 ```
 Your long-term recall for this project — search everything that ever happened here, not just what's currently visible.
 
-Reach for it when something feels familiar but isn't in view: "did we solve this before?", "what did we reject?", "when did this break?", "where does Y live?". Results only contain things you CANNOT currently see — claims already shown in <project-memory> and the live conversation tail are filtered out. Rejected-approach claims are searchable warnings. A query that is entirely opaque public claim ids (`mcm_<32hex>`) or full revision locators resolves claims directly; a numeric id is ordinary search text.
+Reach for it when something feels familiar but isn't in view: "did we solve this before?", "what did we reject?", "when did this break?", "where does Y live?". Results only contain things you CANNOT currently see — memories already shown in <project-memory> and the live conversation tail are filtered out. Rejected-approach memories are searchable warnings. A query that is entirely memory object ids (`mem_<32hex>`) resolves those memories directly; a numeric id is ordinary search text.
 
 Sources (omit for a broad search across all):
 - message: the raw conversation behind your compacted history. Hits include message ordinals — expand the surrounding exchange with ctx_expand(start=N-10, end=N+5).
 - git_commit: this repository's commit history.
 - note: parked decisions, follow-ups, and dismissed notes with their recorded text.
-- memory: rejected-approach warnings plus exact positive-memory locators. Broad positive-memory text retrieval remains disabled.
+- memory: project memories served by the memory daemon; a lagging or absent daemon is reported in the result.
 
 Picking sources:
 - "when did this change / was this working before" → ["git_commit", "message"]
 - "did we discuss this earlier" → ["message"]
 - "did we decide something about this / leave a follow-up" → ["note"]
 - "did we reject this approach" → ["memory"]
-- "what's our convention / rule for X" → use its locator
+- "what's our convention / rule for X" → ["memory"]
 ```
 
 **Parameters (JSON Schema per parameter, as serialized to the provider):**
@@ -596,7 +519,7 @@ Picking sources:
 ```json
 {
   "query": {
-    "description": "Search query. Matches rejected-approach warnings, Primers, git commit messages, notes, and raw user/assistant message text. Positive project-memory claims require an opaque public claim id (mcm_<32hex>) or full revision locator.",
+    "description": "Search query. Matches project memories, Primers, git commit messages, notes, and raw user/assistant message text. A query made only of memory object ids (mem_<32hex>) resolves those memories directly.",
     "type": "string"
   },
   "limit": {
@@ -604,7 +527,7 @@ Picking sources:
     "type": "number"
   },
   "sources": {
-    "description": "Optional. Restrict to specific sources. Examples: [\"primer\"] for standing project explanations, [\"git_commit\"] for \"when did we change X\", [\"message\"] for \"did we discuss this earlier\", [\"note\"] for parked decisions or follow-ups, [\"git_commit\",\"message\"] for regression hunts. [\"memory\"] searches rejected-approach warnings and resolves exact positive-memory locators; broad positive-memory text retrieval remains disabled. Omit for all enabled sources; pass [] to search no sources.",
+    "description": "Optional. Restrict to specific sources. Examples: [\"primer\"] for standing project explanations, [\"git_commit\"] for \"when did we change X\", [\"message\"] for \"did we discuss this earlier\", [\"note\"] for parked decisions or follow-ups, [\"git_commit\",\"message\"] for regression hunts. [\"memory\"] searches the project memories served by the memory daemon. Omit for all enabled sources; pass [] to search no sources.",
     "type": "array",
     "items": {
       "type": "string",

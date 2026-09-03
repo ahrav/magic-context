@@ -28,9 +28,6 @@ describe("computeM0BlockTokens", () => {
 
         const b = computeM0BlockTokens(db, SESSION_ID, {
             m0Text,
-            projectIdentity: "/tmp/proj",
-            injectionBudgetTokens: 10_000,
-            memoryBlockCount: 1,
         });
 
         expect(b.docsTokens).toBeGreaterThan(0);
@@ -50,9 +47,6 @@ describe("computeM0BlockTokens", () => {
         const m0Text = "<session-history>\n## 1-2 · x\ny\n</session-history>";
         const b = computeM0BlockTokens(db, SESSION_ID, {
             m0Text,
-            projectIdentity: undefined,
-            injectionBudgetTokens: undefined,
-            memoryBlockCount: 0,
         });
         expect(b.docsTokens).toBe(0);
         expect(b.profileTokens).toBe(0);
@@ -68,9 +62,6 @@ describe("computeM0BlockTokens", () => {
         ).run(SESSION_ID, 1, 1, 9, "m1", "m9", "Mirrored compartment", "p1 content", Date.now());
         const b = computeM0BlockTokens(db, SESSION_ID, {
             m0Text: "",
-            projectIdentity: undefined,
-            injectionBudgetTokens: undefined,
-            memoryBlockCount: 0,
             compartmentTokensOverride: 17,
         });
         expect(b.compartmentTokens).toBe(17);
@@ -84,9 +75,6 @@ describe("computeM0BlockTokens", () => {
         ).run(SESSION_ID, 1, 1, 9, "m1", "m9", "Cold compartment", "some content body", Date.now());
         const b = computeM0BlockTokens(db, SESSION_ID, {
             m0Text: "", // no materialized m[0] yet
-            projectIdentity: undefined,
-            injectionBudgetTokens: undefined,
-            memoryBlockCount: 0,
         });
         expect(b.compartmentTokens).toBe(
             estimateTokens("## 1-9 · Cold compartment\nsome content body\n"),

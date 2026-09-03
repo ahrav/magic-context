@@ -99,6 +99,22 @@ describe("parseReadResponse", () => {
         expect(parsed.payload?.rows[0]?.token).toEqual({ object_id: "o1", known_as_of: 7 });
     });
 
+    test("a decision row is typed and a null decision is absent", () => {
+        const decision = {
+            decision_kind: "memory",
+            payload: { summary: "s", rationale: "r" },
+        };
+        const parsed = parseReadResponse({
+            ...good,
+            rows: [
+                { ...readRow("o1", 7), decision },
+                { ...readRow("o2", 7), decision: null },
+            ],
+        });
+        expect(parsed.payload?.rows[0]?.decision).toEqual(decision);
+        expect(parsed.payload?.rows[1]).not.toHaveProperty("decision");
+    });
+
     test("a non-available state carries no payload", () => {
         const parsed = parseReadResponse({
             state: { kind: "abstained", lag_positions: 9, oldest_unconsumed_age_ms: 1 },
@@ -124,6 +140,18 @@ describe("parseReadResponse", () => {
         [
             "row with bad visibility",
             { ...good, rows: [{ ...readRow("o1", 7), visibility: "shown" }] },
+        ],
+        [
+            "row with a decision missing its rationale",
+            {
+                ...good,
+                rows: [
+                    {
+                        ...readRow("o1", 7),
+                        decision: { decision_kind: "memory", payload: { summary: "s" } },
+                    },
+                ],
+            },
         ],
     ])("%s parses to unrecognized_state", (_label, raw) => {
         const parsed = parseReadResponse(raw);

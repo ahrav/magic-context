@@ -13,8 +13,7 @@ import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
-import { recordDeliveredAntiMemoryUsage } from "../../features/magic-context/memory/storage-claim-operations";
-import { autoSearchHintFragmentsStillEligible } from "../../features/magic-context/memory/storage-claim-visibility";
+import { resolveProjectRootDirectory } from "../../features/magic-context/memory/project-identity";
 import type {
     UnifiedSearchOptions,
     UnifiedSearchResult,
@@ -25,9 +24,16 @@ import {
     appendAutoSearchHintDecision,
     getAutoSearchHintDecisions,
 } from "../../features/magic-context/storage-meta-persisted";
+import {
+    type KernelClient,
+    type KernelClientResolver,
+    type KernelMemorySnapshot,
+    kernelMemorySnapshotFrom,
+} from "../../shared/kernel-client";
 import { log, sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
-import { collectAntiMemoryWarningFragments, packAutoSearchHint } from "./auto-search-hint";
+import { searchKernelMemoryRows } from "../../tools/ctx-search/kernel-memory-search";
+import { packAutoSearchHint } from "./auto-search-hint";
 import {
     AUTO_SEARCH_RESULT_LIMIT,
     AUTO_SEARCH_SOURCES,
@@ -51,11 +57,16 @@ const AUTO_SEARCH_OK: AutoSearchOutcome = { ok: true };
 export type AutoSearchDeliveryReason =
     | "delivered"
     | "empty"
+    | "memory-abstained"
+    | "memory-unavailable"
     | "below-threshold"
     | "packer-empty"
     | "timeout";
 
-/** Below-threshold, empty, packer-empty, and timeout are completed empty-delivery outcomes.
+/** Below-threshold, empty, memory-abstained, memory-unavailable, packer-empty, and timeout are
+ * completed empty-delivery outcomes. The two memory reasons replace `empty` when the kernel
+ * withheld or could not serve memory, so an empty turn is not mistaken for a project with
+ * nothing relevant.
  * Search failures are incomplete evidence, not empty rankings.
  * The delivered variant carries a non-null hint because the packer-empty branch rejects a null pack.
  *  `reason`. */
@@ -99,6 +110,22 @@ function emptyDelivery(
  * `runAutoSearchHint` gives structured callers the transform's source restrictions, timeout, and packing.
  * Persistence and message mutation stay with the transform caller.
  */
+/** The `memory` source is served by the kernel; every other source still reads the local database. */
+function localSources(sources: readonly string[] | undefined): UnifiedSearchOptions["sources"] {
+    return (sources ?? [])
+        .filter((source) => source !== "memory")
+        .map((source) => source as NonNullable<UnifiedSearchOptions["sources"]>[number]);
+}
+
+/** The no-hint reason an empty turn records, given how the kernel answered. */
+function emptyReason(
+    memory: KernelMemorySnapshot | null,
+): "empty" | "memory-abstained" | "memory-unavailable" {
+    if (memory?.state.kind === "abstained") return "memory-abstained";
+    if (memory?.state.kind === "unavailable") return "memory-unavailable";
+    return "empty";
+}
+
 export async function executeAutoSearchDelivery(args: {
     db: Database;
     sessionId: string;
@@ -106,29 +133,52 @@ export async function executeAutoSearchDelivery(args: {
     prompt: string;
     searchOptions: UnifiedSearchOptions;
     scoreThreshold: number;
+    /** Serves the `memory` source; absent when memory is disabled or the `memory` source is not requested. */
+    kernelClient?: KernelClient;
     timeoutMs?: number;
     /** The reference clock defaults to the live clock for hint-age wording.
      * */
     packNowMs?: number;
 }): Promise<AutoSearchDelivery> {
-    let results: UnifiedSearchResult[] | null;
+    const memoryRequested = (args.searchOptions.sources ?? []).includes("memory");
+    const kernelClient = memoryRequested ? args.kernelClient : undefined;
+    const limit = args.searchOptions.limit ?? AUTO_SEARCH_RESULT_LIMIT;
+    let timed: { results: UnifiedSearchResult[]; memory: KernelMemorySnapshot | null } | null;
     try {
-        results = await unifiedSearchWithTimeout(
+        timed = await unifiedSearchWithTimeout(
             args.db,
             args.sessionId,
             args.projectPath,
             args.prompt,
-            args.searchOptions,
+            { ...args.searchOptions, sources: localSources(args.searchOptions.sources) },
             args.timeoutMs ?? AUTO_SEARCH_TIMEOUT_MS,
+            kernelClient
+                ? async (signal, deadlineMs) =>
+                      kernelMemorySnapshotFrom(
+                          await kernelClient.read({
+                              surface: "auto_search",
+                              gated: true,
+                              signal,
+                              deadlineMs,
+                          }),
+                      )
+                : undefined,
         );
     } catch (error) {
         return { status: "incomplete", kind: "search-failure", error };
     }
-    if (results === null) {
+    if (timed === null) {
         return emptyDelivery("timeout", []);
     }
+    const memoryHits =
+        timed.memory === null
+            ? null
+            : searchKernelMemoryRows({ rows: timed.memory.rows, query: args.prompt, limit });
+    const results = [...(memoryHits ?? []), ...timed.results]
+        .sort((left, right) => right.score - left.score)
+        .slice(0, limit);
     if (results.length === 0) {
-        return emptyDelivery("empty", results);
+        return emptyDelivery(emptyReason(timed.memory), results);
     }
     if (results[0].score < args.scoreThreshold) {
         return emptyDelivery("below-threshold", results);
@@ -158,9 +208,21 @@ export interface AutoSearchRunnerOptions {
     directory?: string;
     projectPath: string;
     ensureProjectRegistered?: (directory: string, db: Database) => Promise<void>;
+    /** Serves the `memory` source; absent when no daemon transport exists. */
+    kernelClient?: KernelClientResolver;
     memoryEnabled?: boolean;
     embeddingEnabled?: boolean;
     gitCommitsEnabled?: boolean;
+}
+
+/**
+ * Persisted anti-memory warnings never replay; each warning requires a fresh
+ * search. Ordinary hints carry an empty fragment list and replay on every pass.
+ */
+export function autoSearchHintReplayable(
+    decision: Extract<AutoSearchHintDecision, { decision: "hint" }>,
+): boolean {
+    return decision.memoryFragments !== undefined && decision.memoryFragments.length === 0;
 }
 
 export function collectUserPromptParts(message: MessageLike): string {
@@ -212,18 +274,16 @@ export async function runAutoSearchHint(args: {
     if (!userMsg || typeof userMsg.info.id !== "string") return AUTO_SEARCH_OK;
     const userMsgId = userMsg.info.id;
 
-    // Persisted anti-memory warnings never replay; each warning requires a fresh search.
-    // Ordinary hints carry no memory fragments and can replay.
     const replayHintIfEligible = (decision: AutoSearchHintDecision): void => {
         if (decision.decision !== "hint") return;
-        if (!autoSearchHintFragmentsStillEligible(db, decision.memoryFragments)) {
-            sessionLog(
-                sessionId,
-                `auto-search: suppressing persisted anti-memory warning for ${decision.messageId} — fresh search required`,
-            );
+        if (autoSearchHintReplayable(decision)) {
+            appendReminderToUserMessageById(messages, decision.messageId, decision.text);
             return;
         }
-        appendReminderToUserMessageById(messages, decision.messageId, decision.text);
+        sessionLog(
+            sessionId,
+            `auto-search: suppressing persisted anti-memory warning for ${decision.messageId} — fresh search required`,
+        );
     };
 
     const existing = getAutoSearchHintDecisions(db, sessionId);
@@ -301,6 +361,14 @@ export async function runAutoSearchHint(args: {
             prompt: rawPrompt,
             searchOptions,
             scoreThreshold: options.scoreThreshold,
+            ...(memoryEnabled !== false && options.kernelClient && options.directory
+                ? {
+                      kernelClient: options.kernelClient({
+                          sessionId,
+                          projectRoot: resolveProjectRootDirectory(options.directory),
+                      }),
+                  }
+                : {}),
         });
     } catch (error) {
         delivery = { status: "incomplete", kind: "search-failure", error };
@@ -324,8 +392,15 @@ export async function runAutoSearchHint(args: {
     }
 
     const results = delivery.prePack;
-    if (delivery.reason === "empty" || delivery.reason === "packer-empty") {
+    if (delivery.reason === "packer-empty") {
         return writeNoHintAndReconcile("empty");
+    }
+    if (
+        delivery.reason === "empty" ||
+        delivery.reason === "memory-abstained" ||
+        delivery.reason === "memory-unavailable"
+    ) {
+        return writeNoHintAndReconcile(delivery.reason);
     }
     if (delivery.reason === "below-threshold") {
         sessionLog(
@@ -338,26 +413,18 @@ export async function runAutoSearchHint(args: {
     const hintText = delivery.hintText;
 
     const payload = `\n\n${hintText}`;
-    // Any anti-memory fragment marks the persisted decision as non-replayable.
-    const { warningResults, memoryFragments } = collectAntiMemoryWarningFragments(
-        delivery.delivered,
-    );
+    // Kernel memory hits carry no claim fragments, so the persisted hint replays on later passes.
     const outcome = appendAutoSearchHintDecision(db, sessionId, {
         messageId: userMsgId,
         decision: "hint",
         text: payload,
-        memoryFragments,
+        memoryFragments: [],
     });
     if (!outcome.ok) {
         sessionLog(sessionId, `auto-search: CAS exhausted for ${userMsgId}; skipping wire append`);
         return { ok: false, kind: "cas-exhaustion" };
     }
-    if (outcome.kind === "appended" && warningResults.length > 0) {
-        appendReminderToUserMessageById(messages, userMsgId, payload);
-        recordDeliveredAntiMemoryUsage(db, warningResults);
-    } else {
-        replayHintIfEligible(outcome.decision);
-    }
+    replayHintIfEligible(outcome.decision);
     sessionLog(
         sessionId,
         `auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,
