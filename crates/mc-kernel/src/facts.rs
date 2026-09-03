@@ -39,8 +39,8 @@ pub struct ArtifactBudgetFacts {
 impl KernelStore {
     /// Samples transaction-consistent commit facts, then database-family and artifact sizes.
     ///
-    /// `now_ms` and `oldest_unconsumed_age_ms` are Unix-epoch milliseconds. Future-dated
-    /// outbox rows report age zero. Missing database sidecar files contribute zero bytes.
+    /// `now_ms` is Unix-epoch milliseconds, while `oldest_unconsumed_age_ms` is an elapsed age in milliseconds measured from the oldest pending outbox row.
+    /// Future-dated outbox rows report age zero. Missing database sidecar files contribute zero bytes.
     pub fn facts(&self, now_ms: i64) -> Result<KernelFacts, KernelError> {
         if now_ms < 0 {
             return Err(KernelError::InvalidInput);

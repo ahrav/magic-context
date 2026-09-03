@@ -344,7 +344,10 @@ fn completed_tool_arc_ranges(blocks: &[FlatBlock]) -> Vec<MessageRange> {
     ranges
 }
 
-/// Builds the next token-bounded historian chunk before `eligible_end_ordinal`.
+/// Builds the next historian chunk before `eligible_end_ordinal`.
+///
+/// `token_budget` bounds the chunk except for a first block that exceeds it alone, which is emitted whole so the chunk is never empty.
+/// A caller that must respect a provider context limit still truncates the result.
 pub fn build_historian_chunk(
     messages: &[CkIngressMessage],
     blocks: &[FlatBlock],

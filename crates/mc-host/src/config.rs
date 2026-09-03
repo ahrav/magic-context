@@ -160,7 +160,7 @@ pub struct HostTiming {
     pub lifecycle_callback_deadline: Duration,
     /// The route-close budget settles or cancels one route's admitted work.
     pub route_close_budget: Duration,
-    /// Deadline for transport setup after route admission.
+    /// Ring preparation and setup-socket activation each start a separate deadline, so setup can take up to twice this duration.
     pub transport_setup_deadline: Duration,
     /// The shutdown deadline covers the whole graceful-shutdown drain.
     pub shutdown_deadline: Duration,
