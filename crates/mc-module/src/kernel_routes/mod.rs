@@ -142,13 +142,17 @@ impl KernelOpenCoordinator {
     /// Publishes `block` only while the phase is still `Ready`, under the same
     /// lock `mark_unavailable` holds, so the two can never interleave; a phase
     /// change wins and is republished instead.
-    pub(crate) fn publish_if_ready(&self, block: health::KernelHealthBlock) -> bool {
+    pub(crate) fn publish_if_ready(
+        &self,
+        block: health::KernelHealthBlock,
+        sampled: Instant,
+    ) -> bool {
         let _slot = self.slot.lock().expect("kernel store slot mutex");
         if self.phase() != Phase::Ready {
             self.publish_phase();
             return false;
         }
-        self.health.publish(block);
+        self.health.publish(block, sampled);
         true
     }
 

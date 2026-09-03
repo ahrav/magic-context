@@ -124,10 +124,12 @@ pub(crate) struct PublishedBlock {
 }
 
 impl PublishedBlock {
-    fn now(block: KernelHealthBlock) -> Self {
+    /// `sampled` is when the block's facts were read, so a walk that already
+    /// ran past the bound publishes a block that is stale on arrival.
+    fn sampled_at(block: KernelHealthBlock, sampled: Instant) -> Self {
         Self {
             block,
-            stale_at: Instant::now() + SAMPLE_STALE_AFTER,
+            stale_at: sampled + SAMPLE_STALE_AFTER,
         }
     }
 
@@ -144,12 +146,15 @@ pub(crate) struct KernelHealthProjection {
 impl KernelHealthProjection {
     pub(crate) fn new() -> Self {
         Self {
-            snapshot: ArcSwap::from_pointee(PublishedBlock::now(KernelHealthBlock {
-                kernel_state: KernelState::Starting,
-                unavailable_reason: None,
-                sampled_at_ms: None,
-                facts: None,
-            })),
+            snapshot: ArcSwap::from_pointee(PublishedBlock::sampled_at(
+                KernelHealthBlock {
+                    kernel_state: KernelState::Starting,
+                    unavailable_reason: None,
+                    sampled_at_ms: None,
+                    facts: None,
+                },
+                Instant::now(),
+            )),
         }
     }
 
@@ -157,8 +162,9 @@ impl KernelHealthProjection {
         self.snapshot.load_full()
     }
 
-    pub(crate) fn publish(&self, block: KernelHealthBlock) {
-        self.snapshot.store(Arc::new(PublishedBlock::now(block)));
+    pub(crate) fn publish(&self, block: KernelHealthBlock, sampled: Instant) {
+        self.snapshot
+            .store(Arc::new(PublishedBlock::sampled_at(block, sampled)));
     }
 
     /// Moves the current block's stale deadline to now.
@@ -188,7 +194,8 @@ impl KernelOpenCoordinator {
     /// between samples such as open failure or shutdown.
     pub(crate) fn publish_phase(&self) {
         let sampled_at_ms = self.health.load().block.sampled_at_ms;
-        self.health.publish(self.phase_block(sampled_at_ms));
+        self.health
+            .publish(self.phase_block(sampled_at_ms), Instant::now());
     }
 
     /// `cancel` is checked by the blocking sampler so shutdown can stop an
@@ -201,6 +208,7 @@ impl KernelOpenCoordinator {
                 return false;
             }
         };
+        let started = Instant::now();
         let cancel = cancel.clone();
         let worker = tokio::task::spawn_blocking(move || {
             store
@@ -222,7 +230,7 @@ impl KernelOpenCoordinator {
         };
         let sampled = block.facts.is_some();
         // The store may have been replaced while the worker ran; the phase wins.
-        self.publish_if_ready(block) && sampled
+        self.publish_if_ready(block, started) && sampled
     }
 
     pub(crate) async fn run_sampler(self: Arc<Self>, cancel: CancellationToken) {
