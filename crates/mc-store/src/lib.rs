@@ -4960,7 +4960,7 @@ pub enum StateImportError {
     Store(McStoreError),
     #[error("session already has durable state")]
     SessionNotEmpty,
-    #[error("{}: {0}", .0.code())]
+    #[error("{}: {}", .0.code(), .0)]
     Validation(StateImportValidationError),
 }
 

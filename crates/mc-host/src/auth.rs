@@ -563,6 +563,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_variants_with_a_named_source_field_report_a_source() {
+        let io = AuthError::Io {
+            stage: AuthStage::ClientHello,
+            source: io::Error::other("io"),
+        };
+        assert!(
+            std::error::Error::source(&io).is_some(),
+            "Io names its wrapped error `source`, so it must stay in the chain"
+        );
+
+        let decode = AuthError::JsonDecode {
+            stage: AuthStage::ClientHello,
+            source: serde_json::from_str::<u8>("{").expect_err("malformed json"),
+        };
+        assert!(
+            std::error::Error::source(&decode).is_some(),
+            "JsonDecode names its wrapped error `source`, so it must stay in the chain"
+        );
+
+        let timeout = AuthError::Timeout {
+            stage: AuthStage::ClientHello,
+            deadline: Duration::from_secs(1),
+        };
+        assert!(
+            std::error::Error::source(&timeout).is_none(),
+            "Timeout wraps nothing and must report no source"
+        );
+    }
+
+    #[test]
     fn proof_debug_output_never_carries_the_proof_bytes() {
         let sentinel = 0xAB;
         let server = ServerProof {
