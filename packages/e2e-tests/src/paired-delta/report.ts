@@ -646,7 +646,17 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     const exclusionsByArm = new Map<string, number>();
     for (const { armId, count } of body.exclusions) exclusionsByArm.set(armId, (exclusionsByArm.get(armId) ?? 0) + count);
     for (const [armId, total] of exclusionsByArm) {
-        if (total > body.runSummary.plannedCoordinates) p.fail(`report.body.exclusions: ${armId}-exceeds-plan`);
+        // A healthy coordinate completed every primary arm, and a completed cell carries no exclusion, so a
+        // primary arm's exclusions fit in the unhealthy remainder.
+        const ceiling = (PRIMARY_ARM_IDS as readonly string[]).includes(armId)
+            ? body.runSummary.plannedCoordinates - body.runSummary.healthyCoordinates
+            : body.runSummary.plannedCoordinates;
+        if (total > ceiling) p.fail(`report.body.exclusions: ${armId}-exceeds-plan`);
+    }
+    // The two counters partition the final record array, which holds at most one record per arm per coordinate.
+    if (body.runSummary.observedCostRollouts + body.runSummary.estimatedCostRollouts >
+        body.runSummary.plannedCoordinates * ARM_IDS.length) {
+        p.fail("report.body.runSummary.observedCostRollouts: exceeds-plan");
     }
     // A healthy coordinate completed every primary arm, and the runner refuses a completed cell priced as an
     // estimate, so each one carries at least one observed rollout per primary arm.
@@ -660,6 +670,12 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     if (body.runSummary.calibrationFingerprint !== null) {
         const derived = body.analysis.evidenceSufficient && body.runSummary.healthyCoordinates >= body.runSummary.plannedCoordinates;
         if (body.runSummary.evidenceComplete !== derived) p.fail("report.body.runSummary.evidenceComplete: derived-mismatch");
+    } else if (body.runSummary.evidenceComplete) {
+        // Calibration completeness is `validForPoolSizing`, which requires a completed run and full replicate
+        // depth counted over complete-primary coordinates. Variance validity is not recoverable here.
+        if (body.runSummary.status !== "completed" || body.runSummary.healthyCoordinates !== body.runSummary.plannedCoordinates) {
+            p.fail("report.body.runSummary.evidenceComplete: derived-mismatch");
+        }
     }
     // Raw regret records are written while iterating the planned coordinates.
     const rawCoordinates = new Set(body.analysis.rawRegretRecords.map(({ coordinateId }) => coordinateId));

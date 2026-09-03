@@ -1895,6 +1895,7 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     if (recall !== null && (expectedClaimsTotal === 0 || recall !== expectedClaimsMatched / expectedClaimsTotal)) {
         p.fail(`${label}.recall: derived-mismatch`);
     }
+    const source = p.enumeration(value.source, SCORE_SOURCES, `${label}.source`);
     const verdict = p.enumeration(value.verdict, SCENARIO_VERDICTS, `${label}.verdict`);
     const failReasons = p.array(value.failReasons, `${label}.failReasons`)
         .map((entry, index) => p.enumeration(entry, FAIL_REASONS, `${label}.failReasons[${index}]`));
@@ -1924,10 +1925,19 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         // `assembleScore` clears both on any non-error score. The one exception is an aborted record whose
         // claims still matched an expected-absent predicate: `scoreRunRecord` keeps the abort's reason on
         // that FAIL, and its reasons are exactly `false-authoritative`.
-        const abortedFalseAuthoritative = verdict === "FAIL" &&
+        const abortedFalseAuthoritative = source === "run-record" && verdict === "FAIL" &&
             failReasons.length === 1 && failReasons[0] === "false-authoritative";
-        if ((errorReason !== null || errorDetail !== null) && !abortedFalseAuthoritative) {
-            p.fail(`${label}.errorReason: derived-mismatch`);
+        if (errorReason !== null || errorDetail !== null) {
+            if (!abortedFalseAuthoritative) p.fail(`${label}.errorReason: derived-mismatch`);
+            // `errorScore` sets both fields from the record's error, whose reason is a string.
+            if (errorReason === null) p.fail(`${label}.errorReason: derived-mismatch`);
+        }
+        // A lint-admitted scenario declares at least one probe and a run yields a verdict for each, so a
+        // run-record score with no probe evidence never reached the scorer. The raw-output seam has no probes.
+        // The two run-record scores built by `errorScore` rather than the scorer carry none.
+        const scorerBypassed = failReasons.includes("invalid-output") || abortedFalseAuthoritative;
+        if (source === "run-record" && probeVerdicts.length === 0 && !scorerBypassed) {
+            p.fail(`${label}.probeVerdicts: probes-required`);
         }
         if ((verdict === "PASS") !== (failReasons.length === 0)) p.fail(`${label}.verdict: derived-mismatch`);
         // `assembleScore` turns an unmeasurable probe with no other failure into an ERROR, never a PASS.
@@ -1956,7 +1966,7 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         structuralFindings,
         probeVerdicts,
         system: parseSystemVersionTuple(p, value.system, `${label}.system`),
-        source: p.enumeration(value.source, SCORE_SOURCES, `${label}.source`),
+        source,
     };
 }
 
@@ -1985,6 +1995,16 @@ export function parseLaneReport(raw: unknown): LaneReport {
         red: p.boolean(root.red, "report.red"),
         runFatal: p.boolean(root.runFatal, "report.runFatal"),
     };
+    // A run-record score reaches the scorer only after its record's system passed shape validation, so a
+    // non-error lane score carries a tuple, and `resolveReportSystem` would otherwise fall back to whatever
+    // root the archive supplies.
+    for (const [index, score] of report.scenarios.entries()) {
+        if (score.verdict === "ERROR" || score.source !== "run-record") continue;
+        if (score.system === null) p.fail(`report.scenarios[${index}].system: system-required`);
+        if (report.system !== null && canonicalJson(score.system) !== canonicalJson(report.system)) {
+            p.fail(`report.scenarios[${index}].system: report-system-mismatch`);
+        }
+    }
     // Rebuilding verifies that the scenarios satisfy the builder's admission rules and that the archived derived fields match.
     let rebuilt: LaneReport;
     try {

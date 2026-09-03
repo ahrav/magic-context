@@ -514,7 +514,11 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
             backed.set(entry.scenarioId, (backed.get(entry.scenarioId) ?? 0) + 1);
         }
         for (const [index, row] of report.coverage.entries()) {
-            if (row.applied > (backed.get(row.scenarioId) ?? 0)) p.fail(`report.coverage[${index}].applied: derived-mismatch`);
+            if (row.applied !== (backed.get(row.scenarioId) ?? 0)) p.fail(`report.coverage[${index}].applied: derived-mismatch`);
+            // Both producers record this violation whenever nothing applied.
+            if (row.applied === 0 && !row.violations.includes("no transforms applied")) {
+                p.fail(`report.coverage[${index}].violations: derived-mismatch`);
+            }
         }
     }
     // Both producers write one coverage row per selected scenario, and `metamorphicExitCode` reads violations
@@ -540,7 +544,12 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     if (report.system !== null) {
         const rootSystem = canonicalJson(report.system);
         for (const [index, entry] of report.entries.entries()) {
-            if (entry.kind !== "scored" || entry.baselineScore.system === null) continue;
+            if (entry.kind !== "scored") continue;
+            // `scoreRunRecord` scores only a record whose system passed shape validation.
+            if (entry.baselineScore.system === null) {
+                if (entry.baselineScore.source === "run-record") p.fail(`report.entries[${index}]: system-required`);
+                continue;
+            }
             if (canonicalJson(entry.baselineScore.system) !== rootSystem) {
                 p.fail(`report.entries[${index}]: report-system-mismatch`);
             }

@@ -2343,7 +2343,8 @@ describe("buildLaneReport", () => {
             visibleClaimsTotal: 2,
             falseAuthoritativeMatches: [],
             structuralFindings: [],
-            probeVerdicts: [],
+            // A lint-admitted scenario declares at least one probe, and a run answers each.
+            probeVerdicts: [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: "yes" }],
             // Lane scores come from runs, so the report accepts only scores with both a system and source.
             system: LANE_SYSTEM,
             source: "run-record",
@@ -2574,6 +2575,17 @@ describe("buildLaneReport", () => {
         const trimmedPass = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         trimmedPass.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "error-trimmed", expected: "yes", actual: null }];
         expect(() => parseLaneReport(trimmedPass)).toThrow(/report\.scenarios\[0\]\.verdict: derived-mismatch/);
+        // A run-record score carries the tuple its record was validated with, and it is the lane's tuple.
+        const nulledSystems = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        nulledSystems.scenarios[0]!.system = null;
+        expect(() => parseLaneReport(nulledSystems)).toThrow(/report\.scenarios\[0\]\.system: system-required/);
+        const foreignSystem = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        foreignSystem.scenarios[0]!.system = { ...LANE_SYSTEM, historianModelId: "other" };
+        expect(() => parseLaneReport(foreignSystem)).toThrow(/report\.scenarios\[0\]\.system: report-system-mismatch/);
+        // A passing run-record score answered at least one probe.
+        const probeless = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        probeless.scenarios[0]!.probeVerdicts = [];
+        expect(() => parseLaneReport(probeless)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: probes-required/);
         // A probe passes only on a non-null answer.
         const answerlessPass = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         answerlessPass.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: null }];

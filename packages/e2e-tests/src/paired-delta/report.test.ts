@@ -88,13 +88,15 @@ function report(overrides: Partial<Parameters<typeof buildPairedDeltaReport>[0]>
         runSummary: {
             status: "completed" as const,
             spentUsd: 12.5,
-            // Twelve healthy coordinates each completed three primary arms, so the runner observed at least 36 rollouts.
-            observedCostRollouts: 36,
-            estimatedCostRollouts: 1,
+            // Nine healthy coordinates each completed three primary arms, so the runner observed at least 27 rollouts;
+            // the three unhealthy coordinates hold the primary-arm exclusions below.
+            observedCostRollouts: 27,
+            estimatedCostRollouts: 3,
             refusedRegretLadders: { "intervention-mismatch": 2 },
             plannedCoordinates: 12,
-            healthyCoordinates: 12,
-            evidenceComplete: true,
+            healthyCoordinates: 9,
+            // A calibration run with a partial matrix cannot be valid for pool sizing.
+            evidenceComplete: false,
             calibrationFingerprint: null,
         },
         exclusions: [
@@ -1025,11 +1027,25 @@ describe("parsePairedDeltaReport", () => {
             body.runSummary.calibrationFingerprint = H1;
             body.runSummary.evidenceComplete = !body.runSummary.evidenceComplete;
         }))).toThrow(/report\.body\.runSummary\.evidenceComplete: derived-mismatch/);
-        // A calibration report derives completeness from calibration validity instead, which the body does not carry.
+        // A calibration report derives completeness from calibration validity, which the body does not carry,
+        // but validity needs a completed run over a full matrix, so a partial matrix cannot be complete.
         expect(() => parsePairedDeltaReport(forge((body) => {
             expect(body.runSummary.calibrationFingerprint).toBeNull();
-            body.runSummary.evidenceComplete = !body.runSummary.evidenceComplete;
+            expect(body.runSummary.healthyCoordinates).toBeLessThan(body.runSummary.plannedCoordinates);
+            body.runSummary.evidenceComplete = true;
+        }))).toThrow(/report\.body\.runSummary\.evidenceComplete: derived-mismatch/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.runSummary.healthyCoordinates = body.runSummary.plannedCoordinates;
+            body.runSummary.observedCostRollouts = 36;
+            body.exclusions = [];
+            body.runSummary.evidenceComplete = true;
         }))).not.toThrow();
+        // A primary arm's exclusions fit within the unhealthy coordinates.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.exclusions.find(({ armId }) => armId === "compaction")!.count = 4;
+        }))).toThrow(/report\.body\.exclusions: compaction-exceeds-plan/);
+        expect(() => parsePairedDeltaReport(forge((body) => { body.runSummary.estimatedCostRollouts = 999; })))
+            .toThrow(/report\.body\.runSummary\.observedCostRollouts: exceeds-plan/);
         // Every analyzable family needs a coordinate whose primary arms all completed.
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.runSummary.healthyCoordinates = 0;

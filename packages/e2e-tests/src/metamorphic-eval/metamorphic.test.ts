@@ -167,6 +167,16 @@ describe("deterministic metamorphic runner", () => {
         inflatedApplied.coverage[0]!.applied += 1;
         expect(metamorphicExitCode(inflatedApplied)).toBe(metamorphicExitCode(report));
         expect(() => parseMetamorphicReport(inflatedApplied)).toThrow(/report\.coverage\[0\]\.applied: derived-mismatch/);
+        const deflatedApplied = structuredClone(report);
+        deflatedApplied.coverage[0]!.applied -= 1;
+        expect(() => parseMetamorphicReport(deflatedApplied)).toThrow(/report\.coverage\[0\]\.applied: derived-mismatch/);
+        // A scenario nothing applied to records that as a violation.
+        const silentZero = structuredClone(report);
+        const zeroRow = silentZero.coverage[0]!;
+        silentZero.entries = silentZero.entries.filter((entry) => entry.scenarioId !== zeroRow.scenarioId || entry.kind === "lint-red");
+        zeroRow.applied = 0;
+        zeroRow.violations = [];
+        expect(() => parseMetamorphicReport(silentZero)).toThrow(/report\.coverage\[0\]\.violations: derived-mismatch/);
         const duplicateCoverage = structuredClone(invalid);
         duplicateCoverage.coverage.push(structuredClone(duplicateCoverage.coverage[0]!));
         expect(() => parseMetamorphicReport(duplicateCoverage)).toThrow(/report\.coverage: duplicate/);
@@ -322,6 +332,9 @@ describe("deterministic metamorphic runner", () => {
             if (entry.kind !== "scored") continue;
             entry.baselineScore.source = "run-record";
             entry.derivativeScore.source = "run-record";
+            const probe = { probeId: "probe-1", outcome: "pass" as const, expected: "yes", actual: "yes" };
+            entry.baselineScore.probeVerdicts = [probe];
+            entry.derivativeScore.probeVerdicts = [probe];
             entry.invariants = entry.invariants.filter(({ invariant }) =>
                 invariant !== "expected-absent-empty" && invariant !== "verdict-monotonicity");
         }
@@ -341,6 +354,14 @@ describe("deterministic metamorphic runner", () => {
         rootMismatch.entries.sort((left, right) =>
             `${left.scenarioId}\u0000${left.transformId}`.localeCompare(`${right.scenarioId}\u0000${right.transformId}`));
         expect(() => parseMetamorphicReport(rootMismatch)).toThrow(/report\.entries\[\d+\]: report-system-mismatch/);
+        // A run-record score carries the tuple its record was validated with.
+        const nullPairSystem = structuredClone(rootMismatch);
+        for (const entry of nullPairSystem.entries) {
+            if (entry.kind !== "scored") continue;
+            entry.baselineScore.system = null;
+            entry.derivativeScore.system = null;
+        }
+        expect(() => parseMetamorphicReport(nullPairSystem)).toThrow(/report\.entries\[\d+\]: system-required/);
         // A live report always names the system it ran.
         const identityless = structuredClone(rootMismatch);
         identityless.system = null;
@@ -370,6 +391,7 @@ describe("deterministic metamorphic runner", () => {
         if (mixedEntry.kind !== "scored") throw new Error("unreachable");
         expect(mixedEntry.baselineScore.source).toBe("raw-output");
         mixedEntry.derivativeScore.source = "run-record";
+        mixedEntry.derivativeScore.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: "yes" }];
         expect(metamorphicExitCode(mixedSource)).toBe(metamorphicExitCode(report));
         expect(() => parseMetamorphicReport(mixedSource))
             .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: pair-source-mismatch`));
