@@ -5,11 +5,8 @@
 
 /// Allocates arena spans and accounts for their states.
 pub mod arena;
-/// Implements transport backends.
 pub mod backend;
-/// Validates peer-controlled frame descriptors.
 pub mod descriptor;
-/// Counts operations used to qualify transport behavior.
 pub mod evidence;
 /// Decodes untrusted bytes for fuzz and contract tests.
 pub mod harness;
@@ -17,9 +14,7 @@ pub mod harness;
 pub mod lease;
 /// Enforces ordered transport shutdown.
 pub mod lifecycle;
-/// Validates hardware profiles and accounts for admission.
 pub mod profile;
-/// Setup-handshake proof transcript shared by both peers.
 pub mod setup_auth;
 
 pub use arena::{MAX_FRAME_BYTES, MIN_ARENA_BYTES};

@@ -1,6 +1,8 @@
 //! N-API bridge for bounded shared-memory transport channels.
 //!
-//! Channel registries are thread-local, while grant claims are process-wide to prevent duplicate mappings across JavaScript workers. External views keep ring mappings alive until detachment succeeds.
+//! Channel registries are thread-local, while grant claims are process-wide to prevent duplicate
+//! mappings across JavaScript workers. External views keep ring mappings alive until detachment
+//! succeeds.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 

@@ -57,6 +57,8 @@ pub fn compute_proof(
 }
 
 /// Committed proof vectors used by both handshake implementations.
+///
+/// Exposed outside `cfg(test)` so both ends assert shared literals rather than their own output.
 pub mod vectors {
     use super::{DAEMON_ID_LEN, NONCE_LEN, PROOF_LEN};
 

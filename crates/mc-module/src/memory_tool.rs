@@ -250,8 +250,7 @@ struct RankedSearchResult {
 /// Matching is lowercase-based and non-regex. Title and note hits rank before
 /// compartment-body hits. Equal ranks sort by descending sequence or update time,
 /// then ascending source identifier. Results are truncated after sorting.
-/// Snippets contain at most 200 Unicode scalar values with about 100 bytes of
-/// context on each side of the first match.
+/// Snippets contain at most 200 Unicode scalar values plus truncation ellipses.
 ///
 /// # Errors
 ///

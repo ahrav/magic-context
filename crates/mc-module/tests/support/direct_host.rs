@@ -1,4 +1,4 @@
-//! This module provides direct-host process fixtures and protocol helpers for integration tests.
+//! Direct-host process fixtures and protocol helpers for integration tests.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};

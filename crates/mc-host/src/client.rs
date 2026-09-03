@@ -57,11 +57,13 @@ pub const CLIENT_STREAM_QUEUE_ITEMS: usize = 16;
 pub const CLIENT_DATA_QUEUE_FRAMES: usize = 256;
 /// `CLIENT_CONTROL_QUEUE_FRAMES` reserves slots for pure-header Pong, Cancel, and Goodbye frames.
 pub const CLIENT_CONTROL_QUEUE_FRAMES: usize = 32;
+/// Byte budget available to queued data frames.
 ///
 /// Reserved control frames use `CLIENT_CONTROL_QUEUED_BYTES` so ordinary traffic cannot starve them.
 /// A failed control-byte charge retires the generation.
 /// A failed data-byte charge returns a local error to that caller.
 pub const CLIENT_QUEUED_BYTES: usize = MAX_BODY_LEN as usize + 1_048_576;
+/// Byte budget reserved for queued control frames.
 ///
 /// `CLIENT_CONTROL_QUEUED_BYTES` covers exactly `CLIENT_CONTROL_QUEUE_FRAMES` header-only control frames.
 /// A control-byte charge can fail only when the control channel is full; that condition retires the generation.
@@ -1240,10 +1242,7 @@ impl Inner {
         Ok(PendingRemoval::Cancelled)
     }
 
-    ///
-    /// `flags` is explicit because `Pong` must echo `Ping` flags exactly, while §6.1 permits any valid priority.
-    /// `Pong` must echo `Ping` flags exactly (V35), while §6.1 permits any valid priority.
-    /// `Pong` must echo `Ping` flags exactly.
+    /// Queues one control frame; `Pong` echoes `Ping` flags exactly.
     fn send_control(
         &self,
         ty: FrameType,

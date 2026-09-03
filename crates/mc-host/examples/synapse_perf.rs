@@ -437,6 +437,7 @@ struct WireReply {
 struct RoutedWire {
     writer: Mutex<WriteHalf<UnixStream>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<(raw_client::RawFrame, u64)>>>,
+    /// Retains timed-out correlations to absorb late terminal replies.
     ///
     /// Timed-out correlations are never evicted; their late terminals consume them.
     /// FIFO eviction can evict a live correlation after unbounded timeouts, turning its late reply into a fatal unknown correlation.
@@ -450,6 +451,7 @@ struct RoutedWire {
     epoch: u32,
     origin: Instant,
     reader_error: Mutex<Option<String>>,
+    /// Counts writes that cross their caller deadline after starting.
     ///
     /// A `write_all` that starts before `deadline` must finish because cancelling it can leave a partial frame on the shared connection.
     /// A write that completes after `deadline` can perturb later load.
@@ -1368,6 +1370,7 @@ fn validate_vectors(json: &serde_json::Value, expected: usize) -> Result<(), Str
     Ok(())
 }
 
+/// Validates one batch response page against expected vectors and identity.
 ///
 /// The batch arm must validate vectors before recording completion.
 /// Corrupted vectors, a mismatched content hash, or a wrong lane identity must not produce `LogicalDisposition::Completed`.
@@ -1498,6 +1501,7 @@ struct TaskWindow {
     observed_end_ns: u64,
 }
 
+/// Observes task-counter deltas across the measured window.
 ///
 /// Sampling outside the measured window would charge warmup and post-window drain to the comparison.
 /// Sampling at `warmup_end` and `end` aligns CPU and context-switch deltas with the measured window.
@@ -1562,6 +1566,7 @@ fn window_boundaries(window: &perf_measurement::HoldWindow, start: Instant) -> (
     )
 }
 
+/// Joins a task-counter observation and rejects a mismatched window.
 ///
 /// The resource-shift comparison is meaningful only over the measured window.
 /// A missing sample is preferable to samples covering different intervals.

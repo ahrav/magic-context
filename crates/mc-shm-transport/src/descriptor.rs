@@ -108,7 +108,9 @@ impl Incarnation {
         Self(bytes)
     }
 
-    /// Returns the incarnation as bytes. commentlint: allow(JUDGE)
+    /// Returns the incarnation as bytes.
+    ///
+    /// Diagnostics must not include this setup-channel representation.
     pub const fn into_bytes(self) -> [u8; 16] {
         self.0
     }

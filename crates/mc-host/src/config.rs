@@ -66,9 +66,9 @@ pub struct HostLimits {
     /// request-derived input ownership, encoded frames, writer queues, and handler-declared
     /// retained bytes. It accounts for named logical payloads, not exact process RSS.
     ///
-    /// `max_resident_bytes` reserves [`EGRESS_RESERVED_BYTES`] for output and [`SCRATCH_RESERVED_BYTES`] for scratch; only the remaining capacity admits inbound frames.
-    /// Increasing `max_resident_bytes` enlarges only the inbound admission pool; scratch capacity remains bounded by [`SCRATCH_RESERVED_BYTES`].
-    /// Components that need more request scratch than [`SCRATCH_RESERVED_BYTES`] must declare limits that accommodate that scratch.
+    /// `max_resident_bytes` reserves `EGRESS_RESERVED_BYTES` for output and `SCRATCH_RESERVED_BYTES` for scratch; only the remaining capacity admits inbound frames.
+    /// Increasing `max_resident_bytes` enlarges only the inbound admission pool; scratch capacity remains bounded by `SCRATCH_RESERVED_BYTES`.
+    /// Components that need more request scratch than `SCRATCH_RESERVED_BYTES` must declare limits that accommodate that scratch.
     /// `max_resident_bytes` must be at least [`MIN_RESIDENT_BYTES`].
     /// Startup requires catalog and retained reservations to leave capacity for one maximum ingress body.
     pub max_resident_bytes: u64,

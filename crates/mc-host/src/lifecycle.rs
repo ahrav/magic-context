@@ -1801,6 +1801,7 @@ mod tests {
             .expect("the pre-poll notification must not be lost");
     }
 
+    /// Runs a potentially blocking test operation within a fixed budget.
     ///
     /// A thread blocked in `openat` on a writer-less FIFO cannot be cancelled or joined.
     /// A timeout must terminate the process because a blocked FIFO-open thread cannot be joined.

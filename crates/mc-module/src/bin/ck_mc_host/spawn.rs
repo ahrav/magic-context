@@ -60,6 +60,7 @@ fn open_log(log_path: &Path) -> Result<OwnedFd, SpawnError> {
     Ok(OwnedFd::from(file))
 }
 
+/// Moves a child-side descriptor above the standard streams.
 ///
 /// `relocate_above_stderr` moves every child-side source above fd 2 because `dup2` overwrites sources at fds 0–2.
 fn relocate_above_stderr(fd: OwnedFd) -> Result<OwnedFd, SpawnError> {

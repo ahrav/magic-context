@@ -17,6 +17,7 @@ pub struct LeaseSpan<'lease> {
 }
 
 impl<'lease> LeaseSpan<'lease> {
+    /// Creates a lease-bound raw mapped span.
     ///
     /// # Safety
     /// `base..base.add(len)` must remain mapped and readable for `'lease`.
@@ -40,7 +41,7 @@ impl<'lease> LeaseSpan<'lease> {
         self.base.as_ptr()
     }
 
-    /// Reports whether mapped length is zero. commentlint: allow(JUDGE)
+    /// Reports whether mapped length is zero.
     pub const fn is_empty(self) -> bool {
         self.len == 0
     }
@@ -109,6 +110,7 @@ pub struct ReceiveLease<'lease> {
 }
 
 impl<'lease> ReceiveLease<'lease> {
+    /// Creates a receive lease from mapped spans and a release callback.
     ///
     /// # Safety
     /// Spans and release context must remain valid for `'lease`.
@@ -143,17 +145,17 @@ impl<'lease> ReceiveLease<'lease> {
         })
     }
 
-    /// Returns declared body length in bytes across all segments. commentlint: allow(JUDGE)
+    /// Returns declared body length in bytes across all segments.
     pub const fn len(&self) -> usize {
         self.body_len
     }
 
-    /// Reports whether declared body length is zero. commentlint: allow(JUDGE)
+    /// Reports whether declared body length is zero.
     pub const fn is_empty(&self) -> bool {
         self.body_len == 0
     }
 
-    /// Returns one for contiguous bodies and two for wrapped bodies. commentlint: allow(JUDGE)
+    /// Returns one for contiguous bodies and two for wrapped bodies.
     pub const fn segment_count(&self) -> usize {
         self.span_count as usize
     }
@@ -171,7 +173,7 @@ impl<'lease> ReceiveLease<'lease> {
         self.wire_header
     }
 
-    /// Returns the exact identity consumed by release processing. commentlint: allow(JUDGE)
+    /// Returns the exact identity consumed by release processing.
     pub const fn identity(&self) -> ReleaseIdentity {
         self.identity
     }

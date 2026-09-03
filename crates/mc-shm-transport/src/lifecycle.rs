@@ -1,6 +1,6 @@
 use std::fmt;
 
-/// Ordered shutdown stage. commentlint: allow(JUDGE)
+/// Ordered shutdown stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseState {
     /// The lifecycle admits and publishes traffic.
@@ -21,20 +21,20 @@ pub enum CloseState {
     ReleasingSamples,
     /// The lifecycle drops transport mappings and objects.
     DroppingTransport,
-    /// Shutdown completed and storage can be reused. commentlint: allow(JUDGE)
+    /// Shutdown completed and storage can be reused.
     Joined,
     /// Storage can never be reused after `Quarantined`.
     Quarantined,
 }
 
-/// Validates shutdown transitions and tracks prepared setup. commentlint: allow(JUDGE)
+/// Validates shutdown transitions and tracks prepared setup.
 pub struct Lifecycle {
     state: CloseState,
     prepared: bool,
 }
 
 impl Lifecycle {
-    /// Starts unprepared in [`CloseState::Open`]. commentlint: allow(JUDGE)
+    /// Starts unprepared in [`CloseState::Open`].
     pub const fn new() -> Self {
         Self {
             state: CloseState::Open,
@@ -42,7 +42,7 @@ impl Lifecycle {
         }
     }
 
-    /// Marks setup complete once while lifecycle remains open. commentlint: allow(JUDGE)
+    /// Marks setup complete once while lifecycle remains open.
     pub fn mark_prepared(&mut self) -> Result<(), LifecycleError> {
         if self.state != CloseState::Open || self.prepared {
             return Err(LifecycleError::InvalidTransition);
@@ -51,7 +51,7 @@ impl Lifecycle {
         Ok(())
     }
 
-    /// Reports whether setup requires fail-closed cleanup. commentlint: allow(JUDGE)
+    /// Reports whether setup requires fail-closed cleanup.
     pub const fn must_fail_closed(&self) -> bool {
         self.prepared
     }
@@ -61,7 +61,7 @@ impl Lifecycle {
         self.state
     }
 
-    /// Advances one permitted shutdown edge. commentlint: allow(JUDGE)
+    /// Advances one permitted shutdown edge.
     pub fn advance(&mut self, next: CloseState) -> Result<(), LifecycleError> {
         let valid = matches!(
             (self.state, next),
@@ -95,7 +95,7 @@ impl Lifecycle {
         Ok(())
     }
 
-    /// Permits reuse only after [`CloseState::Joined`]. commentlint: allow(JUDGE)
+    /// Permits reuse only after [`CloseState::Joined`].
     pub fn reusable(&self) -> bool {
         self.state == CloseState::Joined
     }
@@ -117,12 +117,12 @@ impl fmt::Debug for Lifecycle {
     }
 }
 
-/// Reports rejected lifecycle transitions. commentlint: allow(JUDGE)
+/// Reports rejected lifecycle transitions.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleError {
-    /// Requested edge is outside ordered shutdown. commentlint: allow(JUDGE)
+    /// Requested edge is outside ordered shutdown.
     InvalidTransition,
-    /// Current state cannot transition further. commentlint: allow(JUDGE)
+    /// Current state cannot transition further.
     Terminal,
 }
 

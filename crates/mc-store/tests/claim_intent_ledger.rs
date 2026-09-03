@@ -1,4 +1,4 @@
-//! This module tests claim-intent durability, replay fencing, authority, and rebuild behavior.
+//! Claim-intent durability, replay fencing, authority, and rebuild tests.
 
 use cortexkit_store_types::StorageDescriptor;
 use mc_core::claim_operation::{

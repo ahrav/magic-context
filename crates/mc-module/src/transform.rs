@@ -7005,7 +7005,7 @@ fn reanchor_kept_synthetic_todo_if_folded_or_shrunk(
     Ok(())
 }
 
-///
+/// Cached tag baseline for one store generation.
 #[derive(Debug, Clone)]
 struct TagBaselineCacheEntry {
     store_namespace: u64,
@@ -7191,7 +7191,7 @@ struct TagMintWork {
     tokenized_bytes: usize,
 }
 
-///
+/// Memoized tag-mint frontier inputs and result.
 #[derive(Debug, Clone, Default)]
 struct TagMintFrontierMemo {
     block_keys: Vec<[u8; 32]>,
@@ -7858,6 +7858,7 @@ fn strip_tag_prefix(value: &str, tag_number: i64) -> &str {
     value.strip_prefix(&tag_prefix(tag_number)).unwrap_or(value)
 }
 
+/// Removes leading tag imitations outside inline-code spans.
 ///
 /// Lines inside an already-open inline-code span remain unchanged.
 /// The strip pass removes a `§N§` token only when whitespace, ASCII punctuation, or end of input follows it.
@@ -11577,7 +11578,7 @@ fn latest_assistant_message_mutation_exempt_mid(
         .map(|message| message.mid.as_str())
 }
 
-///
+/// Reports whether the request provider accepts empty content.
 pub(crate) fn request_accepts_empty_content(req: &TransformRequest) -> bool {
     req.provider_id.as_deref() == Some("anthropic")
 }
