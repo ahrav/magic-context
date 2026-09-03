@@ -216,7 +216,7 @@ fn recorded_block_survives_daemon_restart() {
             )
             .unwrap();
     }
-    // AE6: reopen the store — a fresh process with fresh (empty) caches.
+    // AE6: reopen the store as a fresh process with empty caches.
     let store = KernelStore::open(store_dir.path()).unwrap();
     let tip = store.known_as_of(0).unwrap().tip;
     let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
@@ -376,7 +376,7 @@ fn an_already_recorded_verdict_skips_the_commit() {
     ));
     let tip_after_first = store.known_as_of(0).unwrap().tip;
 
-    // A second engine — a different process, empty caches — reaches the same
+    // A second engine in a different process with empty caches reaches the same
     // stale verdict the record already holds.
     let second = ApplicabilityEngine::new()
         .evaluate(
@@ -1025,7 +1025,7 @@ fn the_repair_pass_stops_when_the_deadline_expires_mid_batch() {
 /// A worktree edit between the snapshot and the commit leaves the recorded
 /// fingerprint describing the snapshot rather than the committed worktree.
 /// The record is evidence as observed, and the next evaluation snapshots the
-/// changed worktree, derives a different dedup key, and supersedes it — so the
+/// changed worktree, derives a different dedup key, and supersedes it. The
 /// reducer converges without an unbounded worktree walk inside the writer.
 #[test]
 fn a_worktree_edit_after_the_snapshot_is_superseded_by_the_next_evaluation() {
@@ -1096,7 +1096,7 @@ fn a_worktree_edit_after_the_snapshot_is_superseded_by_the_next_evaluation() {
 
 /// One engine, one cache. A confirmed stale append, a clear, then a return to
 /// the failing state hits the cached stale entry whose append is already marked
-/// confirmed — so the flag cannot be what decides whether repair runs, or the
+/// confirmed. The flag therefore cannot decide whether repair runs, or the
 /// durable block would stay lifted while the object reads stale in-request.
 #[test]
 fn a_confirmed_cache_entry_still_repairs_after_a_clear() {
@@ -1484,7 +1484,7 @@ fn an_implements_observation_still_rebuilds_the_alignment_projection() {
 /// The checkout identity is a filesystem path. The slice redacts the payload
 /// document as one text field, so a path segment shaped like a secret would be
 /// rewritten inside the stored payload while the reducer compared against the
-/// caller's original path — and the block would never match its own checkout.
+/// caller's original path. The block would then never match its own checkout.
 #[test]
 fn a_secret_shaped_checkout_path_still_matches_its_own_block() {
     let store_dir = tempfile::tempdir().unwrap();
@@ -1560,7 +1560,7 @@ fn a_moved_head_with_the_same_failure_still_appends() {
     ));
 
     // HEAD advances; the checked file is still absent, so the verdict is stale
-    // again — at a checkout state the recorded observation does not describe.
+    // again at a checkout state the recorded observation does not describe.
     let moved = commit_snapshot(
         &fixture.repo,
         "moved",
@@ -1788,7 +1788,8 @@ fn a_retired_domain_discards_the_repair_instead_of_failing_the_evaluation() {
 /// before yielding the first one and the row-loop poll cannot run during that
 /// sort. A progress handler tied to the budget stops the statement itself, but it
 /// fires on a virtual-machine step boundary that a small scan can finish without
-/// reaching — so cancellation already raised is checked before the scan starts.
+/// reaching. Cancellation already raised is therefore checked before the scan
+/// starts.
 /// This asserts that check; the handler covers cancellation raised mid-sort,
 /// which needs a history too large to build here.
 #[test]
@@ -2112,8 +2113,8 @@ fn retiring_a_clearing_record_lets_the_next_clear_land() {
 }
 
 /// Newest-first scanning means a matched latest record is already authoritative.
-/// An older row this build cannot read — a v1 payload after the schema moved to
-/// v2, for instance — must not discard it and strand the object uncertain.
+/// An older row this build cannot read, such as a v1 payload after a schema
+/// move to v2, must not discard it and strand the object uncertain.
 #[test]
 fn an_older_unreadable_row_does_not_discard_a_newer_verdict() {
     let store_dir = tempfile::tempdir().unwrap();
@@ -2569,9 +2570,9 @@ fn a_retired_unreadable_row_is_not_authoritative() {
 /// at: an unchanged tip proves no commit landed since, and a moved tip forces a
 /// re-reduction. This asserts that pair of primitives reports movement.
 ///
-/// The interleaving itself — a block landing between the reduction and the
-/// return — has no deterministic trigger from outside the engine, so the fence's
-/// demotion path is argued from these primitives rather than from a timing test.
+/// A block landing between the reduction and return has no deterministic
+/// trigger from outside the engine. The fence's demotion path is therefore
+/// argued from these primitives rather than from a timing test.
 #[test]
 fn the_reduction_reports_the_sequence_it_read_at() {
     let store_dir = tempfile::tempdir().unwrap();
