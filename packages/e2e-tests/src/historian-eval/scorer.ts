@@ -29,6 +29,7 @@ import { makeContractPrimitives } from "../contract-primitives";
 import { openTestDb } from "../test-db";
 import { parseSystemVersionTuple, requireScoreSystemBinding } from "./system-tuple";
 import {
+    MAX_EXPECTATION_ENTRIES,
     NO_INJECTED_GOLD_CLAIM,
     PROBE_CHOICE_SEPARATOR,
     containsCompleteValue,
@@ -1908,7 +1909,8 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
     const precision = parseRatio(value.precision, `${label}.precision`);
     const recall = parseRatio(value.recall, `${label}.recall`);
     const expectedClaimsMatched = p.integer(value.expectedClaimsMatched, `${label}.expectedClaimsMatched`);
-    const expectedClaimsTotal = p.integer(value.expectedClaimsTotal, `${label}.expectedClaimsTotal`);
+    // The count is the scenario's authored expectation list, which the contract caps.
+    const expectedClaimsTotal = p.boundedInteger(value.expectedClaimsTotal, `${label}.expectedClaimsTotal`, 0, MAX_EXPECTATION_ENTRIES);
     const visibleClaimsMatched = p.integer(value.visibleClaimsMatched, `${label}.visibleClaimsMatched`);
     const visibleClaimsTotal = p.integer(value.visibleClaimsTotal, `${label}.visibleClaimsTotal`);
     if (expectedClaimsMatched > expectedClaimsTotal) p.fail(`${label}.expectedClaimsMatched: integer-invalid`);
@@ -1989,8 +1991,10 @@ export function parseScenarioScore(raw: unknown, label: string): ScenarioScore {
         // A lint-admitted scenario declares at least one probe and a run yields a verdict for each, so a
         // run-record score with no probe evidence never reached the scorer. The raw-output seam has no probes.
         // The two run-record scores built without scoring carry none: the aborted false-authoritative FAIL, and
-        // the all-attempts-invalid FAIL, whose facts are the empty ones `scoreRunRecord` writes for it.
-        const allAttemptsInvalid = failReasons.includes("invalid-output") && recall === null && precision === null &&
+        // the all-attempts-invalid FAIL, whose facts are the empty ones `scoreRunRecord` writes for it, so its
+        // only reason is `invalid-output` and it carries no probe verdict.
+        const allAttemptsInvalid = failReasons.length === 1 && failReasons[0] === "invalid-output" &&
+            probeVerdicts.length === 0 && recall === null && precision === null &&
             expectedClaimsMatched === 0 && visibleClaimsMatched === 0 && visibleClaimsTotal === 0 &&
             falseAuthoritativeMatches.length === 0 && structuralFindings.length === 0;
         const scorerBypassed = allAttemptsInvalid || abortedFalseAuthoritative;

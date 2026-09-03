@@ -2697,6 +2697,18 @@ describe("buildLaneReport", () => {
         expect(() => parseLaneReport(partialInvalid)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: probes-required/);
         partialInvalid.scenarios[0]!.recall = null;
         expect(() => parseLaneReport(partialInvalid)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: probes-required/);
+        // The all-invalid shape carries no probe and no other reason, so a probe failure cannot be added to it.
+        const invalidWithProbe = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(invalidWithProbe.scenarios[0]!, {
+            verdict: "FAIL", failReasons: ["invalid-output", "probe"], recall: null, precision: null,
+            expectedClaimsMatched: 0, visibleClaimsMatched: 0, visibleClaimsTotal: 0,
+            probeVerdicts: [{ probeId: "probe-1", outcome: "fail", expected: "yes", actual: "no" }],
+        });
+        expect(() => parseLaneReport(invalidWithProbe)).toThrow(/report\.scenarios\[0\]\.recall: derived-mismatch/);
+        // An expectation count is bounded by the scenario contract's cap on authored expectations.
+        const hugeExpectations = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(hugeExpectations.scenarios[0]!, { expectedClaimsTotal: 1_000_000, recall: 2 / 1_000_000 });
+        expect(() => parseLaneReport(hugeExpectations)).toThrow(/report\.scenarios\[0\]\.expectedClaimsTotal: integer-invalid/);
         // A probe verdict names a non-blank expectation, and a blank reply is recorded as a null answer.
         const blankProbe = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
         blankProbe.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "", actual: "" }];
