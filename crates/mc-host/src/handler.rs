@@ -431,6 +431,12 @@ impl RequestCtx {
         self.cancel.is_cancelled()
     }
 
+    /// A handle a handler can move into blocking work so the work can stop
+    /// when the request is cancelled.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
     /// Reserves capacity and its resident-byte charge before allocating output.
     ///
     /// The returned buffer holds at most `max_len` body bytes and transfers its charge into a unary response or stream item.
