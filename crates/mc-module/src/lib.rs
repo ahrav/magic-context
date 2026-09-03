@@ -386,6 +386,30 @@ impl Drop for StoreOpenWaiterGuard {
     }
 }
 
+/// `'static` lets running tasks own a `TaskAdmission` and admit follow-on tasks.
+#[derive(Clone)]
+struct TaskAdmission {
+    gate: Arc<Mutex<()>>,
+    cancel: CancellationToken,
+    tasks: TaskTracker,
+}
+
+impl TaskAdmission {
+    /// `None` once shutdown has closed admission; the gate keeps a spawn that
+    /// passed the cancellation check from landing after the tracker closes.
+    fn spawn<F, T>(&self, future: F) -> Option<tokio::task::JoinHandle<T>>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let _gate = self.gate.lock().expect("module spawn gate mutex");
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        Some(self.tasks.spawn(future))
+    }
+}
+
 fn jittered_store_open_delay(base: Duration, cap: Duration, attempt: usize) -> Duration {
     const JITTER_PERCENT: [u128; 4] = [100, 108, 116, 104];
     let nanos = base
@@ -3438,34 +3462,20 @@ impl McHandler {
         self.store.lock().expect("store slot mutex").clone()
     }
 
+    fn admission(&self) -> TaskAdmission {
+        TaskAdmission {
+            gate: Arc::clone(&self.spawn_gate),
+            cancel: self.cancel.clone(),
+            tasks: self.tasks.clone(),
+        }
+    }
+
     fn spawn_tracked_task<F, T>(&self, future: F) -> Option<tokio::task::JoinHandle<T>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let _gate = self.spawn_gate.lock().expect("module spawn gate mutex");
-        if self.cancel.is_cancelled() {
-            return None;
-        }
-        Some(self.tasks.spawn(future))
-    }
-
-    /// A spawner a running task can use to admit a follow-on task under the
-    /// same gate and tracker, since it holds no `&self`.
-    fn tracked_spawner(
-        &self,
-    ) -> impl Fn(Arc<kernel_routes::KernelOpenCoordinator>, CancellationToken) + Send + 'static
-    {
-        let gate = Arc::clone(&self.spawn_gate);
-        let cancel = self.cancel.clone();
-        let tasks = self.tasks.clone();
-        move |kernel, task_cancel| {
-            let _gate = gate.lock().expect("module spawn gate mutex");
-            if cancel.is_cancelled() {
-                return;
-            }
-            tasks.spawn(kernel.run_sampler(task_cancel));
-        }
+        self.admission().spawn(future)
     }
 
     fn spawn_module_task<F, T>(&self, future: F) -> Option<tokio::task::JoinHandle<T>>
@@ -3503,12 +3513,13 @@ impl McHandler {
             .fetch_add(1, Ordering::Relaxed);
         let store = Arc::clone(&self.store);
         let kernel = Arc::clone(&self.kernel);
-        let sampler_spawn = self.tracked_spawner();
+        let admission = self.admission();
+        let task_admission = admission.clone();
         let coordinator = Arc::clone(&self.store_open);
         let task_coordinator = Arc::clone(&coordinator);
         let cancel = self.cancel.clone();
-        if self
-            .spawn_tracked_task(async move {
+        if admission
+            .spawn(async move {
                 let _guard = StoreOpenWaiterGuard {
                     coordinator: Arc::clone(&task_coordinator),
                 };
@@ -3516,16 +3527,10 @@ impl McHandler {
                     .policy
                     .lock()
                     .expect("store open policy mutex");
-                let opened = Self::run_store_open(
-                    store,
-                    task_coordinator,
-                    descriptor.clone(),
-                    cancel.clone(),
-                )
-                .await;
-                // The kernel store shares the managed directory, so it opens only once
-                // the cache store holds it; a cache store that never opened leaves the
-                // kernel unavailable rather than starting forever.
+                let opened =
+                    Self::run_store_open(store, task_coordinator, &descriptor, cancel.clone())
+                        .await;
+                // SQLite supplies the path that derives the kernel root.
                 match (opened, &descriptor.backend) {
                     (true, StorageBackend::Sqlite { path }) => {
                         kernel
@@ -3534,12 +3539,13 @@ impl McHandler {
                         if kernel.state() == kernel_routes::KernelState::Ready
                             && kernel.background_sampler_enabled()
                         {
-                            sampler_spawn(Arc::clone(&kernel), cancel);
+                            task_admission.spawn(kernel.run_sampler(cancel));
                         }
                     }
-                    (true, _) | (false, _) => {
-                        kernel.mark_unavailable(kernel_routes::UnavailableReason::StoreUnavailable)
+                    (true, StorageBackend::Postgres { .. }) => {
+                        kernel.mark_unavailable(kernel_routes::UnavailableKind::Unsupported)
                     }
+                    (false, _) => kernel.mark_unavailable(kernel_routes::UnavailableKind::Store),
                 }
             })
             .is_none()
@@ -3555,11 +3561,11 @@ impl McHandler {
     async fn run_store_open(
         store_slot: Arc<Mutex<Option<Arc<McStore>>>>,
         coordinator: Arc<StoreOpenCoordinator>,
-        descriptor: StorageDescriptor,
+        descriptor: &StorageDescriptor,
         cancel: CancellationToken,
     ) -> bool {
         let policy = *coordinator.policy.lock().expect("store open policy mutex");
-        let mut last_lease_error = match Self::open_store_once(&descriptor).await {
+        let mut last_lease_error = match Self::open_store_once(descriptor).await {
             Ok(opened) => {
                 if cancel.is_cancelled() {
                     coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
@@ -3635,7 +3641,7 @@ impl McHandler {
                 continue;
             }
 
-            match Self::open_store_once(&descriptor).await {
+            match Self::open_store_once(descriptor).await {
                 Ok(opened) => {
                     if cancel.is_cancelled() {
                         coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
@@ -11870,7 +11876,7 @@ impl CompositeComponent for McHandler {
             .clear();
         *self.store.lock().expect("store slot mutex") = None;
         self.kernel
-            .mark_unavailable(kernel_routes::UnavailableReason::StoreUnavailable);
+            .mark_unavailable(kernel_routes::UnavailableKind::Store);
         Ok(())
     }
 }

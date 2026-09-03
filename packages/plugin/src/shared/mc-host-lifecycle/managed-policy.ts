@@ -56,11 +56,17 @@ function asRecord(value: unknown): Record<string, unknown> | null {
         : null;
 }
 
-function storageState(metrics: Record<string, unknown>): "ready" | "starting" | "unavailable" {
+/** The `metrics` object of one `host.status` component, or `null` when absent. */
+function componentMetrics(
+    metrics: Record<string, unknown>,
+    component: string,
+): Record<string, unknown> | null {
     const components = asRecord(metrics.components);
-    const magicContext = asRecord(components?.["magic-context"]);
-    const componentMetrics = asRecord(magicContext?.metrics);
-    const state = componentMetrics?.storage_state;
+    return asRecord(asRecord(components?.[component])?.metrics);
+}
+
+function storageState(metrics: Record<string, unknown>): "ready" | "starting" | "unavailable" {
+    const state = componentMetrics(metrics, "magic-context")?.storage_state;
     return state === "ready" || state === "unavailable" ? state : "starting";
 }
 
@@ -73,10 +79,7 @@ export type KernelReadiness =
     | { state: "unavailable"; reason: "kernel_unavailable" };
 
 export function kernelReadiness(metrics: Record<string, unknown>): KernelReadiness {
-    const components = asRecord(metrics.components);
-    const magicContext = asRecord(components?.["magic-context"]);
-    const componentMetrics = asRecord(magicContext?.metrics);
-    const kernel = asRecord(componentMetrics?.kernel);
+    const kernel = asRecord(componentMetrics(metrics, "magic-context")?.kernel);
     const state = kernel?.kernel_state;
     if (state === "starting") return { state: "starting", reason: "kernel_starting" };
     // An absent block is an unknown state and never reads as healthy.
@@ -237,8 +240,7 @@ async function readCompatibilityProbe(
         throw new Error("authenticated peer changed during compatibility probe");
     }
     if (signal?.aborted) throw signal.reason ?? new Error("compatibility probe aborted");
-    const components = asRecord(status.metrics.components);
-    const magicContextMetrics = asRecord(asRecord(components?.["magic-context"])?.metrics);
+    const magicContextMetrics = componentMetrics(status.metrics, "magic-context");
     // The probe reports observations, not a compatibility verdict.
     const snapshot = {
         authenticatedPeer: {
@@ -316,11 +318,9 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
             readiness: { transport: { state: "ready", reason: "healthy" } },
         };
     }
-    const components = asRecord(status.metrics.components);
     const storage = storageState(status.metrics);
     const kernel = kernelReadiness(status.metrics);
-    const synapseMetrics = asRecord(asRecord(components?.synapse)?.metrics);
-    const synapseState = synapseMetrics?.synapse_state;
+    const synapseState = componentMetrics(status.metrics, "synapse")?.synapse_state;
     const synapse =
         synapseState === "ready"
             ? { state: "ready" as const, reason: "healthy" as const }

@@ -534,6 +534,7 @@ pub fn route_open_response_json(channel: u16, epoch: u32) -> Vec<u8> {
 /// The wire protocol permits `unavailable_reason` only when `kernel_state` is
 /// `unavailable`.
 fn sanitize_kernel_block(raw: &serde_json::Value) -> Option<serde_json::Value> {
+    // Largest integer exactly representable by an IEEE 754 double.
     const MAX_COUNTER: u64 = 1 << 53;
     let raw = raw.as_object()?;
     let state = raw

@@ -161,14 +161,9 @@ impl KernelOpenCoordinator {
                 KernelHealthBlock::sample_failed(now_ms)
             }
         };
-        // The store may have been replaced while the worker ran; the phase wins.
-        if self.state() != KernelState::Ready {
-            self.publish_phase();
-            return false;
-        }
         let sampled = block.facts.is_some();
-        self.health.publish(block);
-        sampled
+        // The store may have been replaced while the worker ran; the phase wins.
+        self.publish_if_ready(block) && sampled
     }
 
     /// Cancellation drops the in-flight sample future so shutdown does not wait
