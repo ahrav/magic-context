@@ -7803,7 +7803,11 @@ impl McHandler {
             Some(store) => Arc::clone(&store),
             None => return store_unavailable_error(),
         };
-        let kernel = self.kernel.live_block(now_ms()).await.to_json();
+        let kernel = self
+            .kernel
+            .live_block(now_ms(), &self.cancel)
+            .await
+            .to_json();
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
             return match store.load("__health__") {
                 Ok(state) => respond(json!({

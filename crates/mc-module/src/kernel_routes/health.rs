@@ -223,16 +223,27 @@ impl KernelOpenCoordinator {
 
     /// Live facts for the routed `status` method, which is not bound to the
     /// lock-free health path and may read the store. The read runs on a
-    /// blocking worker so the artifact walk never occupies a route worker.
-    pub(crate) async fn live_block(&self, now_ms: i64) -> KernelHealthBlock {
+    /// blocking worker so the artifact walk never occupies a route worker, and
+    /// `cancel` reaches the walk so a request abandoned at shutdown does not
+    /// keep the store alive; a cancelled read answers unavailable.
+    pub(crate) async fn live_block(
+        &self,
+        now_ms: i64,
+        cancel: &CancellationToken,
+    ) -> KernelHealthBlock {
         let store = match self.kernel_store() {
             Ok(store) => store,
             Err(_) => return self.phase_block(Some(now_ms)),
         };
-        let worker = tokio::task::spawn_blocking(move || store.facts(now_ms));
+        let cancel = cancel.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            store.facts_unless(now_ms, &|| cancel.is_cancelled())
+        });
         match worker.await {
-            Ok(Ok(facts)) => KernelHealthBlock::ready(now_ms, KernelFactsBlock::from_facts(&facts)),
-            Ok(Err(_)) | Err(_) => KernelHealthBlock::sample_failed(now_ms),
+            Ok(Ok(Some(facts))) => {
+                KernelHealthBlock::ready(now_ms, KernelFactsBlock::from_facts(&facts))
+            }
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => KernelHealthBlock::sample_failed(now_ms),
         }
     }
 }
