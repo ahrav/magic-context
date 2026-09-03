@@ -510,6 +510,11 @@ describe("deterministic metamorphic runner", () => {
             .toThrow(/not a non-negative safe integer/);
         expect(() => runDeterministicMetamorphicEval([corpus()[0]!, corpus()[0]!])).toThrow(/scenario ".*" is listed twice/);
         expect(() => runDeterministicMetamorphicEval([{ ...corpus()[0]!, id: " " }])).toThrow(/scenario id is blank/);
+        // Two pairs deriving one scenario id would share an entry binding and an artifact directory.
+        expect(() => runDeterministicMetamorphicEval(
+            [{ ...corpus()[0]!, id: "hse-a" }, { ...corpus()[0]!, id: "hse-a-d-b" }],
+            { transforms: [{ ...reorder(), id: "b-d-c" }, { ...reorder(), id: "c" }] },
+        )).toThrow(/derive the same scenario id "hse-a-d-b-d-c-v1-s\d+"/);
         expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { transforms: [{ ...reorder(), id: "baseline-control" }] }))
             .toThrow(/reserved for the control pair/);
     });

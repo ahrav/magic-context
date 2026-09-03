@@ -163,6 +163,12 @@ describe("family-clustered delta estimator", () => {
             observations: observations.map((row, index) => index === 0 ? { ...row, familyId: " " } : row),
         })).toThrow(/identifier-blank/);
         expect(() => estimate({ bootstrapResamples: 10 ** 9 })).toThrow(/bootstrap-resamples-too-large/);
+        expect(() => estimate({
+            bootstrapResamples: 100_000,
+            observations: Array.from({ length: 300 }, (_, index) => ({
+                ...observations[0]!, coordinateId: `var-z:${index}`,
+            })),
+        })).toThrow(/bootstrap-work-too-large/);
         const result = estimate({ noiseFloors: undefined });
         expect(result.endpoints[0]!.families.every(({ noise }) =>
             noise.label === "no-noise-floor" && noise.floor === null)).toBe(true);

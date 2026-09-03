@@ -355,6 +355,10 @@ describe("paired-delta report", () => {
         expect(() => report({
             runSummary: { ...report().body.runSummary, calibrationFingerprint: H1, evidenceComplete: true },
         })).toThrow(/evidence-complete-mismatch/);
+        // A calibration run is complete only over a completed, fully healthy matrix.
+        expect(() => report({
+            runSummary: { ...report().body.runSummary, evidenceComplete: true },
+        })).toThrow(/evidence-complete-mismatch/);
         expect(() => report({
             runSummary: { ...report().body.runSummary, calibrationFingerprint: "calibration-2026", evidenceComplete: false },
         })).toThrow(/calibration-fingerprint-invalid/);
@@ -1064,9 +1068,18 @@ describe("parsePairedDeltaReport", () => {
             .toThrow(/report\.body\.exclusions: order-invalid/);
         expect(() => parsePairedDeltaReport(forge((body) => { body.limitations = ["b caveat", "a caveat"]; })))
             .toThrow(/report\.body\.limitations: order-invalid/);
-        // The regret estimates are replayed with the archived resample count, so it is bounded above.
+        // The regret estimates are replayed with the archived resample count over the archived records, so both
+        // sizes are bounded, separately and together.
         expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.bootstrapResamples = 10 ** 9; })))
             .toThrow(/report\.body\.analysis\.bootstrapResamples: integer-invalid/);
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.bootstrapResamples = 100_000;
+            // Appended after the last record with ascending suffixes, so the archive stays in producer order.
+            const template = body.analysis.rawRegretRecords.at(-1)!;
+            for (let index = 0; index < 500; index += 1) {
+                body.analysis.rawRegretRecords.push({ ...template, coordinateId: `${template.coordinateId}-z${String(index).padStart(4, "0")}` });
+            }
+        }))).toThrow(/report\.body\.analysis\.rawRegretRecords: bootstrap-work-too-large/);
         // The estimator emits endpoints, families, and raw records in code-unit order.
         expect(() => parsePairedDeltaReport(forge((body) => { body.analysis.endpoints.reverse(); })))
             .toThrow(/report\.body\.analysis\.endpoints: order-invalid/);

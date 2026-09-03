@@ -15,6 +15,8 @@ import type { RunHealth } from "./contract";
 export const MIN_BOOTSTRAP_RESAMPLES = 2000;
 /** Bounds the work a resample count can demand of a reader that replays the bootstrap; the policy uses 5000. */
 export const MAX_BOOTSTRAP_RESAMPLES = 100_000;
+/** Bounds observations times resamples, the sampling work one estimate or its replay performs. */
+export const MAX_BOOTSTRAP_WORK = 20_000_000;
 // `splitmix32` consumes a 32-bit state, so wider seeds would silently alias.
 export const MAX_BOOTSTRAP_SEED = 0xFFFFFFFF;
 export const PRIMARY_ENDPOINTS = ["mc-on-vs-mc-off", "mc-on-vs-compaction"] as const;
@@ -303,6 +305,9 @@ export function estimateFamilyDeltas(input: {
     }
     if (input.bootstrapResamples > MAX_BOOTSTRAP_RESAMPLES) {
         throw new PairedDeltaEstimatorError("bootstrap-resamples-too-large");
+    }
+    if (input.observations.length * input.bootstrapResamples > MAX_BOOTSTRAP_WORK) {
+        throw new PairedDeltaEstimatorError("bootstrap-work-too-large");
     }
     if (!/^[0-9a-f]{64}$/.test(input.lane.poolManifestFingerprint)) {
         throw new PairedDeltaEstimatorError("lane-pool-manifest-fingerprint-invalid");

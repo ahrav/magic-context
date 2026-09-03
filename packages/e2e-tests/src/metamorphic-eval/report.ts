@@ -52,6 +52,22 @@ export function requireRepresentableRunOptions(
         if (seen.has(seed)) throw new Error(`metamorphic-eval: seed ${seed} is listed twice`);
         seen.add(seed);
     }
+    // `derivativeScenarioId` joins free-form ids with a delimiter they may contain, and the parser binds a
+    // derivative score to its pair through that id, so two pairs must not derive the same one.
+    const derived = new Map<string, string>();
+    for (const { id: scenarioId } of scenarios) {
+        for (const { id: transformId, version: transformVersion } of transforms) {
+            for (const seed of seeds) {
+                const pair = { scenarioId, transformId, transformVersion, seed };
+                const derivedId = derivativeScenarioId(pair);
+                const other = derived.get(derivedId);
+                if (other !== undefined) {
+                    throw new Error(`metamorphic-eval: pairs ${other} and ${canonicalJson(pair)} derive the same scenario id "${derivedId}"`);
+                }
+                derived.set(derivedId, canonicalJson(pair));
+            }
+        }
+    }
 }
 
 export interface PairKey {

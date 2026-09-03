@@ -26,7 +26,7 @@ import type {
     RawRegretRecord,
     RegretEndpoint,
 } from "./estimator";
-import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_RESAMPLES, MAX_BOOTSTRAP_SEED, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS, endpointResolution, estimateRegretEndpoint, includesZero, mean, noiseLabel } from "./estimator";
+import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_RESAMPLES, MAX_BOOTSTRAP_SEED, MAX_BOOTSTRAP_WORK, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS, endpointResolution, estimateRegretEndpoint, includesZero, mean, noiseLabel } from "./estimator";
 import { validSuccess } from "./scoring";
 import { tupleKey } from "./tuple-key";
 import type { PairedDeltaRunResult, RolloutRecord } from "./runner";
@@ -298,10 +298,12 @@ export function buildPairedDeltaReport(input: {
             throw new Error(`paired-delta-report: refusal-reason-invalid-${reason}`);
         }
     }
-    // Outside calibration, completeness is the estimator's sufficiency over a fully healthy matrix.
-    if (body.runSummary.calibrationFingerprint !== null &&
-        body.runSummary.evidenceComplete !==
-            (body.analysis.evidenceSufficient && body.runSummary.healthyCoordinates >= body.runSummary.plannedCoordinates)) {
+    // Outside calibration, completeness is the estimator's sufficiency over a fully healthy matrix. Calibration
+    // completeness needs the calibration record's variance, but never holds over an incomplete or unhealthy run.
+    const fullyHealthy = body.runSummary.healthyCoordinates >= body.runSummary.plannedCoordinates;
+    if (body.runSummary.calibrationFingerprint !== null
+        ? body.runSummary.evidenceComplete !== (body.analysis.evidenceSufficient && fullyHealthy)
+        : body.runSummary.evidenceComplete && (body.runSummary.status !== "completed" || !fullyHealthy)) {
         throw new Error("paired-delta-report: evidence-complete-mismatch");
     }
     // A healthy coordinate completed every primary arm, so each metric map carries a value for each of them.
@@ -750,6 +752,11 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     // And only for those endpoints: an aggregate with no observation behind it is unsupported.
     for (const endpoint of aggregateEndpoints) {
         if (!rawEndpoints.has(endpoint)) p.fail(`report.body.analysis: aggregate-without-raw-${endpoint}`);
+    }
+    // The replay below samples every archived regret record `bootstrapResamples` times, so the two archive-
+    // supplied sizes are bounded together before any of that work starts.
+    if (body.analysis.rawRegretRecords.length * body.analysis.bootstrapResamples > MAX_BOOTSTRAP_WORK) {
+        p.fail("report.body.analysis.rawRegretRecords: bootstrap-work-too-large");
     }
     // Every regret observation is archived with the bootstrap settings, so each regret estimate is recomputed
     // whole: families, means, intervals, and resolutions.
