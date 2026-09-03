@@ -5,7 +5,9 @@ use std::rc::Rc;
 
 use crate::descriptor::ReleaseIdentity;
 
-/// `LeaseSpan` provides a raw view of a span whose mapping remains readable for `'lease`.
+/// Raw view of a peer-writable mapping that remains readable for `'lease`.
+///
+/// The type is `!Send`. Reads do not provide a coherent snapshot while the peer mutates bytes.
 #[derive(Clone, Copy)]
 pub struct LeaseSpan<'lease> {
     base: NonNull<u8>,
@@ -15,6 +17,7 @@ pub struct LeaseSpan<'lease> {
 }
 
 impl<'lease> LeaseSpan<'lease> {
+    /// Creates a lease-bound raw mapped span.
     ///
     /// # Safety
     /// `base..base.add(len)` must remain mapped and readable for `'lease`.
@@ -28,15 +31,17 @@ impl<'lease> LeaseSpan<'lease> {
         })
     }
 
-    /// Span length.
+    /// Returns mapped length in bytes.
     pub const fn len(self) -> usize {
         self.len
     }
 
+    /// Exposes the mapping address without extending its lease-bound lifetime.
     pub const fn as_mut_ptr(self) -> *mut u8 {
         self.base.as_ptr()
     }
 
+    /// Reports whether mapped length is zero.
     pub const fn is_empty(self) -> bool {
         self.len == 0
     }
@@ -50,6 +55,10 @@ impl<'lease> LeaseSpan<'lease> {
         Some(unsafe { self.base.as_ptr().add(index).read_volatile() })
     }
 
+    /// Copies the entire span into an equal-length destination.
+    ///
+    /// Returns [`LeaseError::LengthMismatch`] before copying when lengths differ. Concurrent peer
+    /// writes can make the copied bytes reflect more than one peer state.
     pub fn copy_to(self, destination: &mut [u8]) -> Result<(), LeaseError> {
         if destination.len() != self.len {
             return Err(LeaseError::LengthMismatch);
@@ -61,6 +70,10 @@ impl<'lease> LeaseSpan<'lease> {
         Ok(())
     }
 
+    /// Computes a wrapping sum of mapped bytes.
+    ///
+    /// Concurrent peer writes can change the result during iteration; this is not an integrity or
+    /// cryptographic checksum.
     pub fn checksum(self) -> u64 {
         // SAFETY: `LeaseSpan::new` guarantees that the slice range is readable for the lease.
         let bytes = unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.len) };
@@ -78,9 +91,11 @@ impl fmt::Debug for LeaseSpan<'_> {
 
 pub(crate) type ReleaseFn = unsafe fn(*const (), ReleaseIdentity) -> Result<(), LeaseError>;
 
+/// Owns one receive completion and up to two raw mapped spans.
 ///
 /// Raw span access avoids long-lived safe references to mappings a trusted peer can address.
-/// `Rc` marker makes `ReceiveLease` `!Send`.
+/// The lease is `!Send`. Explicit release reports callback failures; drop retries an unreleased
+/// completion once and discards any callback error.
 pub struct ReceiveLease<'lease> {
     spans: [Option<LeaseSpan<'lease>>; 2],
     span_count: u8,
@@ -95,10 +110,11 @@ pub struct ReceiveLease<'lease> {
 }
 
 impl<'lease> ReceiveLease<'lease> {
+    /// Creates a receive lease from mapped spans and a release callback.
     ///
     /// # Safety
     /// Spans and release context must remain valid for `'lease`.
-    /// callback must accept this identity exactly once.
+    /// `release_fn` must accept this identity exactly once.
     pub(crate) unsafe fn new(
         spans: [Option<LeaseSpan<'lease>>; 2],
         span_count: u8,
@@ -129,18 +145,22 @@ impl<'lease> ReceiveLease<'lease> {
         })
     }
 
+    /// Returns declared body length in bytes across all segments.
     pub const fn len(&self) -> usize {
         self.body_len
     }
 
+    /// Reports whether declared body length is zero.
     pub const fn is_empty(&self) -> bool {
         self.body_len == 0
     }
 
+    /// Returns one for contiguous bodies and two for wrapped bodies.
     pub const fn segment_count(&self) -> usize {
         self.span_count as usize
     }
 
+    /// Returns a lease-bounded span, or `None` when `index` is outside `segment_count`.
     pub fn segment(&self, index: usize) -> Option<LeaseSpan<'_>> {
         if index >= usize::from(self.span_count) {
             return None;
@@ -153,14 +173,22 @@ impl<'lease> ReceiveLease<'lease> {
         self.wire_header
     }
 
+    /// Returns the exact identity consumed by release processing.
     pub const fn identity(&self) -> ReleaseIdentity {
         self.identity
     }
 
+    /// Invokes the release callback once and consumes the lease.
+    ///
+    /// If the callback fails, drop retries because completion was not recorded locally.
     pub fn release(mut self) -> Result<(), LeaseError> {
         self.release_once()
     }
 
+    /// Copies segments in index order into one body-sized allocation.
+    ///
+    /// Returns [`LeaseError::LengthMismatch`] if segment lengths do not sum to `len`, and
+    /// [`LeaseError::InvalidSpan`] if constructor invariants are not present.
     pub fn to_vec(&self) -> Result<Vec<u8>, LeaseError> {
         let mut bytes = vec![0u8; self.body_len];
         let mut cursor = 0usize;
@@ -209,19 +237,25 @@ impl Drop for ReceiveLease<'_> {
 /// `LeaseError` reports receive-span or completion failures.
 #[derive(thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
-    /// `LeaseError` reports an invalid span pointer or count.
+    /// Span pointer, count, or required segment presence is invalid.
     #[error("receive span is invalid")]
     InvalidSpan,
+    /// Declared body length and mapped span lengths disagree.
     #[error("receive span lengths disagree")]
     LengthMismatch,
+    /// Release identity belongs to another transport incarnation.
     #[error("release identity does not match incarnation")]
     WrongIncarnation,
+    /// Release identity names another lane.
     #[error("release identity does not match lane")]
     WrongLane,
+    /// Release sequence is outside the lane's valid completion state.
     #[error("release sequence is invalid")]
     InvalidSequence,
+    /// Completion was already released.
     #[error("release is duplicated")]
     DuplicateRelease,
+    /// Transport storage no longer permits lease completion.
     #[error("transport storage is quarantined")]
     Quarantined,
 }

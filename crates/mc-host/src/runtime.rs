@@ -1,4 +1,10 @@
+//! Host lifecycle, admission, task tracking, and ordered shutdown.
 //!
+//! Startup validates configuration and manifests before publishing transport.
+//! Shutdown freezes admission, drains routes and connections, invokes handler
+//! shutdown once, then releases the single-instance lock. Fatal lifecycle
+//! failures cancel shared work and preserve the lock until tracked callbacks
+//! stop.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -27,12 +33,13 @@ use crate::wire::ByteBudget;
 /// HostError reports failures that prevent graceful completion.
 #[derive(thiserror::Error, Debug)]
 pub enum HostError {
+    /// Configuration failed validation before instance startup.
     #[error("invalid host configuration: {0}")]
     Config(crate::config::ConfigError),
+    /// Single-instance acquisition or publication failed.
     #[error("instance startup failed: {0}")]
     Instance(InstanceError),
-    /// The host publishes no state when startup validation or handler initialization fails.
-    /// published.
+    /// Startup validation or handler initialization failed before transport publication.
     #[error("handler initialization failed: {0}")]
     InitFailed(String),
     /// A bind, route-gone, or health callback that panics or misses its deadline causes `HostError::LifecycleFatal`; shutdown is not graceful.
@@ -41,6 +48,7 @@ pub enum HostError {
     /// If host tasks remain unreaped after aborts at the shutdown deadline, shutdown is not graceful.
     #[error("shutdown deadline expired before host tasks were reaped")]
     ShutdownDeadlineExpired,
+    /// Setup-socket creation failed.
     #[error("host I/O failure: {0}")]
     Io(std::io::Error),
 }
@@ -57,6 +65,11 @@ impl FatalCell {
         }
     }
 
+    /// Stores the first fatal message and cancels host shutdown.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     pub fn trip(&self, shutdown: &CancellationToken, message: String) {
         let mut slot = self.message.lock().expect("fatal lock");
         if slot.is_none() {
@@ -128,8 +141,11 @@ impl<H: McHostHandler> HostShared<H> {
         handle
     }
 
-    /// The forced shutdown path's `abort_all` must not cancel an in-progress lifecycle callback; route-gone runs exactly once and completes before handler drop.
-    /// with `lifecycle_callback_deadline`.
+    /// Spawns an abort-exempt lifecycle callback tracked through shutdown.
+    ///
+    /// Forced shutdown does not cancel this task. Callers bound callback waits
+    /// with `lifecycle_callback_deadline`, and the tracker retains handler
+    /// ownership until the callback stops.
     pub fn spawn_lifecycle<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: std::future::Future + Send + 'static,
@@ -138,8 +154,10 @@ impl<H: McHostHandler> HostShared<H> {
         self.tracker.spawn(future)
     }
 
-    /// `lifecycle_callback_deadline` expiry trips the fatal latch; the host must terminate rather than continue.
+    /// Waits for a lifecycle callback through its configured deadline.
     ///
+    /// A panic, abort, or deadline expiry trips the fatal latch and cancels
+    /// shutdown. The error reports whether the callback has stopped.
     pub async fn lifecycle_join<T>(
         &self,
         what: &'static str,
@@ -160,7 +178,6 @@ impl<H: McHostHandler> HostShared<H> {
             Err(_) => {
                 // `timeout` cannot expire while a future fails to yield.
                 // `shared.tracker.wait()` reaps the detached task.
-                // itself bounded.
                 task.abort();
                 self.fatal
                     .trip(&self.shutdown, format!("{what} callback deadline expired"));
@@ -270,10 +287,11 @@ fn spawn_handler_shutdown<H: McHostHandler>(handler: Arc<H>) -> JoinHandle<()> {
     })
 }
 
-/// `PrePublicationCleanup` owns the `InstanceGuard` and handler shutdown before `HostShared` exists.
-/// Running shutdown in its own task lets a cancelled waiter transfer cleanup and the guard to a reaper without invoking `shutdown` twice.
-/// Successful publication disarms the owner without spawning cleanup.
-/// spawning cleanup.
+/// Owns the instance guard and handler shutdown before `HostShared` exists.
+///
+/// Running shutdown in its own task lets a cancelled waiter transfer cleanup
+/// and the guard to a reaper without invoking `shutdown` twice. Successful
+/// publication disarms the owner without spawning cleanup.
 struct PrePublicationCleanup<H: McHostHandler> {
     guard: Option<InstanceGuard>,
     handler: Option<Arc<H>>,
@@ -319,8 +337,7 @@ impl<H: McHostHandler> Drop for PrePublicationCleanup<H> {
         let Some(mut guard) = self.guard.take() else {
             return;
         };
-        // Unwinding demotes the phase before draining shutdown.
-        // `finish`.
+        // Unwinding demotes the phase before draining shutdown, matching `finish`.
         guard.begin_stopping();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let shutdown = self.shutdown.take().unwrap_or_else(|| {
@@ -345,8 +362,7 @@ impl<H: McHostHandler> AbandonGuard<H> {
         &mut self.inner.as_mut().expect("armed abandon guard").1
     }
 
-    /// `disarm` returns `InstanceGuard` so normal completion drops the handler before releasing the lock.
-    /// handler-then-lock drop.
+    /// Returns the guard so normal completion can drop the handler before releasing the lock.
     fn disarm(mut self) -> InstanceGuard {
         self.inner.take().expect("armed abandon guard").1
     }
@@ -523,9 +539,16 @@ fn build_target_index(
     ))
 }
 
+/// Runs one host instance through startup, publication, and shutdown.
 ///
-/// After publication, `run` returns only after shutdown drains or a fatal failure.
-/// After publication, `guard` drops only after `shared.tracker` drains.
+/// Startup errors prevent transport publication. After publication, this
+/// returns only after graceful drain or a fatal failure. The instance guard is
+/// retained until tracked work stops, including after cancellation.
+///
+/// # Errors
+///
+/// Returns [`HostError`] for invalid configuration, instance acquisition,
+/// initialization, setup I/O, fatal lifecycle callbacks, or shutdown timeout.
 pub async fn run<H: McHostHandler>(
     handler: H,
     config: HostConfig,
@@ -661,7 +684,6 @@ pub async fn run_with_publish_hook<H: McHostHandler>(
             }
             Ok(Err(join_err)) => {
                 // A panic after initialization starts handler-owned work requires the same shutdown cleanup as an initialization error.
-                // initialization error.
                 PrePublicationCleanup::new(guard, handler).finish().await;
                 let kind = if join_err.is_panic() {
                     "panic"
@@ -791,7 +813,6 @@ pub async fn run_with_publish_hook<H: McHostHandler>(
     let guard = abandon_guard.disarm();
 
     // `shared` retains the final handler `Arc` until the tracker drains, so the handler drops before `guard` releases the lock.
-    // steps 6-8).
     let fatal = shared.fatal.take();
     if graceful {
         drop(shared);
@@ -815,7 +836,6 @@ const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_mill
 
 /// Startup tracks the handler's post-publication activation without awaiting it because transport is already published.
 /// The accept loop starts regardless of activation progress; an activation `Err`, panic, or task loss trips the fatal latch.
-/// Shutdown abandons unfinished activation.
 /// Shutdown abandons an unfinished activation future at the inner select.
 fn spawn_activation_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
     let outer = Arc::clone(shared);
@@ -928,7 +948,6 @@ fn spawn_health_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
                     biased;
                     // Shutdown cancels the informational probe.
                     // A probe that ignores shutdown keeps its tracker until the joining loop exits.
-                    // shutdown budget.
                     () = watchdog.shutdown.cancelled() => None,
                     result = timeout(deadline, crate::panic_boundary::redact(callback)) => {
                         match result {

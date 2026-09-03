@@ -22,6 +22,7 @@ const PROPAGATION_TARGETS: [&str; 4] = [
 ];
 const MAX_AUDIT_FIELD_BYTES: usize = 1_024;
 
+/// Selects logical invalidation or irreversible content removal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactDeletionKind {
@@ -38,12 +39,18 @@ impl ArtifactDeletionKind {
     }
 }
 
+/// Identifies an artifact directly by digest or through an evidence record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactDeletionIdentity {
     Digest(String),
     EvidenceId(String),
 }
 
+/// Input for an idempotent artifact deletion commit.
+///
+/// `deleted_at` is a nonnegative timestamp supplied by the caller. Purges
+/// require nonblank `operator_id`, `target_locator`, and `reason` values no
+/// longer than 1,024 bytes. Deletes reject those purge-only fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactDeletionRequest {
     pub intent: CommitIntent,
@@ -55,6 +62,10 @@ pub struct ArtifactDeletionRequest {
     pub deleted_at: i64,
 }
 
+/// Durable deletion receipt and affected object identities.
+///
+/// `affected_object_ids` retains database query order, which is lexicographic
+/// by object ID. `already_applied` marks an idempotent replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactDeletionResult {
     pub kind: ArtifactDeletionKind,
@@ -65,6 +76,10 @@ pub struct ArtifactDeletionResult {
     pub already_applied: bool,
 }
 
+/// One consumer's progress toward a deletion barrier.
+///
+/// A consumer is satisfied after its checkpoint reaches the required commit
+/// sequence or after an operator records abandonment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BarrierConsumerStatus {
     pub consumer_id: String,
@@ -75,6 +90,10 @@ pub struct BarrierConsumerStatus {
     pub satisfied: bool,
 }
 
+/// Snapshot of deletion propagation progress.
+///
+/// Consumers are ordered lexicographically by consumer ID. `cleared` is true
+/// exactly when `completed_at` is present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletionBarrierStatus {
     pub barrier_id: String,
@@ -161,6 +180,14 @@ struct Propagation<'a> {
 }
 
 impl KernelStore {
+    /// Invalidates an artifact and, for a purge, durably unlinks its content.
+    ///
+    /// The writer lock serializes deletion with other commits. A purge appends
+    /// and syncs its intent before the database commit, then unlinks content
+    /// after the commit and fence check. A post-commit unlink failure returns
+    /// `PurgeUnlinkPending`; retrying the purge completes pending cleanup.
+    /// Reusing an operation key with a different digest or deletion payload
+    /// returns `ReferenceCommit`.
     pub fn delete_artifact(
         &self,
         request: ArtifactDeletionRequest,
@@ -507,6 +534,10 @@ impl KernelStore {
         Ok(())
     }
 
+    /// Reads consumer progress for one deletion barrier in a deferred transaction.
+    ///
+    /// Returns `InvalidInput` for a blank ID, `NotFound` for an unknown ID, and
+    /// `Io` for database failures. Consumer rows are ordered by consumer ID.
     pub fn deletion_barrier(&self, barrier_id: &str) -> Result<DeletionBarrierStatus, KernelError> {
         if barrier_id.trim().is_empty() {
             return Err(KernelError::InvalidInput);

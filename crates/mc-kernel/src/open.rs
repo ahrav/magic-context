@@ -35,6 +35,9 @@ const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 /// allocation size.
 const RESET_MARKER_MAX_BYTES: u64 = 64 * 1024;
 
+/// Redacted failure classes returned by kernel-store operations.
+///
+/// Variants intentionally omit paths, SQL text, and underlying error details.
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum KernelError {
     #[error("kernel store is held by another writer")]
@@ -96,6 +99,12 @@ impl fmt::Debug for KernelError {
     }
 }
 
+/// Exclusive writer lease plus pooled SQLite connections for one kernel family.
+///
+/// One process owns the writer lease.
+/// Mutations serialize through `writer`, while reads rotate across a fixed query-only pool.
+/// A restore that cannot recover the original family poisons both paths until the store is reopened.
+/// A restore rejected before displacement, or one whose original family is recovered, leaves both paths usable.
 pub struct KernelStore {
     writer: Mutex<Connection>,
     pub(super) purge_intent_log: Mutex<File>,
@@ -122,6 +131,13 @@ impl fmt::Debug for KernelStore {
 }
 
 impl KernelStore {
+    /// Opens, validates, or bootstraps the kernel store below `root`.
+    ///
+    /// Opening acquires the exclusive writer lease, resumes interrupted restore
+    /// or quarantine work, validates SQLite identity, activates WAL, stamps the
+    /// writer fence, and runs artifact recovery. Failures use redacted
+    /// [`KernelError`] classes. A mismatched valid kernel family is quarantined;
+    /// foreign or inconclusive content is left untouched.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, KernelError> {
         let identity =
             probe_sqlite_engine_identity_off_path().map_err(|_| KernelError::EngineUnsupported)?;
@@ -231,6 +247,7 @@ impl KernelStore {
         Ok(store)
     }
 
+    /// Returns the lease epoch stamped into writer-fence transactions.
     pub fn lease_epoch(&self) -> u64 {
         self.lease_epoch
     }
@@ -259,6 +276,7 @@ impl KernelStore {
         self.acquire_within(std::slice::from_ref(&self.writer), 0, limit)
     }
 
+    /// Marks all later connection acquisition as an invalid restore.
     pub(super) fn poison(&self) {
         self.poisoned.store(true, Ordering::Release);
     }
@@ -503,6 +521,10 @@ struct FormatMarker {
     marker_digest: String,
 }
 
+/// Verifies page integrity, foreign keys, format marker, and schema identity.
+///
+/// Returns `IdentityMismatch` only for a structurally valid kernel family with
+/// different identity. Failed integrity or marker checks are inconclusive.
 pub(super) fn verify_exact_identity(conn: &mut Connection) -> Result<(), KernelError> {
     let integrity_check: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -672,6 +694,10 @@ pub(super) fn activate_wal(conn: &Connection) -> Result<(), KernelError> {
         .map_err(|_| KernelError::Io)
 }
 
+/// Atomically stamps `epoch` into the singleton writer-fence row.
+///
+/// Values outside SQLite's signed integer range or a missing singleton row
+/// return `IdentityMismatch`.
 pub(super) fn stamp_writer_fence(conn: &mut Connection, epoch: u64) -> Result<(), KernelError> {
     let epoch = i64::try_from(epoch).map_err(|_| KernelError::IdentityMismatch)?;
     let tx = conn
@@ -732,6 +758,7 @@ pub(super) fn family_sidecars(path: &Path) -> [PathBuf; 3] {
     ]
 }
 
+/// Restricts the main database and existing SQLite sidecars to private access.
 pub(super) fn harden_family(path: &Path) -> Result<(), KernelError> {
     protect_file(path).map_err(|_| KernelError::Io)?;
     for sidecar in family_sidecars(path) {
@@ -959,6 +986,7 @@ pub(super) fn sync_parent(path: &Path) -> Result<(), KernelError> {
     sync_directory(parent)
 }
 
+/// Flushes directory metadata so preceding renames survive a crash.
 pub(super) fn sync_directory(path: &Path) -> Result<(), KernelError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())

@@ -6,6 +6,10 @@
 //! drift fails the benchmark instead of timing a cheaper resolution rung.
 //!
 //! Run with `cargo bench -p mc-kernel --bench anchor_resolution`.
+//!
+//! Setup and shape assertions run outside timed iterations. Fixture construction failures and
+//! resolution mismatches panic before Criterion records a misleading sample. Each cell fixes
+//! corpus size and candidate depth; durations measure wall time per operation.
 
 #[path = "../tests/support/git_fixtures.rs"]
 mod git_fixtures;
@@ -73,6 +77,7 @@ fn snapshot_fixture(modified: usize) -> (tempfile::TempDir, FixtureRepo) {
     (dir, fixture)
 }
 
+/// `assert_snapshot_shape` rejects fixture drift before the snapshot cell enters its timed loop.
 fn assert_snapshot_shape(root: &std::path::Path, budget: &EvalBudget, cell: &str, dirty: usize) {
     let snapshot = snapshot_checkout(root, budget).expect("snapshot succeeds");
     assert_eq!(
@@ -137,6 +142,7 @@ struct EvaluateCell {
     condition: GitCondition,
 }
 
+/// `checkout` materializes `commit` before freezing the checkout used by an evaluate cell.
 fn checkout(fixture: &FixtureRepo, commit: ObjectId, budget: &EvalBudget) -> CheckoutSnapshot {
     set_head_detached(&fixture.repo, commit);
     materialize(&fixture.repo, commit);

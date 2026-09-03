@@ -1,3 +1,9 @@
+//! Linux readiness reactor for shared-memory rings and optional setup sockets.
+//!
+//! One watcher thread owns blocking `epoll` waits. At most one JavaScript callback remains
+//! pending; `handled` acknowledges it, while `kick` requests another callback after the
+//! acknowledgement. Acquire/release atomics order callback state across both threads.
+
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -67,7 +73,7 @@ fn wait_until_handled(
     Ok(!closing.load(Ordering::Acquire))
 }
 
-/// Native worker limit.
+/// Disables extra native workers; the single readiness watcher handles every registration.
 pub(crate) const WORKER_LIMIT: u32 = 0;
 
 type ReadinessCallback = ThreadsafeFunction<(), (), (), Status, false, true, 2>;
@@ -89,6 +95,10 @@ pub(crate) struct Reactor {
 }
 
 impl Reactor {
+    /// Creates epoll and control descriptors, then starts the readiness watcher thread.
+    ///
+    /// Returns `GenericFailure` when descriptor creation, registration, or thread creation
+    /// fails. Callback construction preserves its N-API error.
     pub(crate) fn new(callback: Function<(), ()>) -> Result<Self> {
         let callback = Arc::new(
             callback
@@ -207,6 +217,8 @@ impl Reactor {
         })
     }
 
+    /// Re-registering an existing ID is a no-op. Failures remove descriptors added by this
+    /// call and return `GenericFailure`; no partial registration remains in the map.
     pub(crate) fn register(
         &mut self,
         channel_id: u32,
@@ -286,6 +298,8 @@ impl Reactor {
         let _ = rustix::io::write(&self.control, &1u64.to_ne_bytes());
     }
 
+    /// Signals the watcher, joins it, then drops registrations and pending callback state.
+    /// Calling this more than once is safe because the watcher handle is taken on first use.
     pub(crate) fn shutdown(&mut self) {
         self.closing.store(true, Ordering::Release);
         let _ = rustix::io::write(&self.control, &1u64.to_ne_bytes());

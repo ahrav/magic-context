@@ -841,6 +841,7 @@ mod reference {
 use mc_module::caveman::{compress, CavemanLevel};
 use proptest::prelude::*;
 
+/// Pairs every production level with its frozen-reference counterpart in enum order.
 fn levels() -> [(CavemanLevel, reference::CavemanLevel); 3] {
     [
         (CavemanLevel::Lite, reference::CavemanLevel::Lite),
@@ -849,6 +850,7 @@ fn levels() -> [(CavemanLevel, reference::CavemanLevel); 3] {
     ]
 }
 
+/// Generates protected regions, phrase rules, Unicode, whitespace, and placeholder collisions.
 fn fragment() -> impl Strategy<Value = String> {
     prop_oneof![
         Just("I just really wanted to basically explain the implementation clearly".to_string()),
@@ -931,6 +933,7 @@ fn fragment() -> impl Strategy<Value = String> {
     ]
 }
 
+/// Interleaves generated fragments with punctuation and newline runs.
 fn document() -> impl Strategy<Value = String> {
     (
         proptest::collection::vec(fragment(), 0..24),
@@ -959,6 +962,7 @@ fn document() -> impl Strategy<Value = String> {
         })
 }
 
+/// Generates documents above 32 KiB to exercise large-input equivalence.
 fn large_document() -> impl Strategy<Value = String> {
     (fragment(), 32usize..65).prop_map(|(fragment, repeats)| {
         let unit = format!(

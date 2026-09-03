@@ -115,8 +115,6 @@ fn rust_canonical_encoding_reproduces_every_qualified_closure_digest() {
     for (name, digest, bytes) in mc_module::production_inputs::QUALIFIED_HARNESS_CLOSURES {
         let manifest: ClosureManifest =
             serde_json::from_str(bytes).expect("qualified closure manifest parses");
-        // Digest equality enforces compatibility with the generated canonical digests.
-        // `closure_incomplete`.
         assert_eq!(
             manifest_digest(&manifest).expect("manifest validates and digests"),
             *digest,

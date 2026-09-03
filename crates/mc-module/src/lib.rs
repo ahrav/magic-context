@@ -1,4 +1,3 @@
-//!
 //! `McHandler` owns the primary host lifecycle, transforms already-decoded CK items, and persists per-session state in the single-writer `mc-store`.
 
 #![forbid(unsafe_code)]
@@ -45,6 +44,7 @@ pub mod release_contract {
     ));
 }
 
+/// Generated inventory of production harness inputs.
 pub mod production_inputs {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -141,6 +141,7 @@ pub mod bench_internals {
     use mc_core::CoreState;
     use mc_store::{McStore, McTagRow};
 
+    /// Returns unprotected and total tail-hygiene token estimates.
     pub fn measure_tail_hygiene(
         projection: &FlatProjection,
         core: &CoreState,
@@ -160,6 +161,7 @@ pub mod bench_internals {
         (measurement.u, measurement.t)
     }
 
+    /// Returns how many leading claims fit the supplied token budget.
     pub fn trim_claims_to_budget(claims: &[MirroredClaimMemory], budget_tokens: f64) -> usize {
         crate::m0_compose::trim_claims_to_budget(
             claims,
@@ -169,13 +171,16 @@ pub mod bench_internals {
         .len()
     }
 
+    /// Serialized transform cache used by benchmark calls.
     #[derive(Default)]
     pub struct OutputCache(Mutex<SerializedOutputCache>);
 
+    /// Clears the process-wide benchmark token-estimate cache.
     pub fn clear_token_cache() {
         crate::token_cache::clear();
     }
 
+    /// Runs the cached transform path with a benchmark-owned output cache.
     pub fn transform_cached(
         store: &McStore,
         req: &TransformRequest,
@@ -553,17 +558,19 @@ impl Drop for TransformDispatchTicket<'_> {
     }
 }
 
-/// safety fold.
-/// cannot diverge.
+/// Compatibility requires this exact memory-render format epoch.
 pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = release_contract::MEMORY_RENDER_EPOCH;
+/// Compatibility requires this exact compartment-render format epoch.
 pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = release_contract::COMPARTMENT_RENDER_EPOCH;
+/// Compatibility requires this exact Claude Code Anthropic profile epoch.
 pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 =
     release_contract::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC;
+/// Compatibility requires this exact provider-visible tagging epoch.
 pub const TAGGER_FEATURE_EPOCH: u32 = release_contract::TAGGER_EPOCH;
 /// Compatibility requires the exact numeric epoch, not `state_sync_deltas`.
 pub const STATE_SYNC_EPOCH: u32 = release_contract::STATE_SYNC_EPOCH;
 
-///
+/// Returns the compatibility epoch for a serializer profile.
 pub const fn profile_render_epoch(profile: SerializerProfile) -> u32 {
     match profile {
         SerializerProfile::ClaudeCodeAnthropic => PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
@@ -1933,7 +1940,6 @@ impl TransformSnapshotCache {
         self.in_flight_lru.push_back(session_id.to_string());
         // Wrapup refuses Missing entries, so evicting an InFlight entry to Missing cannot start a wrapup.
         // The generation check prevents `finish_ready` from resurrecting an evicted session's stale snapshot.
-        // The generation check prevents `finish_ready` from resurrecting an evicted session's stale snapshot.
         while self.in_flight_lru.len() > self.max_in_flight_entries {
             let Some(oldest) = self.in_flight_lru.pop_front() else {
                 break;
@@ -2686,6 +2692,7 @@ impl NativeAttachmentCache {
     }
 }
 
+/// Identifies an ingress projection independently of native-render transitions.
 ///
 /// `transition_consumed` is absent because the upcoming transform affects served native rendering but not the ingress CK projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2971,8 +2978,10 @@ fn new_note_evaluator_slot_cycles(capacity: i64) -> Arc<Vec<Mutex<NoteEvaluatorS
     )
 }
 
+/// Creates historian producer drivers for project and harness bindings.
 #[async_trait]
 pub trait HistorianProducerFactory: Send + Sync {
+    /// Connects one producer using the route's credential fingerprints.
     async fn connect(
         &self,
         project_root: &Path,
@@ -3343,10 +3352,12 @@ impl HistorianProducerFactory for MissingProducerFactory {
 }
 
 impl McHandler {
+    /// Creates a handler without a host connection file.
     pub fn new() -> Self {
         Self::new_with_connection_file(None)
     }
 
+    /// Creates a handler that connects historian producers through `connection_file` when present.
     pub fn new_with_connection_file(connection_file: Option<PathBuf>) -> Self {
         let cancel = CancellationToken::new();
         let producer_factory: Arc<dyn HistorianProducerFactory> = match connection_file {
@@ -5296,7 +5307,6 @@ impl McHandler {
     }
 
     /// Emergency-pass firing is bounded by the completion-wait budget.
-    ///
     async fn run_historian_firing_inline(
         &self,
         task: HistorianFiringTask,
@@ -9779,7 +9789,7 @@ impl McHandler {
         }
     }
 
-    ///
+    /// Returns the project root frozen into a bound facade route.
     fn claim_route_root(
         &self,
         channel: RouteHandle,
@@ -12173,6 +12183,7 @@ fn projection_cache_context(request: &TransformRequest) -> ProjectionCacheContex
     }
 }
 
+/// Reuses a projection only when its content frontier and cache context match.
 ///
 /// Transition salt is excluded because transitions affect native rendering, not ingress CK projections.
 fn validated_projection_cache_input(
@@ -14990,7 +15001,7 @@ fn compact_status_detail(detail: &str) -> String {
     sanitize_status_text(detail, 120)
 }
 
-///
+/// Builds the storage-version fields returned by module status.
 fn storage_versions_block(store: &McStore) -> Value {
     json!({
         "context_db_schema_version": null,
@@ -15259,6 +15270,7 @@ fn record_historian_connect_failure(
     unreachable!("the connect-failure CAS loop returns from both attempts")
 }
 
+/// Decodes a storage descriptor or falls back to the development descriptor.
 pub fn resolve_descriptor(storage: Option<&Value>) -> StorageDescriptor {
     if let Some(value) = storage {
         if let Ok(descriptor) = serde_json::from_value::<StorageDescriptor>(value.clone()) {
@@ -15279,6 +15291,7 @@ fn dev_descriptor() -> StorageDescriptor {
     dev_descriptor_at(&data_home)
 }
 
+/// Builds the module-isolated SQLite descriptor under `data_home`.
 pub fn dev_descriptor_at(data_home: &str) -> StorageDescriptor {
     StorageDescriptor {
         module_id: DEFAULT_MODULE_ID.to_string(),
@@ -15489,6 +15502,7 @@ fn ctx_note_schema() -> Value {
     })
 }
 
+/// Builds the tool-provider manifest for `module_id`.
 pub fn manifest(module_id: &str) -> ManifestSnapshot {
     ManifestSnapshot {
         module_id: module_id.to_owned(),
@@ -18448,8 +18462,6 @@ mod tests {
         );
     }
 
-    // Direct calls avoid process-global `MC_DRIVE_FAULT` state.
-    // Direct calls avoid process-global `MC_DRIVE_FAULT` state.
     // Direct calls avoid process-global `MC_DRIVE_FAULT` state.
     #[test]
     #[cfg(feature = "drive-fault")]

@@ -365,9 +365,9 @@ impl HistorianProducerError {
         }
     }
 
+    /// Returns the request send outcome when this error followed a send attempt.
     ///
-    /// `None` denotes a transport or client error rather than a send attempt; callers must not treat it as `NotSent`.
-    /// `None` denotes a transport or client error rather than a send attempt; callers must not treat it as `NotSent`.
+    /// `None` denotes a transport or client error and must not be treated as `NotSent`.
     pub fn send_outcome(&self) -> Option<HistorianSendOutcome> {
         match self {
             Self::Call(failure) => Some(failure.outcome),
@@ -718,12 +718,8 @@ impl HistorianProducer {
         max_output_tokens: u32,
         temperature: f64,
     ) -> Result<RunHandle, HistorianProducerError> {
-        // The handler checks the cancellation token before `ensure_command_route` because its awaits do not observe the token.
-        // The handler checks the cancellation token before `ensure_command_route` because its awaits do not observe the token.
-        // Without a pre-route cancellation check, a cancelled handler can wait through route admission and bind a route.
-        // A handler cancelled before its request starts can otherwise bind a route after route admission completes.
-        // `NotSent` means no frame has been queued on any route.
-        // `NotSent` means no frame has been queued on any route.
+        // Route admission does not observe cancellation, so check before opening a route.
+        // `NotSent` is valid here because no frame has been queued.
         if self.stop_requested() {
             return Err(HistorianProducerError::Call(
                 HistorianCallFailure::untagged(
@@ -881,12 +877,10 @@ impl HistorianProducer {
         Ok(serde_json::from_slice(&response)?)
     }
 
+    /// Replays one frozen request after reconnecting to the same daemon and identity.
     ///
-    /// The recovery path returns `ambiguous` unchanged on every abort because the frozen request may already have reached the host.
-    /// The recovery path returns `ambiguous` unchanged on every abort because the frozen request may already have reached the host.
-    /// Reporting cancellation as `NotSent` would permit retrying a request that may already have reached the host.
-    /// Reporting cancellation as `NotSent` would permit retrying a request that may already have reached the host.
-    /// Reporting cancellation as `NotSent` would permit retrying a request that may already have reached the host.
+    /// Recovery aborts return `ambiguous` unchanged because the original request may
+    /// have reached the host. Reporting `NotSent` would permit an unsafe retry.
     async fn replay_frozen_once(
         &mut self,
         frozen_daemon: [u8; 16],
@@ -894,22 +888,16 @@ impl HistorianProducer {
         frozen: &[u8],
         ambiguous: HistorianProducerError,
     ) -> Result<Value, HistorianProducerError> {
-        // The recovery path releases the ambiguous generation before reconnecting because both connections consume a host permit.
-        // The old and replay connections both consume a host connection permit.
-        // At `max_connections == 1`, reconnecting before release causes the host to drop the new authenticated socket.
-        // At `max_connections == 1`, reconnecting before release causes the host to drop the new authenticated socket.
-        // The recovery path releases the old generation before reconnecting so failed reconnects cannot prevent its cleanup.
+        // Release the old generation before reconnecting because both connections consume
+        // a host permit. This ordering also completes cleanup if reconnecting fails.
         if let Err(error) = self.close_routes_and_connection().await {
             eprintln!("mc-module: historian replay cleanup failed: {error}");
         }
         self.command_route = None;
         self.subscribe_route = None;
 
-        // The recovery path checks cancellation before setup because cleanup, reconnect, and route opening do not observe the token.
-        // The recovery path checks cancellation before setup because cleanup, reconnect, and route opening do not observe the token.
-        // Cleanup, reconnect, and route opening do not observe the cancellation token.
-        // Cancellation during setup is observed by the `stop_requested` checks after cleanup and reconnect.
-        // The recovery path rechecks `stop_requested` after cleanup and reconnect to avoid opening a route after cancellation.
+        // Cleanup, reconnect, and route opening do not observe cancellation.
+        // Recheck between each phase to avoid opening a route after cancellation.
         if self.stop_requested() {
             return Err(ambiguous);
         }
@@ -921,10 +909,7 @@ impl HistorianProducer {
         {
             Ok(reconnected) => reconnected,
             Err(error) => {
-                // Reconnect failures must preserve the original send's unknown outcome.
-                // Reconnect failures must not replace the original send's `OutcomeUnknown` result.
-                // `Client` errors have no `send_outcome()` classification.
-                // The recovery path returns `ambiguous` because the frozen request may already have committed.
+                // Preserve the original `OutcomeUnknown`; the frozen request may have committed.
                 eprintln!("mc-module: historian replay reconnect failed: {error}");
                 return Err(ambiguous);
             }
@@ -995,7 +980,6 @@ impl HistorianProducer {
         tokio::select! {
             biased;
             () = cancellation.cancelled() => {
-                //
                 if let Err(error) = self.connection.close().await {
                     eprintln!("mc-module: historian cancelled route-open cleanup failed: {error}");
                 }
@@ -1026,7 +1010,6 @@ impl HistorianProducer {
         Ok(serde_json::from_slice(&response)?)
     }
 
-    ///
     async fn subscribe_from_start(
         &mut self,
         run_id: &str,
@@ -1098,7 +1081,6 @@ impl HistorianProducer {
         }
     }
 
-    ///
     fn stop_requested(&self) -> bool {
         self.config
             .cancellation
@@ -1414,7 +1396,6 @@ mod tests {
             _target: RouteTarget,
             identity: RouteIdentity,
         ) -> Result<RouteHandle, HistorianProducerError> {
-            // observe.
             let cancel = self.state.lock().unwrap().cancel_on_open_route.take();
             if let Some(cancel) = cancel {
                 cancel.cancel();
@@ -2041,7 +2022,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_attempt_that_outlives_its_budget_reports_timed_out() {
-        // is deterministic.
         let connection = connection(1, [Ok(br#"{"run_id":"run"}"#.to_vec())]);
         connection.state.lock().unwrap().stall_stream = true;
         let (mut producer, _) = producer(connection, None).await;

@@ -9,7 +9,6 @@
 //! Open-loop arms report scheduled-to-completion, issue-to-completion, and scheduler-lag distributions separately.
 //! Open-loop arms preserve the original arrival schedule.
 //! Every scheduled request resolves to exactly one terminal outcome.
-//! outcome.
 //!
 //! `--workload json` sends the compact-JSON fixture.
 //! `json` validates every echoed terminal body against the fixture bytes.
@@ -125,7 +124,6 @@ fn body_bytes(opts: &Opts) -> Vec<u8> {
 struct ConnResult {
     /// Open loop reports issue-to-validated-terminal latency as the issue-based distribution.
     issue_latencies_ns: Vec<u64>,
-    /// honest).
     sched_latencies_ns: Vec<u64>,
     /// `issue - scheduled` measures load-generator lag, not server latency.
     sched_lag_ns: Vec<u64>,
@@ -433,7 +431,6 @@ async fn run_conn(
         let now_ns = Instant::now().duration_since(start).as_nanos() as u64;
         drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
         // Only RESPONSE, ERROR, STREAM_DATA, and STREAM_END may resolve pending requests; PING, PUSH, and GOODBYE may be unsolicited; all other types violate the protocol.
-        // wire-protocol regression.
         if !matches!(
             frame.ty,
             TY_RESPONSE | TY_ERROR | raw_client::TY_STREAM_DATA | raw_client::TY_STREAM_END
@@ -506,7 +503,6 @@ async fn run_conn(
                 } else if !expect_fixture && body_buf.as_slice() != body.as_slice() {
                     // The raw echo contract compares bodies byte-for-byte.
                     // Same-length corruption is a body mismatch.
-                    // echo either.
                     record_failure!(Outcome::BodyMismatch, "raw echo bytes");
                 } else if measured {
                     result.outcomes.record(Outcome::Success);

@@ -9,11 +9,10 @@ use sha2::{Digest, Sha256};
 use super::checkout::{CheckoutSnapshot, EvalBudget, WorktreeEntry};
 use super::payloads::CheckSpec;
 
+/// Maximum config bytes read for one cheap check.
 pub const MAX_CONFIG_BYTES: u64 = 1 << 20;
 
-/// Typed verdict of one cheap check. `Unsupported` is a first-class
-/// outcome — the evaluator maps it to uncertain rather than inventing a
-/// pass or fail (KTD8: no speculative resolver trait).
+/// The evaluator maps `Unsupported` to uncertain rather than pass or fail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckOutcome {
     Passed,

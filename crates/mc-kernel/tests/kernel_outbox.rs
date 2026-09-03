@@ -1,3 +1,7 @@
+//! These tests cover outbox checkpoint, publication, pruning, and writer-fence contracts.
+//!
+//! They inspect SQLite state directly to verify commit-boundary ordering and retention invariants without relying on public read projections.
+
 #![cfg(feature = "test-support")]
 
 use mc_kernel::{CommitIntent, DomainSpec, KernelError, KernelStore, Sensitivity};

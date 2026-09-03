@@ -1,10 +1,8 @@
-//! Text-processing helpers shared by the two conversation-chunk builders
-//! (`boundary.rs` over `BoundaryMsg` and `historian_chunk.rs` over
-//! `FlatMessage`). The builders themselves are type-specific and stay in
-//! their modules; everything here is type-independent string/JSON work, kept
-//! in one place so role compaction, commit-hash extraction, and whitespace
-//! normalization cannot drift between the transform boundary summary and the
-//! historian chunk rendering.
+//! Shared text processing for boundary summaries and historian chunks.
+//!
+//! Helpers operate only on strings and JSON values. Commit hashes preserve first
+//! appearance order, role labels use compact display forms, and normalization
+//! collapses Unicode whitespace without changing non-whitespace characters.
 
 use std::sync::OnceLock;
 
@@ -21,6 +19,11 @@ pub(crate) struct CompactedText {
     pub(crate) commit_hashes: Vec<String>,
 }
 
+/// Extracts up to [`MAX_COMMITS_PER_BLOCK`] unique commit hashes from assistant text.
+///
+/// Hashes preserve first appearance order and are normalized to lowercase. Text is
+/// compacted only when it contains both a recognized commit verb and at least one
+/// hash; other roles retain their original text.
 pub(crate) fn compact_text_for_summary(text: String, role: &str) -> CompactedText {
     let commit_hashes = if role == "assistant" {
         extract_commit_hashes(&text)
@@ -53,6 +56,7 @@ pub(crate) fn compact_text_for_summary(text: String, role: &str) -> CompactedTex
     }
 }
 
+/// Appends unseen hashes from `next` in order, capped at [`MAX_COMMITS_PER_BLOCK`].
 pub(crate) fn merge_commit_hashes(existing: &[String], next: &[String]) -> Vec<String> {
     if next.is_empty() {
         return existing.to_vec();
@@ -87,7 +91,10 @@ fn extract_commit_hashes(text: &str) -> Vec<String> {
     hashes
 }
 
-/// Chunk-block render line over the fields both builders' block types share.
+/// Renders one chunk block as an ordinal range, role, optional commit list, and parts.
+///
+/// `parts` retain input order and are separated by ` / `. The ordinal range is
+/// inclusive and is not reordered when `start_ordinal` exceeds `end_ordinal`.
 pub(crate) fn format_block_line(
     role: &str,
     start_ordinal: u64,
@@ -108,6 +115,10 @@ pub(crate) fn format_block_line(
     format!("{} {}:{} {}", range, role, commit_suffix, parts.join(" / "))
 }
 
+/// Extracts the first recognized display argument from a JSON object.
+///
+/// Path-like keys have priority and are truncated to 60 Unicode scalar values.
+/// Symbol-like keys are returned without truncation. Non-objects return `None`.
 pub(crate) fn extract_key_arg(input: &Value) -> Option<String> {
     let object = input.as_object()?;
     for key in ["filePath", "path", "pattern", "query"] {
@@ -150,6 +161,7 @@ pub(crate) fn is_system_directive(text: &str) -> bool {
     text.trim_start().starts_with(SYSTEM_DIRECTIVE_PREFIX)
 }
 
+/// Collapses runs of Unicode whitespace to single ASCII spaces and trims both ends.
 pub(crate) fn normalize_text(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     for word in text.split_whitespace() {
@@ -161,6 +173,9 @@ pub(crate) fn normalize_text(text: &str) -> String {
     output
 }
 
+/// Maps assistant and user roles to `A` and `U`; other roles use an uppercase initial.
+///
+/// Empty roles map to `M`.
 pub(crate) fn compact_role(role: &str) -> String {
     match role {
         "assistant" => "A".to_string(),

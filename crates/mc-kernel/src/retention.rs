@@ -1,3 +1,7 @@
+//! Timestamps and retention intervals use Unix milliseconds. Every staging mutation starts an
+//! immediate SQLite transaction and checks the store lease epoch before changing rows. Run and
+//! candidate lifecycle fields change in the same transaction.
+
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::envelope::check_fence;
@@ -6,8 +10,10 @@ use super::{map_sqlite, KernelError, KernelStore};
 use crate::cas::gc::GcFaults;
 use crate::cas::ArtifactGcResult;
 
+/// Retention interval after a staging run reaches a terminal state, in milliseconds.
 pub const STAGING_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 
+/// Maximum number of runs removed by one deletion transaction.
 const DELETE_BATCH_RUNS: i64 = 1_024;
 
 /// Owners cannot declare `abandoned`, reserving it for lease-sweep reclamation.
@@ -128,9 +134,13 @@ impl KernelStore {
         tx.commit().map_err(map_sqlite)
     }
 
+    /// Atomically marks every active run whose lease expires at or before `now` as abandoned.
+    /// Candidate lifecycle rows receive the same terminal timestamp.
+    ///
     /// # Errors
     ///
-    /// Returns [`KernelError::InvalidInput`] when `now` is negative.
+    /// Returns [`KernelError::InvalidInput`] when `now` is negative. Writer-lock, lease-fence,
+    /// SQLite, and commit failures propagate as [`KernelError`].
     pub fn abandon_expired_staging_runs(&self, now: i64) -> Result<usize, KernelError> {
         if now < 0 {
             return Err(KernelError::InvalidInput);
@@ -160,9 +170,15 @@ impl KernelStore {
         Ok(deleted)
     }
 
+    /// Runs capture-pin maintenance, staging abandonment and deletion, then artifact GC.
+    ///
+    /// Staging changes commit before artifact GC acquires the writer. A later artifact-GC failure
+    /// does not roll back already committed staging maintenance.
+    ///
     /// # Errors
     ///
-    /// Returns [`KernelError::InvalidInput`] when `now` is negative.
+    /// Returns [`KernelError::InvalidInput`] when `now` is negative. Any maintenance, writer,
+    /// lease-fence, SQLite, or artifact-GC failure propagates.
     pub fn run_staging_maintenance(
         &self,
         now: i64,
@@ -299,6 +315,7 @@ fn delete_aged(tx: &Transaction<'_>, now: i64) -> Result<usize, KernelError> {
     Ok(run_ids.len())
 }
 
+/// Starts an immediate transaction and rejects a stale process lease before any write.
 pub(super) fn begin_fenced_write(
     writer: &mut rusqlite::Connection,
     lease_epoch: u64,

@@ -3,9 +3,12 @@ use rusqlite::{params, Transaction};
 
 use super::{map_sqlite, KernelError};
 
+/// Redacted durable text and its detection metadata.
 #[derive(Clone)]
 pub(super) struct RedactedField {
+    /// Text returned by the durable redactor.
     pub text: String,
+    /// Detections returned by the durable redactor.
     pub detections: Vec<Detection>,
 }
 
@@ -19,6 +22,10 @@ pub(super) fn redact_lossy(value: &str) -> RedactedField {
     }
 }
 
+/// Redacts input that fits the durable-text size limit.
+///
+/// Returns [`KernelError::InvalidInput`] when UTF-8 byte length exceeds
+/// `MAX_REDACTABLE_BYTES`.
 pub(super) fn redact(value: &str) -> Result<RedactedField, KernelError> {
     if value.len() > mc_core::redaction::MAX_REDACTABLE_BYTES {
         return Err(KernelError::InvalidInput);
@@ -36,6 +43,12 @@ pub(super) fn identity(value: &str) -> Result<String, KernelError> {
     }
 }
 
+/// Inserts one metadata row per detection in ordinal order.
+///
+/// Detection offsets and lengths use UTF-8 byte units. Returns
+/// [`KernelError::InvalidInput`] if an ordinal or coordinate cannot fit in
+/// SQLite's signed integer representation, and maps database failures through
+/// `map_sqlite`.
 pub(super) fn record(
     tx: &Transaction<'_>,
     owner_kind: &str,

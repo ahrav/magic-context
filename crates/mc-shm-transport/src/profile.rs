@@ -1,3 +1,9 @@
+//! Immutable transport profiles and process-wide resource admission.
+//!
+//! Profile construction validates protocol geometry before resources exist. Admission charges
+//! active and quarantined resources against explicit host ceilings. Dropping an active admission
+//! releases its charge; quarantine retains memory and descriptor charges until process teardown.
+
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::fmt;
@@ -249,7 +255,9 @@ pub struct HostLimits {
 pub struct VerifiedPhysicalCores(u64);
 
 impl VerifiedPhysicalCores {
-    /// Reads allowed logical CPUs and counts unique package/core pairs.
+    /// Reads the process CPU allowance and counts unique Linux package/core pairs.
+    ///
+    /// Returns `None` when procfs or any required sysfs topology value is absent or malformed.
     #[cfg(target_os = "linux")]
     pub fn detect() -> Option<Self> {
         let allowed = allowed_linux_cpus()?;
@@ -368,6 +376,9 @@ impl AdmissionController {
     }
 
     /// Checks candidate admission without changing accounting or creating resources.
+    ///
+    /// Quarantined memory, mappings, descriptors, leases, and clients still consume limits.
+    /// Worker and pinned-worker checks apply only to active charges.
     pub fn can_admit(
         &self,
         profile: &TargetProfile,
@@ -382,6 +393,9 @@ impl AdmissionController {
     }
 
     /// Charges candidate before mappings or workers are created.
+    ///
+    /// Returned [`Admission`] releases the charge on drop unless explicitly released or
+    /// quarantined. Lock poisoning and limit failures leave accounting unchanged.
     pub fn admit(
         self: &Arc<Self>,
         profile: &TargetProfile,
@@ -514,7 +528,10 @@ impl Admission {
         self.state = AdmissionState::Released;
     }
 
-    /// Retains bytes, descriptors, leases, and mappings until process teardown.
+    /// Retains bytes, descriptors, leases, mappings, and client count until process teardown.
+    ///
+    /// Worker charges are released because quarantine follows worker termination. Failure leaves
+    /// this admission active, so its eventual drop releases the original charge.
     pub fn quarantine(mut self) -> Result<QuarantineRecord, AdmissionError> {
         self.controller.quarantine(self.charges)?;
         self.state = AdmissionState::Quarantined;
@@ -633,7 +650,10 @@ pub const MC_HOST_RING_PROFILE: &str = "mc-host-test-ring-v1";
 /// Descriptor slots and lease bound of `MC_HOST_RING_PROFILE`.
 pub const MC_HOST_RING_DEPTH: usize = 8;
 
-/// Geometry named by `MC_HOST_RING_PROFILE`, so a peer or harness that echoes that id exercises the depth and topology the host actually creates.
+/// Builds the geometry named by [`MC_HOST_RING_PROFILE`].
+///
+/// A peer or harness that echoes the identifier therefore exercises the same descriptor depth,
+/// lease bound, arena size, and fused-worker topology created by the host.
 pub fn mc_host_ring_profile() -> Result<TargetProfile, ProfileError> {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
@@ -650,7 +670,10 @@ pub fn mc_host_ring_profile() -> Result<TargetProfile, ProfileError> {
     })
 }
 
-/// Builds a generic ring profile for tests and local tools.
+/// Builds a caller-thread ring profile for tests and local tools.
+///
+/// The supplied hardware identifier is preserved in the transport descriptor. All other geometry
+/// uses fixed local defaults and still passes through [`TargetProfile::new`] validation.
 pub fn ring_profile(hardware: HardwareProfileId) -> Result<TargetProfile, ProfileError> {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(hardware),

@@ -1,6 +1,7 @@
-//! The Rust contract mirrors `packages/plugin/src/features/magic-context/memory/claim-operation-contract.ts`.
-//! `packages/plugin/src/features/magic-context/memory/claim-operation-contract.ts`.
-//! `memory/fixtures/claim-operation-contract-v1.json`.
+//! Canonical claim-operation encoding shared with the TypeScript runtime.
+//!
+//! The contract mirrors `packages/plugin/src/features/magic-context/memory/claim-operation-contract.ts`.
+//! Golden cross-runtime cases live in `memory/fixtures/claim-operation-contract-v1.json`.
 //!
 //! Canonical values are null, booleans, safe integers with |n| <= 2^53 - 1, strings, arrays, and objects.
 //! Floats with fractional parts, non-finite numbers, and out-of-range integers are rejected.
@@ -123,12 +124,17 @@ fn encode_canonical_value(out: &mut String, value: &Value) -> Result<(), Contrac
     Ok(())
 }
 
+/// Encodes a JSON value using the canonical form documented by this module.
+///
+/// Returns [`ContractError::NotCanonical`] when a number is fractional, non-finite,
+/// or outside the cross-runtime safe-integer range.
 pub fn canonical_json_encode(value: &Value) -> Result<String, ContractError> {
     let mut out = String::new();
     encode_canonical_value(&mut out, value)?;
     Ok(out)
 }
 
+/// Returns lowercase SHA-256 hex for the UTF-8 bytes of `text`.
 pub fn sha256_hex_utf8(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
@@ -145,14 +151,18 @@ fn protocol_digest(protocol: &str, value: &Value) -> Result<String, ContractErro
     Ok(sha256_hex_utf8(&format!("{protocol}\n{canonical}")))
 }
 
-/// The canonical request digest identifies the operation.
+/// Computes the protocol-separated canonical request digest that identifies an operation.
+///
+/// Returns [`ContractError::NotCanonical`] when `request` contains a number that
+/// canonical JSON cannot represent.
 pub fn compute_claim_operation_request_digest(request: &Value) -> Result<String, ContractError> {
     protocol_digest(CLAIM_REQUEST_DIGEST_PROTOCOL, request)
 }
 
+/// Reports whether `text` contains exactly `expected_len` lowercase ASCII hex bytes.
 ///
-/// The claim-operation contract, intent ledger, and claim mirror require identities in this format.
-/// A shared definition prevents layers from accepting incompatible ID lengths or character sets.
+/// The claim-operation contract, intent ledger, and claim mirror use this shared
+/// check to avoid incompatible identity lengths or character sets.
 pub fn is_lower_hex(text: &str, expected_len: usize) -> bool {
     text.len() == expected_len
         && text
@@ -160,13 +170,14 @@ pub fn is_lower_hex(text: &str, expected_len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Reports whether `candidate` is `mcm_` followed by 32 lowercase hex bytes.
 pub fn is_valid_public_claim_id(candidate: &str) -> bool {
     candidate
         .strip_prefix(PUBLIC_CLAIM_ID_PREFIX)
         .is_some_and(|rest| is_lower_hex(rest, 32))
 }
 
-/// content digest.
+/// Identifies one claim revision by public ID, positive revision, and content digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevisionLocator {
     pub public_claim_id: String,
@@ -174,6 +185,10 @@ pub struct RevisionLocator {
     pub content_digest: String,
 }
 
+/// Formats a validated locator as `<claim-id>/r<revision>/<digest>`.
+///
+/// Returns `None` for an invalid claim ID, a revision outside `1..=2^53-1`,
+/// or a content digest other than 64 lowercase hex bytes.
 pub fn format_revision_locator(locator: &RevisionLocator) -> Option<String> {
     if !is_valid_public_claim_id(&locator.public_claim_id)
         || !(1..=MAX_SAFE_INTEGER).contains(&locator.revision)
@@ -187,6 +202,10 @@ pub fn format_revision_locator(locator: &RevisionLocator) -> Option<String> {
     ))
 }
 
+/// Parses the exact locator form emitted by [`format_revision_locator`].
+///
+/// Returns `None` for extra path components, leading-zero revisions, invalid
+/// claim IDs or digests, and revisions outside `1..=2^53-1`.
 pub fn parse_revision_locator(raw: &str) -> Option<RevisionLocator> {
     let mut parts = raw.split('/');
     let public_claim_id = parts.next()?;
@@ -245,6 +264,9 @@ pub fn compute_claim_mutation_token_digest(
     protocol_digest(CLAIM_MUTATION_TOKEN_DIGEST_PROTOCOL, &token_value(token))
 }
 
+/// Computes an applicability-head digest after sorting entries by stream key.
+///
+/// Duplicate stream keys retain their relative order because slice sorting is stable.
 pub fn compute_applicability_heads_digest(
     heads: &[(String, i64)],
 ) -> Result<String, ContractError> {
@@ -403,8 +425,10 @@ pub enum ClaimIntentAckKind {
     TerminalRejected,
 }
 
-/// Result bytes are supplied only when recording `context-committed` or `terminal-rejected`; they must already use canonical claim-result encoding.
-/// claim-result encoding.
+/// Acknowledges an intent transition.
+///
+/// Result bytes are supplied only for `context-committed` or `terminal-rejected`
+/// and must already use canonical claim-result encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimIntentAckRequest {
@@ -562,6 +586,10 @@ fn decode_effect(entry: &Value, index: usize) -> Result<ClaimOperationResultEffe
     })
 }
 
+/// Strictly decodes a stored claim-operation result envelope.
+///
+/// Returns [`ContractError::MalformedResult`] for invalid JSON, unknown fields, unsupported versions or outcomes, malformed effects, unsafe integers in effect and generation fields, or invalid revision locators.
+/// `payload` is returned as parsed, so numbers nested inside it are never range-checked; a missing `payload` is represented as JSON null.
 pub fn decode_claim_operation_result(
     result_json: &str,
 ) -> Result<ClaimOperationResult, ContractError> {

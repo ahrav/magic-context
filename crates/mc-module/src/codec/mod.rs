@@ -1,3 +1,5 @@
+//! Provider codec adapters and sidecar metadata.
+
 pub mod opencode;
 pub mod pi;
 pub mod sidecar;

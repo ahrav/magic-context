@@ -1,5 +1,8 @@
-//! The harness provides a deterministic embedding engine for Synapse protocol tests.
-//! The harness provides a fake primary component and a real-loopback composite host.
+//! Synapse protocol-test harness with deterministic embeddings and a loopback host.
+//!
+//! Engine counters use sequentially consistent atomics. Mutable controls use
+//! mutexes, and the optional condition-variable gate blocks inference calls
+//! until tests release it.
 
 #![allow(dead_code)]
 
@@ -80,6 +83,7 @@ impl DeterministicEngine {
         wake.notify_all();
     }
 
+    /// Derives a deterministic unit vector from the first `dims` SHA-256 bytes.
     pub fn vector_for(&self, text: &str) -> Vec<f32> {
         use sha2::Digest;
         let digest = sha2::Sha256::digest(text.as_bytes());
@@ -299,9 +303,7 @@ pub async fn open_synapse_route_rejection(client: &mut raw_client::RawClient) ->
             Err(code) if code == "module_reloading" && tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            // The harness treats `module_reloading` that never settles as a timeout, not a permanent rejection.
-            // The harness treats `module_reloading` that never settles as a timeout, not a permanent rejection.
-            // The harness treats `module_reloading` that never settles as a timeout, not a permanent rejection.
+            // A reloading lane that misses the deadline is a timeout, not a permanent rejection.
             Err(code) if code == "module_reloading" => {
                 panic!("synapse route still reloading at the rejection deadline")
             }
@@ -328,7 +330,11 @@ pub async fn call(
 }
 
 /// Publishes one application call and returns its correlation without waiting
-/// for the terminal.
+/// for its terminal frame.
+///
+/// # Panics
+///
+/// Panics if request serialization or frame transmission fails.
 pub async fn send_call(
     client: &mut raw_client::RawClient,
     channel: u16,

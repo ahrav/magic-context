@@ -1,7 +1,10 @@
+//! Secures one host instance and its runtime publication on Unix.
 //!
-//! All mutations use one validated directory descriptor opened with `O_NOFOLLOW`.
-//! Path-based operations remain inside the validated directory.
-//! A concurrent path or symlink swap cannot redirect create, rename, or unlink outside the validated directory.
+//! Mutations use a validated directory descriptor opened with `O_NOFOLLOW`.
+//! Descriptor-relative create, rename, and unlink operations stay anchored to
+//! that directory even if a concurrent process replaces its pathname. The
+//! lifetime lock fences replacement of the managed subtree, while `flock` fences
+//! publication through the pinned runtime directory.
 
 use std::fmt;
 use std::io;
@@ -82,11 +85,13 @@ pub(crate) fn io_err(op: &'static str, path: &Path, source: rustix::io::Errno) -
     }
 }
 
+/// Resolves the data root from an explicit override, `XDG_DATA_HOME`, or `HOME`,
+/// in that order. Relative and empty environment values are ignored.
 ///
-/// The resolver ignores relative or empty `XDG_DATA_HOME` and `HOME` values to prevent cwd-dependent data roots.
-/// lifecycle root.
+/// # Errors
 ///
-/// a level.
+/// Returns [`InstanceError::Insecure`] for a relative override and
+/// [`InstanceError::NoDataDir`] when no absolute root is available.
 pub fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
     fn absolute(value: std::ffi::OsString) -> Option<PathBuf> {
         let path = PathBuf::from(value);
@@ -122,19 +127,20 @@ pub fn managed_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, Ins
     Ok(data_dir_path(data_dir_override)?.join(MANAGED_DIR_NAME))
 }
 
-/// order.
+/// Resolves the `run` directory below the managed subtree.
+///
+/// Errors match [`managed_dir_path`].
 pub fn runtime_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
     Ok(managed_dir_path(data_dir_override)?.join(RUNTIME_DIR_NAME))
 }
 
-/// An `InstanceGuard` represents one secured host incarnation.
-/// An `InstanceGuard` retains validated directory, lock, credentials, and publication identity after `publish`.
+/// Owns the locks, credentials, pinned runtime directory, and publication
+/// identity for one host incarnation.
 ///
-/// Dropping the guard best-effort removes its fenced publication.
-/// Dropping the guard releases the lock; callers must retain it until handlers drop.
-/// `Drop` best-effort removes this guard's publication when a `run` future is cancelled or aborted.
-/// `Drop` best-effort removes this guard's publication when `run` is cancelled or aborted.
-/// `Drop` best-effort removes the canonical file only when it still names this guard's publication.
+/// Callers must retain the guard until request handlers stop. Dropping it releases
+/// both locks and best-effort removes the setup socket, lifecycle record, and
+/// canonical publication. Publication removal requires matching file identity and
+/// daemon ID, so drop does not unlink a successor's file.
 pub struct InstanceGuard {
     dir: OwnedFd,
     dir_path: PathBuf,
@@ -166,11 +172,17 @@ impl fmt::Debug for InstanceGuard {
 }
 
 impl InstanceGuard {
-    /// Credentials are minted only after the runtime-directory lock is acquired, so a lost lock race cannot create credentials.
-    /// The lifetime fence prevents managed-subtree replacement from admitting an overlapping incarnation while this guard lives.
+    /// Acquires the lifetime and runtime-directory locks, then mints credentials.
+    /// The lifetime fence prevents managed-subtree replacement from admitting an
+    /// overlapping coordination-aware incarnation while this guard lives.
     ///
-    /// `payload_manifest_digest` must contain exactly 64 lowercase hexadecimal characters.
-    /// `payload_manifest_digest` must contain exactly 64 lowercase hexadecimal characters.
+    /// `payload_manifest_digest` must contain exactly 64 lowercase hexadecimal
+    /// characters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported platforms, insecure paths or state, lock
+    /// contention, invalid digest text, or OS random-number failure.
     pub fn acquire(
         data_dir_override: Option<&Path>,
         payload_manifest_digest: &str,
@@ -636,16 +648,14 @@ pub(crate) fn mode_bits(stat: &rustix::fs::Stat) -> u32 {
     stat.st_mode
 }
 
-///
-/// All anchor opens must use `HARDENED_DIR_FLAGS` to prevent symlink traversal.
+/// Flags required for directory traversal without following symlinks.
 pub(crate) const HARDENED_DIR_FLAGS: OFlags = OFlags::DIRECTORY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::RDONLY)
     .union(OFlags::CLOEXEC);
 
-///
-/// walking `..` would let a pathname climb out of the tree the anchor pinned.
-/// Rejecting `ParentDir` and `Prefix` prevents traversal outside the anchored tree.
+/// Returns normal path components while rejecting `..` and platform prefixes.
+/// Root and current-directory components do not name descendants and are skipped.
 pub(crate) fn normal_components(path: &Path) -> Option<Vec<&std::ffi::OsStr>> {
     let mut names = Vec::new();
     for component in path.components() {
@@ -658,11 +668,11 @@ pub(crate) fn normal_components(path: &Path) -> Option<Vec<&std::ffi::OsStr>> {
     Some(names)
 }
 
-/// The function rejects anchors that another principal can replace.
-/// replaceable.
+/// Opens `/` for an absolute path or the process working directory for a relative
+/// path, without following a symlink.
 ///
-/// For relative paths, `open_safe_anchor` validates the process working directory before resolving path components.
-/// `open_safe_anchor` returns `Ok(None)` when the opened anchor fails `is_safe_ancestor`.
+/// Returns `Ok(None)` when another principal can replace the anchor according to
+/// [`is_safe_ancestor`].
 pub(crate) fn open_safe_anchor(path: &Path) -> Result<Option<OwnedFd>, rustix::io::Errno> {
     let anchor = openat(
         CWD,

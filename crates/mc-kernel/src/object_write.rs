@@ -1,3 +1,8 @@
+//! Transactional helpers for registry rows, redaction metadata, and object invalidation.
+//!
+//! Callers own transaction commit or rollback. Multi-table operations rely on that
+//! transaction boundary so an error cannot persist only part of an object mutation.
+
 use rusqlite::{params, Transaction};
 
 use super::envelope::ObjectRow;
@@ -8,6 +13,9 @@ pub(super) fn map_write_error(error: rusqlite::Error) -> KernelError {
     super::map_sqlite(error)
 }
 
+/// Inserts one object registry row at `commit_seq`.
+///
+/// Returns mapped SQLite errors, including uniqueness and foreign-key violations.
 pub(super) fn insert_registry(
     tx: &Transaction<'_>,
     commit_seq: i64,
@@ -56,6 +64,10 @@ pub(super) fn record_registry_fields(
     )
 }
 
+/// Records redaction metadata for each field in slice order.
+///
+/// Returns the first recording error. The surrounding transaction must be rolled back
+/// by the caller to avoid retaining an earlier subset.
 pub(super) fn record_fields(
     tx: &Transaction<'_>,
     owner_kind: &str,
@@ -69,8 +81,12 @@ pub(super) fn record_fields(
     Ok(())
 }
 
-/// Invalidation requires exactly one live row in both the registry and typed
-/// table.
+/// Invalidates exactly one live row in both the registry and typed table.
+///
+/// Returns [`KernelError::NotFound`] unless each update changes one row. SQLite errors
+/// are mapped through [`map_write_error`]. `table` and `column` are interpolated into
+/// SQL and must be trusted schema identifiers, not external input. Caller rollback
+/// preserves the cross-table invariant when the second update fails.
 pub(super) fn invalidate(
     tx: &Transaction<'_>,
     commit_seq: i64,
@@ -102,6 +118,11 @@ pub(super) fn invalidate(
     Ok(())
 }
 
+/// Stores the successor ID in registry and typed-table rows.
+///
+/// SQLite errors are mapped through [`map_write_error`]. `table` is interpolated into
+/// SQL and must be a trusted schema identifier. This helper does not require either
+/// update to match a row; callers enforce existence when needed.
 pub(super) fn set_successor(
     tx: &Transaction<'_>,
     table: &str,

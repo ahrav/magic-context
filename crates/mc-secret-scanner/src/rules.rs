@@ -1,3 +1,9 @@
+//! Embedded secret-rule loading, validation, preselection, and semantic hashing.
+//!
+//! Construction verifies source digests before parsing. Rules are ordered by
+//! source and name, then indexed by a fixed 256-bit mask. Preselection is
+//! allocation-free after construction and preserves rule-vector order.
+
 use std::collections::BTreeSet;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
@@ -7,8 +13,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{ConstructionError, RuleSource, ScanLimits, ScanProfile};
 
+/// Expected SHA-256 digest of the embedded upstream rule document.
 pub const UPSTREAM_CORPUS_SHA256: &str =
     "2f1292b50148d38afe3ebdb7c489449d103b75b7df464e06da0d5d7c89ac2820";
+/// Expected SHA-256 digest of the embedded conservative overlay document.
 pub const CONSERVATIVE_OVERLAY_SHA256: &str =
     "973181a0af049fb4c0ae06160cd022b1beae3660b87ac9fa4d498864912b3487";
 
@@ -59,6 +67,9 @@ struct RuleDocument {
     rules: Vec<RuleDeclaration>,
 }
 
+/// Parsed rule policy retained verbatim for semantic hashing.
+///
+/// Unknown document fields are rejected during deserialization.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuleDeclaration {
@@ -173,6 +184,7 @@ pub(crate) enum OfflineValidationKind {
     SlackToken,
 }
 
+/// Compiled declaration and its prepared candidate filters.
 pub(crate) struct Rule {
     pub source: RuleSource,
     pub declaration: RuleDeclaration,
@@ -181,6 +193,7 @@ pub(crate) struct Rule {
     pub suppressor_matcher: Option<AhoCorasick>,
 }
 
+/// Verified rule collection with anchor and safelist indexes.
 pub(crate) struct RuleSet {
     rules: Vec<Rule>,
     anchors: AhoCorasick,
@@ -235,6 +248,13 @@ impl RuleMask {
 }
 
 impl RuleSet {
+    /// Loads embedded upstream and overlay documents after digest verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConstructionError`] for digest mismatch, malformed YAML,
+    /// duplicate or invalid policy, excess rule count, or regex construction
+    /// failure.
     pub fn from_embedded() -> Result<Self, ConstructionError> {
         Self::from_sources(
             UPSTREAM_BYTES,
@@ -295,6 +315,10 @@ impl RuleSet {
         })
     }
 
+    /// Iterates active rules in canonical source-and-name order.
+    ///
+    /// Comprehensive scans include both sources. Conservative scans include only
+    /// overlay rules.
     pub fn active(&self, profile: ScanProfile) -> impl Iterator<Item = &Rule> {
         self.rules.iter().filter(move |rule| {
             profile == ScanProfile::Comprehensive || rule.source == RuleSource::ConservativeOverlay
@@ -320,14 +344,25 @@ impl RuleSet {
         selected.iter().map(|index| &self.rules[index])
     }
 
+    /// Tests candidate context bytes against context suppressors.
     pub fn context_is_safelisted(&self, bytes: &[u8]) -> bool {
         self.context_safelist.is_match(bytes)
     }
 
+    /// Tests candidate value bytes against value-only suppressors.
     pub fn value_is_safelisted(&self, bytes: &[u8]) -> bool {
         self.value_safelist.is_match(bytes)
     }
 
+    /// Hashes all finding-affecting rule, profile, limit, and evaluator inputs.
+    ///
+    /// Integer limits use little-endian 64-bit encoding. Rules are sorted before
+    /// encoding, so storage order does not affect the digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConstructionError::InvalidRulePolicy`] if a validated declaration
+    /// cannot be serialized.
     pub fn semantic_digest(
         &self,
         profile: ScanProfile,

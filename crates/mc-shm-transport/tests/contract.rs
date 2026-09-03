@@ -740,7 +740,6 @@ fn harness_replays_terminate_on_arbitrary_lengths() {
 #[test]
 fn sample_errors_redact_every_sentinel() {
     // Debug and error output must not expose sentinel values.
-    // Debug and error output must not expose sentinel values.
     let sentinel = b"SENTINEL";
     let mut wire = [0u8; WIRE_V2_HEADER_BYTES];
     wire[..sentinel.len()].copy_from_slice(sentinel);

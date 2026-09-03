@@ -1,3 +1,9 @@
+//! Linux shared-memory SPSC ring with descriptor and payload conservation.
+//!
+//! Producer publication uses release/acquire ordering. Receive leases may be
+//! released out of order, but arena reclamation advances only across the
+//! contiguous completed prefix. Any uncertain cleanup quarantines the mapping.
+
 #[cfg(not(target_os = "linux"))]
 compile_error!("mc-shm-transport ring backend supports Linux only");
 
@@ -715,7 +721,11 @@ impl fmt::Debug for RingAttachment {
     }
 }
 
-/// Cacheline-isolated SPSC descriptor ring with FIFO payload arena.
+/// Cacheline-isolated SPSC descriptor ring with a FIFO payload arena.
+///
+/// One producer owns reservation and publication cursors. One consumer owns
+/// delivery cursors. Receive leases can coexist up to the authenticated grant's
+/// limit. `Ring` is intentionally neither `Send` nor `Sync`.
 pub struct Ring {
     mapping: Mapping,
     layout: Layout,
@@ -901,7 +911,11 @@ impl Ring {
         Ok(())
     }
 
-    /// Attempts immediate descriptor and arena reservation.
+    /// Attempts an immediate descriptor-slot and arena-byte reservation.
+    ///
+    /// Returns `Exhausted` when either bounded resource is unavailable,
+    /// `BoundExceedsSpans` above the maximum frame size, and `Quarantined` after
+    /// terminal storage failure. Dropping the returned reservation aborts it.
     pub fn try_reserve(
         &self,
         bound: usize,
@@ -976,7 +990,10 @@ impl Ring {
         })
     }
 
-    /// Waits on capacity readiness until deadline.
+    /// Waits for reservation capacity until `deadline`.
+    ///
+    /// Generation-bound parking closes the check-to-sleep race. Returns
+    /// `Deadline` if capacity remains exhausted when the deadline passes.
     pub fn reserve_until(
         &self,
         bound: usize,
@@ -1171,7 +1188,11 @@ impl Ring {
         Ok(published != consumed && active < self.grant.max_leases)
     }
 
-    /// Validates and records one explicit completion.
+    /// Validates and records one explicit lease completion.
+    ///
+    /// Completion may arrive out of order. Reclamation remains FIFO and waits
+    /// for every earlier sequence. Wrong incarnation, lane, sequence, and
+    /// duplicate releases return distinct `LeaseError` variants.
     pub fn release(&self, identity: ReleaseIdentity) -> Result<(), LeaseError> {
         if self.is_quarantined() {
             return Err(LeaseError::Quarantined);
@@ -1246,7 +1267,11 @@ impl Ring {
         Ok(())
     }
 
-    /// Returns descriptor and byte conservation snapshot.
+    /// Returns descriptor-slot and arena-byte conservation counts.
+    ///
+    /// Every slot and every arena byte appears in exactly one state. A
+    /// quarantined ring reports all capacity as quarantined. Arithmetic or an
+    /// unknown shared state returns an error.
     pub fn conservation(&self) -> Result<(DescriptorCounts, ArenaCounts), RingError> {
         if self.is_quarantined() {
             return Ok((
@@ -1765,7 +1790,10 @@ impl ProducerReservation<'_> {
         Ok(())
     }
 
-    /// Publishes exact committed length after cursor equality check.
+    /// Publishes only when `body_len` equals bytes written.
+    ///
+    /// Commit also validates that length and wire version match the header.
+    /// Any failure aborts the reservation before returning an error.
     pub fn commit(mut self, body_len: usize) -> Result<ReleaseIdentity, ProducerError> {
         if self.finished {
             return Err(ProducerError::Aborted);

@@ -1,3 +1,10 @@
+//! Content-addressed artifact ingestion and capacity accounting.
+//!
+//! Ingestion validates and redacts input before staging bytes.
+//! Publication uses no-replace filesystem operations followed by directory synchronization, then commits the SQLite reference under writer fencing.
+//! Failed staging removes its temporary file best-effort: `StagedObject::drop` discards unlink and directory-sync errors, so an orphaned temporary entry can survive.
+//! Storage-integrity failures latch CAS ingestion closed.
+
 use std::fs::File;
 
 use mc_core::redaction::Detection;
@@ -204,6 +211,19 @@ impl PreparedArtifact {
 }
 
 impl KernelStore {
+    /// Validates, redacts, durably publishes, and references one artifact.
+    ///
+    /// The returned digest covers stored bytes after text redaction. Replaying the
+    /// same commit intent succeeds only when its committed digest matches. Calls
+    /// serialize through the store writer while reserving and committing the
+    /// reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError`] for invalid or oversized fields, rejected secret
+    /// material, exhausted capacity, conflicting reclamation, commit failure, or
+    /// filesystem failure. Integrity-related storage failures may latch later CAS
+    /// ingestion closed.
     pub fn ingest_artifact(
         &self,
         request: ArtifactIngestRequest,
@@ -211,6 +231,11 @@ impl KernelStore {
         self.ingest_artifact_inner(request, IngestFaults::default(), None, None)
     }
 
+    /// Runs artifact ingestion with one injected failure point.
+    ///
+    /// # Errors
+    ///
+    /// Returns the normal ingestion error or the error induced by `fault`.
     #[cfg(feature = "test-support")]
     pub fn ingest_artifact_with_fault_for_test(
         &self,
@@ -220,6 +245,11 @@ impl KernelStore {
         self.ingest_artifact_inner(request, fault.into(), None, None)
     }
 
+    /// Runs `hook` after the staged file is synced and before writer acquisition.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from the normal ingestion path. Hook panics propagate.
     #[cfg(feature = "test-support")]
     pub fn ingest_artifact_with_temp_hook_for_test(
         &self,
@@ -229,6 +259,12 @@ impl KernelStore {
         self.ingest_artifact_inner(request, IngestFaults::default(), Some(&mut hook), None)
     }
 
+    /// Reports durable protocol boundaries while optionally injecting a failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the normal ingestion error or the error induced by `fault`. Hook
+    /// panics propagate.
     #[cfg(feature = "test-support")]
     pub fn ingest_artifact_with_protocol_hook_for_test(
         &self,
@@ -907,6 +943,10 @@ fn open_shard_nofollow(objects: &File, name: impl rustix::path::Arg) -> Result<F
     .map_err(classify_errno)
 }
 
+/// Sums regular-file sizes directly below `objects` and its shard directories.
+///
+/// Symlinks and other file types do not contribute. Entries removed during the
+/// walk are skipped. The sum saturates at [`u64::MAX`].
 pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
     let mut bytes = 0_u64;
     for entry in rfs::Dir::read_from(objects).map_err(classify_errno)? {

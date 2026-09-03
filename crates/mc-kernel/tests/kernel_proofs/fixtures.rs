@@ -21,8 +21,14 @@ use mc_kernel::{
 
 pub const DOMAIN: &str = "domain";
 pub const DOMAIN_OBJECT: &str = "domain-object";
+/// Fixture lease duration in milliseconds.
 pub const LEASE_MS: i64 = 3_600_000;
 
+/// Returns wall-clock milliseconds since the Unix epoch.
+///
+/// # Panics
+///
+/// Panics when the system clock predates the Unix epoch or the millisecond count does not fit in `i64`.
 pub fn now_ms() -> i64 {
     i64::try_from(
         SystemTime::now()
@@ -33,6 +39,7 @@ pub fn now_ms() -> i64 {
     .unwrap()
 }
 
+/// Builds a commit intent whose request digest is SHA-256 of `key` bytes.
 pub fn intent(key: &str) -> CommitIntent {
     CommitIntent {
         producer: "kernel-proofs".to_string(),
@@ -56,6 +63,7 @@ pub fn root_domain() -> DomainSpec {
     }
 }
 
+/// Builds an independent normal-sensitivity domain keyed by decimal `index`.
 pub fn domain(index: usize) -> DomainSpec {
     DomainSpec {
         domain_id: format!("domain-{index}"),
@@ -68,6 +76,11 @@ pub fn domain(index: usize) -> DomainSpec {
     }
 }
 
+/// Builds a staging candidate with a [`LEASE_MS`] lease from its recorded time.
+///
+/// # Panics
+///
+/// Panics under the same clock conditions as [`now_ms`].
 pub fn staging(run: &str, candidate: &str, payload: &str) -> StagingCandidateSpec {
     let recorded_at = now_ms();
     StagingCandidateSpec {
@@ -85,6 +98,7 @@ pub fn staging(run: &str, candidate: &str, payload: &str) -> StagingCandidateSpe
     }
 }
 
+/// Returns fixed repository provenance shared by artifact fixtures.
 pub fn provenance() -> RepositoryProvenance {
     RepositoryProvenance {
         repository_id: "repo".to_string(),
@@ -136,6 +150,7 @@ pub fn code_observation(candidate: &str) -> ObservationSpec {
     }
 }
 
+/// Builds an admission event for an existing subject without a candidate.
 pub fn subject_request(object_id: &str, kind: EventKind) -> AdmissionRequest {
     AdmissionRequest {
         candidate_id: None,
@@ -152,6 +167,7 @@ pub fn subject_request(object_id: &str, kind: EventKind) -> AdmissionRequest {
     }
 }
 
+/// Builds the domain created when `candidate` is admitted.
 pub fn admitted_domain(candidate: &str, name: &str) -> AdmissionDomainSpec {
     AdmissionDomainSpec {
         domain_id: format!("domain-{candidate}"),
@@ -160,6 +176,7 @@ pub fn admitted_domain(candidate: &str, name: &str) -> AdmissionDomainSpec {
     }
 }
 
+/// Builds a canonical-retention artifact ingest request for raw `payload` bytes.
 pub fn ingest(key: &str, payload: &[u8], sensitivity: Sensitivity) -> ArtifactIngestRequest {
     ArtifactIngestRequest {
         intent: intent(key),
@@ -180,6 +197,7 @@ pub fn ingest(key: &str, payload: &[u8], sensitivity: Sensitivity) -> ArtifactIn
     }
 }
 
+/// Builds a digest-addressed deletion recorded at fixture timestamp `42`.
 pub fn deletion(key: &str, digest: &str) -> ArtifactDeletionRequest {
     ArtifactDeletionRequest {
         intent: intent(key),
@@ -192,6 +210,7 @@ pub fn deletion(key: &str, digest: &str) -> ArtifactDeletionRequest {
     }
 }
 
+/// Builds an architecture decision with `index` as source revision.
 pub fn decision(index: usize) -> DecisionSpec {
     DecisionSpec {
         decision_id: format!("decision-{index}"),
