@@ -725,6 +725,10 @@ impl RingClientEndpoint {
     ///
     /// Timeout, malformed headers, copy failures, and release failures return a
     /// redacted error.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the current instant plus `timeout` overflows, as [`Duration::MAX`] does.
     pub fn recv(&self, timeout: Duration) -> Result<(EnvelopeHeader, Vec<u8>), RingClientError> {
         let deadline = StdInstant::now() + timeout;
         loop {

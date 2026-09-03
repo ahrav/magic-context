@@ -10,7 +10,7 @@ pub const MAX_INPUT_BYTES: usize = 512 * 1024;
 pub enum ScanProfile {
     /// Runs only the conservative overlay rules, so upstream-only secrets are not detected.
     Conservative,
-    /// Runs the comprehensive upstream rule set.
+    /// Runs upstream rules and the same conservative overlay, so its findings are a superset of `Conservative`.
     Comprehensive,
 }
 

@@ -86,7 +86,9 @@ struct ObservationClassification {
 impl KernelStore {
     /// Derives alignment from a consistent deferred transaction at `requested`.
     ///
-    /// Returns [`KernelError::CorruptCanonicalRow`] for malformed stored observation
+    /// Returns [`KernelError::InvalidInput`] for a negative sequence,
+    /// [`KernelError::FutureSnapshot`] when `requested` exceeds the transaction's current tip,
+    /// [`KernelError::CorruptCanonicalRow`] for malformed stored observation
     /// JSON, [`KernelError::Conflict`] for a supersession cycle, and
     /// [`KernelError::Io`] for database failures.
     pub fn alignment_as_of(&self, requested: i64) -> Result<AlignmentSnapshot, KernelError> {

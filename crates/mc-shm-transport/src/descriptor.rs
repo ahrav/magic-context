@@ -371,6 +371,10 @@ impl ValidatedFrame {
     }
 
     /// Returns a validated span by index.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` is [`MAX_SPANS`] or greater because `self.spans[index]` is evaluated before `then_some`.
     pub fn span(self, index: usize) -> Option<ArenaSpan> {
         (index < usize::from(self.span_count)).then_some(self.spans[index])
     }

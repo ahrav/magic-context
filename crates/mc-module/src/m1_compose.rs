@@ -12,7 +12,7 @@ use crate::memory_render::{
     assemble_m1, render_new_compartments, render_user_profile_block, M1_PLACEHOLDER,
 };
 
-/// Failure to read composition state or resolve contiguous compartment coverage.
+/// Failure to read composition state, or a compartment range that overlaps or fails to advance.
 #[derive(Debug)]
 pub enum M1ComposeError {
     Store(McStoreError),
