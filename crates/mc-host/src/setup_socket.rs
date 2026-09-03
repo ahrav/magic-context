@@ -31,6 +31,7 @@ pub const RING_DESCRIPTOR_COUNT: usize = mc_shm_transport::descriptor::SETUP_DES
 ///
 /// Existing non-sockets, sockets owned by another user, and sockets with broader permissions
 /// are left in place and return [`io::ErrorKind::PermissionDenied`].
+/// Every step names the path rather than a descriptor, so the permission guarantee holds only while no process with write access to the parent directory replaces the occupant between the check, unlink, bind, and permission change.
 pub(crate) fn bind_owner_only(path: &Path) -> io::Result<tokio::net::UnixListener> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {

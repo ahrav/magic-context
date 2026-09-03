@@ -203,10 +203,9 @@ where
 
 /// Authenticates a client and returns only after its proof verifies.
 ///
-/// The total `deadline` covers all framing I/O and failure teardown. The function
-/// rejects short keys, malformed or oversized JSON frames, invalid client proofs,
-/// entropy failures, I/O failures, and elapsed or unrepresentable deadlines. A failed
-/// handshake attempts to shut down the stream before returning. It does not panic.
+/// The total `deadline` covers all framing I/O and failure teardown.
+/// The function rejects short keys, malformed or oversized JSON frames, invalid client proofs, entropy failures, I/O failures, and elapsed or unrepresentable deadlines.
+/// A handshake that fails after deadline construction attempts to shut down the stream before returning, while an unrepresentable `deadline` returns before the stream is touched. It does not panic.
 pub async fn authenticate_server<S>(
     stream: &mut S,
     key: &[u8],

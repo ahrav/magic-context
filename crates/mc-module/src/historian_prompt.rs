@@ -291,6 +291,8 @@ pub fn render_session_ref_compartment(c: &ReferenceCompartment) -> String {
 }
 
 /// Render the most recent [`SESSION_REF_WINDOW`] compartments.
+///
+/// The trailing slice is taken as given, so `all_compartments` must already run oldest to newest; a newest-first input renders the oldest compartments instead.
 pub fn render_session_references_block(all_compartments: &[ReferenceCompartment]) -> String {
     if all_compartments.is_empty() {
         return String::new();

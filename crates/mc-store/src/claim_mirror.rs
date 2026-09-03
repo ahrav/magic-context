@@ -42,7 +42,7 @@ pub enum ClaimMirrorLifecycle {
     Active,
     /// Claim remains committed but is not active.
     Archived,
-    /// Claim has left the committed mirror view.
+    /// Claim is retained in the mirror like `Archived`, so callers still receive it and filter non-active rows themselves.
     Retired,
 }
 
