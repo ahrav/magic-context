@@ -1062,6 +1062,11 @@ describe("parsePairedDeltaReport", () => {
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.analysis.rawRegretRecords = body.analysis.rawRegretRecords.filter(({ endpoint }) => endpoint !== "retrieval");
         }))).toThrow(/report\.body\.analysis\.rawRegretRecords: ladder-prefix-missing-/);
+        // An aggregate regret endpoint has raw observations behind it.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.rawRegretRecords = body.analysis.rawRegretRecords.filter(({ endpoint }) => endpoint !== "formation");
+            body.regret.raw = body.regret.raw.map((row) => ({ ...row, formation: null }));
+        }))).toThrow(/report\.body\.analysis: aggregate-without-raw-formation/);
         // A raw regret endpoint has its aggregate estimate.
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.analysis.providerMixedRegret = body.analysis.providerMixedRegret.filter(({ endpoint }) => endpoint !== "formation");

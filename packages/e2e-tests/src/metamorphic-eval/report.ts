@@ -20,14 +20,30 @@ export const CONTROL_SEED = 0;
  * The parser classifies an entry by the control id alone, so no product transform may claim it, and a pair key
  * carries its seed as a bounded integer, so a seed the transform would refuse must not reach an error entry.
  */
-export function requireRepresentableRunOptions(transforms: readonly { id: string }[], seeds: readonly number[]): void {
-    if (transforms.some(({ id }) => id === CONTROL_TRANSFORM_ID)) {
-        throw new Error(`metamorphic-eval: transform id "${CONTROL_TRANSFORM_ID}" is reserved for the control pair`);
+export function requireRepresentableRunOptions(
+    transforms: readonly { id: string; version: number }[],
+    seeds: readonly number[],
+): void {
+    const coordinates = new Set<string>();
+    for (const { id, version } of transforms) {
+        if (id === CONTROL_TRANSFORM_ID) {
+            throw new Error(`metamorphic-eval: transform id "${CONTROL_TRANSFORM_ID}" is reserved for the control pair`);
+        }
+        if (id.trim().length === 0) throw new Error("metamorphic-eval: transform id is blank");
+        if (!Number.isSafeInteger(version) || version < 0) {
+            throw new Error(`metamorphic-eval: transform "${id}" version ${String(version)} is not a non-negative safe integer`);
+        }
+        const coordinate = canonicalJson([id, version]);
+        if (coordinates.has(coordinate)) throw new Error(`metamorphic-eval: transform "${id}" v${version} is listed twice`);
+        coordinates.add(coordinate);
     }
+    const seen = new Set<number>();
     for (const seed of seeds) {
         if (!Number.isSafeInteger(seed) || seed < 0 || seed > MAX_TRANSFORM_SEED) {
             throw new Error(`metamorphic-eval: seed ${String(seed)} is outside the unsigned 32-bit range`);
         }
+        if (seen.has(seed)) throw new Error(`metamorphic-eval: seed ${seed} is listed twice`);
+        seen.add(seed);
     }
 }
 
@@ -560,9 +576,15 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     // `admitPair` returns exactly one disposition per coordinate, so an inapplicable key never also has an entry.
     const entryKeys = new Set(report.entries.map(key));
     for (const [index, row] of report.coverage.entries()) {
+        p.unique(row.inapplicable.map(key), `report.coverage[${index}].inapplicable`);
         for (const [innerIndex, pair] of row.inapplicable.entries()) {
             if (entryKeys.has(key(pair))) p.fail(`report.coverage[${index}].inapplicable[${innerIndex}]: entry-conflict`);
         }
+    }
+    // The live runner records this reason only when nothing was admitted and nothing was scored.
+    if (report.tierInvalidReason?.kind === "selection-empty" &&
+        (report.entries.length > 0 || report.coverage.some(({ applied }) => applied > 0))) {
+        p.fail("report.tierInvalidReason: selection-empty-with-entries");
     }
     const covered = new Set(report.coverage.map(({ scenarioId }) => scenarioId));
     for (const [index, entry] of report.entries.entries()) {

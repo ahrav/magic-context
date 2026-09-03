@@ -193,6 +193,32 @@ describe("live metamorphic orchestration", () => {
         expect(metamorphicExitCode(report)).toBe(0);
     });
 
+    test("names the observed system when the caller omits it, even before any pair is scored", async () => {
+        const options = {
+            mode: { kind: "live" as const, apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
+            artifactRoot: "/tmp/metamorphic-live-test",
+            opencodeVersion: "1.0.0",
+            transforms: [TRANSFORMS[0]!],
+            seeds: [0],
+            admit: () => [],
+        };
+        const completed = await runLiveMetamorphicEval([validScenario()], { ...options, execute: async () => observation() });
+        expect(completed.system).toEqual(score().system);
+        // A canary on control-a returns before any pair is scored; the report still names the system that ran.
+        const injected = await runLiveMetamorphicEval([validScenario()], {
+            ...options,
+            execute: async () => observation({ injectedClaims: [{
+                publicClaimId: "clm_01h00000000000000000000008",
+                revisionLocator: "clm_01h00000000000000000000008@1",
+                content: INJECTION_CANARY,
+                category: "CONSTRAINTS",
+                revision: 1,
+            }] }),
+        });
+        expect(injected.injectionCanaryHits.length).toBeGreaterThan(0);
+        expect(injected.system).toEqual(score().system);
+    });
+
     test("control disagreement invalidates the tier before product pairs", async () => {
         const calls: string[] = [];
         const report = await runLiveMetamorphicEval([validScenario()], {

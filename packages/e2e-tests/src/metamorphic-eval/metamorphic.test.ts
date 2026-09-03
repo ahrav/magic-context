@@ -180,6 +180,14 @@ describe("deterministic metamorphic runner", () => {
         zeroRow.applied = 0;
         zeroRow.violations = [];
         expect(() => parseMetamorphicReport(silentZero)).toThrow(/report\.coverage\[0\]\.violations: derived-mismatch/);
+        // One admission disposition per coordinate, so an inapplicable pair is listed once.
+        const doubledInapplicable = structuredClone(invalid);
+        doubledInapplicable.coverage[0]!.inapplicable.push(structuredClone(doubledInapplicable.coverage[0]!.inapplicable[0]!));
+        expect(() => parseMetamorphicReport(doubledInapplicable)).toThrow(/report\.coverage\[0\]\.inapplicable: duplicate/);
+        // selection-empty means nothing was admitted or scored.
+        const falseEmpty = structuredClone(report);
+        falseEmpty.tierInvalidReason = { kind: "selection-empty", reason: "n/a" };
+        expect(() => parseMetamorphicReport(falseEmpty)).toThrow(/report\.tierInvalidReason: selection-empty-with-entries/);
         // A coordinate is inapplicable, rejected, or admitted, never two of those.
         const doubleBooked = structuredClone(report);
         const bookedEntry = doubleBooked.entries.find((entry) => entry.kind === "scored")!;
@@ -428,6 +436,10 @@ describe("deterministic metamorphic runner", () => {
     test("refuses a seed the transforms would reject before building any entry", () => {
         expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { seeds: [0x1_0000_0000] }))
             .toThrow(/seed 4294967296 is outside the unsigned 32-bit range/);
+        expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { seeds: [7, 7] })).toThrow(/seed 7 is listed twice/);
+        expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { transforms: [reorder(), reorder()] })).toThrow(/is listed twice/);
+        expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { transforms: [{ ...reorder(), version: 1.5 }] }))
+            .toThrow(/not a non-negative safe integer/);
         expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { transforms: [{ ...reorder(), id: "baseline-control" }] }))
             .toThrow(/reserved for the control pair/);
     });

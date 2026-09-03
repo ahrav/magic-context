@@ -716,10 +716,15 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     }
     // The estimator emits an aggregate for every endpoint present in the observations.
     const aggregateEndpoints = new Set([...body.analysis.liveRegret, ...body.analysis.providerMixedRegret].map(({ endpoint }) => endpoint));
+    const rawEndpoints = new Set<string>(body.analysis.rawRegretRecords.map(({ endpoint }) => endpoint));
     for (const [index, record] of body.analysis.rawRegretRecords.entries()) {
         if (!aggregateEndpoints.has(record.endpoint)) {
             p.fail(`report.body.analysis.rawRegretRecords[${index}].endpoint: aggregate-required`);
         }
+    }
+    // And only for those endpoints: an aggregate with no observation behind it is unsupported.
+    for (const endpoint of aggregateEndpoints) {
+        if (!rawEndpoints.has(endpoint)) p.fail(`report.body.analysis: aggregate-without-raw-${endpoint}`);
     }
     // A coordinate either refused its ladder or produced raw regret records, never both.
     const rawCoordinates = new Set(body.analysis.rawRegretRecords.map(({ coordinateId }) => coordinateId));

@@ -136,13 +136,6 @@ export function liveDerivativeAdmissionDiagnostics(
     return diagnostics.sort();
 }
 
-function scoredSystem(entries: readonly MetamorphicReportEntry[]): SystemVersionTuple | null {
-    for (const entry of entries) {
-        if (entry.kind === "scored" && entry.baselineScore.system !== null) return entry.baselineScore.system;
-    }
-    return null;
-}
-
 function sameSystem(left: ScenarioScore, right: ScenarioScore): boolean {
     return left.system !== null && right.system !== null && canonicalJson(left.system) === canonicalJson(right.system);
 }
@@ -223,6 +216,9 @@ export async function runLiveMetamorphicEval(
     const prepared = buildPairs(scenarios, transforms, seeds);
     const entries = [...prepared.entries];
     const injectionCanaryHits: InjectionCanaryHit[] = [];
+    // The first run-record system any role resolves, so a report cut short before its first scored pair
+    // still names the system it ran on.
+    let observedSystem: SystemVersionTuple | null = null;
     const finish = (tierInvalidReason?: MetamorphicReport["tierInvalidReason"]): MetamorphicReport =>
         buildMetamorphicReport({
             entries,
@@ -230,7 +226,7 @@ export async function runLiveMetamorphicEval(
             injectionCanaryHits,
             // Every run-record score carries the resolved system, and the parser requires the root to name it,
             // so a caller that omits the option gets the system the scores agree on.
-            system: options.system ?? scoredSystem(entries),
+            system: options.system ?? observedSystem,
             ...(tierInvalidReason === undefined ? {} : { tierInvalidReason }),
         });
     const observe = (
@@ -258,7 +254,7 @@ export async function runLiveMetamorphicEval(
 
     observe();
 
-    const execute: LiveScenarioExecutor = options.execute ?? (async (scenario, _role, artifactDir) => {
+    const executeRole: LiveScenarioExecutor = options.execute ?? (async (scenario, _role, artifactDir) => {
         const record = await runScenario(scenario, {
             mode: options.mode,
             artifactDir,
@@ -270,6 +266,11 @@ export async function runLiveMetamorphicEval(
             injectedClaims: record.injectedClaims,
         };
     });
+    const execute: LiveScenarioExecutor = async (scenario, role, artifactDir) => {
+        const observation = await executeRole(scenario, role, artifactDir);
+        observedSystem ??= observation.score.system;
+        return observation;
+    };
 
     const controlScenario = scenarios[0]!;
     const controlKey: PairKey = {
