@@ -1863,7 +1863,8 @@ function parseProbeVerdicts(raw: unknown, label: string): ProbeVerdict[] {
         // itself after entity decoding and normalization; for a claim-id probe, one of the ` | `-joined ids in
         // `expected`. The answer type is not archived, so a pass must satisfy one of the two.
         // The answer type is not archived, so the two rules are applied jointly: a pass must satisfy one, and a
-        // fail must satisfy neither.
+        // fail must satisfy neither. That is sound because the scenario contract forbids the id separator in an
+        // exact or multiple-choice answer, so only a claim-id expectation can split into several candidates.
         const matches = actual !== null && (
             normalizeContent(decodeXmlEntities(actual)) === normalizeContent(decodeXmlEntities(expected)) ||
             expected.split(" | ").some((id) => normalizeContent(id) === normalizeContent(actual)));

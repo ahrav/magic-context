@@ -337,6 +337,9 @@ function parseProbe(raw: unknown, label: string): Probe {
             envelopeSafeAnswer(string(value.goldAnswer, `${label}.goldAnswer`), `${label}.goldAnswer`),
             `${label}.goldAnswer`,
         );
+        // A claim-id verdict publishes its candidate ids joined by this separator, and the archived verdict does not
+        // record its answer type, so an exact answer must not be mistakable for a joined id list.
+        if (goldAnswer.includes(PROBE_CHOICE_SEPARATOR)) fail(`${label}.goldAnswer: choice-separator`);
         // Questions must not state their own answers because the model can answer without injected memory or session history.
         //
         // Claim-id answers are runtime IDs and cannot appear in authored questions.
