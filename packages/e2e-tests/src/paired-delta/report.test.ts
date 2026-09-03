@@ -1048,6 +1048,18 @@ describe("parsePairedDeltaReport", () => {
         expect(() => parsePairedDeltaReport(forge((body) => {
             body.runSummary.refusedRegretLadders = { "intervention-mismatch": 12 };
         }))).toThrow(/report\.body\.analysis\.rawRegretRecords: exceeds-plan/);
+        // A floor is 1.96 * sqrt(variance / n) over deltas in {-1, 0, 1}, so it stays under 2.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            const family = body.analysis.endpoints[0]!.families[0]!;
+            family.noise.floor = { endpoint: "mc-on-vs-compaction", familyId: family.familyId, value: 3, interval: { lower: 0, upper: 3 } };
+            family.noise.label = "inside-floor";
+            family.resolution = "unresolved";
+            body.analysis.endpoints[0]!.resolution = "unresolved";
+        }))).toThrow(/noise\.floor\.value: number-invalid/);
+        // Rungs run in order and stop at the first failure.
+        expect(() => parsePairedDeltaReport(forge((body) => {
+            body.analysis.rawRegretRecords = body.analysis.rawRegretRecords.filter(({ endpoint }) => endpoint !== "retrieval");
+        }))).toThrow(/report\.body\.analysis\.rawRegretRecords: ladder-prefix-missing-/);
         // A calibrated floor's interval is exactly [0, value].
         expect(() => parsePairedDeltaReport(forge((body) => {
             const family = body.analysis.endpoints[0]!.families[0]!;
@@ -1098,7 +1110,7 @@ describe("parsePairedDeltaReport", () => {
         expect(() => parsePairedDeltaReport(forge((body) => {
             for (const [index, endpoint] of body.analysis.endpoints.entries()) {
                 const family = endpoint.families[0]!;
-                family.noise.floor = { familyId: family.familyId, value: 10 + index, interval: { lower: 0, upper: 10 + index } };
+                family.noise.floor = { familyId: family.familyId, value: 1.5 + index * 0.1, interval: { lower: 0, upper: 1.5 + index * 0.1 } };
                 family.noise.label = "inside-floor";
                 family.resolution = "unresolved";
             }
@@ -1113,7 +1125,7 @@ describe("parsePairedDeltaReport", () => {
         // An unscoped floor is the fallback for both endpoints, so the other one cannot read as having none.
         expect(() => parsePairedDeltaReport(forge((body) => {
             const family = body.analysis.endpoints[0]!.families[0]!;
-            family.noise.floor = { familyId: family.familyId, value: 10, interval: { lower: 0, upper: 10 } };
+            family.noise.floor = { familyId: family.familyId, value: 1.5, interval: { lower: 0, upper: 1.5 } };
             family.noise.label = "inside-floor";
             family.resolution = "unresolved";
             body.analysis.endpoints[0]!.resolution = "unresolved";

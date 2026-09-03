@@ -20,6 +20,7 @@ import {
     CONTROL_TRANSFORM_ID,
     CONTROL_TRANSFORM_VERSION,
     buildMetamorphicReport,
+    rejectReservedTransformIds,
     type InjectionCanaryHit,
     type MetamorphicInvariantVerdict,
     type MetamorphicReport,
@@ -210,6 +211,7 @@ export async function runLiveMetamorphicEval(
 ): Promise<MetamorphicReport> {
     if (scenarios.length === 0) throw new Error("live metamorphic eval needs at least one scenario");
     const transforms = options.transforms ?? TRANSFORMS;
+    rejectReservedTransformIds(transforms);
     const seeds = options.seeds ?? DETERMINISTIC_SEEDS;
     const prepared = buildPairs(scenarios, transforms, seeds);
     const entries = [...prepared.entries];

@@ -14,6 +14,13 @@ export const CONTROL_TRANSFORM_ID = "baseline-control";
 export const CONTROL_TRANSFORM_VERSION = 1;
 export const CONTROL_SEED = 0;
 
+/** The parser classifies an entry by this id alone, so no product transform may claim it. */
+export function rejectReservedTransformIds(transforms: readonly { id: string }[]): void {
+    if (transforms.some(({ id }) => id === CONTROL_TRANSFORM_ID)) {
+        throw new Error(`metamorphic-eval: transform id "${CONTROL_TRANSFORM_ID}" is reserved for the control pair`);
+    }
+}
+
 export interface PairKey {
     scenarioId: string;
     transformId: string;

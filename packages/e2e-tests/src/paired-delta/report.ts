@@ -311,7 +311,9 @@ function parseNoiseFloor(raw: unknown, label: string, owner: { familyId: string;
     const value = p.record(raw, label);
     const hasEndpoint = Object.hasOwn(value, "endpoint");
     p.exact(value, hasEndpoint ? ["endpoint", "familyId", "value", "interval"] : ["familyId", "value", "interval"], label);
-    const floorValue = nonNegativeNumber(value.value, `${label}.value`);
+    // A floor is 1.96 * sqrt(variance / n) over deltas in {-1, 0, 1}, whose sample variance is at most 2, so
+    // no calibration yields a floor of 2 or more.
+    const floorValue = p.number(value.value, `${label}.value`, { minimum: 0, maximum: 2 });
     // `calibrationNoiseFloors` is the only producer and always writes `{ lower: 0, upper: value }`.
     const rawInterval = p.record(value.interval, `${label}.interval`);
     p.exact(rawInterval, ["lower", "upper"], `${label}.interval`);
@@ -438,10 +440,22 @@ function parseRawRegretRecords(raw: unknown, label: string): FamilyDeltaAnalysis
     // join two bootstrap clusters, so its family assignment is fixed.
     p.unique(records.map(({ endpoint, coordinateId }) => tupleKey(endpoint, coordinateId)), label);
     const familyByCoordinate = new Map<string, string>();
+    const endpointsByCoordinate = new Map<string, Set<string>>();
     for (const [index, record] of records.entries()) {
         const seen = familyByCoordinate.get(record.coordinateId);
         if (seen === undefined) familyByCoordinate.set(record.coordinateId, record.familyId);
         else if (seen !== record.familyId) p.fail(`${label}[${index}].familyId: family-conflict`);
+        const endpoints = endpointsByCoordinate.get(record.coordinateId) ?? new Set<string>();
+        endpoints.add(record.endpoint);
+        endpointsByCoordinate.set(record.coordinateId, endpoints);
+    }
+    // Rungs run in order and stop at the first failure, so a later delta exists only with every earlier one.
+    for (const [coordinateId, endpoints] of endpointsByCoordinate) {
+        const ladder = ["retrieval", "formation", "representation"];
+        const deepest = Math.max(...ladder.map((endpoint, depth) => (endpoints.has(endpoint) ? depth : -1)));
+        for (let depth = 0; depth <= deepest; depth += 1) {
+            if (!endpoints.has(ladder[depth]!)) p.fail(`${label}: ladder-prefix-missing-${coordinateId}`);
+        }
     }
     return records;
 }
@@ -686,6 +700,11 @@ export function parsePairedDeltaReport(raw: unknown): PairedDeltaReport {
     const rawCoordinates = new Set(body.analysis.rawRegretRecords.map(({ coordinateId }) => coordinateId));
     if (rawCoordinates.size + refusedTotal > body.runSummary.plannedCoordinates) {
         p.fail("report.body.analysis.rawRegretRecords: exceeds-plan");
+    }
+    // The ladder fires only after a completed, observed mc-on cell, so every refused or raw regret coordinate
+    // implies at least one observed rollout. It may also be a healthy coordinate, so the two bounds do not add.
+    if (body.runSummary.observedCostRollouts < rawCoordinates.size + refusedTotal) {
+        p.fail("report.body.runSummary.observedCostRollouts: regret-coordinate-shortfall");
     }
     // A healthy coordinate contributes both primary observations, so healthy evidence implies the paired
     // endpoint set, at least one family, and every primary arm in each secondary-metric map.
