@@ -2552,6 +2552,8 @@ describe("buildLaneReport", () => {
         expect(() => parseLaneReport(duplicated)).toThrow(/report\.scenarios: lane-invalid \(.*duplicate scenario/);
         const rawOutput = structuredClone(report);
         rawOutput.scenarios[0]!.source = "raw-output";
+        // A raw-output score carries no tuple, so the seam rule is what a well-formed one reaches.
+        rawOutput.scenarios[0]!.system = null;
         expect(() => parseLaneReport(rawOutput)).toThrow(/report\.scenarios: lane-invalid \(.*raw-output seam/);
         // `scoreFacts` derives both ratios from the counts, and the rebuild carries scenarios through
         // unchanged, so these are the parser's only chance to check them.

@@ -16,11 +16,13 @@ import {
 } from "./contract";
 import type {
     DeltaEndpoint,
+    DeltaResolution,
     EndpointEstimate,
     FamilyDeltaAnalysis,
     FamilyEstimate,
     FamilyNoiseFloor,
     Interval,
+    NoiseComparison,
     RawRegretRecord,
 } from "./estimator";
 import { LIVE_REGRET_ENDPOINTS, MAX_BOOTSTRAP_SEED, MIN_BOOTSTRAP_RESAMPLES, PRIMARY_ENDPOINTS, PROVIDER_MIXED_REGRET_ENDPOINTS, REGRET_ENDPOINTS, endpointResolution, includesZero, mean, noiseLabel } from "./estimator";
@@ -352,10 +354,10 @@ function parseFamilyEstimate(
     // `noise.floor` is allowed only for primary endpoints.
     if (!isPrimary && noise.floor !== null) p.fail(`${label}.noise.floor: floor-owner-mismatch`);
     const floor = noise.floor === null ? null : parseNoiseFloor(noise.floor, `${label}.noise.floor`, { familyId, endpoint });
-    const noiseLabelValue = p.enumeration(noise.label, ["no-noise-floor", "inside-floor", "outside-floor"] as const, `${label}.noise.label`);
+    const noiseLabelValue = p.enumeration(noise.label, NOISE_COMPARISONS, `${label}.noise.label`);
     if (noiseLabelValue !== noiseLabel(pointEstimate, floor)) p.fail(`${label}.noise.label: derived-mismatch`);
     const interval = parseInterval(value.interval, `${label}.interval`);
-    const resolution = p.enumeration(value.resolution, ["resolved", "unresolved"] as const, `${label}.resolution`);
+    const resolution = p.enumeration(value.resolution, DELTA_RESOLUTIONS, `${label}.resolution`);
     // Zero-crossing intervals, inside-floor noise, and insufficient endpoint families each require
     // `unresolved`. The unpublished per-family observation count only blocks proving the converse.
     if (
@@ -396,7 +398,7 @@ function parseEndpointEstimates(
         if (familyCount !== families.length) p.fail(`${itemLabel}.familyCount: derived-mismatch`);
         const pointEstimate = deltaNumber(value.pointEstimate, `${itemLabel}.pointEstimate`);
         const interval = parseInterval(value.interval, `${itemLabel}.interval`);
-        const resolution = p.enumeration(value.resolution, ["resolved", "unresolved"] as const, `${itemLabel}.resolution`);
+        const resolution = p.enumeration(value.resolution, DELTA_RESOLUTIONS, `${itemLabel}.resolution`);
         const familyMeans = families.map((family) => family.pointEstimate);
         // Using the estimator's `mean` prevents last-bit drift during recomputation.
         if (families.length > 0 && pointEstimate !== mean(familyMeans)) {
@@ -545,6 +547,9 @@ function mirroredEstimates(raw: unknown, label: string, parsed: EndpointEstimate
     if (canonicalFingerprint(raw) !== canonicalFingerprint(parsed)) p.fail(`${label}: analysis-mismatch`);
     return parsed;
 }
+
+const NOISE_COMPARISONS = vocabulary<NoiseComparison>({ "no-noise-floor": true, "inside-floor": true, "outside-floor": true });
+const DELTA_RESOLUTIONS = vocabulary<DeltaResolution>({ resolved: true, unresolved: true });
 
 const REFUSED_REGRET_REASONS = vocabulary<NonNullable<PairedDeltaRunResult["coordinates"][number]["regret"]>["refusedReason"] & string>({
     "base-fingerprint-mismatch": true,

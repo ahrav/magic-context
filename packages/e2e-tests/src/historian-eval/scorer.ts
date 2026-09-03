@@ -26,7 +26,7 @@ import type { Database } from "../../../plugin/src/shared/sqlite";
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { makeContractPrimitives } from "../contract-primitives";
 import { openTestDb } from "../test-db";
-import { parseSystemVersionTuple } from "./system-tuple";
+import { parseSystemVersionTuple, requireScoreSystemBinding } from "./system-tuple";
 import {
     containsCompleteValue,
     decodeXmlEntities,
@@ -1822,9 +1822,9 @@ export function buildLaneReport(
             errors: errors.length,
             errorCountsByReason,
             failCountsByReason,
-            precision: visibleTotal === 0 ? null : visibleMatched / visibleTotal,
-            recall: expectedTotal === 0 ? null : expectedMatched / expectedTotal,
-            falseAuthoritativeRate: scored.length === 0 ? null : falseAuthoritativeScenarios.length / scored.length,
+            precision: claimRatio(visibleMatched, visibleTotal),
+            recall: claimRatio(expectedMatched, expectedTotal),
+            falseAuthoritativeRate: claimRatio(falseAuthoritativeScenarios.length, scored.length),
         },
         red: sorted.some((score) => score.verdict !== "PASS"),
         runFatal: scored.some((score) => score.failReasons.includes("false-authoritative")),
@@ -2017,11 +2017,8 @@ export function parseLaneReport(raw: unknown): LaneReport {
     // non-error lane score carries a tuple, and `resolveReportSystem` would otherwise fall back to whatever
     // root the archive supplies.
     for (const [index, score] of report.scenarios.entries()) {
-        if (score.verdict === "ERROR" || score.source !== "run-record") continue;
-        if (score.system === null) p.fail(`report.scenarios[${index}].system: system-required`);
-        if (report.system !== null && canonicalJson(score.system) !== canonicalJson(report.system)) {
-            p.fail(`report.scenarios[${index}].system: report-system-mismatch`);
-        }
+        if (score.verdict === "ERROR") continue;
+        requireScoreSystemBinding(p, score, report.system, `report.scenarios[${index}].system`);
     }
     // Rebuilding verifies that the scenarios satisfy the builder's admission rules and that the archived derived fields match.
     let rebuilt: LaneReport;

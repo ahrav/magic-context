@@ -3,7 +3,7 @@ import { compareCodeUnits } from "../code-unit-order";
 import { makeContractPrimitives, vocabulary } from "../contract-primitives";
 import type { SystemVersionTuple } from "../historian-eval/runner";
 import { FAIL_REASONS, SCENARIO_VERDICTS, parseScenarioScore, type ScenarioScore } from "../historian-eval/scorer";
-import { parseSystemVersionTuple } from "../historian-eval/system-tuple";
+import { parseSystemVersionTuple, requireScoreSystemBinding } from "../historian-eval/system-tuple";
 import { falseAuthoritativeMatchSet, introducedFailReasons, invariantHolds, type InvariantEvidence, type InvariantVerdict } from "./invariants";
 import { MAX_TRANSFORM_SEED } from "./transforms";
 
@@ -283,10 +283,26 @@ function parseInvariantEvidence(value: Record<string, unknown>, invariant: Metam
  * `injection-set-equality` and `expectation-predicate-equality` are omitted: they derive from injected
  * claims and expectation predicates, which the report does not publish.
  */
+interface PairScores {
+    baselineScore: ScenarioScore;
+    derivativeScore: ScenarioScore;
+    /** Sorted unique false-authoritative matches per role, shared by the two set-equality invariants. */
+    baselineMatches: string[];
+    derivativeMatches: string[];
+}
+
+function pairScores(baselineScore: ScenarioScore, derivativeScore: ScenarioScore): PairScores {
+    return {
+        baselineScore,
+        derivativeScore,
+        baselineMatches: falseAuthoritativeMatchSet(baselineScore),
+        derivativeMatches: falseAuthoritativeMatchSet(derivativeScore),
+    };
+}
+
 function checkScoreDerivedEvidence(
     evidence: InvariantEvidence,
-    baselineScore: ScenarioScore,
-    derivativeScore: ScenarioScore,
+    { baselineScore, derivativeScore, baselineMatches, derivativeMatches }: PairScores,
     label: string,
 ): void {
     const mismatch = (field: string): never => p.fail(`${label}.${field}: score-evidence-mismatch`);
@@ -305,12 +321,8 @@ function checkScoreDerivedEvidence(
         }
         case "expected-absent-empty":
         case "false-authoritative-set-equality": {
-            if (canonicalJson(evidence.baselineMatches) !== canonicalJson(falseAuthoritativeMatchSet(baselineScore))) {
-                mismatch("baselineMatches");
-            }
-            if (canonicalJson(evidence.derivativeMatches) !== canonicalJson(falseAuthoritativeMatchSet(derivativeScore))) {
-                mismatch("derivativeMatches");
-            }
+            if (canonicalJson(evidence.baselineMatches) !== canonicalJson(baselineMatches)) mismatch("baselineMatches");
+            if (canonicalJson(evidence.derivativeMatches) !== canonicalJson(derivativeMatches)) mismatch("derivativeMatches");
             return;
         }
         case "injection-set-equality":
@@ -322,7 +334,7 @@ function checkScoreDerivedEvidence(
 function parseInvariant(
     raw: unknown,
     label: string,
-    scores: { baselineScore: ScenarioScore; derivativeScore: ScenarioScore },
+    scores: PairScores,
 ): MetamorphicInvariantVerdict {
     const value = p.record(raw, label);
     const invariant = p.enumeration(value.invariant, INVARIANT_IDS, `${label}.invariant`);
@@ -330,7 +342,7 @@ function parseInvariant(
     const evidence = parseInvariantEvidence(value, invariant, label);
     if (invariantHolds(evidence) !== holds) p.fail(`${label}.holds: derived-mismatch`);
     // Editing both sides of one invariant keeps `holds` self-consistent, so the scores are the outside oracle.
-    checkScoreDerivedEvidence(evidence, scores.baselineScore, scores.derivativeScore, label);
+    checkScoreDerivedEvidence(evidence, scores, label);
     return { ...evidence, holds } as MetamorphicInvariantVerdict;
 }
 
@@ -383,8 +395,9 @@ function parseEntry(raw: unknown, label: string): MetamorphicReportEntry {
             if (derivativeScore.scenarioId !== derivativeScenarioId) {
                 p.fail(`${label}.derivativeScore.scenarioId: pair-scenario-mismatch`);
             }
+            const scores = pairScores(baselineScore, derivativeScore);
             const invariants = p.array(value.invariants, `${label}.invariants`)
-                .map((entry, index) => parseInvariant(entry, `${label}.invariants[${index}]`, { baselineScore, derivativeScore }));
+                .map((entry, index) => parseInvariant(entry, `${label}.invariants[${index}]`, scores));
             // Each producer emits a fixed invariant set, so a missing row hides a failure rather than omitting evidence.
             const expected = INVARIANTS_BY_SOURCE[baselineScore.source];
             const actual = invariants.map(({ invariant }) => invariant);
@@ -559,25 +572,10 @@ export function parseMetamorphicReport(raw: unknown): MetamorphicReport {
     // resolves its tuple before running and exits without a report when it cannot.
     if (sources.has("raw-output") && report.system !== null) p.fail("report.system: report-system-mismatch");
     if (sources.has("run-record") && report.system === null) p.fail("report.system: report-system-mismatch");
-    // The raw-output scorer stamps `system: null` on every score it produces.
+    // The pair checks prove the two roles agree with each other; this binds the pair to its seam and report.
     for (const [index, entry] of report.entries.entries()) {
-        if (entry.kind === "scored" && entry.baselineScore.source === "raw-output" && entry.baselineScore.system !== null) {
-            p.fail(`report.entries[${index}]: report-system-mismatch`);
-        }
-    }
-    if (report.system !== null) {
-        const rootSystem = canonicalJson(report.system);
-        for (const [index, entry] of report.entries.entries()) {
-            if (entry.kind !== "scored") continue;
-            // `scoreRunRecord` scores only a record whose system passed shape validation.
-            if (entry.baselineScore.system === null) {
-                if (entry.baselineScore.source === "run-record") p.fail(`report.entries[${index}]: system-required`);
-                continue;
-            }
-            if (canonicalJson(entry.baselineScore.system) !== rootSystem) {
-                p.fail(`report.entries[${index}]: report-system-mismatch`);
-            }
-        }
+        if (entry.kind !== "scored") continue;
+        requireScoreSystemBinding(p, entry.baselineScore, report.system, `report.entries[${index}]`);
     }
     return report;
 }
