@@ -1,4 +1,4 @@
-//!
+//! Host resource, timing, liveness, and initialization configuration.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -9,14 +9,14 @@ use crate::connection_file::{
 };
 use crate::wire::{HEADER_LEN, MAX_BODY_LEN, PROTOCOL_VERSION};
 
-/// floor.
+/// Minimum resident-byte budget that preserves one maximum ingress frame.
 pub const MIN_RESIDENT_BYTES: u64 =
     MAX_BODY_LEN as u64 + EGRESS_RESERVED_BYTES + SCRATCH_RESERVED_BYTES;
 
+/// Resident-byte slice reserved for one maximum encoded egress frame.
 pub(crate) const EGRESS_RESERVED_BYTES: u64 = MAX_BODY_LEN as u64 + HEADER_LEN as u64;
 
-///
-///
+/// Resident-byte slice reserved for parsing, page assembly, waiters, and retained metadata.
 pub(crate) const SCRATCH_RESERVED_BYTES: u64 = (MAX_BODY_LEN as u64 * 5 / 2)
     + (6 * 1024 * 1024)
     + 256
@@ -33,9 +33,10 @@ pub(crate) const SYNAPSE_WAITER_HEADROOM_BYTES: u64 = 4 * (2 * 1024 * 1024 + 256
 /// Without this reservation, retained metadata can leave insufficient capacity for an identical maximum-batch replay until expiry.
 pub(crate) const RETAINED_METADATA_RESERVED_BYTES: u64 = 2 * 1024 * 1024;
 
-/// `MAX_CONFIG_DURATION` bounds configured deadlines and periods to prevent `Instant + Duration` overflow panics.
-/// Validation rejects unbounded durations such as `Duration::MAX` to prevent `Instant + Duration` overflow panics.
-/// The one-year cap stays below the `Instant + Duration` overflow range.
+/// Maximum accepted deadline or period.
+///
+/// The one-year cap prevents `Instant + Duration` overflow from unbounded values such as
+/// `Duration::MAX`.
 pub const MAX_CONFIG_DURATION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// The SHA-256 of zero bytes.
@@ -45,18 +46,25 @@ pub const UNSTAGED_PAYLOAD_MANIFEST_DIGEST: &str =
 /// Each `HostLimits` field gates an independent resource class; exhausting one class does not consume another.
 #[derive(Debug, Clone)]
 pub struct HostLimits {
+    /// Maximum concurrent authentication handshakes.
+    ///
     /// The host closes excess unauthenticated sockets without reading client bytes.
     pub max_handshakes: usize,
+    /// Maximum authenticated connections.
     pub max_connections: usize,
-    /// `max_routes` limits live routes across all connections and cannot exceed the `u16` channel namespace.
-    /// namespace).
+    /// Maximum live routes across all connections.
+    ///
+    /// This value cannot exceed the `u16` channel namespace.
     pub max_routes: usize,
     /// `max_pending_requests` limits consumer requests admitted but not yet settled across all connections.
     pub max_pending_requests: usize,
+    /// Maximum concurrent handler tasks.
     pub max_handler_tasks: usize,
-    /// The cap includes inbound bodies, handler-owned request bodies, parser scratch, request-derived input ownership, encoded frames, writer queues, and handler-declared retained bytes.
-    /// The limit accounts for named logical payloads, not exact process RSS.
-    /// process-RSS claim.
+    /// Maximum bytes charged to host-managed resident payloads.
+    ///
+    /// The cap includes inbound bodies, handler-owned request bodies, parser scratch,
+    /// request-derived input ownership, encoded frames, writer queues, and handler-declared
+    /// retained bytes. It accounts for named logical payloads, not exact process RSS.
     ///
     /// `max_resident_bytes` reserves [`EGRESS_RESERVED_BYTES`] for output and [`SCRATCH_RESERVED_BYTES`] for scratch; only the remaining capacity admits inbound frames.
     /// Increasing `max_resident_bytes` enlarges only the inbound admission pool; scratch capacity remains bounded by [`SCRATCH_RESERVED_BYTES`].
@@ -64,6 +72,7 @@ pub struct HostLimits {
     /// `max_resident_bytes` must be at least [`MIN_RESIDENT_BYTES`].
     /// Startup requires catalog and retained reservations to leave capacity for one maximum ingress body.
     pub max_resident_bytes: u64,
+    /// Maximum queued egress frames per connection writer.
     pub writer_queue_frames: usize,
 }
 
@@ -88,6 +97,7 @@ impl Default for HostLimits {
 }
 
 impl HostLimits {
+    /// Validate all limits against runtime and protocol bounds.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let zeros = [
             ("max_handshakes", self.max_handshakes),
@@ -122,8 +132,8 @@ impl HostLimits {
                 minimum: MIN_RESIDENT_BYTES,
             });
         }
-        // Tokio semaphores cap permits below `u32::MAX` on 32-bit targets; byte-granular charges must fit in that cap so `ByteBudget::new` cannot panic.
-        // counts.
+        // Tokio semaphores cap permits below `u32::MAX` on 32-bit targets. Byte-granular
+        // charges must fit in that cap so `ByteBudget::new` cannot panic.
         let max_budget_bytes = (tokio::sync::Semaphore::MAX_PERMITS as u64).min(u32::MAX as u64);
         if self.max_resident_bytes > max_budget_bytes {
             return Err(ConfigError::ResidentBytesTooLarge {
@@ -145,16 +155,16 @@ pub struct HostTiming {
     /// Idle waiting between frames is unbounded (protocol §6.3).
     /// The frame deadline also bounds writing one dequeued frame to the consumer.
     /// The host retires a peer that stops reading instead of allowing it to pin shared egress budget indefinitely.
-    /// budget indefinitely.
     pub frame_deadline: Duration,
     /// The budget covers bind, route-gone, initialization, and health callbacks; expiry is host-fatal.
-    /// host-fatal.
     pub lifecycle_callback_deadline: Duration,
     /// The route-close budget settles or cancels one route's admitted work.
     pub route_close_budget: Duration,
+    /// Deadline for transport setup after route admission.
     pub transport_setup_deadline: Duration,
     /// The shutdown deadline covers the whole graceful-shutdown drain.
     pub shutdown_deadline: Duration,
+    /// Interval between handler health callbacks.
     pub health_interval: Duration,
 }
 
@@ -178,8 +188,11 @@ impl Default for HostTiming {
 /// Enabling `invalidate_on_missed` for clients that cannot answer Ping kills healthy long-running awaits.
 #[derive(Debug, Clone)]
 pub struct LivenessPolicy {
+    /// Interval between liveness probes.
     pub ping_interval: Duration,
+    /// Time allowed for the matching Pong.
     pub pong_deadline: Duration,
+    /// Whether a missed Pong invalidates the connection.
     pub invalidate_on_missed: bool,
 }
 
@@ -187,6 +200,7 @@ pub struct LivenessPolicy {
 /// The host hands the payload to the linked handler before the listener binds (protocol §8.1 steps 3–4).
 #[derive(Clone, Default)]
 pub struct HostInit {
+    /// Capabilities advertised by the managed `subc` consumer.
     pub subc_capabilities: Vec<String>,
     /// Managed deployments pass an opaque resolved storage descriptor.
     /// The handler deserializes the descriptor; the host never reads it.
@@ -195,8 +209,8 @@ pub struct HostInit {
 
 impl std::fmt::Debug for HostInit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The storage descriptor can carry credentials or deployment metadata.
-        // presence only.
+        // The storage descriptor can carry credentials or deployment metadata. Report only
+        // whether it is present.
         f.debug_struct("HostInit")
             .field("subc_capabilities", &self.subc_capabilities)
             .field("storage", &self.storage.is_some())
@@ -204,18 +218,22 @@ impl std::fmt::Debug for HostInit {
     }
 }
 
+/// Complete host configuration validated before startup.
 #[derive(Debug, Clone)]
 pub struct HostConfig {
-    /// Diagnostics, including `HostConfig`'s derived `Debug`, report only whether storage is present.
-    /// contains `cortexkit/run/subc-connection.json`.
+    /// Directory containing runtime data, including `cortexkit/run/subc-connection.json`.
     pub data_dir: Option<PathBuf>,
     /// The host publishes `daemon_ver` and echoes it in the authentication `ServerProof`.
     pub daemon_ver: String,
-    /// `payload_manifest_digest` must contain 64 lowercase hex characters and defaults to `UNSTAGED_PAYLOAD_MANIFEST_DIGEST`.
-    /// [`UNSTAGED_PAYLOAD_MANIFEST_DIGEST`].
+    /// Payload manifest SHA-256 as 64 lowercase hexadecimal characters.
+    ///
+    /// Defaults to [`UNSTAGED_PAYLOAD_MANIFEST_DIGEST`].
     pub payload_manifest_digest: String,
+    /// Synthetic initialization payload passed to the linked handler.
     pub init: HostInit,
+    /// Resource limits enforced across all connections.
     pub limits: HostLimits,
+    /// Deadlines and periods used by host operations.
     pub timing: HostTiming,
     /// `None` sends no Pings at all.
     pub liveness: Option<LivenessPolicy>,
@@ -236,6 +254,7 @@ impl Default for HostConfig {
 }
 
 impl HostConfig {
+    /// Validate nested limits, bounded durations, and wire-sized identity fields.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.limits.validate()?;
         if self.daemon_ver.is_empty() {
@@ -316,6 +335,7 @@ impl HostConfig {
     }
 }
 
+/// Invalid host configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     ZeroLimit {
@@ -460,13 +480,13 @@ mod tests {
         let admission_at_floor =
             MIN_RESIDENT_BYTES - EGRESS_RESERVED_BYTES - SCRATCH_RESERVED_BYTES;
         assert_eq!(admission_at_floor, frame);
-        // deployment tuning.
+        // Defaults may provide extra admission capacity for deployment tuning.
         let defaults = HostLimits::default();
         assert!(defaults.max_resident_bytes >= MIN_RESIDENT_BYTES);
         let admission_at_default =
             defaults.max_resident_bytes - EGRESS_RESERVED_BYTES - SCRATCH_RESERVED_BYTES;
         assert!(admission_at_default > frame);
-        // egress guarantees.
+        // Catalog headroom does not weaken scratch or egress guarantees.
         assert!(
             admission_at_default - frame > 0,
             "catalog headroom comes out of admission, not the reserved slices"

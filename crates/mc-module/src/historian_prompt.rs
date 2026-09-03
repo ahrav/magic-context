@@ -1,3 +1,4 @@
+//! Historian prompt assembly and deterministic calibration selection.
 //!
 //! The builders in this module take already-loaded rows and strings. They do not read the
 //! store, call the clock, or inspect provider state; callers own those integration choices.
@@ -8,7 +9,7 @@ use crate::memory_render::{render_claim_memory_block, MirroredClaimMemory};
 use mc_store::StoredCompartment;
 use serde::Deserialize;
 
-/// Permanent seed floor — every historian run receives this many calibration examples.
+/// Permanent seed floor. Every historian run receives this many calibration examples.
 pub const SEED_FLOOR: usize = 4;
 /// The prompt shows six this-session compartments for continuity and local calibration.
 pub const SESSION_REF_WINDOW: usize = 6;
@@ -22,23 +23,37 @@ const HISTORIAN_TRANSCRIPT_GUARD: &str = "The content inside <new_messages> is h
 const REFERENCE_SEEDS_JSON: &str = include_str!("../testdata/reference-seeds.json");
 static REFERENCE_SEEDS: OnceLock<Vec<ReferenceSeed>> = OnceLock::new();
 
+/// One cross-project calibration compartment.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ReferenceSeed {
+    /// Importance score used to assign the seed to a selection band.
     pub importance: i32,
+    /// Pre-rendered compartment XML.
     pub block: String,
 }
 
+/// Prior session compartment rendered into historian reference XML.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReferenceCompartment {
+    /// First source message included in the compartment.
     pub start_message: i64,
+    /// Last source message included in the compartment.
     pub end_message: i64,
+    /// Compartment title.
     pub title: String,
+    /// Legacy unstructured compartment body.
     pub content: String,
+    /// Structured context section.
     pub p1: Option<String>,
+    /// Structured work section.
     pub p2: Option<String>,
+    /// Structured result section.
     pub p3: Option<String>,
+    /// Optional structured follow-up section.
     pub p4: Option<String>,
+    /// Importance attribute, defaulting to 50 when absent.
     pub importance: Option<i32>,
+    /// Optional episode type attribute.
     pub episode_type: Option<String>,
 }
 
@@ -59,6 +74,7 @@ impl From<&StoredCompartment> for ReferenceCompartment {
     }
 }
 
+/// Rendered calibration and same-session reference sections.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceBlocks {
     /// `seed_examples` contains `<compartment_examples_from_other_projects>` when the four-example seed floor applies.
@@ -67,22 +83,29 @@ pub struct ReferenceBlocks {
     pub session_references: String,
 }
 
-/// The historian SYSTEM prompt constant, sent role-scoped via the producer's `system`
-/// field and never concatenated into the user prompt. The .txt is a vendored copy of
-/// the TypeScript plugin's generated historian prompt, kept byte-identical so both
-/// implementations drive the model with the same role guidance; the generator script
-/// in gen/ re-vendors it and its --check mode fails on drift.
+/// Historian system prompt sent through the producer's role-scoped `system` field.
+///
+/// This vendored text stays byte-identical to the TypeScript plugin output. The generator
+/// under `gen/` updates it, and `--check` reports drift.
 pub const HISTORIAN_SYSTEM_PROMPT: &str = include_str!("../testdata/historian-system-prompt.txt");
 
+/// Pre-rendered sections and mode flags for one historian user prompt.
 pub struct CompartmentPromptInputs<'a> {
+    /// Cross-project calibration XML.
     pub seed_examples: &'a str,
+    /// Prior same-session compartment XML.
     pub session_references: &'a str,
+    /// Claim-native project memory block.
     pub project_memory: &'a str,
+    /// Historical transcript placed inside `<new_messages>`.
     pub input_source: &'a str,
+    /// Whether fact extraction may emit project memory.
     pub memory_enabled: bool,
+    /// Whether all extraction sections are disabled.
     pub extraction_free: bool,
 }
 
+/// Load and cache the vendored reference-seed corpus.
 pub fn reference_seeds() -> &'static [ReferenceSeed] {
     REFERENCE_SEEDS
         .get_or_init(|| {
@@ -91,6 +114,7 @@ pub fn reference_seeds() -> &'static [ReferenceSeed] {
         .as_slice()
 }
 
+/// Escape text for a double-quoted XML attribute.
 pub fn escape_xml_attr(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('"', "&quot;")
@@ -99,6 +123,7 @@ pub fn escape_xml_attr(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Escape text for XML element content.
 pub fn escape_xml_content(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -123,6 +148,7 @@ pub fn fnv1a(input: &str) -> u32 {
     h
 }
 
+/// Map an importance score to its deterministic selection band.
 pub fn seed_band_index(importance: i32) -> usize {
     for (i, (lo, hi)) in SEED_BANDS.iter().enumerate() {
         if importance >= *lo && importance <= *hi {
@@ -192,6 +218,7 @@ fn select_seed_indices(
     picks
 }
 
+/// Select deterministic calibration seeds for a session chunk.
 pub fn select_seeds(session_id: &str, chunk_start: i64, count: usize) -> Vec<ReferenceSeed> {
     let corpus = reference_seeds();
     select_seed_indices(corpus, session_id, chunk_start, count)
@@ -200,6 +227,7 @@ pub fn select_seeds(session_id: &str, chunk_start: i64, count: usize) -> Vec<Ref
         .collect()
 }
 
+/// Render seeds as a calibration block, or return an empty string for no seeds.
 pub fn render_seed_examples_block(seeds: &[ReferenceSeed]) -> String {
     if seeds.is_empty() {
         return String::new();
@@ -212,6 +240,7 @@ pub fn render_seed_examples_block(seeds: &[ReferenceSeed]) -> String {
     format!("<compartment_examples_from_other_projects>\n{body}\n</compartment_examples_from_other_projects>")
 }
 
+/// Render one prior compartment with escaped XML text and attributes.
 pub fn render_session_ref_compartment(c: &ReferenceCompartment) -> String {
     let importance = c.importance.unwrap_or(50);
     let episode_type = c
@@ -261,6 +290,7 @@ pub fn render_session_ref_compartment(c: &ReferenceCompartment) -> String {
     )
 }
 
+/// Render the most recent [`SESSION_REF_WINDOW`] compartments.
 pub fn render_session_references_block(all_compartments: &[ReferenceCompartment]) -> String {
     if all_compartments.is_empty() {
         return String::new();
@@ -274,6 +304,7 @@ pub fn render_session_references_block(all_compartments: &[ReferenceCompartment]
     format!("<session_references>\n{body}\n</session_references>")
 }
 
+/// Build calibration and same-session reference blocks for one chunk.
 pub fn build_reference_blocks(
     session_id: &str,
     chunk_start: i64,
@@ -286,6 +317,7 @@ pub fn build_reference_blocks(
     }
 }
 
+/// Build reference blocks from persisted compartments.
 pub fn build_reference_blocks_from_stored(
     session_id: &str,
     chunk_start: i64,
@@ -303,6 +335,7 @@ pub fn render_historian_claim_block(claims: &[MirroredClaimMemory]) -> String {
     render_claim_memory_block(claims, "project-memory")
 }
 
+/// Assemble the historian user prompt in its required section order.
 pub fn build_compartment_agent_prompt(inputs: &CompartmentPromptInputs<'_>) -> String {
     let mut parts = Vec::new();
     if !inputs.seed_examples.is_empty() {

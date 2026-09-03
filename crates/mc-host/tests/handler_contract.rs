@@ -316,7 +316,7 @@ fn three_child_composite(
     StaticComposite::new(mc, synapse, broca.with_resources(declaration)).expect("distinct ids")
 }
 
-/// A 96-slot declaration must leave at least one general slot in each pool:
+/// A 96-slot declaration must leave at least one general slot in each pool.
 #[tokio::test]
 async fn reservations_must_leave_one_general_slot_in_each_pool() {
     for (pending, tasks) in [(96, 200), (200, 96), (96, 96)] {
@@ -504,13 +504,10 @@ async fn retained_declaration_raises_the_resident_floor_exactly() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// The default resident cap is the no-retention ingress floor.
-/// Composites must include linked components' retained-memory declarations in the resident cap.
+/// The default resident cap covers ingress without external retention.
 ///
-/// The default resident cap excludes external components' declarations.
-/// Composites that link external components must include their declarations in the resident cap.
-/// The composition site must calculate the resident cap because it knows the linked components.
-/// ingress.
+/// A composition site must add linked components' retained-memory declarations because it alone
+/// knows the complete component set.
 #[tokio::test]
 async fn a_composite_sizes_the_resident_cap_from_its_own_declarations() {
     const RETAINED: u64 = 64 * 1024 * 1024
@@ -539,9 +536,9 @@ async fn a_composite_sizes_the_resident_cap_from_its_own_declarations() {
         "a declaration the ceiling cannot cover must fail startup"
     );
 
-    // Startup charges the full catalog body, the empty catalog body, and each per-module body plus its ID.
-    // Computing the charge from `catalog.list` responses avoids a fixed slack allowance.
-    // catalog depends only on the manifests, which are identical.
+    // Startup charges the full catalog body, the empty catalog body, and each per-module body plus
+    // its ID. Computing the charge from `catalog.list` responses avoids a fixed slack allowance.
+    // Catalog size depends only on the manifests, which are identical.
     let catalog_charge = {
         async fn fetch_body(
             client: &mut support::raw_client::RawClient,
