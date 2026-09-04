@@ -236,10 +236,22 @@ impl Redactor {
 
     /// Detects findings in bytes that need not be UTF-8.
     ///
-    /// Scans text produced by `String::from_utf8_lossy`, one window at a time,
-    /// because invalid bytes expand to three-byte replacement characters.
+    /// Scans valid UTF-8 in place; otherwise, scans lossy UTF-8 one window at a
+    /// time because invalid bytes expand to three-byte replacement characters.
     pub fn detect_windowed_bytes(&self, bytes: &[u8]) -> Result<bool, RedactionError> {
-        let mut scan = WindowScan::new(self);
+        // Valid UTF-8 decodes to itself, so its windows are slices of the input.
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            return self.detect_sliding(&mut WindowScan::new(self), text);
+        }
+        self.detect_copying(&mut WindowScan::new(self), bytes)
+    }
+
+    /// Copies each window of the lossy decoding of `bytes` into a buffer and scans it.
+    fn detect_copying(
+        &self,
+        scan: &mut WindowScan<'_>,
+        bytes: &[u8],
+    ) -> Result<bool, RedactionError> {
         let mut buffer = String::with_capacity(MAX_REDACTABLE_BYTES.min(bytes.len() + 3));
         // Byte offset of `buffer[0]` in the lossy text; zero marks the text's real left edge.
         let mut start = 0usize;
@@ -267,6 +279,29 @@ impl Redactor {
         }
         Ok(!scan.findings(&buffer, start, true)?.is_empty())
     }
+
+    /// Slides a window over `text` exactly as the copying loop in
+    /// [`Self::detect_copying`] does: fill to `MAX_REDACTABLE_BYTES` on a
+    /// char boundary, scan, keep the last `WINDOW_OVERLAP_BYTES`, repeat.
+    fn detect_sliding(
+        &self,
+        scan: &mut WindowScan<'_>,
+        text: &str,
+    ) -> Result<bool, RedactionError> {
+        let mut start = 0usize;
+        loop {
+            let end = char_floor(text, start.saturating_add(MAX_REDACTABLE_BYTES));
+            let is_last = end == text.len();
+            let window = window(text, start, end)?;
+            if !scan.findings(window, start, is_last)?.is_empty() {
+                return Ok(true);
+            }
+            if is_last {
+                return Ok(false);
+            }
+            start += window_advance(window);
+        }
+    }
 }
 
 /// One pass of overlapping windows over a text, in ascending order of `start`.
@@ -278,6 +313,9 @@ struct WindowScan<'a> {
     redactor: &'a Redactor,
     /// Absolute end of the range earlier windows have claimed.
     claimed_to: usize,
+    /// Every `(start, end, is_last)` scanned, so tests can compare two walks over one text.
+    #[cfg(test)]
+    seen: Vec<(usize, usize, bool)>,
 }
 
 impl<'a> WindowScan<'a> {
@@ -285,6 +323,8 @@ impl<'a> WindowScan<'a> {
         Self {
             redactor,
             claimed_to: 0,
+            #[cfg(test)]
+            seen: Vec::new(),
         }
     }
 
@@ -295,6 +335,8 @@ impl<'a> WindowScan<'a> {
         start: usize,
         is_last: bool,
     ) -> Result<Vec<Finding>, RedactionError> {
+        #[cfg(test)]
+        self.seen.push((start, start + window.len(), is_last));
         let mut report = self.redactor.scanner.scan(window)?;
         if let Some(limit) = report.limits_hit {
             return Err(RedactionError {
@@ -326,11 +368,17 @@ impl<'a> WindowScan<'a> {
         if !self.findings(buffer, *start, false)?.is_empty() {
             return Ok(true);
         }
-        let cut = char_floor(buffer, buffer.len().saturating_sub(WINDOW_OVERLAP_BYTES));
+        let cut = window_advance(buffer);
         buffer.drain(..cut);
         *start += cut;
         Ok(false)
     }
+}
+
+/// Advances by all but the trailing `WINDOW_OVERLAP_BYTES`, cut back to a char boundary.
+/// Shared so valid UTF-8 and the lossy decoding of invalid bytes window identically.
+fn window_advance(window: &str) -> usize {
+    char_floor(window, window.len().saturating_sub(WINDOW_OVERLAP_BYTES))
 }
 
 fn window(input: &str, start: usize, end: usize) -> Result<&str, RedactionError> {
@@ -794,6 +842,63 @@ mod tests {
     fn short_input_uses_a_single_window() {
         assert_eq!(scan_windows("a\nb"), vec![(0, 3)]);
         assert_eq!(scan_windows(""), vec![(0, 0)]);
+    }
+
+    fn assert_sliding_matches_copying(text: &str) -> Result<bool, RedactionError> {
+        let redactor = Redactor::new().unwrap();
+        let mut sliding = WindowScan::new(&redactor);
+        let slid = redactor.detect_sliding(&mut sliding, text);
+        let mut copying = WindowScan::new(&redactor);
+        let copied = redactor.detect_copying(&mut copying, text.as_bytes());
+        assert_eq!(slid, copied);
+        assert_eq!(sliding.seen, copying.seen);
+        assert_eq!(sliding.claimed_to, copying.claimed_to);
+        slid
+    }
+
+    #[test]
+    fn in_place_detection_walks_the_copying_loop_windows() {
+        let window = MAX_REDACTABLE_BYTES;
+        let secret = "\npassword=hunter-two\n";
+
+        assert_eq!(assert_sliding_matches_copying(""), Ok(false));
+        assert_eq!(assert_sliding_matches_copying("a\nb"), Ok(false));
+        assert_eq!(
+            assert_sliding_matches_copying(&"x".repeat(window)),
+            Ok(false)
+        );
+
+        // Three-byte characters never divide the window evenly: each fill and cut lands mid-character.
+        let euros = "\u{20AC}".repeat(window);
+        assert_eq!(assert_sliding_matches_copying(&euros), Ok(false));
+        let mut text = euros.clone();
+        text.push_str(secret);
+        text.push_str(&"\u{20AC}".repeat(window / 3));
+        assert_eq!(assert_sliding_matches_copying(&text), Ok(true));
+
+        // With four-byte characters, filling ends on a boundary but the overlap cut lands mid-character.
+        let emoji = "\u{1F600}".repeat(window / 2 + 1);
+        assert_eq!(assert_sliding_matches_copying(&emoji), Ok(false));
+
+        // Anchor-free ASCII spanning several windows, so the walk runs to the end.
+        let prose = "lorem ipsum dolor sit amet\n".repeat(3 * window / 27);
+        let windows = {
+            let redactor = Redactor::new().unwrap();
+            let mut scan = WindowScan::new(&redactor);
+            redactor.detect_sliding(&mut scan, &prose).unwrap();
+            scan.seen
+        };
+        assert!(windows.len() >= 4, "{windows:?}");
+        assert_eq!(assert_sliding_matches_copying(&prose), Ok(false));
+
+        // Each secret is visible to exactly one window, so a shifted cut changes who reports it.
+        let in_first_edge_margin = window - EDGE_MARGIN_BYTES / 2 - secret.len();
+        let in_second_overlap = 2 * window - WINDOW_OVERLAP_BYTES - 2 * EDGE_MARGIN_BYTES;
+        for offset in [in_first_edge_margin, in_second_overlap] {
+            let mut text = prose.clone();
+            text.replace_range(offset..offset + secret.len(), secret);
+            assert_eq!(assert_sliding_matches_copying(&text), Ok(true), "{offset}");
+        }
     }
 
     #[test]
