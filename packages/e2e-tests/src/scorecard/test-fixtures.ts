@@ -262,12 +262,15 @@ export function metamorphicReportFixture(options: {
     source?: ScenarioScore["source"];
     /** Entries appended after the scored pairs, for runs that left a pair unscored. */
     extraEntries?: readonly MetamorphicReport["entries"][number][];
+    /** Overrides applied to every derivative score, for a run whose derivative role errored. */
+    derivativeScore?: Partial<ScenarioScore>;
 } = {}): MetamorphicReport {
     const covered = options.coveredScenarioIds ?? CANARY_SCENARIO_IDS;
     const source = options.source ?? "run-record";
-    const score = (scenarioId: string): ScenarioScore =>
-        source === "run-record" ? scenarioScoreFixture(scenarioId) : scenarioScoreFixture(scenarioId, { system: null, source, probeVerdicts: [] });
-    const invariants = () => [
+    const score = (scenarioId: string, overrides: Partial<ScenarioScore> = {}): ScenarioScore =>
+        source === "run-record" ? scenarioScoreFixture(scenarioId, overrides) : scenarioScoreFixture(scenarioId, { system: null, source, probeVerdicts: [], ...overrides });
+    const derivativeVerdict = options.derivativeScore?.verdict ?? "PASS";
+    const invariants = (derivative: ScenarioScore["verdict"] = "PASS") => [
         { invariant: "injection-set-equality" as const, holds: true, changes: [] },
         ...(source === "raw-output"
             ? [
@@ -277,7 +280,7 @@ export function metamorphicReportFixture(options: {
             : []),
         { invariant: "expectation-predicate-equality" as const, holds: true, changedExpectationIds: [] },
         { invariant: "false-authoritative-set-equality" as const, holds: true, baselineMatches: [], derivativeMatches: [] },
-        { invariant: "scenario-verdict-equality" as const, holds: true, baselineVerdict: "PASS" as const, derivativeVerdict: "PASS" as const },
+        { invariant: "scenario-verdict-equality" as const, holds: derivative === "PASS", baselineVerdict: "PASS" as const, derivativeVerdict: derivative },
     ];
     const entries: MetamorphicReport["entries"] = covered.flatMap((scenarioId, index) => {
             const pair = { scenarioId, transformId: "reorder-independent-turns", transformVersion: 1, seed: 0 };
@@ -285,8 +288,8 @@ export function metamorphicReportFixture(options: {
                 ...pair,
                 kind: "scored" as const,
                 baselineScore: score(scenarioId),
-                derivativeScore: score(derivativeScenarioId(pair)),
-                invariants: invariants(),
+                derivativeScore: score(derivativeScenarioId(pair), options.derivativeScore ?? {}),
+                invariants: invariants(derivativeVerdict),
             };
             return index === 0 && source === "run-record"
                 ? [{

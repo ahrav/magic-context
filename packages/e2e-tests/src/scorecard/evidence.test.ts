@@ -102,6 +102,12 @@ describe("loadEvidenceBundle", () => {
         });
         expect(unscored.tierInvalidReason).toBeNull();
         expect(statuses(tree({ lanes: { metamorphic: unscored } })).metamorphic).toBe("incomplete");
+        // A derivative role that scored ERROR is packaged as a scored pair, and is still a pair the run did not finish.
+        const erroredRole = metamorphicReportFixture({
+            derivativeScore: { verdict: "ERROR", errorReason: "run-never-fired", precision: null, recall: null, expectedClaimsMatched: 0, expectedClaimsTotal: 0, visibleClaimsMatched: 0, visibleClaimsTotal: 0, probeVerdicts: [] },
+        });
+        expect(erroredRole.tierInvalidReason).toBeNull();
+        expect(statuses(tree({ lanes: { metamorphic: erroredRole } })).metamorphic).toBe("incomplete");
         expect(statuses(tree({
             lanes: { historian: historianReportFixture([scenarioScoreFixture("hse-a", { verdict: "ERROR", errorReason: "run-never-fired", precision: null, recall: null })]) },
         })).historian).toBe("incomplete");
