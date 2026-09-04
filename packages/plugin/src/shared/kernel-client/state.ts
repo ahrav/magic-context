@@ -43,8 +43,8 @@ export const INVALID_REASONS = [
 ] as const;
 export type DaemonInvalidReason = (typeof INVALID_REASONS)[number];
 
-/** `daemon_absent` is minted by the client; the daemon cannot report its own absence. */
-export type UnavailableReason = DaemonUnavailableReason | "daemon_absent";
+/** `daemon_absent` and `outcome_unknown` are minted by the client; the daemon cannot report its own absence or a response the transport lost after the request was sent. commentlint: allow(JUDGE) */
+export type UnavailableReason = DaemonUnavailableReason | "daemon_absent" | "outcome_unknown";
 /** `unrecognized_state` is minted by the client for a `state` it cannot classify. */
 export type InvalidReason = DaemonInvalidReason | "unrecognized_state";
 
@@ -127,6 +127,10 @@ export const MEMORY_STATE_GUIDANCE = {
     "unavailable:daemon_absent": {
         marker: "memory: daemon not running",
         tool: "Memory is unavailable because the daemon is not running.",
+    },
+    "unavailable:outcome_unknown": {
+        marker: "memory: request outcome unknown",
+        tool: "The memory request was interrupted after it was sent and may have been applied; read the memory back to see whether it took effect.",
     },
     "conflict:known_as_of_advanced": {
         marker: "memory: object changed since it was read",

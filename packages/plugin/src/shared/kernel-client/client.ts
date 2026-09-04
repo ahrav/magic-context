@@ -292,8 +292,15 @@ export class KernelClient {
         let rebound = false;
         let reissued = false;
         for (;;) {
-            if (options.deadline.isExpired())
-                return { ok: false, state: nonAvailable(cancelled()) };
+            if (options.deadline.isExpired()) {
+                // After a reissued unknown outcome, an expired deadline still leaves the original request possibly applied; a plain cancellation would invite a retry under a fresh identity. commentlint: allow(JUDGE)
+                return {
+                    ok: false,
+                    state: reissued
+                        ? nonAvailable(unavailable("outcome_unknown"))
+                        : nonAvailable(cancelled()),
+                };
+            }
             try {
                 const raw = await this.transport.call({
                     sessionId: this.sessionId,
@@ -305,8 +312,15 @@ export class KernelClient {
                 });
                 return { ok: true, raw };
             } catch (error) {
+                // An `outcome_unknown` thrown while cancellation or the deadline fires must keep its classification: the daemon may have committed, and reporting an ordinary cancellation would claim a definitively unapplied request. commentlint: allow(JUDGE)
+                const unknownOutcome = isMcHostCallError(error) && error.kind === "outcome_unknown";
                 if (options.signal?.aborted || options.deadline.isExpired()) {
-                    return { ok: false, state: nonAvailable(cancelled()) };
+                    return {
+                        ok: false,
+                        state: unknownOutcome
+                            ? nonAvailable(unavailable("outcome_unknown"))
+                            : nonAvailable(cancelled()),
+                    };
                 }
                 if (isMcHostCallError(error)) {
                     if (error.kind === "not_sent") return absent();

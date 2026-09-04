@@ -157,6 +157,22 @@ describe("KernelClient gating", () => {
         expect(result.state).toEqual({ kind: "cancelled" });
         expect(transport.calls).toHaveLength(1);
     });
+
+    test("an outcome_unknown racing an abort keeps its classification instead of cancelled", async () => {
+        const transport = new FakeTransport();
+        const controller = new AbortController();
+        transport.queue(() => {
+            controller.abort();
+            throw new McHostCallError("outcome_unknown", "deadline", "request_deadline");
+        });
+        // The commit was sent and may have been applied; reporting a plain cancellation would invite a retry under a fresh identity and a duplicate commit. commentlint: allow(JUDGE)
+        const result = await client(transport).create(spec, {
+            ...intent,
+            signal: controller.signal,
+        });
+        expect(result.state).toEqual({ kind: "unavailable", reason: "outcome_unknown" });
+        expect(transport.bodies("kernel.commit")).toHaveLength(1);
+    });
 });
 
 describe("KernelClient transport mapping", () => {

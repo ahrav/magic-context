@@ -14,6 +14,7 @@ import {
     readProjectMemoryCurrentState,
     resolveProjectIdsForIdentities,
 } from "../../features/magic-context/memory/storage-claim-current-state";
+import { CLAIM_MEMORY_LIFECYCLE_STATES } from "../../features/magic-context/storage-claim-memory-schema";
 import { CLAIM_POLICY_VERSION } from "../../features/magic-context/storage-claim-policy-schema";
 import {
     computeWorkspaceEpochFingerprint,
@@ -81,17 +82,32 @@ function hasMetaTable(db: Database): boolean {
     );
 }
 
+/** Hashes authorization inputs only — sorted member identities and `share_categories`, never per-project write epochs — so the done marker survives ordinary writes and invalidates exactly when membership or sharing policy changes. A non-workspaced project answers a constant. commentlint: allow(JUDGE) */
+export function claimLaneAuthorizationFingerprint(db: Database, projectPath: string): string {
+    const resolved = resolveWorkspaceIdentitySet(db, projectPath);
+    if (resolved.identities.length <= 1) return "none";
+    const identities = [...resolved.identities].sort();
+    const share = resolveWorkspaceShareCategories(db, projectPath) ?? [];
+    return sha256Hex(`${JSON.stringify(identities)}\u001f${JSON.stringify(share)}`);
+}
+
+/** Done means done under the current workspace authorization: a marker written before a membership or share-policy change (or one predating the authorization field) answers false, so the next schedule reconciles imports against the new policy. commentlint: allow(JUDGE) */
 export function claimLaneImportDone(
     db: Database,
     projectPath: string,
     projectRoot: string,
 ): boolean {
     if (!hasMetaTable(db)) return false;
-    return (
-        db
-            .prepare("SELECT 1 FROM context_store_meta WHERE key = ?")
-            .get(markerKey(projectPath, projectRoot)) != null
-    );
+    const row = db
+        .prepare("SELECT value FROM context_store_meta WHERE key = ?")
+        .get(markerKey(projectPath, projectRoot)) as { value?: string } | undefined;
+    if (row?.value === undefined) return false;
+    try {
+        const detail = JSON.parse(row.value) as { authorization?: string };
+        return detail.authorization === claimLaneAuthorizationFingerprint(db, projectPath);
+    } catch {
+        return false;
+    }
 }
 
 /** Writes the done marker only while the generation still equals `generation`, in one statement, so a reset that lands mid-import wins over the stale importer's completion. Answers whether the marker was written. commentlint: allow(JUDGE) */
@@ -138,13 +154,19 @@ export function resetClaimLaneImportMarker(
     })();
 }
 
-/** `null` means the claim-lane projection could not publish a snapshot (the reader answered `stale`); the lane's contents are unknown, which is distinct from an empty lane. commentlint: allow(JUDGE) */
-export function listClaimLaneMemories(
-    db: Database,
-    projectPath: string,
-): ProjectMemoryClaimSnapshot[] | null {
-    if (!hasClaimMemoryFragment(db)) return [];
-    // The lane served workspace members' shareable rows under `share_categories`, so the bridge reads with the same workspace authorization; importing only the project's own rows would drop foreign shared memories the retired lane paths served. commentlint: allow(JUDGE)
+interface ClaimLaneWorkspace {
+    /** Expanded read identities: aliases included when workspaced, `[projectPath]` otherwise. */
+    identities: string[];
+    /** Identities whose canonical project is `projectPath`. */
+    ownIdentities: string[];
+    isWorkspaced: boolean;
+    sharedCategories: string[];
+    /** Canonical member set, the input `computeWorkspaceEpochFingerprint` expects. */
+    resolvedIdentities: string[];
+}
+
+/** The lane served workspace members' shareable rows under `share_categories`, so the bridge reads with the same workspace authorization; importing only the project's own rows would drop foreign shared memories the retired lane paths served. commentlint: allow(JUDGE) */
+function claimLaneWorkspace(db: Database, projectPath: string): ClaimLaneWorkspace {
     const resolved = resolveWorkspaceIdentitySet(db, projectPath);
     const isWorkspaced = resolved.identities.length > 1;
     const expanded = expandWorkspaceIdentitySetWithAliases(db, resolved.identities);
@@ -154,20 +176,36 @@ export function listClaimLaneMemories(
               (identity) => expanded.canonicalIdentityByStoredPath.get(identity) === projectPath,
           )
         : identities;
-    const projectIds = resolveProjectIdsForIdentities(db, identities);
-    if (projectIds.length === 0) return [];
-    const ownProjectIds = resolveProjectIdsForIdentities(db, ownIdentities);
     const sharedCategories = isWorkspaced
         ? (resolveWorkspaceShareCategories(db, projectPath) ?? [])
         : [];
+    return {
+        identities,
+        ownIdentities,
+        isWorkspaced,
+        sharedCategories,
+        resolvedIdentities: resolved.identities,
+    };
+}
+
+/** `null` means the claim-lane projection could not publish a snapshot (the reader answered `stale`); the lane's contents are unknown, which is distinct from an empty lane. commentlint: allow(JUDGE) */
+export function listClaimLaneMemories(
+    db: Database,
+    projectPath: string,
+): ProjectMemoryClaimSnapshot[] | null {
+    if (!hasClaimMemoryFragment(db)) return [];
+    const ws = claimLaneWorkspace(db, projectPath);
+    const projectIds = resolveProjectIdsForIdentities(db, ws.identities);
+    if (projectIds.length === 0) return [];
+    const ownProjectIds = resolveProjectIdsForIdentities(db, ws.ownIdentities);
     const result = readProjectMemoryCurrentState(db, {
         projectIds,
-        workspaceAuthorization: { ownProjectIds, sharedCategories },
+        workspaceAuthorization: { ownProjectIds, sharedCategories: ws.sharedCategories },
         // `workspaceIdentities` lets the reader detect membership or share-policy revocation between hydration and publication. commentlint: allow(JUDGE)
-        ...(isWorkspaced
+        ...(ws.isWorkspaced
             ? {
-                  workspaceEpoch: computeWorkspaceEpochFingerprint(db, resolved.identities),
-                  workspaceIdentities: resolved.identities,
+                  workspaceEpoch: computeWorkspaceEpochFingerprint(db, ws.resolvedIdentities),
+                  workspaceIdentities: ws.resolvedIdentities,
               }
             : {}),
         surface: "explicit_search",
@@ -232,10 +270,8 @@ export function claimLaneImportSpec(
         payload: { summary: claimLaneImportSummary(claim), rationale: "" },
         source_id: CLAIM_LANE_IMPORT_SOURCE_ID,
         source_revision: Math.max(1, claim.revision),
-        // A positive claim the lane withheld from automatic surfaces imports as `sensitive`: the kernel hides sensitive rows from automatic surfaces while explicit search still serves them, preserving the lane's eligibility split. Anti-memories keep their own category fence — marking them sensitive would also drop their auto-search warnings. commentlint: allow(JUDGE)
-        ...(claim.category !== ANTI_MEMORY_CATEGORY && !claimAutoEligible(claim)
-            ? { sensitivity: "sensitive" as const }
-            : {}),
+        // A claim the lane withheld from automatic surfaces imports as `sensitive`: the kernel and the automatic consumers hide sensitive rows while explicit search still serves them, preserving the lane's eligibility split. Anti-memories get the same treatment — a stale, disputed, superseded, or ineligible warning the lane's auto-search path withheld must not resurface as an automatic warning through the bridge. commentlint: allow(JUDGE)
+        ...(claimAutoEligible(claim) ? {} : { sensitivity: "sensitive" as const }),
     };
 }
 
@@ -246,6 +282,25 @@ export function liveMemoryContentKeys(rows: readonly ReadRow[]): Set<string> {
             .filter((row) => row.object.domain_id === CTX_MEMORY_DOMAIN_ID && row.decision)
             .map((row) => `${row.decision?.decision_kind}\u001f${row.decision?.payload.summary}`),
     );
+}
+
+/** Import ids derivable from the project's own lane claims across every lifecycle state. Reconciliation excludes these so a lane lifecycle change on an own claim never reaches back into the kernel copy; `null` means the projection answered stale. commentlint: allow(JUDGE) */
+function listOwnClaimImportIds(
+    db: Database,
+    projectPath: string,
+    projectRoot: string,
+): Set<string> | null {
+    if (!hasClaimMemoryFragment(db)) return new Set();
+    const ws = claimLaneWorkspace(db, projectPath);
+    const ownProjectIds = resolveProjectIdsForIdentities(db, ws.ownIdentities);
+    if (ownProjectIds.length === 0) return new Set();
+    const result = readProjectMemoryCurrentState(db, {
+        projectIds: ownProjectIds,
+        surface: "explicit_search",
+        lifecycleStates: CLAIM_MEMORY_LIFECYCLE_STATES,
+    });
+    if (result.status !== "ok") return null;
+    return new Set(result.items.map((item) => importedObjectId(item.publicClaimId, projectRoot)));
 }
 
 /** The marker is written only after every batch is `available` and only under the generation the run started at; a partial or fenced run resumes from the kernel's live rows. commentlint: allow(JUDGE) */
@@ -260,6 +315,7 @@ export async function importClaimLaneMemories(args: {
     const { db, client, projectPath, projectRoot, sessionId } = args;
     if (claimLaneImportDone(db, projectPath, projectRoot)) return "skipped";
     const generation = claimLaneImportGeneration(db, projectPath, projectRoot);
+    const authorization = claimLaneAuthorizationFingerprint(db, projectPath);
     const claims = listClaimLaneMemories(db, projectPath);
     if (claims === null) {
         sessionLog(
@@ -268,8 +324,9 @@ export async function importClaimLaneMemories(args: {
         );
         return "deferred";
     }
-    if (claims.length === 0) {
-        return markDone(db, projectPath, projectRoot, generation, { imported: 0 })
+    // Without lane tables no import ever ran on this store, so there is nothing to insert or reconcile. commentlint: allow(JUDGE)
+    if (claims.length === 0 && !hasClaimMemoryFragment(db)) {
+        return markDone(db, projectPath, projectRoot, generation, { imported: 0, authorization })
             ? "done"
             : "deferred";
     }
@@ -280,6 +337,42 @@ export async function importClaimLaneMemories(args: {
             `claim-lane import deferred: kernel read answered ${stateKey(existing.state)}`,
         );
         return "deferred";
+    }
+    // Reconciliation retires foreign imports the current workspace policy no longer authorizes. Own-claim import ids (every lifecycle state) are excluded so the kernel keeps owning the lifecycle of the project's own bridged rows; a row outside both sets can only be a foreign import whose sharing was revoked or whose member left. commentlint: allow(JUDGE)
+    const authorizedIds = new Set(
+        claims.map((claim) => importedObjectId(claim.publicClaimId, projectRoot)),
+    );
+    const ownImportIds = listOwnClaimImportIds(db, projectPath, projectRoot);
+    if (ownImportIds === null) {
+        sessionLog(
+            sessionId,
+            "claim-lane import deferred: the own-claim projection answered stale; reconciliation needs a published snapshot",
+        );
+        return "deferred";
+    }
+    const revocable = existing.rows.filter(
+        (row) =>
+            row.object.domain_id === CTX_MEMORY_DOMAIN_ID &&
+            row.object.source_id === CLAIM_LANE_IMPORT_SOURCE_ID &&
+            !authorizedIds.has(row.object.object_id) &&
+            !ownImportIds.has(row.object.object_id),
+    );
+    let revoked = 0;
+    for (const row of revocable) {
+        const result = await client.archive(row.object.object_id, {
+            actor: CLAIM_LANE_IMPORT_ACTOR,
+            // The authorization fingerprint scopes the operation key to this policy change; the same revocation replays, and a later distinct policy change keys fresh operations. commentlint: allow(JUDGE)
+            operationId: `revoke\u001f${row.object.object_id}\u001f${authorization}`,
+            cause: `claim-lane share revocation ${row.object.object_id}`,
+        });
+        if (!isAvailable(result)) {
+            sessionLog(
+                sessionId,
+                `claim-lane import deferred after revoking ${revoked} of ${revocable.length} foreign memories: kernel commit answered ${stateKey(result.state)}`,
+            );
+            return "deferred";
+        }
+        revoked += 1;
     }
     const present = new Set(existing.rows.map((row) => row.object.object_id));
     // A marker reset replays the whole lane, so claims the historian already
@@ -323,6 +416,8 @@ export async function importClaimLaneMemories(args: {
         !markDone(db, projectPath, projectRoot, generation, {
             imported,
             retired,
+            revoked,
+            authorization,
             alreadyPresent: claims.length - pending.length,
         })
     ) {

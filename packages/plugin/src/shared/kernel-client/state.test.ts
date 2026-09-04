@@ -28,6 +28,7 @@ const CLIENT_ONLY_KEYS: StateKey[] = [
     "disabled",
     "cancelled",
     "unavailable:daemon_absent",
+    "unavailable:outcome_unknown",
     "invalid:unrecognized_state",
 ];
 

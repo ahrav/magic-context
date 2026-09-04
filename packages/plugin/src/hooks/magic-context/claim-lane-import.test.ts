@@ -190,6 +190,69 @@ describe("claim-lane import", () => {
         ]);
     });
 
+    test("a share-policy change invalidates the done marker and reconciles imports", async () => {
+        const { db, kernel, client } = harness();
+        db.exec(
+            `INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+             VALUES (1, 'shared', 0, 0, '["CONSTRAINTS"]');
+             INSERT INTO workspace_members
+                 (workspace_id, project_path, display_name, display_path, added_at)
+             VALUES
+                 (1, '${PROJECT}', 'own', '${PROJECT}', 0),
+                 (1, '${OTHER_PROJECT}', 'foreign', '${OTHER_PROJECT}', 0);`,
+        );
+        seedClaim(db, PROJECT, "a", "Own claim A.");
+        const sharedId = seedClaim(
+            db,
+            OTHER_PROJECT,
+            "b",
+            "Shared constraint.",
+            "CONSTRAINTS",
+            "shareable",
+        );
+        const run = () =>
+            importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            });
+        expect(await run()).toBe("done");
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
+        const importedForeign = importedObjectId(sharedId, ROOT);
+        expect(kernel.liveRows().map((row) => row.object_id)).toContain(importedForeign);
+
+        db.exec(`UPDATE workspaces SET share_categories = '[]' WHERE id = 1`);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(false);
+        expect(await run()).toBe("done");
+        const live = kernel.liveRows().map((row) => row.object_id);
+        expect(live).not.toContain(importedForeign);
+        expect(live.length).toBe(1);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
+    });
+
+    test("an anti-memory the lane withheld from automatic surfaces imports as sensitive", async () => {
+        const { db, kernel, client } = harness();
+        seedAntiMemory(db, PROJECT, "warn", Date.now());
+        db.prepare(
+            "UPDATE claim_effective_policy SET auto_eligible = 0, explicit_eligible = 1",
+        ).run();
+        expect(
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
+        ).toBe("done");
+        const rows = kernel.liveRows();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.decision?.decision_kind).toBe(ANTI_MEMORY_CATEGORY);
+        expect(rows[0]?.sensitivity).toBe("sensitive");
+    });
+
     test("a claim the lane withholds from automatic surfaces imports as sensitive", async () => {
         const { db, kernel, client } = harness();
         seedClaim(db, PROJECT, "a", "Explicit-search-only claim.");
@@ -319,7 +382,7 @@ describe("claim-lane import", () => {
         expect(kernel.liveRows()).toHaveLength(0);
     });
 
-    test("a project with no claims is marked done without dialing the daemon", async () => {
+    test("a project with no claims reconciles against one kernel read and is marked done", async () => {
         const { db, transport, client } = harness();
         expect(
             await importClaimLaneMemories({
@@ -330,7 +393,8 @@ describe("claim-lane import", () => {
                 sessionId: "s1",
             }),
         ).toBe("done");
-        expect(transport.calls).toHaveLength(0);
+        // Zero authorized claims can mean a revocation emptied the list, so the importer still reads the kernel to reconcile; it commits nothing.
+        expect(transport.methods()).toEqual(["kernel.read"]);
         expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
     });
 
