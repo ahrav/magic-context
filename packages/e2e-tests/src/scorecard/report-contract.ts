@@ -41,13 +41,20 @@ export const GATE_STATUSES = ["passed", "failed", "not-observed", "errored"] as 
 export type GateStatus = (typeof GATE_STATUSES)[number];
 
 /** The one lane whose report can observe each gate; `null` when no lane produces the gate's evidence, so it cannot be observed. */
-export const GATE_SOURCE_LANES: Readonly<Record<GateId, LaneId | null>> = {
+export const GATE_SOURCE_LANES = {
     "gate-cross-project-leak": null,
     "gate-unrelated-scope-secret": null,
     "gate-injection-promoted": "metamorphic",
     "gate-false-enforced-policy": null,
     "gate-database-corruption": null,
-};
+} as const satisfies Readonly<Record<GateId, LaneId | null>>;
+
+/** The gates some lane produces; the extractor table in `gates.ts` is keyed by this so it cannot name a gate this table leaves unproduced. */
+export type ProducedGateId = { [G in GateId]: (typeof GATE_SOURCE_LANES)[G] extends LaneId ? G : never }[GateId];
+
+export function isProducedGate(gateId: GateId): gateId is ProducedGateId {
+    return GATE_SOURCE_LANES[gateId] !== null;
+}
 
 /** Flat on the wire: every key is present on every row, with `null` where the status carries no value. */
 export interface GateRow {

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { GATE_SOURCES, evaluateGates } from "./gates";
+import { GATE_EXTRACTORS, evaluateGates } from "./gates";
 import { SCORECARD_GATE_IDS } from "./policy";
-import { hardGateFailures } from "./report-contract";
+import { GATE_SOURCE_LANES, hardGateFailures } from "./report-contract";
 import { bundleFixture, metamorphicReportFixture } from "./test-fixtures";
 
 describe("evaluateGates", () => {
@@ -101,8 +101,10 @@ describe("evaluateGates", () => {
         expect(hardGateFailures(rows)).toHaveLength(5);
     });
 
-    it("keeps exactly one producer entry per gate id", () => {
-        expect(Object.keys(GATE_SOURCES).sort()).toEqual([...SCORECARD_GATE_IDS].sort());
-        expect(Object.values(GATE_SOURCES).filter((source) => source !== null)).toHaveLength(1);
+    it("keeps one extractor for exactly the gates a lane produces", () => {
+        expect(Object.keys(GATE_EXTRACTORS).sort()).toEqual(SCORECARD_GATE_IDS.filter((gateId) => GATE_SOURCE_LANES[gateId] !== null).sort());
+        for (const row of evaluateGates(bundleFixture())) {
+            if (row.sourceLane !== null) expect<string | null>(row.sourceLane).toBe(GATE_SOURCE_LANES[row.gateId]);
+        }
     });
 });

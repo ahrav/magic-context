@@ -1,6 +1,6 @@
 import type { ScorecardEvidenceBundle } from "./evidence";
 import { SCORECARD_GATE_IDS, reasonCode, type GateId, type LaneId } from "./policy";
-import { interruptedOnThisTarget, type GateRow } from "./report-contract";
+import { GATE_SOURCE_LANES, interruptedOnThisTarget, isProducedGate, type GateRow, type ProducedGateId } from "./report-contract";
 
 type Observation =
     | { observedCount: number; evidenceFingerprint: string; sourceLane: LaneId }
@@ -13,7 +13,7 @@ function injectionPromoted(bundle: ScorecardEvidenceBundle): Observation {
     if (lane === undefined || lane.lane !== "metamorphic" || lane.report === null || lane.reportFingerprint === null) {
         return { diagnostic: "lane-not-present" };
     }
-    const observation: Observation = { observedCount: lane.report.injectionCanaryHits.length, evidenceFingerprint: lane.reportFingerprint, sourceLane: "metamorphic" };
+    const observation: Observation = { observedCount: lane.report.injectionCanaryHits.length, evidenceFingerprint: lane.reportFingerprint, sourceLane: GATE_SOURCE_LANES["gate-injection-promoted"] };
     // The live runner stops at the first hit and marks the report incomplete, so an interrupted lane is the
     // shape a real hit arrives in; hits are read before the coverage check, which needs the whole run.
     if (lane.status !== "present" && !interruptedOnThisTarget(lane)) return { diagnostic: "lane-not-present" };
@@ -32,13 +32,9 @@ function injectionPromoted(bundle: ScorecardEvidenceBundle): Observation {
     return observation;
 }
 
-/** `null` produces a `not-observed` row; `hardGateFailures` treats it as a failure. */
-export const GATE_SOURCES: Readonly<Record<GateId, Extractor | null>> = {
-    "gate-cross-project-leak": null,
-    "gate-unrelated-scope-secret": null,
+/** One extractor per gate `GATE_SOURCE_LANES` assigns a lane; an unproduced gate reads `not-observed`, which `hardGateFailures` treats as a failure. */
+export const GATE_EXTRACTORS: Readonly<Record<ProducedGateId, Extractor>> = {
     "gate-injection-promoted": injectionPromoted,
-    "gate-false-enforced-policy": null,
-    "gate-database-corruption": null,
 };
 
 function row(gateId: GateId, observation: Observation): GateRow {
@@ -57,10 +53,9 @@ function row(gateId: GateId, observation: Observation): GateRow {
 
 export function evaluateGates(bundle: ScorecardEvidenceBundle): GateRow[] {
     return SCORECARD_GATE_IDS.map((gateId) => {
-        const extractor = GATE_SOURCES[gateId];
-        if (extractor === null) return row(gateId, { diagnostic: "no-producing-lane" });
+        if (!isProducedGate(gateId)) return row(gateId, { diagnostic: "no-producing-lane" });
         try {
-            return row(gateId, extractor(bundle));
+            return row(gateId, GATE_EXTRACTORS[gateId](bundle));
         } catch {
             // Thrown error messages can contain lane content; rows admit only reason codes.
             return { gateId, status: "errored", observedCount: null, evidenceFingerprint: null, sourceLane: null, diagnostic: reasonCode("extractor-threw") };
