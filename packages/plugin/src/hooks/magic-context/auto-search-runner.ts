@@ -56,7 +56,15 @@ import type { MessageLike } from "./transform-operations";
 
 export type AutoSearchOutcome =
     | { ok: true }
-    | { ok: false; kind: "timeout" | "search-failure" | "cas-exhaustion" };
+    | {
+          ok: false;
+          kind:
+              | "timeout"
+              | "search-failure"
+              | "cas-exhaustion"
+              | "memory-abstained"
+              | "memory-unavailable";
+      };
 
 const AUTO_SEARCH_OK: AutoSearchOutcome = { ok: true };
 
@@ -69,10 +77,9 @@ export type AutoSearchDeliveryReason =
     | "packer-empty"
     | "timeout";
 
-/** Below-threshold, empty, memory-abstained, memory-unavailable, packer-empty, and timeout are
- * completed empty-delivery outcomes. The two memory reasons replace `empty` when the kernel
- * withheld or could not serve memory, so an empty turn is not mistaken for a project with
- * nothing relevant.
+/** Below-threshold, empty, and packer-empty are completed empty-delivery outcomes.
+ * The two memory reasons replace `empty` when the kernel withheld or could not serve memory.
+ * Like timeout, memory reasons are transient evidence: the runner persists nothing and later re-evaluates the message after the daemon recovers.
  * Search failures are incomplete evidence, not empty rankings.
  * The delivered variant carries a non-null hint because the packer-empty branch rejects a null pack.
  *  `reason`. */
@@ -421,11 +428,15 @@ export async function runAutoSearchHint(args: {
     if (delivery.reason === "packer-empty") {
         return writeNoHintAndReconcile("empty");
     }
-    if (
-        delivery.reason === "empty" ||
-        delivery.reason === "memory-abstained" ||
-        delivery.reason === "memory-unavailable"
-    ) {
+    if (delivery.reason === "memory-abstained" || delivery.reason === "memory-unavailable") {
+        // A withheld memory lane is transient evidence like a timeout: the pass persists no decision, so a later pass re-evaluates the message once the daemon recovers.
+        sessionLog(
+            sessionId,
+            `auto-search: memory lane ${delivery.reason}, skipping hint for this turn (will retry)`,
+        );
+        return { ok: false, kind: delivery.reason };
+    }
+    if (delivery.reason === "empty") {
         return writeNoHintAndReconcile(delivery.reason);
     }
     if (delivery.reason === "below-threshold") {

@@ -216,7 +216,7 @@ describe("auto-search-runner", () => {
             "memory-abstained",
         ],
         ["unavailable", unavailable("store_busy"), "memory-unavailable"],
-    ] as const)("a provided %s snapshot persists the typed no-hint reason without a kernel read", async (_label, state, reason) => {
+    ] as const)("a provided %s snapshot persists nothing without a kernel read", async (_label, state, reason) => {
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
         const { transport, kernelClient } = kernelHarness();
         try {
@@ -235,11 +235,9 @@ describe("auto-search-runner", () => {
                         memorySnapshot: { state, rows: [], knownAsOf: null },
                     },
                 }),
-            ).toEqual({ ok: true });
+            ).toEqual({ ok: false, kind: reason });
             expect(findUserPromptText(messages[0])).not.toContain("<ctx-search-hint>");
-            expect(getAutoSearchHintDecisions(db, `s-snap-${reason}`)).toMatchObject([
-                { decision: "no-hint", reason },
-            ]);
+            expect(getAutoSearchHintDecisions(db, `s-snap-${reason}`)).toEqual([]);
             expect(transport.calls).toEqual([]);
         } finally {
             spy.mockRestore();
@@ -255,7 +253,7 @@ describe("auto-search-runner", () => {
         ["unavailable", unavailable("store_busy"), "memory-unavailable"],
         ["invalid", invalid("unrecognized_state"), "memory-unavailable"],
         ["cancelled", cancelled(), "memory-unavailable"],
-    ] as const)("a %s kernel persists a typed no-hint reason and appends nothing", async (_label, state, reason) => {
+    ] as const)("a %s kernel persists nothing and appends nothing", async (_label, state, reason) => {
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
         const { kernel, kernelClient } = kernelHarness();
         kernel.seedDecision({
@@ -275,10 +273,40 @@ describe("auto-search-runner", () => {
                     messages,
                     options: { ...baseOptions, directory: "/tmp/auto-search", kernelClient },
                 }),
-            ).toEqual({ ok: true });
+            ).toEqual({ ok: false, kind: reason });
             expect(findUserPromptText(messages[0])).not.toContain("<ctx-search-hint>");
-            expect(getAutoSearchHintDecisions(db, `s-${reason}`)).toMatchObject([
-                { decision: "no-hint", reason },
+            expect(getAutoSearchHintDecisions(db, `s-${reason}`)).toEqual([]);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("a recovered kernel delivers the hint a withheld pass skipped", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const { kernel, kernelClient } = kernelHarness();
+        kernel.seedDecision({
+            object_id: OBJECT_A,
+            decision_kind: "PROJECT_RULES",
+            summary: "the historian decides to run when context passes the execute threshold",
+        });
+        kernel.surfaceStates.set("explicit_search", unavailable("store_busy"));
+        try {
+            const messages = [
+                makeUserMsg("u-recover", "please explain how the historian decides when to run"),
+            ];
+            const options = { ...baseOptions, directory: "/tmp/auto-search", kernelClient };
+            expect(
+                await runAutoSearchHint({ sessionId: "s-recover", db, messages, options }),
+            ).toEqual({ ok: false, kind: "memory-unavailable" });
+            expect(getAutoSearchHintDecisions(db, "s-recover")).toEqual([]);
+
+            kernel.surfaceStates.delete("explicit_search");
+            expect(
+                await runAutoSearchHint({ sessionId: "s-recover", db, messages, options }),
+            ).toEqual({ ok: true });
+            expect(findUserPromptText(messages[0])).toContain("<ctx-search-hint>");
+            expect(getAutoSearchHintDecisions(db, "s-recover")).toMatchObject([
+                { decision: "hint" },
             ]);
         } finally {
             spy.mockRestore();

@@ -16,7 +16,6 @@
  *     historyRefreshSessions signal.
  */
 
-import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
 import type { MuralWireOptions } from "@magic-context/core/features/magic-context/mural/resolve-mural";
 import {
 	type ContextDatabase,
@@ -333,8 +332,7 @@ export interface PiM0M1State {
 	/** `hardSignals` provides provider-side cache-eviction signals for HARD-bust detection. */
 	hardSignals?: PiM0HardSignals;
 	/**
-	 * When `muralEnabled` is true and the fold's model accepts images, HARD materialization resolves the mural on demand.
-	 * HARD materialization renders the deterministic mural and stores its image in the cached baseline.
+	 * On-demand mural resolution is disabled; an explicit `mural` still folds.
 	 * Defer passes replay the mural bytes stored in the cached baseline. */
 	muralEnabled?: boolean;
 	/** `mural` supplies explicit wire options and skips on-demand mural resolution.
@@ -518,23 +516,15 @@ function piImageFromDataUrl(dataUrl: string): PiImageContent | null {
 	return { type: "image", mimeType: match[1], data: match[2] };
 }
 
-/**
- */
-function resolveMuralForM0Pi(
-	state: PiM0M1State,
-	db: ContextDatabase,
-	modelKey: string,
-	budgetTokens: number,
-): MuralWireOptions | undefined {
+/** The mural pool, importance scores, and per-revision cues come from the legacy SQLite claim lane, while the Pi m[0] text block renders kernel snapshot rows; the lanes diverge on archived and revised memories, so the injector withholds the image instead of pairing stale claim-lane content with kernel-rendered text. An explicit `state.mural` override still folds. commentlint: allow(JUDGE) */
+function resolveMuralForM0Pi(state: PiM0M1State): MuralWireOptions | undefined {
 	if (state.mural) return state.mural;
 	if (!state.muralEnabled) return undefined;
-	return resolveMuralWire(
-		db,
-		memoryProjectPath(state),
-		modelKey,
-		true,
-		budgetTokens,
+	logSession(
+		state.sessionId,
+		"mural: skipped — the mural pool reads the claim lane while m[0] renders kernel rows",
 	);
+	return undefined;
 }
 
 function cachedInjectionTokenCounts(
@@ -1124,14 +1114,7 @@ function renderFreshM0PiNonPersisted(
 	frozen.markers.materializedAt = cachedMaterializedAt;
 	const historyBudget =
 		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
-	const memoryBudget =
-		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
-	const mural = resolveMuralForM0Pi(
-		state,
-		db,
-		frozen.markers.modelKey,
-		memoryBudget,
-	);
+	const mural = resolveMuralForM0Pi(state);
 	rememberPiMural(state.sessionId, mural);
 	const render = (dpm: number): string =>
 		renderM0Pi(
@@ -1183,16 +1166,8 @@ export function materializeM0Pi(
 	const snapshotUserProfile = frozen.userProfile;
 	const renderedRevisionLocators = snapshotRows.map(memoryRowLocator);
 	// On-demand murals run only during HARD folds, not deferrals.
-	// When no on-demand mural is supplied, mural resolution uses `muralEnabled` and the HARD fold's model key.
 	// cachedMuralBySession replays on deferral.
-	const memoryBudget =
-		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
-	const mural = resolveMuralForM0Pi(
-		state,
-		db,
-		snapshotMarkers.modelKey,
-		memoryBudget,
-	);
+	const mural = resolveMuralForM0Pi(state);
 	const frozenMuralDataUrl =
 		mural?.enabled && mural.supportsVision ? (mural.dataUrl ?? null) : null;
 	const frozenMuralHash =

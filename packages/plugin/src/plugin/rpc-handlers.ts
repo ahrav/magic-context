@@ -315,6 +315,7 @@ export function buildSidebarSnapshot(
                 : archivedCompartmentCount;
 
         const memoryCount = memory ? memory.rows.filter(isMemoryDecisionRow).length : 0;
+        const memoryTruncated = memory?.truncated === true;
         const memoryState = memory ? stateKey(memory.state) : null;
 
         let pendingOpsCount = 0;
@@ -516,6 +517,7 @@ export function buildSidebarSnapshot(
             compartmentCount,
             archivedCompartmentCount,
             memoryCount,
+            ...(memoryTruncated ? { memoryTruncated } : {}),
             memoryState,
             memoryBlockCount,
             pendingOpsCount,

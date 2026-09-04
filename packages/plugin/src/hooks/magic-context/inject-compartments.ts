@@ -11,7 +11,6 @@ import {
 } from "../../features/magic-context/compartment-storage";
 import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
 import type { Memory } from "../../features/magic-context/memory/types";
-import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
 import type { MuralWireOptions } from "../../features/magic-context/mural/resolve-mural";
 import {
     computeProjectDocsHash,
@@ -1646,18 +1645,14 @@ function historySliceTokens(m0Text: string): number {
     return slice ? estimateTokens(slice) : 0;
 }
 
-/**
- * Use no mural image unless the mural feature is enabled and the fold's model accepts images.
- * The renderer generates a PNG only when the mural changes.
- */
-function resolveMuralForM0(
-    options: M0M1RenderOptions,
-    projectPath: string | undefined,
-    modelKey: string,
-    budgetTokens: number,
-): MuralWireOptions | undefined {
+/** The mural pool, importance scores, and per-revision cues come from the legacy SQLite claim lane, while the m[0] text block renders kernel snapshot rows; the lanes diverge on archived and revised memories, so the injector withholds the image instead of pairing stale claim-lane content with kernel-rendered text. An explicit `options.mural` override still folds. commentlint: allow(JUDGE) */
+function resolveMuralForM0(options: M0M1RenderOptions): MuralWireOptions | undefined {
     if (!options.muralEnabled) return undefined;
-    return resolveMuralWire(options.db, projectPath, modelKey, true, budgetTokens);
+    sessionLog(
+        options.sessionId,
+        "mural: skipped — the mural pool reads the claim lane while m[0] renders kernel rows",
+    );
+    return undefined;
 }
 
 export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
@@ -1682,9 +1677,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
     const facts: SessionFact[] = [];
     const userMemories = safeGetActiveUserMemories(options.db);
     compartments = withCompartmentDates(options.sessionId, compartments, options.temporalAwareness);
-    const mural =
-        options.mural ??
-        resolveMuralForM0(options, projectPath, snapshotMarkers.modelKey, memoryBudget);
+    const mural = options.mural ?? resolveMuralForM0(options);
     let decayPressureMultiplier = 1;
     const memoryForRender = projectPath ? options.memory : undefined;
     let m0Text = renderM0({
@@ -2187,9 +2180,7 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
           );
     const userMemories = safeGetActiveUserMemories(options.db);
     const budget = options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
-    const mural =
-        options.mural ??
-        resolveMuralForM0(options, projectPath, snapshotMarkers.modelKey, memoryBudget);
+    const mural = options.mural ?? resolveMuralForM0(options);
     const render = (decayPressureMultiplier: number): string =>
         renderM0({
             projectDocs: docs.renderedBlock,

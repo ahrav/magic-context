@@ -15,6 +15,10 @@ import {
 import { ClaimOperationInputError } from "../../features/magic-context/memory/claim-operation-contract";
 import { ANTI_MEMORY_CATEGORY } from "../../features/magic-context/memory/constants";
 import {
+    MAX_RENDER_FIELD_BYTES,
+    truncateUtf8Bytes,
+} from "../../features/magic-context/search-bounds";
+import {
     type CommitResult,
     type DecisionSpecInput,
     deriveObjectId,
@@ -31,7 +35,12 @@ import {
     type Sensitivity,
     type SourceKind,
 } from "../../shared/kernel-client";
-import { DEFAULT_SEARCH_LIMIT, GET_MAX_CLAIMS, MERGE_MAX_TARGETS } from "./constants";
+import {
+    CTX_MEMORY_RESPONSE_BUDGET_BYTES,
+    DEFAULT_SEARCH_LIMIT,
+    GET_MAX_CLAIMS,
+    MERGE_MAX_TARGETS,
+} from "./constants";
 import type { CtxMemoryAction, CtxMemoryArgs } from "./types";
 import { assertCtxMemoryWriteShape } from "./write-shape";
 
@@ -77,6 +86,58 @@ function memoryView(row: ReadRow): Record<string, unknown> {
         sensitivity: row.object.sensitivity,
         knownAsOf: row.token.known_as_of,
     };
+}
+
+/** The marker a bounded field ends with, so an elided middle is visible in the tool text. */
+const CTX_MEMORY_TRUNCATION_MARKER = "… [truncated]";
+
+function boundedText(text: string): string {
+    if (Buffer.byteLength(text, "utf8") <= MAX_RENDER_FIELD_BYTES) return text;
+    return `${truncateUtf8Bytes(text, MAX_RENDER_FIELD_BYTES)}${CTX_MEMORY_TRUNCATION_MARKER}`;
+}
+
+/** Bounds every string the view serializes — content, rationale, and parsed anti-memory fields — to the shared per-field byte cap. */
+function boundedMemoryView(row: ReadRow): Record<string, unknown> {
+    const view = memoryView(row);
+    const bounded: Record<string, unknown> = { ...view };
+    if (typeof view.content === "string") bounded.content = boundedText(view.content);
+    if (typeof view.rationale === "string") bounded.rationale = boundedText(view.rationale);
+    if (view.antiMemory !== undefined) {
+        const antiMemory: Record<string, unknown> = {
+            ...(view.antiMemory as Record<string, unknown>),
+        };
+        for (const [key, value] of Object.entries(antiMemory)) {
+            if (typeof value === "string") antiMemory[key] = boundedText(value);
+        }
+        bounded.antiMemory = antiMemory;
+    }
+    return bounded;
+}
+
+/**
+ * Retains the leading rows whose serialized views fit the response byte
+ * budget and elides the rest, so one call cannot inject an unbounded read
+ * into the conversation. The first row always yields a view: complete when
+ * it fits, field-bounded when it alone exceeds the budget.
+ */
+function packMemoryViews(
+    rows: readonly ReadRow[],
+    viewOf: (row: ReadRow) => Record<string, unknown>,
+): { views: Record<string, unknown>[]; elidedRows: ReadRow[] } {
+    const views: Record<string, unknown>[] = [];
+    let usedBytes = 0;
+    for (const [index, row] of rows.entries()) {
+        const view = viewOf(row);
+        const cost = Buffer.byteLength(JSON.stringify(view), "utf8");
+        if (usedBytes + cost > CTX_MEMORY_RESPONSE_BUDGET_BYTES) {
+            if (views.length > 0) return { views, elidedRows: rows.slice(index) };
+            views.push(boundedMemoryView(row));
+            return { views, elidedRows: rows.slice(index + 1) };
+        }
+        views.push(view);
+        usedBytes += cost;
+    }
+    return { views, elidedRows: [] };
 }
 
 /** Tool text for a state other than `available`; a conflict names the object to re-read. */
@@ -422,11 +483,20 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         const found = read.rows.filter((row) => wanted.includes(row.object.object_id));
         const foundIds = new Set(found.map((row) => row.object.object_id));
         const notFound = wanted.filter((id) => !foundIds.has(id));
+        // Each named id serializes complete when it fits; ids past the response byte budget are elided by name so the caller can re-request them in smaller batches. commentlint: allow(JUDGE)
+        const packed = packMemoryViews(found, memoryView);
+        const elidedObjectIds = packed.elidedRows.map((row) => row.object.object_id);
         // A truncated read cannot prove absent ids are missing — they can live beyond the daemon's row cap — so those ids report as unresolved rather than missing. commentlint: allow(JUDGE)
         return JSON.stringify({
             action,
             knownAsOf: read.knownAsOf,
-            memories: found.map(memoryView),
+            memories: packed.views,
+            ...(elidedObjectIds.length > 0
+                ? {
+                      elidedObjectIds,
+                      elisionNote: `response byte budget reached; re-request ${elidedObjectIds.length} elided id${elidedObjectIds.length === 1 ? "" : "s"} in smaller batches`,
+                  }
+                : {}),
             ...(read.truncated
                 ? { truncated: true, missingObjectIds: [], unresolvedObjectIds: notFound }
                 : { missingObjectIds: notFound }),
@@ -443,10 +513,15 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
             .filter((row) => !isExpiredAntiMemoryRow(row, nowMs))
             .sort((left, right) => (left.object.object_id < right.object.object_id ? -1 : 1))
             .slice(0, normalizeLimit(args.limit));
+        // List entries are field-bounded before packing, so a single oversized memory truncates instead of consuming the whole budget. commentlint: allow(JUDGE)
+        const packed = packMemoryViews(listed, boundedMemoryView);
         return JSON.stringify({
             action,
             knownAsOf: read.knownAsOf,
-            memories: listed.map(memoryView),
+            memories: packed.views,
+            ...(packed.elidedRows.length > 0
+                ? { elidedMemoryCount: packed.elidedRows.length }
+                : {}),
             ...(read.truncated ? { truncated: true } : {}),
         });
     }

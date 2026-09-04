@@ -9,6 +9,7 @@ import {
     KernelClient,
     type KernelTransport,
     type KernelTransportCall,
+    kernelMemorySnapshotFrom,
 } from "./client";
 
 const PROJECT = "/repo/project";
@@ -566,5 +567,37 @@ describe("KernelClient mutations", () => {
         });
         const result = await client(transport).archive("o1", intent);
         expect(result.state).toEqual({ kind: "conflict", reason: "known_as_of_advanced" });
+    });
+});
+
+describe("kernelMemorySnapshotFrom", () => {
+    test("an available read's truncated flag rides the snapshot projection", async () => {
+        const transport = new FakeTransport().queue({ ...readReply(9, "o1"), truncated: true });
+        const read = await client(transport).read({ surface: "explicit_search" });
+        expect(kernelMemorySnapshotFrom(read)).toMatchObject({
+            rows: [
+                expect.objectContaining({ object: expect.objectContaining({ object_id: "o1" }) }),
+            ],
+            knownAsOf: 9,
+            truncated: true,
+        });
+    });
+
+    test("a complete read projects truncated false", async () => {
+        const transport = new FakeTransport().queue(readReply(9, "o1"));
+        const read = await client(transport).read({ surface: "explicit_search" });
+        expect(kernelMemorySnapshotFrom(read).truncated).toBe(false);
+    });
+
+    test("a non-available read projects no rows and no truncation", async () => {
+        const transport = new FakeTransport().queue({
+            state: { kind: "unavailable", reason: "store_busy" },
+        });
+        const read = await client(transport).read({ surface: "explicit_search" });
+        expect(kernelMemorySnapshotFrom(read)).toEqual({
+            state: { kind: "unavailable", reason: "store_busy" },
+            rows: [],
+            knownAsOf: null,
+        });
     });
 });

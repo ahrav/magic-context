@@ -1134,3 +1134,94 @@ describe("ctx_memory memory path text bans", () => {
         }
     });
 });
+
+describe("ctx_memory response byte budget", () => {
+    const bigContent = (seed: string) => seed.repeat(8 * 1024);
+
+    test("list bounds oversized fields and reports how many memories were elided", async () => {
+        const kernel = new FakeKernel();
+        for (let index = 0; index < 20; index += 1) {
+            kernel.seedDecision({
+                object_id: `mem_big_${String(index).padStart(2, "0")}`,
+                decision_kind: "ARCHITECTURE",
+                summary: bigContent("s"),
+                rationale: bigContent("r"),
+            });
+        }
+        const tool = harness(kernel);
+        const raw = await tool.execute(
+            { action: "list", limit: 20 },
+            "call-list-big",
+            DREAMER_AGENT,
+        );
+        expect(raw.length).toBeLessThan(32 * 1024);
+        const listed = parseJson<ReadJson & { elidedMemoryCount?: number }>(raw);
+        expect(listed.memories.length).toBeGreaterThan(0);
+        expect(listed.memories.length).toBeLessThan(20);
+        expect(listed.elidedMemoryCount).toBe(20 - listed.memories.length);
+        for (const memory of listed.memories) {
+            expect(memory.content.endsWith("… [truncated]")).toBeTrue();
+        }
+    });
+
+    test("get keeps leading ids complete and elides trailing ids by name", async () => {
+        const kernel = new FakeKernel();
+        for (const suffix of ["a", "b", "c"]) {
+            kernel.seedDecision({
+                object_id: `mem_big_${suffix}`,
+                decision_kind: "ARCHITECTURE",
+                summary: bigContent(suffix),
+            });
+        }
+        const tool = harness(kernel);
+        const got = parseJson<ReadJson & { elidedObjectIds?: string[]; elisionNote?: string }>(
+            await tool.execute(
+                { action: "get", objectIds: ["mem_big_a", "mem_big_b", "mem_big_c"] },
+                "call-get-big",
+            ),
+        );
+        expect(got.memories).toEqual([
+            expect.objectContaining({ objectId: "mem_big_a", content: bigContent("a") }),
+        ]);
+        expect(got.elidedObjectIds).toEqual(["mem_big_b", "mem_big_c"]);
+        expect(got.elisionNote).toContain("2 elided ids");
+        expect(got.missingObjectIds).toEqual([]);
+    });
+
+    test("get bounds a single id whose row alone exceeds the budget", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: "mem_huge",
+            decision_kind: "ARCHITECTURE",
+            summary: "x".repeat(64 * 1024),
+        });
+        const tool = harness(kernel);
+        const got = parseJson<ReadJson & { elidedObjectIds?: string[] }>(
+            await tool.execute({ action: "get", objectIds: ["mem_huge"] }, "call-get-huge"),
+        );
+        expect(got.memories).toHaveLength(1);
+        expect(got.memories[0].content.endsWith("… [truncated]")).toBeTrue();
+        expect(got.memories[0].content.length).toBeLessThan(2 * 1024);
+        expect(got.elidedObjectIds).toBeUndefined();
+    });
+
+    test("small get and list results stay complete with no elision fields", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        const tool = harness(kernel);
+        const got = parseJson<ReadJson & { elidedObjectIds?: string[] }>(
+            await tool.execute({ action: "get", objectIds: ["mem_a"] }, "call-get-small"),
+        );
+        expect(got.memories).toEqual([
+            expect.objectContaining({ objectId: "mem_a", content: "A." }),
+        ]);
+        expect(got.elidedObjectIds).toBeUndefined();
+        const listed = parseJson<ReadJson & { elidedMemoryCount?: number }>(
+            await tool.execute({ action: "list" }, "call-list-small", DREAMER_AGENT),
+        );
+        expect(listed.memories).toEqual([
+            expect.objectContaining({ objectId: "mem_a", content: "A." }),
+        ]);
+        expect(listed.elidedMemoryCount).toBeUndefined();
+    });
+});

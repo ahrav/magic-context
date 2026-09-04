@@ -43,6 +43,8 @@ export interface SidebarSnapshot {
     archivedCompartmentCount?: number;
     /** Rows the kernel serves this project on the `explicit_search` surface. */
     memoryCount: number;
+    /** True when the read behind `memoryCount` was truncated by the daemon's per-read bounds, making the count a lower bound. */
+    memoryTruncated?: boolean;
     /** The kernel's state key for that read, such as `available` or `unavailable:daemon_absent`. */
     memoryState: string | null;
     memoryBlockCount: number;
@@ -121,6 +123,13 @@ export interface SidebarSnapshot {
         message?: string;
         note?: string;
     } | null;
+}
+
+/** A `+` suffix marks a truncated read; the count is a lower bound. */
+export function formatMemoryCount(
+    snapshot: Pick<SidebarSnapshot, "memoryCount" | "memoryTruncated">,
+): string {
+    return `${snapshot.memoryCount}${snapshot.memoryTruncated ? "+" : ""}`;
 }
 
 export interface StatusDetail extends SidebarSnapshot {

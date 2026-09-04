@@ -11,6 +11,7 @@ import { For, Show, createEffect, createMemo, createSignal, on, onCleanup } from
 import packageJson from "../../../package.json";
 import { badgeTextColor } from "../badge-contrast";
 import { loadSidebarSnapshot } from "../data/context-db";
+import { formatMemoryCount } from "../../shared/rpc-types";
 import { formatThresholdPercent } from "../../shared/format-threshold";
 import { formatTailHygiene } from "../../shared/tail-hygiene-status";
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "../compaction-off";
@@ -864,7 +865,11 @@ const SidebarContent = props => {
             _$insertNode(_el$61, _$createTextNode(`Memories`));
             _$insert(_el$63, (() => {
               var _c$11 = _$memo(() => !!(s()?.memoryState && s()?.memoryState !== "available"));
-              return () => _c$11() ? String(s().memoryState) : _$memo(() => (s()?.memoryBlockCount ?? 0) > 0)() ? `${s().memoryBlockCount}/${s()?.memoryCount ?? 0}` : String(s()?.memoryCount ?? 0);
+              return () => _c$11() ? String(s().memoryState) : _$memo(() => (s()?.memoryBlockCount ?? 0) > 0)() ? `${s().memoryBlockCount}/${formatMemoryCount(s() ?? {
+                memoryCount: 0
+              })}` : formatMemoryCount(s() ?? {
+                memoryCount: 0
+              });
             })());
             _$effect(_p$ => {
               var _v$15 = props.theme.textMuted,
@@ -995,7 +1000,9 @@ const SidebarContent = props => {
         },
         label: "Memories",
         get value() {
-          return _$memo(() => !!(s()?.memoryState && s()?.memoryState !== "available"))() ? String(s().memoryState) : String(s()?.memoryCount ?? 0);
+          return _$memo(() => !!(s()?.memoryState && s()?.memoryState !== "available"))() ? String(s().memoryState) : formatMemoryCount(s() ?? {
+            memoryCount: 0
+          });
         },
         accent: true
       }), _$memo(() => _$memo(() => (s()?.memoryBlockCount ?? 0) > 0)() && _$createComponent(StatRow, {

@@ -120,6 +120,7 @@ export class FakeKernel {
                   state: parsed.state,
                   rows: parsed.payload.rows,
                   knownAsOf: parsed.payload.known_as_of,
+                  truncated: parsed.payload.truncated,
               }
             : { state: parsed.state, rows: [], knownAsOf: null };
     }

@@ -202,8 +202,8 @@ describe("runAutoSearchHintForPi", () => {
 			"memory-abstained",
 		],		["unavailable", unavailable("store_busy"), "memory-unavailable"],
 	] as const)(
-		"a %s kernel persists a typed no-hint reason and appends nothing",
-		async (_label, state, reason) => {
+		"a %s kernel persists nothing and appends nothing",
+		async (_label, state, _reason) => {
 			const db = createTestDb();
 			const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
 			const fake = fakeKernelResolver();
@@ -229,10 +229,21 @@ describe("runAutoSearchHintForPi", () => {
 					},
 				});
 				expect(textOf(messages[0])).not.toContain("<ctx-search-hint>");
-				expect(getAutoSearchHintDecisions(db, "ses-auto")[0]).toMatchObject({
-					decision: "no-hint",
-					reason,
+				expect(getAutoSearchHintDecisions(db, "ses-auto")).toEqual([]);
+
+				// The recovered kernel serves the withheld hint on the next pass because no decision pinned the message.
+				fake.kernel.surfaceStates.delete("explicit_search");
+				await runAutoSearchHintForPi({
+					sessionId: "ses-auto",
+					db,
+					messages,
+					options: {
+						...baseOptions,
+						directory: "/tmp/auto-search",
+						kernelClient: fake.kernelClient,
+					},
 				});
+				expect(textOf(messages[0])).toContain("<ctx-search-hint>");
 			} finally {
 				spy.mockRestore();
 				closeQuietly(db);

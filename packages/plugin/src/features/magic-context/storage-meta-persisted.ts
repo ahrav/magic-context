@@ -86,11 +86,7 @@ export type AutoSearchHintNoHintReason =
     | "error"
     | "stacked"
     | "too-short"
-    | "policy-reset"
-    /** The kernel withheld memory for lag and no other source produced a hint. */
-    | "memory-abstained"
-    /** The kernel could not be read and no other source produced a hint. */
-    | "memory-unavailable";
+    | "policy-reset";
 
 export type AutoSearchHintDecision =
     | {
@@ -207,8 +203,6 @@ const AUTO_SEARCH_NO_HINT_REASONS = new Set<string>([
     "too-short",
     // A pre-policy hint decision converted to `no-hint` retains its block ID to revoke an already-seeded native hint.
     "policy-reset",
-    "memory-abstained",
-    "memory-unavailable",
 ]);
 
 function isPersistedUsageRow(row: unknown): row is PersistedUsageRow {

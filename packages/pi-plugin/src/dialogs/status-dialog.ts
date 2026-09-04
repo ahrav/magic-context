@@ -95,6 +95,8 @@ interface StatusDialogDetail {
 	compartmentCount: number;
 	/** Rows the kernel serves this project on the `explicit_search` surface. */
 	memoryCount: number;
+	/** True when the read behind `memoryCount` was truncated by the daemon's per-read bounds, making the count a lower bound. */
+	memoryTruncated?: boolean;
 	/** The kernel's state for that read, such as `available` or `unavailable:daemon_absent`. */
 	memoryState: StateKey;
 	memoryBlockCount: number;
@@ -357,7 +359,7 @@ function renderInner(
 	lines.push("");
 
 	lines.push(
-		`Counts: ${s.compartmentCount} compartments · ${s.memoryCount} memories (${s.memoryBlockCount} injected, ${s.memoryState}) · ${
+		`Counts: ${s.compartmentCount} compartments · ${s.memoryCount}${s.memoryTruncated ? "+" : ""} memories (${s.memoryBlockCount} injected, ${s.memoryState}) · ${
 			s.sessionNoteCount + s.readySmartNoteCount
 		} notes`,
 	);
@@ -607,6 +609,7 @@ export function buildPiStatusDetail(
 		systemPromptTokens,
 		compartmentCount: compartments.length,
 		memoryCount: memory.rows.filter(isMemoryDecisionRow).length,
+		...(memory.truncated === true ? { memoryTruncated: true } : {}),
 		memoryState: stateKey(memory.state),
 		memoryBlockCount,
 		sessionNoteCount: safeRead(

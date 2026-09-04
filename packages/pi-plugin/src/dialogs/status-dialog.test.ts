@@ -299,4 +299,56 @@ describe("Pi status dialog", () => {
 			closeQuietly(db);
 		}
 	});
+
+	it("marks a truncated read's memory count as a lower bound", async () => {
+		const db = createTestDb();
+		try {
+			const sessionId = "ses-status-truncated";
+			const fake = fakeKernelResolver();
+			fake.kernel.seedDecision({
+				object_id: `mem_${"2".repeat(32)}`,
+				decision_kind: "NAMING",
+				summary: "One memory.",
+			});
+			fake.kernel.readTruncated = true;
+			const rendered: string[][] = [];
+			const ctx = {
+				...fakeContext(sessionId),
+				ui: {
+					async custom(factory: unknown) {
+						const makeComponent = factory as (
+							tui: { requestRender: () => void },
+							theme: {
+								fg: (_name: string, text: string) => string;
+								bold: (text: string) => string;
+							},
+							keybindings: unknown,
+							done: (value: undefined) => void,
+						) => { render: (width: number) => string[]; dispose?: () => void };
+						const component = makeComponent(
+							{ requestRender: () => undefined },
+							{ fg: (_name, text) => text, bold: (text) => text },
+							undefined,
+							() => undefined,
+						);
+						rendered.push(component.render(90));
+						component.dispose?.();
+						return undefined;
+					},
+				},
+				getSystemPrompt: () => "system prompt",
+			};
+
+			await showStatusDialog({ getAllTools: () => [] } as never, ctx as never, {
+				db,
+				kernelClient: fake.kernelClient,
+				projectIdentity: resolveProjectIdentity(process.cwd()),
+			});
+			expect(rendered.flat().join("\n")).toContain(
+				"1+ memories (0 injected, available)",
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
 });

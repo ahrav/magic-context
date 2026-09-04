@@ -439,4 +439,33 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             closeQuietly(db);
         }
     });
+
+    it("withholds the on-demand claim-lane mural when the text renders kernel rows", () => {
+        const db = makeDb();
+        try {
+            // A stored claim-lane manifest exists, but on-demand resolution never serves it.
+            replaceCurrentManifest(db);
+            kernel.seedDecision({
+                object_id: `mem_${"d".repeat(32)}`,
+                decision_kind: "PROJECT_RULES",
+                summary: "Always use Bun for builds",
+            });
+            const state = getOrCreateSessionMeta(db, SESSION_ID) as unknown as M0M1State;
+            const messages: MessageLike[] = [];
+            const result = injectM0M1({
+                db,
+                memory: memoryFor(db),
+                sessionId: SESSION_ID,
+                messages,
+                state,
+                projectPath: PROJECT_ID,
+                isCacheBustingPass: true,
+                muralEnabled: true,
+            });
+            expect(result.m0Bytes?.toString("utf8")).not.toContain("<memory-mural>");
+            expect(imageUrl(messages)).toBeUndefined();
+        } finally {
+            closeQuietly(db);
+        }
+    });
 });

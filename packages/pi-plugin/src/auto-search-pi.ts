@@ -339,10 +339,17 @@ export async function runAutoSearchHintForPi(args: {
 		return messages;
 	}
 	if (
-		delivery.reason === "empty" ||
 		delivery.reason === "memory-abstained" ||
 		delivery.reason === "memory-unavailable"
 	) {
+		// A withheld memory lane is transient evidence like a timeout: the pass persists no decision, so a later pass re-evaluates the message once the daemon recovers.
+		sessionLog(
+			sessionId,
+			`auto-search: memory lane ${delivery.reason}, skipping hint for this turn (will retry)`,
+		);
+		return messages;
+	}
+	if (delivery.reason === "empty") {
 		writeNoHintAndReconcile(delivery.reason);
 		return messages;
 	}

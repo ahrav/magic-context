@@ -124,6 +124,8 @@ export interface KernelMemorySnapshot {
     state: MemoryState;
     rows: ReadRow[];
     knownAsOf: number | null;
+    /** Mirrors the read's `truncated` flag: the daemon dropped rows to fit its per-read bounds, so `rows` is a capped prefix and counts derived from it are lower bounds. commentlint: allow(JUDGE) */
+    truncated?: boolean;
 }
 
 /** Resolves the client bound to one session and filesystem project root. */
@@ -134,7 +136,12 @@ export type KernelClientResolver = (args: {
 
 export function kernelMemorySnapshotFrom(result: ReadResult): KernelMemorySnapshot {
     return isAvailable(result)
-        ? { state: result.state, rows: result.rows, knownAsOf: result.known_as_of }
+        ? {
+              state: result.state,
+              rows: result.rows,
+              knownAsOf: result.known_as_of,
+              truncated: result.truncated,
+          }
         : { state: result.state, rows: [], knownAsOf: null };
 }
 export type CommitResult = KernelResult<CommitPayload>;

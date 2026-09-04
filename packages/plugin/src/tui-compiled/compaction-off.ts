@@ -1,4 +1,4 @@
-import type { SidebarSnapshot } from "../shared/rpc-types";
+import { formatMemoryCount, type SidebarSnapshot } from "../shared/rpc-types";
 
 export interface CompactionOffSidebarRow {
     label: "Memories" | "Notes" | "Archived compartments";
@@ -15,7 +15,7 @@ export function nativeCompactionContextLabel(snapshot: SidebarSnapshot): string 
 
 export function compactionOffSidebarRows(snapshot: SidebarSnapshot): CompactionOffSidebarRow[] {
     const rows: CompactionOffSidebarRow[] = [
-        { label: "Memories", value: String(snapshot.memoryCount) },
+        { label: "Memories", value: formatMemoryCount(snapshot) },
         { label: "Notes", value: String(snapshot.sessionNoteCount) },
     ];
     const archivedCount = snapshot.archivedCompartmentCount ?? 0;

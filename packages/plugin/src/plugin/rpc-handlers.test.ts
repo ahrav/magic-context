@@ -13,6 +13,7 @@ import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
 import { unavailable } from "../shared/kernel-client";
 import { FakeKernel } from "../shared/kernel-client-testing/fake-kernel";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models-dev-cache";
+import { formatMemoryCount } from "../shared/rpc-types";
 import type { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
 import {
@@ -231,6 +232,45 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
             });
             expect(absent.memoryCount).toBe(0);
             expect(absent.memoryState).toBe("unavailable:daemon_absent");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a truncated read flags the count as a lower bound and status formats it approximate", () => {
+        const db = createTestDb();
+        try {
+            const sessionId = "ses-truncated";
+            const directory = process.cwd();
+            const kernel = new FakeKernel();
+            kernel.seedDecision({
+                object_id: `mem_${"a".repeat(32)}`,
+                decision_kind: "PROJECT_RULES",
+                summary: "Always use Bun for builds",
+            });
+            kernel.readTruncated = true;
+
+            const snapshot = buildSidebarSnapshot(
+                db,
+                sessionId,
+                directory,
+                undefined,
+                kernel.snapshot("explicit_search"),
+            );
+            expect(snapshot.memoryCount).toBe(1);
+            expect(snapshot.memoryTruncated).toBe(true);
+            expect(formatMemoryCount(snapshot)).toBe("1+");
+
+            kernel.readTruncated = false;
+            const complete = buildSidebarSnapshot(
+                db,
+                "ses-complete",
+                directory,
+                undefined,
+                kernel.snapshot("explicit_search"),
+            );
+            expect(complete.memoryTruncated).toBeUndefined();
+            expect(formatMemoryCount(complete)).toBe("1");
         } finally {
             closeQuietly(db);
         }
