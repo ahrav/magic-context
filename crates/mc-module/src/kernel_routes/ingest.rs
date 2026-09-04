@@ -588,7 +588,7 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        let parsed = match serde_json::from_value::<BeginRequest>(request.clone()) {
+        let parsed = match BeginRequest::deserialize(request) {
             Ok(parsed) => parsed,
             Err(error) => return crate::invalid_params_error(format!("invalid {BEGIN}: {error}")),
         };
@@ -775,7 +775,7 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        let parsed = match serde_json::from_value::<FinishRequest>(request.clone()) {
+        let parsed = match FinishRequest::deserialize(request) {
             Ok(parsed) => parsed,
             Err(error) => return crate::invalid_params_error(format!("invalid {FINISH}: {error}")),
         };

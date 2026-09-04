@@ -552,7 +552,7 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        let parsed = match serde_json::from_value::<CommitRequest>(request.clone()) {
+        let parsed = match CommitRequest::deserialize(request) {
             Ok(parsed) => parsed,
             Err(error) => {
                 return crate::invalid_params_error(format!("invalid {OPERATION}: {error}"))
