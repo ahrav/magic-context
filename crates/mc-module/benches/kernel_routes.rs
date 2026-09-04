@@ -16,7 +16,7 @@
 //!
 //! A refusal (`conflict`, `invalid`, `unavailable`) returns before the work a
 //! case names, so a timed refusal would read as a speedup. `Daemon::call`
-//! panics unless the encoded body contains `"state":{"kind":"available"}`.
+//! panics unless the prepared value's `state.kind` is `available`.
 //!
 //! Warm state: the store is open, every SQLite page touched by the case is in
 //! the page cache, the secret scanner is constructed, and the tokio runtime
@@ -38,6 +38,10 @@
 //!   `insert_decision`, one quarter `insert_observation`, with one token per
 //!   16 operations naming a pre-existing row. Each iteration uses a fresh
 //!   operation key and fresh object ids, so the envelope is never replayed.
+//!   Fresh commits permanently append rows, and commit time increases with
+//!   row count. Rebuild the daemon and store before every sample and after a
+//!   fixed number of commits so every sample follows the same row-count
+//!   trajectory whatever the binary's speed.
 //! - `commit/replay`: the same envelope re-sent; the route answers from the
 //!   receipt without entering the operation.
 //! - `eligibility/{n}-candidates/{cold,warm}`: `n` candidates from a
@@ -46,6 +50,9 @@
 //!   batch twice and times the second.
 //! - `egress/decide/{outcome}`: one decision per outcome the gate can produce,
 //!   so a refusal path is never mistaken for the allow path.
+//! - `ingest/begin/2-pages`: one `begin` declaring a two-page upload under a
+//!   fresh upload id. The route replaces the previous pending upload on the
+//!   same route, so the store never grows.
 //! - `ingest/page/{bytes}`: one `page` call carrying `bytes` of base64 text,
 //!   staged against an upload begun in the batch setup.
 //! - `ingest/finish/{bytes}`: `begin` + pages run in setup; the timed call is
@@ -74,7 +81,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput,
+};
 use mc_host::{
     BindOutcome, CompositeComponent, HostInit, PrimaryComponent, RouteHandle, RouteIdentity,
 };
@@ -94,10 +103,10 @@ const SESSION: &str = "session-bench";
 const DOMAIN: &str = "domain";
 const SECRET_LINE: &str = "password=hunter-two-very-secret-value-0123456789\n";
 const FILLER_LINE: &str = "plain filler line without any credential words 0123\n";
-const PAGE_BYTES_MAX: usize = 16 * 1024 * 1024;
-/// Compact `serde_json` encoding of `KernelOutcome::Available` under the
-/// `state` key every kernel route emits.
-const AVAILABLE_STATE: &[u8] = br#""state":{"kind":"available"}"#;
+const PAGE_BYTES_MAX: usize = mc_module::kernel_routes::ingest::PAGE_BYTES_MAX as usize;
+/// Width of the zero-padded iteration counter `ingest/finish` writes into the
+/// last line of each payload.
+const COUNTER_TAG_BYTES: usize = 16;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(bytes))
@@ -193,17 +202,14 @@ impl Daemon {
             .block_on(self.handler.dispatch_value_for_test(self.route, request));
         match outcome {
             PreparedOutcome::Response(output) => {
+                let body = output.json_for_test().expect("kernel route answers JSON");
+                if body["state"]["kind"] != "available" {
+                    panic!("kernel route did not answer available: {}", body["state"]);
+                }
                 let mut encoded = self.encoded.borrow_mut();
                 encoded.clear();
                 let measured = output.measure().expect("response measures");
                 measured.write_to(&mut *encoded).expect("response encodes");
-                if memchr::memmem::rfind(&encoded, AVAILABLE_STATE).is_none() {
-                    let tail = encoded.len().saturating_sub(256);
-                    panic!(
-                        "kernel route did not answer available; body tail: {}",
-                        String::from_utf8_lossy(&encoded[tail..])
-                    );
-                }
                 encoded.len()
             }
             PreparedOutcome::Error { code, message } => {
@@ -591,42 +597,112 @@ fn commit_envelope(daemon: &Daemon, key: &str, ops: usize, token_ids: &[(String,
     commit_request(daemon, key, operations, tokens)
 }
 
-fn bench_commit(c: &mut Criterion) {
-    if !group_enabled("commit") {
-        return;
-    }
-    let mut group = c.benchmark_group("commit");
-    for ops in [1usize, 16, 128] {
+struct CommitFixture {
+    daemon: Daemon,
+    token_ids: Vec<(String, i64)>,
+    committed: usize,
+}
+
+impl CommitFixture {
+    fn start() -> Self {
         let daemon = Daemon::start();
         let own_scope = daemon.project_scope_id();
         // Token targets: rows the route may mutate, with the tip they were read at.
         let targets = seed_decisions(&daemon.store(), 0, 16, std::slice::from_ref(&own_scope));
         let tip = daemon.store().tip().unwrap();
-        let token_ids: Vec<(String, i64)> = targets.into_iter().map(|id| (id, tip)).collect();
-        let mut counter = 0usize;
+        let token_ids = targets.into_iter().map(|id| (id, tip)).collect();
+        Self {
+            daemon,
+            token_ids,
+            committed: 0,
+        }
+    }
+
+    fn next_envelope(&mut self, ops: usize) -> Value {
+        self.committed += 1;
+        commit_envelope(
+            &self.daemon,
+            &format!("k{}", self.committed),
+            ops,
+            &self.token_ids,
+        )
+    }
+}
+
+/// `FreshCommits` rebuilds its fixture every `reset_every` commits, so timed
+/// commits operate on stores at most `reset_every * ops` rows past the seed.
+struct FreshCommits {
+    ops: usize,
+    reset_every: usize,
+    fixture: Option<CommitFixture>,
+}
+
+impl FreshCommits {
+    fn new(ops: usize, reset_every: usize) -> Self {
+        Self {
+            ops,
+            reset_every,
+            fixture: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        if let Some(fixture) = self.fixture.take() {
+            fixture.daemon.shutdown();
+        }
+    }
+
+    /// `stage` prepares setup outside the timed region; the caller times only
+    /// `daemon.call(request)`.
+    fn stage(&mut self) -> (&Daemon, Value) {
+        let cycle_done = match &self.fixture {
+            Some(fixture) => fixture.committed >= self.reset_every,
+            None => true,
+        };
+        if cycle_done {
+            self.reset();
+            self.fixture = Some(CommitFixture::start());
+        }
+        let fixture = self.fixture.as_mut().expect("fixture started");
+        let request = fixture.next_envelope(self.ops);
+        (&fixture.daemon, request)
+    }
+}
+
+fn bench_commit(c: &mut Criterion) {
+    if !group_enabled("commit") {
+        return;
+    }
+    let mut group = c.benchmark_group("commit");
+    for (ops, reset_every) in [(1usize, 64usize), (16, 16), (128, 4)] {
+        let mut fresh = FreshCommits::new(ops, reset_every);
         let case = format!("commit/{ops}-ops");
         if profile_or_bench(&case, || {
-            counter += 1;
-            let request = commit_envelope(&daemon, &format!("p{counter}"), ops, &token_ids);
+            let (daemon, request) = fresh.stage();
             black_box(daemon.call(request));
         }) {
-            daemon.shutdown();
+            fresh.reset();
             continue;
         }
         group.sample_size(if ops >= 128 { 10 } else { 20 });
+        group.sampling_mode(SamplingMode::Flat);
         group.throughput(Throughput::Elements(ops as u64));
         group.bench_function(BenchmarkId::new(format!("{ops}-ops"), "fresh"), |b| {
-            b.iter_batched(
-                || {
-                    counter += 1;
-                    commit_envelope(&daemon, &format!("k{counter}"), ops, &token_ids)
-                },
-                |request| black_box(daemon.call(request)),
-                BatchSize::PerIteration,
-            )
+            b.iter_custom(|iters| {
+                fresh.reset();
+                let mut elapsed = Duration::ZERO;
+                for _ in 0..iters {
+                    let (daemon, request) = fresh.stage();
+                    let started = Instant::now();
+                    black_box(daemon.call(request));
+                    elapsed += started.elapsed();
+                }
+                elapsed
+            })
         });
-        daemon.shutdown();
+        fresh.reset();
     }
+    group.sampling_mode(SamplingMode::Auto);
 
     // Replay: the receipt answers without entering the operation.
     let daemon = Daemon::start();
@@ -972,6 +1048,42 @@ fn rekey_begin(begin: &Value, upload_id: &str) -> Value {
     begin
 }
 
+fn bench_ingest_begin(c: &mut Criterion) {
+    if !group_enabled("ingest/begin") {
+        return;
+    }
+    let mut group = c.benchmark_group("ingest/begin");
+    let daemon = Daemon::start();
+    // The request declares two 4 KiB pages. A fresh id per call replaces the
+    // previous pending upload on this route, so no upload ever completes.
+    let payload = text_payload(8 * 1024, 0);
+    let begin = ingest_begin_request(&daemon, "u", &payload, 2);
+    let started = daemon.assert_available(begin.clone());
+    assert_eq!(started["upload_id"], "u", "{started}");
+    let mut counter = 0usize;
+    if profile_or_bench("ingest/begin/2-pages", || {
+        counter += 1;
+        black_box(daemon.call(rekey_begin(&begin, &format!("u{counter}"))));
+    }) {
+        daemon.shutdown();
+        group.finish();
+        return;
+    }
+    group.sample_size(30);
+    group.bench_function(BenchmarkId::new("begin", "2-pages"), |b| {
+        b.iter_batched(
+            || {
+                counter += 1;
+                rekey_begin(&begin, &format!("u{counter}"))
+            },
+            |begin| black_box(daemon.call(begin)),
+            BatchSize::PerIteration,
+        )
+    });
+    daemon.shutdown();
+    group.finish();
+}
+
 fn bench_ingest_page(c: &mut Criterion) {
     if !group_enabled("ingest/page") {
         return;
@@ -1036,6 +1148,10 @@ fn bench_ingest_finish(c: &mut Criterion) {
     for (label, bytes) in [("1MiB", 1usize << 20), ("64MiB", 64usize << 20)] {
         let daemon = Daemon::start();
         let payload = text_payload(bytes, 0);
+        assert!(
+            payload.len() > COUNTER_TAG_BYTES,
+            "ingest/finish/{label} payload must hold a {COUNTER_TAG_BYTES}-byte tag plus newline"
+        );
         let page_count = bytes.div_ceil(PAGE_BYTES_MAX) as u32;
         let pages: Vec<Value> = payload
             .chunks(PAGE_BYTES_MAX)
@@ -1050,9 +1166,9 @@ fn bench_ingest_finish(c: &mut Criterion) {
         let stage = |daemon: &Daemon, counter: usize| -> Value {
             let id = format!("u{counter}");
             let mut payload = payload.clone();
-            let tag = format!("{counter:016}");
+            let tag = format!("{counter:0COUNTER_TAG_BYTES$}");
             let n = payload.len();
-            payload[n - 17..n - 1].copy_from_slice(tag.as_bytes());
+            payload[n - 1 - COUNTER_TAG_BYTES..n - 1].copy_from_slice(tag.as_bytes());
             let mut begin = rekey_begin(&begin, &id);
             begin["payload_digest"] = json!(sha256_hex(&payload));
             daemon.assert_available(begin);
@@ -1146,6 +1262,6 @@ criterion_group! {
     name = benches;
     config = configure();
     targets = bench_read, bench_commit, bench_eligibility, bench_egress,
-              bench_ingest_page, bench_ingest_finish, bench_redaction
+              bench_ingest_begin, bench_ingest_page, bench_ingest_finish, bench_redaction
 }
 criterion_main!(benches);
