@@ -48,6 +48,10 @@ tokio-util = { version = "0.7", features = ["rt"] }
 sha2 = { workspace = true }
 # Artifact pages cross the JSON ring as base64; same version mc-tokenizer uses.
 base64 = "0.22"
+# Page decoding: SIMD with runtime dispatch and a scalar fallback; decodes
+# the same inputs to the same bytes as `base64`'s STANDARD engine and rejects
+# the same malformed ones.
+base64-simd = "0.8"
 libc = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 

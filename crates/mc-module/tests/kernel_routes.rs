@@ -3852,6 +3852,80 @@ async fn a_page_for_an_unknown_upload_or_an_oversized_frame_is_refused_before_de
     daemon.handler.shutdown().await.unwrap();
 }
 
+/// The page decoder accepts only canonical, padded, standard-alphabet base64.
+#[tokio::test]
+async fn a_begun_upload_refuses_a_page_that_is_not_canonical_standard_base64() {
+    use base64::Engine as _;
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    // 0xFB 0xFF 0xBF encodes as "+/+/", the standard-only '+' and '/'.
+    let payload: Vec<u8> = [0xfb, 0xff, 0xbf]
+        .iter()
+        .copied()
+        .cycle()
+        .take(300)
+        .collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&payload[..100]);
+    assert!(encoded.contains('+') && encoded.contains('/'));
+
+    assert_state(
+        &daemon
+            .ingest_begin(daemon.route, "framed", &payload, 3)
+            .await,
+        "available",
+        None,
+    );
+
+    let malformed = [
+        format!("!{}", &encoded[1..]),
+        encoded.replace('+', "-").replace('/', "_"),
+        "QUJDRA".to_string(),
+        "QUJDRA===".to_string(),
+        "QUJDR===".to_string(),
+        "QUJDRA=A".to_string(),
+        // 'B' leaves four low bits set that no output byte accounts for.
+        "QUJDRB==".to_string(),
+        "QUJD\nRA==".to_string(),
+        "QUJDRA==\n".to_string(),
+        "QUJDRA==QUJDRA==".to_string(),
+    ];
+    for text in &malformed {
+        // The handler must reject every input that `STANDARD.decode` rejects.
+        assert!(
+            base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .is_err(),
+            "{text:?} is accepted by the reference decoder"
+        );
+        let mut page = ingest_page_request(&daemon.project, "framed", 0, &payload[..100]);
+        page["bytes_base64"] = json!(text);
+        match daemon
+            .handler
+            .dispatch_value_for_test(daemon.route, page)
+            .await
+        {
+            PreparedOutcome::Error { code, message } => {
+                assert_eq!(code, "invalid_params", "{text:?}: {message}");
+                assert!(
+                    message.ends_with("bytes_base64 is not standard base64"),
+                    "{text:?}: {message}"
+                );
+            }
+            other => panic!("{text:?} was not refused: {other:?}"),
+        }
+    }
+    // Each refusal released its decode reservation and left the upload live.
+    assert_eq!(daemon.handler.staging_budget_for_test(), (300, 1));
+
+    let finished = daemon
+        .ingest_paged(daemon.route, "framed", &payload, 100)
+        .await;
+    assert_state(&finished, "available", None);
+    assert_eq!(daemon.read_artifact(&finished), payload);
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+    daemon.handler.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_stale_ready_sample_reads_as_unavailable_until_a_fresh_one_lands() {
     let daemon = Daemon::start().await;

@@ -17,7 +17,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
 use mc_core::claim_operation::is_lower_hex;
 use mc_host::RouteHandle;
 use mc_kernel::{
@@ -713,8 +712,8 @@ impl McHandler {
         // handler must not release the charge while the worker still holds
         // the bytes.
         let decoded = blocking(move || {
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(parsed.bytes_base64.as_bytes())
+            let decoded = base64_simd::STANDARD
+                .decode_to_vec(parsed.bytes_base64.as_bytes())
                 .map(|bytes| (parsed.upload_id, parsed.index, parsed.page_digest, bytes));
             (decoded, decoding)
         })
@@ -826,6 +825,7 @@ impl McHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use mc_kernel::CommitIntent;
 
     fn route(channel: u16) -> RouteHandle {

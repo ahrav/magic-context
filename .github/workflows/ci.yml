@@ -279,7 +279,12 @@ jobs:
           cargo nextest run -p mc-module \
             --test caveman_differential \
             --test historian_truncate_differential \
-            --test selection_differential
+            --test selection_differential \
+            --test base64_differential
+
+      # The self dev-dependency enables `test-support`, which this suite needs.
+      - name: Kernel route contracts
+        run: cargo nextest run -p mc-module --test kernel_routes
 
       - name: Native module adapter and CLI lifecycle
         run: |
@@ -287,6 +292,35 @@ jobs:
           cargo test -p mc-module \
             --test host_adapter \
             --test lifecycle_cli
+
+  # `base64-simd` dispatches to NEON on aarch64 and AVX2 on x86-64; the x86
+  # jobs above never execute the NEON kernel.
+  base64-differential-arm64:
+    name: base64 decoder differential (Linux arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: magic-context
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: magic-context
+          persist-credentials: false
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ahrav/commons
+          ref: c11f1e42acf37ae956a524238e434acc6cfbedfa
+          path: commons
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: NEON path against the reference decoder
+        run: cargo nextest run -p mc-module --test base64_differential
 
   check-plugin:
     name: Check (plugin)
