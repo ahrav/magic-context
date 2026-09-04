@@ -220,6 +220,8 @@ struct ClaimMirrorReceiptRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionBinding {
     pub project_root: PathBuf,
+    /// The project the `kernel.*` routes work against, canonicalized at bind.
+    pub(crate) kernel_project: kernel_routes::ProjectBinding,
     pub harness: String,
     pub session: String,
     pub model_key: Option<String>,
@@ -2337,7 +2339,11 @@ pub const DECLARED_RETAINED_RESIDENT_BYTES: u64 = TRANSFORM_SERVE_CACHE_COMBINED
     + TRANSFORM_SNAPSHOT_BUDGET_BYTES as u64
     + BOUNDARY_TOKEN_CACHE_BUDGET_BYTES as u64
     + STATE_IMPORT_MAX_STAGED_BYTES as u64
-    + transform::TAG_CACHE_COMBINED_BUDGET_BYTES as u64;
+    + transform::TAG_CACHE_COMBINED_BUDGET_BYTES as u64
+    + kernel_routes::ingest::MAX_STAGED_BYTES
+    + kernel_routes::ingest::FINISH_WORKING_BYTES_MAX
+    + kernel_routes::ingest::PAGE_DECODE_BYTES_MAX
+    + kernel_routes::eligibility::CACHE_BUDGET_BYTES;
 
 #[derive(Debug, Clone)]
 struct NativeDeltaFrontier {
@@ -4245,6 +4251,9 @@ impl McHandler {
     /// Final binding closure removes the route and evicts process-local session state.
     fn unbind_route(&self, channel: RouteHandle) {
         self.remove_note_evaluator_registrations_for_channel(channel);
+        // Artifact uploads are keyed by route, not session, so the route's
+        // upload goes whether or not a sibling route keeps the session bound.
+        self.kernel.uploads().discard(channel);
         self.transform_route_channels
             .lock()
             .expect("transform route channels mutex")
@@ -11704,6 +11713,7 @@ impl CompositeComponent for McHandler {
         self.bind_route(
             route,
             SessionBinding {
+                kernel_project: kernel_routes::ProjectBinding::new(&identity.project_root),
                 project_root: identity.project_root,
                 harness: identity.harness,
                 session: identity.session,
@@ -12042,6 +12052,18 @@ impl McHandler {
     }
 
     #[cfg(feature = "test-support")]
+    pub fn eligibility_cache_len_for_test(&self) -> usize {
+        self.kernel.eligibility_cache().len()
+    }
+
+    /// `(total_bytes, pending)` of the artifact upload staging budget.
+    #[cfg(feature = "test-support")]
+    pub fn staging_budget_for_test(&self) -> (u64, usize) {
+        let budget = self.kernel.uploads().budget();
+        (budget.total_bytes, budget.pending)
+    }
+
+    #[cfg(feature = "test-support")]
     pub fn kernel_unavailable_reason_for_test(&self) -> Option<kernel_routes::UnavailableReason> {
         (self.kernel.state() == kernel_routes::KernelState::Unavailable)
             .then(|| self.kernel.unavailable_reason())
@@ -12120,6 +12142,22 @@ impl McHandler {
                 "session.status" => self.handle_session_status_value(channel, &request),
                 "session.delete" => self.handle_session_delete_value(channel, &request),
                 "session.wrapup" => self.handle_session_wrapup_value(channel, &request).await,
+                "kernel.read" => self.handle_kernel_read(channel, &request).await,
+                "kernel.commit" => self.handle_kernel_commit(channel, &request).await,
+                "kernel.eligibility.batch" => {
+                    self.handle_kernel_eligibility_batch(channel, &request)
+                        .await
+                }
+                "kernel.egress.decide" => self.handle_kernel_egress_decide(channel, &request).await,
+                "kernel.artifact.ingest.begin" => {
+                    self.handle_kernel_ingest_begin(channel, &request).await
+                }
+                "kernel.artifact.ingest.page" => {
+                    self.handle_kernel_ingest_page(channel, request).await
+                }
+                "kernel.artifact.ingest.finish" => {
+                    self.handle_kernel_ingest_finish(channel, &request).await
+                }
                 // The handler echoes only explicit wire-debugging requests.
                 // Unknown request bodies must fail so misrouted callers cannot mistake an echo for success.
                 // An unconditional echo lets a misrouted caller mistake an echo for success.
@@ -14010,18 +14048,28 @@ const MAX_TRANSFORM_FRAME_BYTES: usize = 32 * 1024 * 1024;
 /// Serde ignores the remaining fields, avoiding a full `Value` parse of a multi-MiB array.
 #[derive(Deserialize)]
 struct RequestMethodProbe {
+    /// Held as a `Value` so a non-string field does not fail the probe: dispatch
+    /// reads each field with `Value::as_str` and treats anything else as absent.
     #[serde(default)]
-    method: Option<String>,
+    method: Option<Value>,
     #[serde(default)]
-    kind: Option<String>,
+    kind: Option<Value>,
 }
 
 impl RequestMethodProbe {
     fn is_transform_class(&self) -> bool {
-        let named = |value: &Option<String>, name: &str| value.as_deref() == Some(name);
-        named(&self.kind, "transform")
+        // Dispatch reads `method` and falls back to `kind`, so the class is
+        // read the same way; a `kind` beside a `method` names nothing.
+        let route = self
+            .method
+            .as_ref()
+            .and_then(Value::as_str)
+            .or_else(|| self.kind.as_ref().and_then(Value::as_str));
+        route == Some("transform")
             // The state-sync path uses the transform-class ceiling because one row can exceed the facade cap.
-            || named(&self.method, "state_sync")
+            || route == Some("state_sync")
+            // One base64 artifact page carries up to 16 MiB decoded.
+            || route == Some(kernel_routes::ingest::PAGE)
     }
 }
 
@@ -16789,6 +16837,7 @@ mod tests {
     fn binding_with_harness(root: &str, harness: &str, session: &str) -> SessionBinding {
         SessionBinding {
             project_root: PathBuf::from(root),
+            kernel_project: kernel_routes::ProjectBinding::new(Path::new(root)),
             harness: harness.to_string(),
             session: session.to_string(),
             model_key: None,
@@ -17196,6 +17245,26 @@ mod tests {
         let two_mib = 2 * 1024 * 1024;
         assert!(enforce_request_byte_cap(&pad("transform", "kind", two_mib)).is_ok());
         assert!(enforce_request_byte_cap(&pad("state_sync", "method", two_mib)).is_ok());
+        assert!(
+            enforce_request_byte_cap(&pad("kernel.artifact.ingest.page", "method", two_mib))
+                .is_ok()
+        );
+        assert!(
+            enforce_request_byte_cap(&pad("kernel.artifact.ingest.begin", "method", two_mib))
+                .is_err()
+        );
+        // A `kind` beside a `method` does not widen the cap: dispatch ignores it.
+        let widened = format!(
+            "{{\"method\":\"kernel.artifact.ingest.begin\",\"kind\":\"transform\",\"pad\":\"{}\"}}",
+            "x".repeat(two_mib)
+        );
+        assert!(enforce_request_byte_cap(widened.as_bytes()).is_err());
+        // A non-string `method` is absent to dispatch, which then reads `kind`.
+        let fallback = format!(
+            "{{\"method\":0,\"kind\":\"kernel.artifact.ingest.page\",\"pad\":\"{}\"}}",
+            "x".repeat(two_mib)
+        );
+        assert!(enforce_request_byte_cap(fallback.as_bytes()).is_ok());
         // Oversized facade bodies reject at 1 MiB.
         assert!(enforce_request_byte_cap(&pad("ctx_memory", "method", two_mib)).is_err());
         // Unparseable oversized bodies reject conservatively.

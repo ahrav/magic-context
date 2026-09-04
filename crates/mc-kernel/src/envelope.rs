@@ -7,7 +7,7 @@
 //! Timestamps the kernel records itself are Unix milliseconds; caller-supplied observation, event, and abandonment timestamps stay in the caller's own units, and commit sequences and source revisions are signed integers.
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -18,7 +18,7 @@ use super::redaction::{clear_owner, clear_owner_kind, identity, record, redact, 
 use super::{map_sqlite, KernelError, KernelStore};
 use crate::current_time_ms;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Sensitivity {
     Normal,
@@ -103,6 +103,36 @@ pub struct KnownAsOf {
     pub known_as_of: i64,
     pub tip: i64,
     pub objects: Vec<ObjectRow>,
+}
+
+/// One object's registry row with its invalidation and succession columns
+/// unmasked, the scope its typed row names, and the last commit that changed
+/// it. A mutation token `(object_id, known_as_of)` is judged against this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectState {
+    pub object: ObjectRow,
+    pub scope_id: Option<String>,
+    /// The digest of the artifact the row's `evidence_id` cites; `None` when
+    /// the row cites no evidence or the evidence row is gone or invalidated.
+    pub artifact_digest: Option<String>,
+    pub latest_change_commit_seq: Option<i64>,
+}
+
+/// Why a mutation token no longer names the object the caller read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenConflict {
+    /// A change to the object committed after the token's `known_as_of`.
+    Advanced,
+    /// The object is missing or invalidated without a successor.
+    Retracted,
+    /// The object was replaced by a successor.
+    Superseded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenCheck {
+    Unchanged,
+    Conflict(TokenConflict),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,6 +372,33 @@ impl Envelope<'_> {
         Ok(())
     }
 
+    /// Reads inside the envelope's transaction, so a check here and the write
+    /// that follows it observe one state.
+    pub fn object_state(&self, object_id: &str) -> Result<Option<ObjectState>, KernelError> {
+        load_object_state(self.tx, object_id)
+    }
+
+    /// Succession is judged before invalidation because a superseded object is
+    /// also invalidated, and advancement last because both of the others also
+    /// leave a later change event.
+    ///
+    /// `known_as_of >= self.commit_seq` names a snapshot no reader has seen,
+    /// and `Advanced` would compare against it as if it were real, so
+    /// `check_token` returns `FutureSnapshot` before consulting any object.
+    pub fn check_token(
+        &self,
+        object_id: &str,
+        known_as_of: i64,
+    ) -> Result<TokenCheck, KernelError> {
+        if known_as_of >= self.commit_seq {
+            return Err(KernelError::FutureSnapshot);
+        }
+        Ok(match self.object_state(object_id)? {
+            None => TokenCheck::Conflict(TokenConflict::Retracted),
+            Some(state) => token_check(&state, known_as_of),
+        })
+    }
+
     fn invalidate_domain(&self, object_id: &str) -> Result<ObjectRow, KernelError> {
         let object = load_object(self.tx, object_id)?.ok_or(KernelError::NotFound)?;
         if object.object_kind != DOMAIN_OBJECT_KIND {
@@ -459,6 +516,26 @@ impl KernelStore {
             operation,
             after_events,
         )
+    }
+
+    /// The latest commit sequence, read without loading any object row.
+    pub fn tip(&self) -> Result<i64, KernelError> {
+        self.read_snapshot(0, |_| Ok(())).map(|(tip, ())| tip)
+    }
+
+    /// States for `object_ids` in request order from one read transaction,
+    /// paired with the tip that transaction observed; `None` marks an object the
+    /// registry has never seen.
+    pub fn object_states(
+        &self,
+        object_ids: &[String],
+    ) -> Result<(i64, Vec<Option<ObjectState>>), KernelError> {
+        self.read_snapshot(0, |tx| {
+            object_ids
+                .iter()
+                .map(|object_id| load_object_state(tx, object_id))
+                .collect()
+        })
     }
 
     /// `invalidated_commit_seq` and `superseded_by` are `None` for every returned row; `object_history_as_of` reads those columns.
@@ -1262,6 +1339,56 @@ pub(super) fn object_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<Objec
         superseded_by: row.get(8)?,
         sensitivity: Sensitivity::from_stored(&sensitivity),
     })
+}
+
+fn token_check(state: &ObjectState, known_as_of: i64) -> TokenCheck {
+    if state.object.superseded_by.is_some() {
+        return TokenCheck::Conflict(TokenConflict::Superseded);
+    }
+    if state.object.invalidated_commit_seq.is_some() {
+        return TokenCheck::Conflict(TokenConflict::Retracted);
+    }
+    if state
+        .latest_change_commit_seq
+        .is_some_and(|latest| latest > known_as_of)
+    {
+        return TokenCheck::Conflict(TokenConflict::Advanced);
+    }
+    TokenCheck::Unchanged
+}
+
+/// Decisions and observations are the object kinds that carry a scope and an
+/// evidence citation; every other kind reads `None` for both.
+pub(super) fn load_object_state(
+    tx: &Transaction<'_>,
+    object_id: &str,
+) -> Result<Option<ObjectState>, KernelError> {
+    tx.query_row(
+        &format!(
+            "SELECT {OBJECT_ROW_COLUMNS},
+                    COALESCE(dec.scope_id,obs.scope_id),
+                    (SELECT MAX(commit_seq) FROM change_event c WHERE c.object_id=o.object_id),
+                    em.artifact_digest
+             FROM object_registry o
+             LEFT JOIN decisions dec ON dec.object_id=o.object_id
+             LEFT JOIN observations obs ON obs.object_id=o.object_id
+             LEFT JOIN evidence_meta em
+                    ON em.evidence_id=COALESCE(dec.evidence_id,obs.evidence_id)
+                   AND em.invalidated_commit_seq IS NULL
+             WHERE o.object_id=?1"
+        ),
+        [object_id],
+        |row| {
+            Ok(ObjectState {
+                object: object_row_from(row)?,
+                scope_id: row.get(10)?,
+                latest_change_commit_seq: row.get(11)?,
+                artifact_digest: row.get(12)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(map_sqlite)
 }
 
 fn load_object(tx: &Transaction<'_>, object_id: &str) -> Result<Option<ObjectRow>, KernelError> {

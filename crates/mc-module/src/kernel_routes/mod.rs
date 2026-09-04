@@ -5,7 +5,13 @@
 //! route can never observe a `Ready` phase with an empty slot, and `health()`
 //! can read the phase from one atomic without touching the store.
 
+pub mod commit;
+pub mod egress;
+pub mod eligibility;
 pub mod health;
+pub mod ingest;
+pub(crate) mod project;
+pub mod read;
 pub mod serving;
 pub(crate) mod state;
 
@@ -14,10 +20,14 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use mc_host::RouteHandle;
 use mc_kernel::{KernelError, KernelStore};
+use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::{jittered_store_open_delay, StoreOpenPolicy};
+use crate::dispatch::PreparedOutcome;
+use crate::{jittered_store_open_delay, McHandler, StoreOpenPolicy};
+pub(crate) use project::ProjectBinding;
 pub use state::{ConflictReason, InvalidReason, KernelOutcome, UnavailableReason};
 
 /// Directory under the managed data directory holding `core.sqlite` and
@@ -116,6 +126,12 @@ pub(crate) struct KernelOpenCoordinator {
     /// sample cannot overwrite the block a concurrent transition published.
     slot: Mutex<Option<Arc<KernelStore>>>,
     health: health::KernelHealthProjection,
+    /// Derived from the store in the slot, so it is emptied whenever the slot
+    /// changes hands.
+    eligibility_cache: Mutex<eligibility::VerdictCache>,
+    /// Staged artifact uploads never outlive the store they were begun
+    /// against, so they are dropped whenever the slot changes hands.
+    uploads: Mutex<ingest::UploadCoordinator>,
     background_sampler: AtomicBool,
 }
 
@@ -125,8 +141,20 @@ impl KernelOpenCoordinator {
             phase: AtomicU8::new(Phase::Starting as u8),
             slot: Mutex::new(None),
             health: health::KernelHealthProjection::new(),
+            eligibility_cache: Mutex::new(eligibility::VerdictCache::default()),
+            uploads: Mutex::new(ingest::UploadCoordinator::default()),
             background_sampler: AtomicBool::new(true),
         }
+    }
+
+    pub(crate) fn uploads(&self) -> std::sync::MutexGuard<'_, ingest::UploadCoordinator> {
+        self.uploads.lock().expect("upload coordinator mutex")
+    }
+
+    pub(crate) fn eligibility_cache(&self) -> std::sync::MutexGuard<'_, eligibility::VerdictCache> {
+        self.eligibility_cache
+            .lock()
+            .expect("eligibility cache mutex")
     }
 
     /// The last published health block; reads one atomic pointer.
@@ -206,6 +234,8 @@ impl KernelOpenCoordinator {
     /// block: `Ready` reaches health only from a sample that carries measured
     /// facts.
     fn install(&self, store: KernelStore) {
+        self.eligibility_cache().clear();
+        self.uploads().clear();
         let mut slot = self.slot.lock().expect("kernel store slot mutex");
         *slot = Some(Arc::new(store));
         self.phase.store(Phase::Ready as u8, Ordering::Release);
@@ -220,6 +250,8 @@ impl KernelOpenCoordinator {
         self.phase
             .store(Phase::unavailable(kind) as u8, Ordering::Release);
         *slot = None;
+        self.eligibility_cache().clear();
+        self.uploads().clear();
         self.publish_phase();
     }
 
@@ -316,4 +348,65 @@ pub(crate) fn kernel_root_for(sqlite_path: &str) -> PathBuf {
         .map(Path::to_path_buf)
         .unwrap_or_default()
         .join(KERNEL_DIRECTORY)
+}
+
+/// Every `kernel.*` response is `payload` plus a `state` field, so a client
+/// parses one shape whatever the outcome; a non-available state carries an
+/// otherwise empty payload.
+pub(crate) fn kernel_response(state: &KernelOutcome, payload: Value) -> PreparedOutcome {
+    let mut body = match payload {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    body.insert(
+        "state".to_string(),
+        serde_json::to_value(state).expect("kernel outcome serializes"),
+    );
+    crate::respond(Value::Object(body))
+}
+
+pub(crate) fn state_only(state: KernelOutcome) -> PreparedOutcome {
+    kernel_response(&state, json!({}))
+}
+
+/// The store and project binding a `kernel.*` route works against. Binding
+/// failures answer through the shared management error codes; a project
+/// mismatch or an unopened store answers with a typed kernel state.
+pub(crate) struct RouteScope {
+    pub(crate) store: Arc<KernelStore>,
+    pub(crate) project: ProjectBinding,
+}
+
+impl McHandler {
+    pub(crate) fn kernel_route_scope(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+        operation: &str,
+    ) -> Result<RouteScope, PreparedOutcome> {
+        let (_, binding) = self.management_binding(channel, request, operation)?;
+        let Some(requested_root) = request.get("project_root").and_then(Value::as_str) else {
+            return Err(crate::invalid_params_error(format!(
+                "{operation} requires project_root"
+            )));
+        };
+        let project = binding.kernel_project;
+        if !project.accepts(Path::new(requested_root)) {
+            return Err(state_only(KernelOutcome::invalid(
+                InvalidReason::ProjectMismatch,
+            )));
+        }
+        let store = self.kernel.kernel_store().map_err(state_only)?;
+        Ok(RouteScope { store, project })
+    }
+}
+
+/// Runs kernel work off the async workers; a panic inside the store closure is
+/// reported as an unavailable store rather than taking the handler down.
+pub(crate) async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, KernelOutcome> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| KernelOutcome::unavailable(UnavailableReason::StoreUnavailable))
 }

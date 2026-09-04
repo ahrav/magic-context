@@ -6,6 +6,7 @@
 //! Storage-integrity failures latch CAS ingestion closed.
 
 use std::fs::File;
+use std::sync::atomic::Ordering;
 
 use mc_core::redaction::{Detection, RedactionError, RedactionErrorKind};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -27,6 +28,7 @@ use crate::durable_fs::{
     sync_publish_directories_with, temp_name, write_and_sync, PublishOutcome, StorageError,
 };
 use crate::envelope::{check_fence, commit_with_writer, ObjectRow, PendingChange};
+use crate::object_write::map_write_error;
 use crate::redaction::{
     identity, payload_has_secret, record, redact_lossy, redact_payload, RedactedField,
 };
@@ -131,9 +133,11 @@ impl PreparedArtifact {
 
         let (payload_redaction, bytes, inspected) = match std::str::from_utf8(&request.payload) {
             Ok(text) => {
-                let redaction = redact_payload(text, MAX_PAYLOAD_DETECTIONS)
+                let mut redaction = redact_payload(text, MAX_PAYLOAD_DETECTIONS)
                     .map_err(|error| ArtifactError::new(scan_failure(error)))?;
-                let bytes = redaction.text.as_bytes().to_vec();
+                // The redacted text becomes the stored bytes without a copy;
+                // only its detections are needed afterwards.
+                let bytes = std::mem::take(&mut redaction.text).into_bytes();
                 (redaction, bytes, true)
             }
             Err(_) => {
@@ -183,7 +187,9 @@ impl PreparedArtifact {
         let digest = format!("{:x}", Sha256::digest(&bytes));
         let artifact_reference = format!("objects/{}/{}", &digest[..2], &digest[2..]);
         let redaction_metadata = detection_metadata(&payload_redaction.detections)?;
-        request.payload.clear();
+        // `clear` would keep the allocation; the payload's bytes now live in
+        // `bytes` and the original buffer is released.
+        request.payload = Vec::new();
 
         Ok(Self {
             request,
@@ -490,11 +496,20 @@ impl KernelStore {
             return Err(ArtifactError::new(ArtifactErrorKind::IngestionFailClosed));
         }
 
+        // The receipt lookup runs before the operation, so a `Conflict` raised
+        // without entering it is a reused `operation_key`, not a constraint.
+        let mut entered = false;
+        // Names the reason behind a `Conflict` the operation raises itself,
+        // since a storage constraint surfaces as the same error.
+        let mut refusal = None;
         let commit_result = commit_with_writer(
             &mut writer,
             self.lease_epoch(),
             prepared.request.intent.clone(),
-            |envelope| insert_reference(envelope, &prepared, &reservation_id),
+            |envelope| {
+                entered = true;
+                insert_reference(envelope, &prepared, &reservation_id, &mut refusal)
+            },
             || {
                 if faults.after_events {
                     Err(KernelError::Fault)
@@ -558,6 +573,10 @@ impl KernelStore {
                 );
                 Err(ArtifactError::new(match error {
                     KernelError::InvalidInput => ArtifactErrorKind::InvalidInput,
+                    KernelError::Conflict if !entered => ArtifactErrorKind::OperationKeyReused,
+                    KernelError::Conflict => {
+                        refusal.unwrap_or(ArtifactErrorKind::StorageConstraint)
+                    }
                     _ => ArtifactErrorKind::ReferenceCommit,
                 }))
             }
@@ -583,7 +602,24 @@ impl KernelStore {
         Ok(())
     }
 
+    /// The classification generation is odd for the duration of the merge and
+    /// even again afterwards, whether or not the commit succeeded, so a reader
+    /// that saw the same even value on both sides of its snapshot knows the
+    /// facts it read were not changing underneath it.
     fn merge_replayed_classification(
+        &self,
+        writer: &mut Connection,
+        prepared: &PreparedArtifact,
+    ) -> Result<(), ArtifactError> {
+        self.classification_generation
+            .fetch_add(1, Ordering::SeqCst);
+        let merged = self.merge_replayed_classification_inner(writer, prepared);
+        self.classification_generation
+            .fetch_add(1, Ordering::SeqCst);
+        merged
+    }
+
+    fn merge_replayed_classification_inner(
         &self,
         writer: &mut Connection,
         prepared: &PreparedArtifact,
@@ -601,8 +637,7 @@ impl KernelStore {
         )
         .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
         tx.commit()
-            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
-        Ok(())
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))
     }
 
     fn release_reservation(&self, writer: &mut Connection, reservation_id: &str) {
@@ -680,8 +715,10 @@ fn insert_reference(
     envelope: &mut crate::Envelope<'_>,
     prepared: &PreparedArtifact,
     reservation_id: &str,
+    refusal: &mut Option<ArtifactErrorKind>,
 ) -> Result<String, KernelError> {
     if artifact_is_blocked(envelope.tx, &prepared.digest)? {
+        *refusal = Some(ArtifactErrorKind::ReAdmissionBlocked);
         return Err(KernelError::Conflict);
     }
     let reservation_state: Option<String> = envelope
@@ -694,6 +731,7 @@ fn insert_reference(
         .optional()
         .map_err(|_| KernelError::Io)?;
     if reservation_state.as_deref() != Some("Live") {
+        *refusal = Some(ArtifactErrorKind::ReferenceCommit);
         return Err(KernelError::Conflict);
     }
     let reclaiming: i64 = envelope
@@ -705,6 +743,7 @@ fn insert_reference(
         )
         .map_err(|_| KernelError::Io)?;
     if reclaiming != 0 {
+        *refusal = Some(ArtifactErrorKind::ReclaimInProgress);
         return Err(KernelError::Conflict);
     }
 
@@ -744,7 +783,7 @@ fn insert_reference(
                 sensitivity.as_str(),
             ],
         )
-        .map_err(|_| KernelError::Io)?;
+        .map_err(map_write_error)?;
     let first_detection = prepared.payload_redaction.detections.first();
     envelope
         .tx
@@ -783,7 +822,7 @@ fn insert_reference(
                 sensitivity.as_str(),
             ],
         )
-        .map_err(|_| KernelError::Io)?;
+        .map_err(map_write_error)?;
     record(
         envelope.tx,
         "evidence",

@@ -2035,6 +2035,7 @@ dependencies = [
  "aho-corasick",
  "arc-swap",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "chrono-tz",
  "cortexkit-lease",

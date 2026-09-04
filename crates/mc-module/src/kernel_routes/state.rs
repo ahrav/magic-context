@@ -51,6 +51,9 @@ pub enum UnavailableReason {
     NoRequiredConsumer,
     /// The client's `as_of` is ahead of the store's tip.
     SnapshotDiverged,
+    /// The staging budget for paged artifact uploads is exhausted, or the
+    /// route already has an upload in flight.
+    QueueFull,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -74,13 +77,34 @@ pub enum InvalidReason {
     /// Kernel input validation or admission policy rejected the request.
     InvalidInput,
     AdmissionPolicy,
+    /// The named object does not exist, is not live, or is not scoped to the
+    /// bound project.
+    NotFound,
+    /// A write named an id the registry already holds or otherwise violated a
+    /// storage constraint; retrying with fresh tokens cannot succeed.
+    AlreadyExists,
+    /// A successor's `source_revision` does not exceed its predecessor's.
+    /// Retrying with a higher revision can succeed.
+    RevisionNotAdvanced,
+    /// A foreign scope occupies the bound project's reserved scope id.
+    /// Retrying cannot succeed until that scope is removed.
+    ScopeReserved,
     PayloadTooLarge,
-    /// A staged page's bytes do not match its declared digest.
+    /// A staged page's bytes do not match its declared digest, or a page index
+    /// was resent with different bytes.
     PageDigest,
+    /// A page does not fit the declared upload layout: its index is past
+    /// `page_count`, its bytes overrun `total_bytes`, or `finish` was called
+    /// with pages still missing.
+    PageIndex,
+    /// A page decodes to more bytes than one page may carry.
+    PageTooLarge,
+    /// The assembled payload does not hash to the declared payload digest.
+    PayloadDigest,
+    /// The named upload is not in flight on this route.
+    UploadNotFound,
     /// Artifact ingestion is fail-closed until the store reopens.
     IngestionFailClosed,
-    /// The upload coordinator has no room for another staged upload.
-    QueueFull,
     /// An artifact is referenced but not live, or the payload holds a secret
     /// the redactor cannot rewrite.
     ArtifactUnusable,
@@ -130,10 +154,10 @@ impl From<KernelError> for KernelOutcome {
             KernelError::Conflict => Self::conflict(ConflictReason::KnownAsOfAdvanced),
             KernelError::InvalidInput => Self::invalid(InvalidReason::InvalidInput),
             KernelError::AdmissionPolicy => Self::invalid(InvalidReason::AdmissionPolicy),
-            // Backup, restore, checkpoint, and lookup outcomes have no `kernel.*`
-            // route that can produce them.
-            KernelError::NotFound
-            | KernelError::InvalidCheckpoint
+            KernelError::NotFound => Self::invalid(InvalidReason::NotFound),
+            // Only the backup, restore, and checkpoint APIs raise these, and no
+            // `kernel.*` route calls those APIs.
+            KernelError::InvalidCheckpoint
             | KernelError::UnsafeDestination
             | KernelError::InvalidBackup
             | KernelError::InvalidRestore => Self::invalid(InvalidReason::Internal),
@@ -157,6 +181,10 @@ impl From<ArtifactErrorKind> for KernelOutcome {
                 Self::unavailable(UnavailableReason::StoreUnavailable)
             }
             ArtifactErrorKind::PayloadTooLarge => Self::invalid(InvalidReason::PayloadTooLarge),
+            ArtifactErrorKind::OperationKeyReused => {
+                Self::invalid(InvalidReason::OperationKeyReused)
+            }
+            ArtifactErrorKind::StorageConstraint => Self::invalid(InvalidReason::AlreadyExists),
             ArtifactErrorKind::InvalidInput
             | ArtifactErrorKind::TextFieldTooLong
             | ArtifactErrorKind::DetectionLimit => Self::invalid(InvalidReason::InvalidInput),
@@ -217,6 +245,8 @@ mod tests {
         ArtifactErrorKind::DetectionLimit,
         ArtifactErrorKind::TextFieldTooLong,
         ArtifactErrorKind::InvalidInput,
+        ArtifactErrorKind::OperationKeyReused,
+        ArtifactErrorKind::StorageConstraint,
         ArtifactErrorKind::PurgeIntent,
         ArtifactErrorKind::PurgeUnlinkPending,
     ];

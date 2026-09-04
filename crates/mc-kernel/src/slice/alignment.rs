@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// `commit_affects_alignment` and `insert_observation` both gate on this kind,
 /// so a second alignment-relevant kind added to the query below has to change
 /// this constant with it.
-pub(crate) const ALIGNMENT_DEPENDENCY_KIND: &str = "implements";
+pub const ALIGNMENT_DEPENDENCY_KIND: &str = "implements";
 
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};

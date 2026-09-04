@@ -141,7 +141,7 @@ pub struct ArtifactHandle {
 }
 
 /// Destination considered by artifact egress eligibility checks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArtifactDestination {
     Local,
     Remote,
@@ -167,6 +167,15 @@ pub enum ArtifactEligibility {
     Denied(EligibilityDeniedReason),
 }
 
+/// An egress verdict and the class it was derived from, read in one snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactEgressFacts {
+    pub eligibility: ArtifactEligibility,
+    /// The restrictive fold over every live reference to the digest; `None`
+    /// when no live reference exists or the digest is tombstoned.
+    pub stored_class: Option<(Sensitivity, ProviderEgress)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactErrorKind {
     PayloadTooLarge,
@@ -186,6 +195,13 @@ pub enum ArtifactErrorKind {
     DetectionLimit,
     TextFieldTooLong,
     InvalidInput,
+    /// The intent's `operation_key` already carries a receipt for a different
+    /// `request_digest`; no retry with this key can succeed.
+    OperationKeyReused,
+    /// A database constraint rejected the reference: an `object_id` or
+    /// `evidence_id` the registry already holds, or a reference to a row that
+    /// does not exist. Retrying the same request cannot succeed.
+    StorageConstraint,
     PurgeIntent,
     PurgeUnlinkPending,
 }
@@ -346,6 +362,12 @@ impl fmt::Display for ArtifactErrorMessage<'_> {
             ArtifactErrorKind::PurgeUnlinkPending => {
                 formatter.write_str("artifact purge committed with durable unlink pending")
             }
+            ArtifactErrorKind::OperationKeyReused => {
+                formatter.write_str("operation key already used with a different request digest")
+            }
+            ArtifactErrorKind::StorageConstraint => {
+                formatter.write_str("artifact reference violates a storage constraint")
+            }
         }
     }
 }
@@ -359,6 +381,7 @@ pub use deletion::{
 #[cfg(feature = "test-support")]
 pub use gc::ArtifactGcFault;
 pub use gc::ArtifactGcResult;
+pub(crate) use read::egress_facts_tx;
 
 impl fmt::Debug for ArtifactError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -444,7 +467,7 @@ pub(super) fn read_capped(source: impl std::io::Read) -> std::io::Result<Option<
     Ok(Some(bytes))
 }
 
-pub(super) fn is_artifact_digest(value: &str) -> bool {
+pub(crate) fn is_artifact_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
