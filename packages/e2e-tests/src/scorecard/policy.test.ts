@@ -90,6 +90,11 @@ describe("parseScorecardPolicy", () => {
 
     it("rejects unknown metric slot ids and non-utility secondary slots", () => {
         expectRejects(policyFixture({ requiredMetricSlots: ["headline-score" as never] }), "policy.requiredMetricSlots[0]: enum-invalid");
+        // A slot no lane produces can never be measured, so a policy requiring it could never be satisfied.
+        expectRejects(
+            policyFixture({ requiredMetricSlots: ["valid-success-delta-mc-on-vs-mc-off", "post-compaction-probe-accuracy"] }),
+            "policy.requiredMetricSlots: slot-unproduced",
+        );
         expectRejects(policyFixture({ secondaryMetricSlots: ["recall-at-10-explicit" as never] }), "policy.secondaryMetricSlots[0]: enum-invalid");
         expect(new Set(METRIC_SLOT_IDS).size).toBe(METRIC_SLOT_IDS.length);
     });
