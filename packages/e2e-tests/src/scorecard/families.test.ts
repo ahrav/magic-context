@@ -92,8 +92,12 @@ describe("buildScoreFamilies", () => {
         expect(value(families.retrieval.slots, "recall-at-10-explicit")).toBeCloseTo(0.75);
         expect(value(families.retrieval.slots, "duplicate-rate-at-50-explicit")).toBeCloseTo(0.3);
         expect(value(families.retrieval.slots, "ndcg-at-10-automatic")).toBeCloseTo(0.25);
-        expect(slot(families.retrieval.slots, "duplicate-rate-at-50-automatic")).toMatchObject({ status: "not-measured", reason: "no-holdout-queries" });
+        expect(slot(families.retrieval.slots, "duplicate-rate-at-50-automatic")).toMatchObject({ status: "not-measured", reason: "metric-undefined" });
         expect(slot(families.retrieval.slots, "currentness")).toMatchObject({ reason: "producer-pending" });
+        const explicitOnly = retrievalReportFixture({ scenarios: [retrievalScenarioFixture("case-1:q-1", { mode: "explicit" })] });
+        const automaticSlots = buildScoreFamilies(bundleFixture({ lanes: { retrieval: explicitOnly } })).retrieval.slots;
+        expect(slot(automaticSlots, "recall-at-10-automatic")).toMatchObject({ status: "not-measured", reason: "no-holdout-queries" });
+        expect(slot(automaticSlots, "duplicate-rate-at-50-automatic")).toMatchObject({ status: "not-measured", reason: "no-holdout-queries" });
     });
 
     it("weights the duplicate rate by paraphrase group and drops lane-restricted cases like its sibling slots", () => {

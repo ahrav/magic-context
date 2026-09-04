@@ -367,6 +367,11 @@ export function estimateKey(row: { endpoint: PrimaryEndpoint; familyId: string }
     return tupleKey(row.endpoint, row.familyId);
 }
 
+/** Every gate that is not `passed` blocks promotion: `not-observed` and `errored` count as failures, not as unknowns. */
+export function hardGateFailures(rows: readonly GateRow[]): GateId[] {
+    return rows.filter((row) => row.status !== "passed").map((row) => row.gateId).sort();
+}
+
 /** Whether every row and slot the policy requires supports promotion. Recomputed by the parser so a report cannot claim what its own rows deny. */
 export function deriveOutcome(input: {
     gates: readonly GateRow[];
@@ -377,7 +382,7 @@ export function deriveOutcome(input: {
     adverseDeltas: readonly AdverseRow[];
     maxToleratedRegressions: number;
 }): ScorecardReportBody["outcome"] {
-    const hardGateFailures = input.gates.filter((row) => row.status !== "passed").map((row) => row.gateId).sort();
+    const failures = hardGateFailures(input.gates);
     const measured = new Set(input.families.flatMap((family) => family.slots)
         .filter((slot) => slot.status === "measured").map((slot) => slot.id));
     // A pinned baseline that did not load leaves the release-over-release comparison unmade.
@@ -386,11 +391,11 @@ export function deriveOutcome(input: {
         && input.requiredMetricSlots.every((slot) => measured.has(slot));
     const blockingRegressionCount = input.adverseDeltas.filter((row) => row.blocking).length;
     return {
-        promotionAllowed: hardGateFailures.length === 0
+        promotionAllowed: failures.length === 0
             && mandatoryEvidenceComplete
             && blockingRegressionCount <= input.maxToleratedRegressions,
         mandatoryEvidenceComplete,
-        hardGateFailures,
+        hardGateFailures: failures,
         blockingRegressionCount,
     };
 }

@@ -1,7 +1,7 @@
 import { compareCodeUnits } from "../code-unit-order";
 import type { RawRegretLadder } from "../paired-delta/report";
 import { laneEvidence, type BaselineEvidence, type ScorecardEvidenceBundle } from "./evidence";
-import { estimateId, estimateKey, type AdverseRow, type BaselineStatus, type DeltaRow, type FamilyEstimateRow } from "./report-contract";
+import { estimateId, estimateKey, type AdverseRow, type BaselineStatus, type DeltaRow, type FamilyEstimateRow, type LaneStatus } from "./report-contract";
 
 export interface BaselineEstimates {
     status: BaselineStatus;
@@ -10,6 +10,15 @@ export interface BaselineEstimates {
 
 export function baselineEstimates(baseline: BaselineEvidence): BaselineEstimates {
     return { status: baseline.status, familyEstimates: baseline.report?.body.utility.familyEstimates ?? [] };
+}
+
+/**
+ * An empty `familyEstimates` under a paired-delta lane that is not `present` is absence of evidence,
+ * not a release that estimated nothing, so the comparison must not read it as every family vanishing.
+ */
+export interface CurrentEstimates {
+    status: LaneStatus;
+    familyEstimates: readonly FamilyEstimateRow[];
 }
 
 export interface Comparison {
@@ -57,36 +66,38 @@ function compareAdverseRows(left: AdverseRow, right: AdverseRow): number {
 }
 
 /**
- * Pairs every current `(endpoint, estimate family)` estimate with the baseline scorecard's row for
- * the same key. A pair whose shifted interval lies wholly below zero is adverse; a key the baseline
- * carried but the current release does not is a blocking `family-missing` row.
+ * Pairs current and baseline estimates by `(endpoint, familyId)`. Only a `present` current lane can
+ * drop a key the baseline estimated; a lane that did not finish yields a limitation instead of
+ * `family-missing` rows, because those rows would count an evidence gap as regressions.
  */
-export function compareWithBaseline(current: readonly FamilyEstimateRow[], baseline: BaselineEstimates): Comparison {
+export function compareWithBaseline(current: CurrentEstimates, baseline: BaselineEstimates): Comparison {
+    const limitations: string[] = [];
+    if (current.status !== "present") limitations.push("current-estimates-unavailable");
     if (baseline.status !== "present") {
+        limitations.push(baseline.status === "absent" ? "no-baseline" : "baseline-not-comparable");
         return {
-            deltas: current.map((row) => ({ endpoint: row.endpoint, familyId: row.familyId, status: "no-baseline", value: row.pointEstimate })),
+            deltas: current.familyEstimates.map((row) => ({ endpoint: row.endpoint, familyId: row.familyId, status: "no-baseline", value: row.pointEstimate })),
             adverseDeltas: [],
-            limitations: [baseline.status === "absent" ? "no-baseline" : "baseline-not-comparable"],
+            limitations,
         };
     }
     const baselineRows = new Map(baseline.familyEstimates.map((row) => [estimateKey(row), row]));
-    const deltas = current.map((row): DeltaRow => {
+    const deltas = current.familyEstimates.map((row): DeltaRow => {
         const matched = baselineRows.get(estimateKey(row));
         return matched === undefined
             ? { endpoint: row.endpoint, familyId: row.familyId, status: "no-baseline", value: row.pointEstimate }
             : compareRow(row, matched);
     });
-    const currentKeys = new Set(current.map(estimateKey));
-    const missing = baseline.familyEstimates.filter((row) => !currentKeys.has(estimateKey(row)));
+    const currentKeys = new Set(current.familyEstimates.map(estimateKey));
+    const missing = current.status === "present"
+        ? baseline.familyEstimates.filter((row) => !currentKeys.has(estimateKey(row)))
+        : [];
     const adverseDeltas = [
         ...deltas.filter((row): row is Extract<DeltaRow, { status: "compared" }> => row.status === "compared" && row.interval.upper < 0).map(adverseRow),
         ...missing.map(familyMissingRow),
     ].sort(compareAdverseRows);
-    return {
-        deltas,
-        adverseDeltas,
-        limitations: deltas.some((row) => row.status === "no-baseline") ? ["no-baseline-families"] : [],
-    };
+    if (deltas.some((row) => row.status === "no-baseline")) limitations.push("no-baseline-families");
+    return { deltas, adverseDeltas, limitations };
 }
 
 /** The paired-delta ladder runs only for coordinates the treatment arm failed, so its raw rows are already the failures-only decomposition. */

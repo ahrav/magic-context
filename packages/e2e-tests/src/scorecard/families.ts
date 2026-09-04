@@ -1,4 +1,4 @@
-import { aggregateReportQuality, type BenchmarkReport } from "../../../plugin/scripts/retrieval-benchmark/report";
+import { aggregateReportQuality } from "../../../plugin/scripts/retrieval-benchmark/report";
 import { gateAggregates, type MacroAggregate } from "../../../plugin/scripts/retrieval-benchmark/metrics";
 import { compareCodeUnits } from "../code-unit-order";
 import type { DreamerEvalRunReport } from "../dreamer-eval/contract";
@@ -116,15 +116,19 @@ const RETRIEVAL_AGGREGATE_FIELDS: Readonly<Record<string, keyof Pick<MacroAggreg
     "duplicate-rate-at-50": "duplicateRateAt50",
 };
 
-/** Every retrieval slot reads the lane's gate aggregate, so lane-restricted diagnostic cases and paraphrase weighting apply uniformly. */
-function retrievalReading(report: BenchmarkReport, id: MetricSlotId): Reading {
-    const match = RETRIEVAL_SLOT_RE.exec(id);
-    if (match === null) return PENDING;
-    const field = RETRIEVAL_AGGREGATE_FIELDS[match[1]!]!;
-    const mode = match[2]! as "explicit" | "automatic";
-    const aggregate = gateAggregates(aggregateReportQuality(report)).find((entry) => entry.mode === mode);
-    if (aggregate === undefined) return { reason: "no-holdout-queries" };
-    return ratio(aggregate[field], "no-holdout-queries");
+function retrievalReader(): Reader<"retrieval"> {
+    let aggregates: MacroAggregate[] | undefined;
+    return (report, id) => {
+        const match = RETRIEVAL_SLOT_RE.exec(id);
+        if (match === null) return PENDING;
+        const field = RETRIEVAL_AGGREGATE_FIELDS[match[1]!]!;
+        const mode = match[2]! as "explicit" | "automatic";
+        aggregates ??= gateAggregates(aggregateReportQuality(report));
+        const aggregate = aggregates.find((entry) => entry.mode === mode);
+        if (aggregate === undefined) return { reason: "no-holdout-queries" };
+        // A `null` field on an existing aggregate means the mode's holdout queries define no value for this metric.
+        return ratio(aggregate[field], "metric-undefined");
+    };
 }
 
 function pairedDeltaReliability(report: PairedDeltaReport, id: MetricSlotId): Reading {
@@ -189,6 +193,7 @@ export interface ScoreFamilies {
 
 export function buildScoreFamilies(bundle: ScorecardEvidenceBundle): ScoreFamilies {
     const pairedDelta = laneEvidence(bundle, "paired-delta");
+    const readRetrieval = retrievalReader();
     return {
         utility: {
             ...section("utility", (id) => laneSlot(bundle, "paired-delta", false, utilityReading, id)),
@@ -196,7 +201,7 @@ export function buildScoreFamilies(bundle: ScorecardEvidenceBundle): ScoreFamili
             familyEstimates: pairedDelta.status === "present" && pairedDelta.report !== null ? familyEstimateRows(pairedDelta.report) : [],
         },
         formation: section("formation", (id) => laneSlot(bundle, "historian", false, formationReading, id)),
-        retrieval: section("retrieval", (id) => laneSlot(bundle, "retrieval", false, retrievalReading, id)),
+        retrieval: section("retrieval", (id) => laneSlot(bundle, "retrieval", false, readRetrieval, id)),
         context: section("context", (id) => ({ id, status: "not-measured", reason: "producer-pending" })),
         reliability: section("reliability", (id) => reliabilitySlot(bundle, id)),
     };

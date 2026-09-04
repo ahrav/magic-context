@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { GATE_SOURCES, evaluateGates, hardGateFailures } from "./gates";
+import { GATE_SOURCES, evaluateGates } from "./gates";
 import { SCORECARD_GATE_IDS } from "./policy";
+import { hardGateFailures } from "./report-contract";
 import { bundleFixture, metamorphicReportFixture } from "./test-fixtures";
 
 describe("evaluateGates", () => {

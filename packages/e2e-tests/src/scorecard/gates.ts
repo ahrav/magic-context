@@ -64,7 +64,3 @@ export function evaluateGates(bundle: ScorecardEvidenceBundle): GateRow[] {
         }
     });
 }
-
-export function hardGateFailures(rows: readonly GateRow[]): GateId[] {
-    return rows.filter((entry) => entry.status !== "passed").map((entry) => entry.gateId).sort();
-}
