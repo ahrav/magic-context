@@ -2457,16 +2457,59 @@ fn debug_assert_served_columns(statement: &rusqlite::Statement<'_>) {
     if !cfg!(debug_assertions) {
         return;
     }
+    // Per-field checks catch swapped interior aliases that count and
+    // block-anchor checks miss.
     let expected = [
         (OWN_DECISION_COLUMNS.maturity, "d_maturity"),
-        (OWN_DECISION_COLUMNS.approval_object_id, "d_approval_object_id"),
+        (
+            OWN_DECISION_COLUMNS.effective_maturity,
+            "d_effective_maturity",
+        ),
+        (OWN_DECISION_COLUMNS.disposition, "d_disposition"),
+        (OWN_DECISION_COLUMNS.visibility, "d_visibility"),
+        (OWN_DECISION_COLUMNS.taint_class, "d_taint_class"),
+        (OWN_DECISION_COLUMNS.source_class, "d_source_class"),
+        (OWN_DECISION_COLUMNS.policy_revision, "d_policy_revision"),
+        (
+            OWN_DECISION_COLUMNS.sensitivity_class,
+            "d_sensitivity_class",
+        ),
+        (
+            OWN_DECISION_COLUMNS.approval_object_id,
+            "d_approval_object_id",
+        ),
         (LINEAGE_DECISION_COLUMNS.maturity, "s_maturity"),
-        (LINEAGE_DECISION_COLUMNS.approval_object_id, "s_approval_object_id"),
+        (
+            LINEAGE_DECISION_COLUMNS.effective_maturity,
+            "s_effective_maturity",
+        ),
+        (LINEAGE_DECISION_COLUMNS.disposition, "s_disposition"),
+        (LINEAGE_DECISION_COLUMNS.visibility, "s_visibility"),
+        (LINEAGE_DECISION_COLUMNS.taint_class, "s_taint_class"),
+        (LINEAGE_DECISION_COLUMNS.source_class, "s_source_class"),
+        (
+            LINEAGE_DECISION_COLUMNS.policy_revision,
+            "s_policy_revision",
+        ),
+        (
+            LINEAGE_DECISION_COLUMNS.sensitivity_class,
+            "s_sensitivity_class",
+        ),
+        (
+            LINEAGE_DECISION_COLUMNS.approval_object_id,
+            "s_approval_object_id",
+        ),
         (ACCEPTED_DECISION_COLUMN, "accepted_decision"),
         (HISTORY_SENSITIVITY_COLUMN, "history_sensitivity_class"),
         (OWN_HISTORY_INCONSISTENT_COLUMN, "own_history_inconsistent"),
         (SCOPE_ID_COLUMN, "scope_id"),
     ];
+    debug_assert_eq!(
+        statement.column_count(),
+        SCOPE_ID_COLUMN + 1,
+        "served_rows must select exactly {} columns",
+        SCOPE_ID_COLUMN + 1
+    );
     for (index, alias) in expected {
         debug_assert_eq!(
             statement.column_name(index).ok(),
