@@ -381,7 +381,7 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        let parsed = match serde_json::from_value::<BatchRequest>(request.clone()) {
+        let parsed = match BatchRequest::deserialize(request) {
             Ok(parsed) => parsed,
             Err(error) => {
                 return crate::invalid_params_error(format!("invalid {OPERATION}: {error}"))
