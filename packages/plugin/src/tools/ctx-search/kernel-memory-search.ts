@@ -25,15 +25,29 @@ export type KernelMemorySearchResult = MemorySearchResult | AntiMemorySearchResu
 export type KernelMemoryMatchType = "exact" | "lexical";
 
 const OBJECT_ID = /^mem_[0-9a-f]{32}$/;
+/** The `revisionLocator` shape search results emit: `<object id>@<created commit seq>`. */
+const REVISION_LOCATOR = /^(mem_[0-9a-f]{32})@\d+$/;
 
-/** Object ids when the whole query is a list of them; `null` for ordinary text. */
+/** The bare object id of an id or revision-locator token; `null` for ordinary text. */
+function objectIdFromToken(token: string): string | null {
+    if (OBJECT_ID.test(token)) return token;
+    return REVISION_LOCATOR.exec(token)?.[1] ?? null;
+}
+
+/** Object ids when the whole query is a list of ids or revision locators; `null` for ordinary text. A pasted locator resolves its object's current row: the commit-seq suffix names the revision the result was read from, and the store serves one live row per id. commentlint: allow(JUDGE) */
 export function parseObjectIdQuery(query: string): string[] | null {
     const tokens = query
         .trim()
         .split(/[\s,]+/)
         .filter(Boolean);
-    if (tokens.length === 0 || !tokens.every((token) => OBJECT_ID.test(token))) return null;
-    return [...new Set(tokens)];
+    if (tokens.length === 0) return null;
+    const ids: string[] = [];
+    for (const token of tokens) {
+        const id = objectIdFromToken(token);
+        if (id === null) return null;
+        ids.push(id);
+    }
+    return [...new Set(ids)];
 }
 
 function queryTerms(query: string): string[] {

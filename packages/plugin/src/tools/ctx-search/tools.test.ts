@@ -454,6 +454,37 @@ describe("createCtxSearchTools", () => {
         }
     });
 
+    it("resolves a pasted revision locator from the daemon without calling unifiedSearch", async () => {
+        const harness = kernelHarness();
+        const seeded = harness.kernel.seedDecision({
+            object_id: OBJECT_A,
+            decision_kind: "ARCHITECTURE",
+            summary: "Locator round trip.",
+        });
+        const searchSpy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => {
+            throw new Error("unifiedSearch must not run for locator queries");
+        });
+        try {
+            const tools = createCtxSearchTools({
+                db,
+                kernelClient: harness.kernelClient,
+                resolveProjectPath: () => "git:repo-project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+            const result = await tools.ctx_search.execute(
+                { query: `${seeded.object_id}@${seeded.created_commit_seq}` },
+                toolContext(),
+            );
+            expect(result).toContain("[1] [memory]");
+            expect(result).toContain(`id=${OBJECT_A}`);
+            expect(result).toContain("Locator round trip.");
+        } finally {
+            searchSpy.mockRestore();
+        }
+    });
+
     it("renders the state text when the memory source is not available", async () => {
         const harness = kernelHarness();
         harness.kernel.surfaceStates.set("explicit_search", {

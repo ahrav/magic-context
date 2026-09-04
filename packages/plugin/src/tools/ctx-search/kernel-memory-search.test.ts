@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { renderAntiMemoryContent } from "../../features/magic-context/memory/anti-memory-content";
 import { ANTI_MEMORY_CATEGORY } from "../../features/magic-context/memory/constants";
 import type { ReadRow } from "../../shared/kernel-client";
-import { memoryResultFromRow, searchKernelMemoryRows } from "./kernel-memory-search";
+import {
+    memoryResultFromRow,
+    parseObjectIdQuery,
+    searchKernelMemoryRows,
+} from "./kernel-memory-search";
 
 const OBJECT_A = `mem_${"a".repeat(32)}`;
 const OBJECT_B = `mem_${"b".repeat(32)}`;
@@ -210,6 +214,34 @@ describe("searchKernelMemoryRows baseline exclusion", () => {
             excludeObjectIds,
         });
         expect(hits?.map((hit) => hit.publicClaimId)).toEqual([OBJECT_B]);
+    });
+});
+
+describe("parseObjectIdQuery revision-locator round-trip", () => {
+    test("a pasted result revisionLocator resolves through the exact object-id path", () => {
+        const row = readRow({
+            objectId: OBJECT_A,
+            decisionKind: "PROJECT_RULES",
+            summary: "the historian runs on a lease",
+            seq: 7,
+        });
+        const locator = memoryResultFromRow(row, 1, "exact").revisionLocator;
+        expect(locator).toBe(`${OBJECT_A}@7`);
+        const hits = searchKernelMemoryRows({ rows: [row], query: locator, limit: 5 });
+        expect(hits?.map((hit) => [hit.publicClaimId, hit.matchType])).toEqual([
+            [OBJECT_A, "exact"],
+        ]);
+    });
+
+    test("bare ids and locators mix in one query and deduplicate to the same object", () => {
+        expect(parseObjectIdQuery(`${OBJECT_A}@3 ${OBJECT_B}`)).toEqual([OBJECT_A, OBJECT_B]);
+        expect(parseObjectIdQuery(`${OBJECT_A} ${OBJECT_A}@3`)).toEqual([OBJECT_A]);
+    });
+
+    test("a malformed locator keeps the query ordinary text", () => {
+        expect(parseObjectIdQuery(`${OBJECT_A}@`)).toBeNull();
+        expect(parseObjectIdQuery(`${OBJECT_A}@r1`)).toBeNull();
+        expect(parseObjectIdQuery(`mcm_${"a".repeat(32)}/r1/${"0".repeat(64)}`)).toBeNull();
     });
 });
 

@@ -482,6 +482,22 @@ describe("ctx_memory lifecycle and merge", () => {
 });
 
 describe("ctx_memory merge category and sensitivity fences", () => {
+    test("merge rejects a duplicated target naming the id, before any read or commit", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        kernel.seedDecision({ object_id: "mem_b", decision_kind: "ARCHITECTURE", summary: "B." });
+        const tool = harness(kernel);
+        expect(
+            await tool.execute(
+                { action: "merge", objectIds: ["mem_a", "mem_a", "mem_b"], content: "AB." },
+                "call-merge-duplicate",
+            ),
+        ).toBe("Error: merge requires distinct objectIds; duplicated: mem_a");
+        expect(tool.transport.methods()).not.toContain("kernel.commit");
+        expect(kernel.objects.get("mem_a")?.invalidated_commit_seq).toBeNull();
+        expect(kernel.objects.get("mem_b")?.invalidated_commit_seq).toBeNull();
+    });
+
     test("merge refuses predecessors from different categories before any commit", async () => {
         const kernel = new FakeKernel();
         kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
