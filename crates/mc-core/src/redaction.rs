@@ -239,6 +239,11 @@ impl Redactor {
     /// Scans text produced by `String::from_utf8_lossy`, one window at a time,
     /// because invalid bytes expand to three-byte replacement characters.
     pub fn detect_windowed_bytes(&self, bytes: &[u8]) -> Result<bool, RedactionError> {
+        // Valid UTF-8 decodes to itself, so the windows are slices of the input
+        // rather than copies; the slide arithmetic below is the copying loop's.
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            return self.detect_sliding(text);
+        }
         let mut scan = WindowScan::new(self);
         let mut buffer = String::with_capacity(MAX_REDACTABLE_BYTES.min(bytes.len() + 3));
         // Byte offset of `buffer[0]` in the lossy text; zero marks the text's real left edge.
@@ -266,6 +271,36 @@ impl Redactor {
             }
         }
         Ok(!scan.findings(&buffer, start, true)?.is_empty())
+    }
+
+    /// Slides a window over `text` exactly as the copying loop in
+    /// [`Self::detect_windowed_bytes`] does: fill to `MAX_REDACTABLE_BYTES` on a
+    /// char boundary, scan, keep the last `WINDOW_OVERLAP_BYTES`, repeat.
+    fn detect_sliding(&self, text: &str) -> Result<bool, RedactionError> {
+        let mut scan = WindowScan::new(self);
+        let mut start = 0usize;
+        let mut end = 0usize;
+        loop {
+            let filled = char_floor(text, start.saturating_add(MAX_REDACTABLE_BYTES));
+            if filled == end && end < text.len() {
+                if !scan
+                    .findings(window(text, start, end)?, start, false)?
+                    .is_empty()
+                {
+                    return Ok(true);
+                }
+                let window = window(text, start, end)?;
+                start += char_floor(window, window.len().saturating_sub(WINDOW_OVERLAP_BYTES));
+                continue;
+            }
+            end = filled;
+            if end >= text.len() {
+                break;
+            }
+        }
+        Ok(!scan
+            .findings(window(text, start, end)?, start, true)?
+            .is_empty())
     }
 }
 
