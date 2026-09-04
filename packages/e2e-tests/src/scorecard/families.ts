@@ -5,7 +5,7 @@ import type { DreamerEvalRunReport } from "../dreamer-eval/contract";
 import type { LaneReport as HistorianReport } from "../historian-eval/scorer";
 import type { IncidentPoolReport } from "../incident-pool/report";
 import type { PairedDeltaReport } from "../paired-delta/report";
-import { laneEvidence, type LaneReports, type ScorecardEvidenceBundle } from "./evidence";
+import { interruptedOnThisTarget, laneEvidence, type LaneReports, type ScorecardEvidenceBundle } from "./evidence";
 import {
     PRIMARY_ENDPOINT_SLOTS,
     SECONDARY_SLOT_SOURCES,
@@ -40,10 +40,13 @@ function count(value: number): Reading {
 
 type Reader<L extends LaneId> = (report: LaneReports[L], id: MetricSlotId) => Reading;
 
-/** A lane that did not finish contributes only to reliability, so `allowIncomplete` is set by that family alone. */
+/**
+ * A lane that did not finish contributes only to reliability, so `allowIncomplete` is set by that family alone,
+ * and only for a run interrupted on this target: counts from a report that names another build stay unmeasured.
+ */
 function laneSlot<L extends LaneId>(bundle: ScorecardEvidenceBundle, lane: L, allowIncomplete: boolean, read: Reader<L>, id: MetricSlotId): MetricSlot {
     const evidence = laneEvidence(bundle, lane);
-    const usable = evidence.status === "present" || (allowIncomplete && evidence.status === "incomplete");
+    const usable = evidence.status === "present" || (allowIncomplete && interruptedOnThisTarget(evidence));
     if (!usable || evidence.report === null || evidence.reportFingerprint === null) {
         return { id, status: "not-measured", reason: evidence.status === "incomplete" ? "lane-incomplete" : "lane-missing" };
     }

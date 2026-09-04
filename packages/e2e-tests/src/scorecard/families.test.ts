@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { buildScoreFamilies, familyEstimateRows } from "./families";
-import { SCORE_FAMILY_IDS, SLOT_IDS_BY_FAMILY, type MetricSlotId } from "./policy";
+import { SCORE_FAMILY_IDS, SLOT_CONTRACTS, SLOT_IDS_BY_FAMILY, type MetricSlotId } from "./policy";
 import type { MetricSlot } from "./report-contract";
 import {
     bundleFixture,
@@ -50,6 +50,26 @@ describe("buildScoreFamilies", () => {
         expect(families.utility.familyEstimates).toEqual([]);
         expect(value(families.reliability.slots, "paired-delta-excluded-cells")).toBe(2);
         expect(value(families.reliability.slots, "paired-delta-planned-coordinates")).toBe(4);
+    });
+
+    it("keeps reliability counts unmeasured when an incomplete lane's report may describe another target", () => {
+        for (const diagnostics of [["pre-registration-mismatch"], ["run-incomplete", "build-identity-mismatch"]]) {
+            const families = buildScoreFamilies(bundleFixture({ statuses: { "paired-delta": "incomplete" }, diagnostics: { "paired-delta": diagnostics } }));
+            for (const id of ["paired-delta-excluded-cells", "paired-delta-planned-coordinates", "paired-delta-healthy-coordinates"] as const) {
+                expect(slot(families.reliability.slots, id)).toEqual({ id, status: "not-measured", reason: "lane-incomplete" });
+            }
+        }
+    });
+
+    it("marks a slot produced exactly when a present lane set measures it", () => {
+        // `produced` must match whether a reader populates the slot; otherwise a policy can require unavailable evidence.
+        const families = buildScoreFamilies(bundleFixture());
+        for (const family of SCORE_FAMILY_IDS) {
+            for (const entry of families[family].slots) {
+                const pending = entry.status === "not-measured" && entry.reason === "producer-pending";
+                expect([entry.id, SLOT_CONTRACTS[entry.id].produced]).toEqual([entry.id, !pending]);
+            }
+        }
     });
 
     it("reads utility deltas, secondary arm metrics, and pending producers from a present paired-delta lane", () => {

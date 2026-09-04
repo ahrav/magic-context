@@ -122,8 +122,17 @@ function observedIdentity(parsed: ParsedLane): LaneIdentity | null {
     }
 }
 
-/** The one diagnostic `runIncompleteReasons` emits; a lane whose diagnostics are exactly this ran on the right build but stopped early. */
+/** The one diagnostic `runIncompleteReasons` emits. */
 export const RUN_INCOMPLETE = "run-incomplete";
+
+/**
+ * An `incomplete` lane whose only diagnostic is `run-incomplete` ran on the pinned build under the pinned
+ * policy and stopped early, so what it did record is evidence for this scorecard. Any other diagnostic
+ * (a build-identity mismatch, a conformance failure) means the report may describe a different target.
+ */
+export function interruptedOnThisTarget(evidence: LaneEvidence): boolean {
+    return evidence.status === "incomplete" && evidence.diagnostics.every((code) => code === RUN_INCOMPLETE);
+}
 
 /** Reason codes for a parsed report whose own run summary says the run did not finish. Empty when the lane completed. */
 function runIncompleteReasons(parsed: ParsedLane): string[] {
