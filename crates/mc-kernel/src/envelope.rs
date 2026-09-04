@@ -596,11 +596,8 @@ impl KernelStore {
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(map_sqlite)?;
         let tip = tx
-            .query_row(
-                "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
+            .prepare_cached("SELECT COALESCE(MAX(commit_seq),0) FROM commit_log")
+            .and_then(|mut statement| statement.query_row([], |row| row.get::<_, i64>(0)))
             .map_err(map_sqlite)?;
         if requested > tip {
             return Err(KernelError::FutureSnapshot);
