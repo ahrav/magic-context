@@ -1,4 +1,6 @@
-use aho_corasick::AhoCorasick;
+use std::sync::LazyLock;
+
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
 use regex::bytes::Captures;
 
 use crate::api::REVISION;
@@ -640,12 +642,40 @@ fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// The keyword alternation of every `magic-keyed-*` rule, as one case-insensitive
+/// automaton. Its Teddy prefilter skips the long keyword-free spans a sparse
+/// quote pair encloses; probing every byte with `keyed_keyword_at` cost more
+/// than the rest of the scan on such text.
+static KEYED_KEYWORDS: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    AhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostFirst)
+        .ascii_case_insensitive(true)
+        .kind(Some(AhoCorasickKind::DFA))
+        .build([
+            "auth",
+            "bearer",
+            "credential",
+            "key",
+            "password",
+            "secret",
+            "token",
+        ])
+        .expect("keyed keyword automaton")
+});
+
 fn contains_keyed_keyword(key: &[u8]) -> bool {
-    (0..key.len()).any(|index| keyed_keyword_at(key, index))
+    KEYED_KEYWORDS.is_match(key)
 }
 
 // `(?:[^QUOTE\\]|\\.)*` parses left to right into single bytes and `\x` pairs, so the keyword alternation can only start on one of those unit boundaries.
 fn quoted_key_contains_keyword(key: &[u8]) -> bool {
+    if !KEYED_KEYWORDS.is_match(key) {
+        return false;
+    }
+    // Without a backslash every byte starts a unit, so any occurrence qualifies.
+    if memchr::memchr(b'\\', key).is_none() {
+        return true;
+    }
     let mut index = 0;
     while index < key.len() {
         if key[index] == b'\\' {
