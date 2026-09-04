@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { LANE_IDS } from "./policy";
+import { LANE_IDS, SCORECARD_GATE_IDS } from "./policy";
 import {
+    GATE_SOURCE_LANES,
+    deriveOutcome,
     parseScorecardReport,
     type AdverseRow,
     type DeltaRow,
@@ -16,6 +18,8 @@ import { H2, H3, policyFixture, scorecardReportFixture } from "./test-fixtures";
 
 /** The paired-delta and metamorphic rows carry `FP`; every other present lane carries its own fingerprint. */
 const FP = "b".repeat(64);
+const INJECTION = SCORECARD_GATE_IDS.indexOf("gate-injection-promoted");
+const UNPRODUCED_GATES = SCORECARD_GATE_IDS.filter((gateId) => GATE_SOURCE_LANES[gateId] === null).sort();
 type ComparedDelta = Extract<DeltaRow, { status: "compared" }>;
 
 /** Re-signs `report` after `edit` mutates its body, so only the edited claim can make the parser refuse. */
@@ -30,8 +34,14 @@ function presentLane(row: EvidenceRow, index: number): EvidenceRow {
     return { ...row, status: "present", reportFingerprint: shared ? FP : String(index).repeat(64), diagnostics: [] };
 }
 
-const passedGate = (row: GateRow): GateRow =>
-    ({ ...row, status: "passed", observedCount: 0, evidenceFingerprint: FP, sourceLane: "metamorphic", diagnostic: null });
+/** Passes the one gate a lane produces and leaves the rest unobserved, as the gate evaluator does. */
+function observedGate(row: GateRow): GateRow {
+    return GATE_SOURCE_LANES[row.gateId] === null
+        ? { ...row, status: "not-observed", observedCount: null, evidenceFingerprint: null, sourceLane: null, diagnostic: "no-producing-lane" }
+        : { ...row, status: "passed", observedCount: 0, evidenceFingerprint: FP, sourceLane: "metamorphic", diagnostic: null };
+}
+
+const allPassed = (row: GateRow): GateRow => ({ ...row, status: "passed", observedCount: 0, evidenceFingerprint: FP, sourceLane: "metamorphic", diagnostic: null });
 
 const estimate = (familyId: string, pointEstimate: number, noiseLabel: FamilyEstimateRow["noiseLabel"] = "outside-floor"): FamilyEstimateRow =>
     ({ endpoint: "mc-on-vs-mc-off", familyId, pointEstimate, interval: { lower: pointEstimate - 0.1, upper: pointEstimate + 0.1 }, noiseLabel });
@@ -54,15 +64,15 @@ describe("parseScorecardReport", () => {
     const missingLanes = scorecardReportFixture(policy);
     const presentLanes = scorecardReportFixture(policy, {
         evidence: { lanes: missingLanes.body.evidence.lanes.map(presentLane), baseline: { status: "absent", reportFingerprint: null } },
-        safetyGates: missingLanes.body.safetyGates.map(passedGate),
+        safetyGates: missingLanes.body.safetyGates.map(observedGate),
     });
 
     it("round-trips a report whose outcome is derived from its rows", () => {
         expect(parseScorecardReport(missingLanes)).toEqual(missingLanes);
         expect(missingLanes.body.outcome).toMatchObject({ promotionAllowed: false, mandatoryEvidenceComplete: false });
         expect(parseScorecardReport(presentLanes)).toEqual(presentLanes);
-        // Every required slot is unmeasured.
-        expect(presentLanes.body.outcome).toMatchObject({ promotionAllowed: false, mandatoryEvidenceComplete: false, hardGateFailures: [] });
+        // Every required slot is unmeasured, and the four gates without a producing lane are hard-gate failures.
+        expect(presentLanes.body.outcome).toMatchObject({ promotionAllowed: false, mandatoryEvidenceComplete: false, hardGateFailures: UNPRODUCED_GATES });
     });
 
     it("recomputes the whole outcome from the restated policy terms", () => {
@@ -70,13 +80,13 @@ describe("parseScorecardReport", () => {
             edited(presentLanes, (body) => Object.assign(body.outcome, outcome));
         expect(() => parseScorecardReport(claim({ mandatoryEvidenceComplete: true }))).toThrow(/report.body.outcome: cross-field-invalid/);
         expect(() => parseScorecardReport(claim({ promotionAllowed: true, mandatoryEvidenceComplete: true }))).toThrow(/outcome: cross-field-invalid/);
-        expect(() => parseScorecardReport(edited(missingLanes, (body) => { body.outcome.hardGateFailures = []; }))).toThrow(/outcome: cross-field-invalid/);
+        expect(() => parseScorecardReport(claim({ hardGateFailures: [] }))).toThrow(/outcome: cross-field-invalid/);
         expect(() => parseScorecardReport(edited(missingLanes, (body) => { body.outcome.blockingRegressionCount = 1; }))).toThrow(/outcome: cross-field-invalid/);
         const unconstrained = scorecardReportFixture(policyFixture({ requiredMetricSlots: [] }), {
             evidence: presentLanes.body.evidence,
             safetyGates: presentLanes.body.safetyGates,
         });
-        expect(parseScorecardReport(unconstrained).body.outcome).toMatchObject({ promotionAllowed: true, mandatoryEvidenceComplete: true });
+        expect(parseScorecardReport(unconstrained).body.outcome).toMatchObject({ promotionAllowed: false, mandatoryEvidenceComplete: true, hardGateFailures: UNPRODUCED_GATES });
         expect(() => parseScorecardReport(edited(unconstrained, (body) => { body.target.maxToleratedRegressions = -1; }))).toThrow(/maxToleratedRegressions: integer-invalid/);
         expect(() => parseScorecardReport(edited(unconstrained, (body) => { body.target.requiredMetricSlots = ["currentness", "currentness"]; }))).toThrow(/requiredMetricSlots: duplicate/);
     });
@@ -93,8 +103,17 @@ describe("parseScorecardReport", () => {
         });
         expect(parseScorecardReport(regressed).body.outcome).toMatchObject({ promotionAllowed: false, blockingRegressionCount: 1, mandatoryEvidenceComplete: true });
         expect(() => parseScorecardReport(edited(regressed, (body) => { body.outcome.promotionAllowed = true; }))).toThrow(/outcome: cross-field-invalid/);
-        const tolerant = edited(regressed, (body) => { body.target.maxToleratedRegressions = 1; body.outcome.promotionAllowed = true; });
-        expect(parseScorecardReport(tolerant).body.outcome.promotionAllowed).toBe(true);
+        // With every gate passed the tolerance alone decides promotion.
+        const terms = {
+            gates: regressed.body.safetyGates.map(allPassed),
+            lanes: regressed.body.evidence.lanes,
+            baseline: "present" as const,
+            families: [regressed.body.utility, regressed.body.formation, regressed.body.retrieval, regressed.body.context, regressed.body.reliability],
+            requiredMetricSlots: [],
+            adverseDeltas: regressed.body.adverseDeltas,
+        };
+        expect(deriveOutcome({ ...terms, maxToleratedRegressions: 0 })).toMatchObject({ promotionAllowed: false, blockingRegressionCount: 1 });
+        expect(deriveOutcome({ ...terms, maxToleratedRegressions: 1 })).toMatchObject({ promotionAllowed: true, blockingRegressionCount: 1 });
     });
 
     it("derives the adverse rows from the compared deltas", () => {
@@ -121,7 +140,7 @@ describe("parseScorecardReport", () => {
             .toThrow(/deltas\[0\].noiseLabel: cross-field-invalid/);
         expect(() => parseScorecardReport(withBaseline({ utility: { ...presentLanes.body.utility, familyEstimates: current, deltas: deltas.slice(0, 1) } })))
             .toThrow(/deltas: estimate-mirror-invalid/);
-        // A delta that does not equal the current estimate minus the stated baseline point is refused, as is a shifted interval that does not.
+        // A delta or shifted interval that the current estimate and the stated baseline point do not produce is refused.
         const inflated = [{ ...deltas[0]!, delta: 0.1, interval: { lower: 0, upper: 0.2 } }, deltas[1]!];
         expect(() => parseScorecardReport(withBaseline({ utility: { ...presentLanes.body.utility, familyEstimates: current, deltas: inflated }, adverseDeltas: [] })))
             .toThrow(/deltas\[0\]: cross-field-invalid/);
@@ -148,8 +167,7 @@ describe("parseScorecardReport", () => {
             evidence: { lanes: presentLanes.body.evidence.lanes, baseline: { status: "present", reportFingerprint: H2 } },
             safetyGates: presentLanes.body.safetyGates,
         });
-        expect(loaded.body.evidence.baseline).toEqual({ status: "present", reportFingerprint: H2 });
-        expect(parseScorecardReport(loaded).body.outcome.promotionAllowed).toBe(true);
+        expect(parseScorecardReport(loaded).body.outcome.mandatoryEvidenceComplete).toBe(true);
         const unloaded = scorecardReportFixture(pinned, {
             evidence: { lanes: presentLanes.body.evidence.lanes, baseline: { status: "schema-mismatch", reportFingerprint: null } },
             safetyGates: presentLanes.body.safetyGates,
@@ -174,29 +192,44 @@ describe("parseScorecardReport", () => {
     });
 
     it("binds every observed gate to a present lane row with the same fingerprint", () => {
-        const gate = (edit: (row: GateRow) => void): ScorecardReport => edited(presentLanes, (body) => edit(body.safetyGates[0]!));
-        expect(() => parseScorecardReport(gate((row) => { row.evidenceFingerprint = "c".repeat(64); }))).toThrow(/safetyGates\[0\]: evidence-binding-invalid/);
+        const gate = (edit: (row: GateRow) => void): ScorecardReport => edited(presentLanes, (body) => edit(body.safetyGates[INJECTION]!));
+        expect(() => parseScorecardReport(gate((row) => { row.evidenceFingerprint = "c".repeat(64); }))).toThrow(/safetyGates\[2\]: evidence-binding-invalid/);
         expect(() => parseScorecardReport(edited(presentLanes, (body) => {
             const row = body.evidence.lanes[LANE_IDS.indexOf("metamorphic")]!;
             row.status = "incomplete";
             row.diagnostics = ["run-incomplete"];
-        }))).toThrow(/safetyGates\[0\]: evidence-binding-invalid/);
+            body.outcome.mandatoryEvidenceComplete = false;
+        }))).toThrow(/safetyGates\[2\]: evidence-binding-invalid/);
         const failed = gate((row) => { row.status = "failed"; row.observedCount = 2; row.evidenceFingerprint = "c".repeat(64); });
-        expect(() => parseScorecardReport(failed)).toThrow(/safetyGates\[0\]: evidence-binding-invalid/);
+        expect(() => parseScorecardReport(failed)).toThrow(/safetyGates\[2\]: evidence-binding-invalid/);
     });
 
     it("requires the gate row shape its status tags", () => {
-        const gate = (report: ScorecardReport, edit: (row: GateRow) => void): ScorecardReport => edited(report, (body) => edit(body.safetyGates[0]!));
-        expect(() => parseScorecardReport(gate(presentLanes, (row) => { row.diagnostic = "lane-missing"; }))).toThrow(/safetyGates\[0\]: evidence-shape-invalid/);
-        expect(() => parseScorecardReport(gate(missingLanes, (row) => { row.sourceLane = "metamorphic"; row.evidenceFingerprint = FP; }))).toThrow(/safetyGates\[0\]: evidence-shape-invalid/);
-        expect(() => parseScorecardReport(gate(missingLanes, (row) => { row.diagnostic = null; }))).toThrow(/safetyGates\[0\]: evidence-shape-invalid/);
+        const gate = (report: ScorecardReport, index: number, edit: (row: GateRow) => void): ScorecardReport => edited(report, (body) => edit(body.safetyGates[index]!));
+        expect(() => parseScorecardReport(gate(presentLanes, INJECTION, (row) => { row.diagnostic = "lane-missing"; }))).toThrow(/safetyGates\[2\]: evidence-shape-invalid/);
+        expect(() => parseScorecardReport(gate(missingLanes, 0, (row) => { row.sourceLane = "metamorphic"; row.evidenceFingerprint = FP; }))).toThrow(/safetyGates\[0\]: evidence-shape-invalid/);
+        expect(() => parseScorecardReport(gate(missingLanes, 0, (row) => { row.diagnostic = null; }))).toThrow(/safetyGates\[0\]: evidence-shape-invalid/);
     });
 
-    it("binds every measured slot to a parsed lane row and to the slot's unit and domain", () => {
+    it("restricts each observed gate to its producing lane", () => {
+        const incidentSourced = edited(presentLanes, (body) => {
+            const row = body.safetyGates[INJECTION]!;
+            row.sourceLane = "incident";
+            row.evidenceFingerprint = body.evidence.lanes[LANE_IDS.indexOf("incident")]!.reportFingerprint;
+        });
+        expect(() => parseScorecardReport(incidentSourced)).toThrow(/safetyGates\[2\].sourceLane: gate-producer-invalid/);
+        // A gate no lane produces cannot be observed, whichever lane a report names.
+        const forged = edited(presentLanes, (body) => {
+            body.safetyGates = body.safetyGates.map(allPassed);
+            body.outcome.hardGateFailures = [];
+        });
+        expect(() => parseScorecardReport(forged)).toThrow(/safetyGates\[0\].sourceLane: gate-producer-invalid/);
+    });
+
+    it("binds every measured slot to a parsed lane row and to the slot's unit, domain, and producer", () => {
         const measured = (slot: Partial<Extract<MetricSlot, { status: "measured" }>>): ScorecardReport => edited(presentLanes, (body) => {
             body.utility.slots[0] = { id: "valid-success-delta-mc-on-vs-mc-off", status: "measured", value: 0.25, unit: "delta", sourceLane: "paired-delta", sourceFingerprint: FP, ...slot };
             body.outcome.mandatoryEvidenceComplete = true;
-            body.outcome.promotionAllowed = true;
         });
         expect(parseScorecardReport(measured({})).body.outcome.mandatoryEvidenceComplete).toBe(true);
         expect(() => parseScorecardReport(measured({ sourceFingerprint: "c".repeat(64) }))).toThrow(/utility.slots\[0\]: evidence-binding-invalid/);
@@ -214,7 +247,6 @@ describe("parseScorecardReport", () => {
             row.status = "incomplete";
             row.diagnostics = ["run-incomplete"];
             body.outcome.mandatoryEvidenceComplete = false;
-            body.outcome.promotionAllowed = false;
         });
         expect(parseScorecardReport(incompleteSource).body.outcome.mandatoryEvidenceComplete).toBe(false);
         const rejectedSource = edited(incompleteSource, (body) => { body.evidence.lanes[LANE_IDS.indexOf("paired-delta")]!.status = "schema-mismatch"; });

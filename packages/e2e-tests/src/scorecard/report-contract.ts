@@ -35,6 +35,15 @@ export const SCORECARD_REPORT_SCHEMA = "scorecard-report/v1";
 export const GATE_STATUSES = ["passed", "failed", "not-observed", "errored"] as const;
 export type GateStatus = (typeof GATE_STATUSES)[number];
 
+/** The one lane whose report can observe each gate; `null` when no lane produces the gate's evidence, so it cannot be observed. */
+export const GATE_SOURCE_LANES: Readonly<Record<GateId, LaneId | null>> = {
+    "gate-cross-project-leak": null,
+    "gate-unrelated-scope-secret": null,
+    "gate-injection-promoted": "metamorphic",
+    "gate-false-enforced-policy": null,
+    "gate-database-corruption": null,
+};
+
 /** Flat on the wire: every key is present on every row, with `null` where the status carries no value. */
 export interface GateRow {
     gateId: GateId;
@@ -262,6 +271,7 @@ function parseGateRow(raw: unknown, index: number): GateRow {
     if (evidence.some((field) => (field !== null) !== observed) || (row.diagnostic !== null) === observed) {
         fail(`${label}: evidence-shape-invalid`);
     }
+    if (observed && row.sourceLane !== GATE_SOURCE_LANES[row.gateId]) fail(`${label}.sourceLane: gate-producer-invalid`);
     if (row.status === "passed" && row.observedCount !== 0) fail(`${label}: passed-with-observations`);
     if (row.status === "failed" && row.observedCount === 0) fail(`${label}: failed-without-observations`);
     return row;

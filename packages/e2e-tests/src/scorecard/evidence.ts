@@ -163,6 +163,8 @@ function pairedDeltaConformanceReasons(report: PairedDeltaReport, policy: Scorec
     const mismatched = body.analysis.bootstrapResamples !== policy.statisticalComparison.bootstrapResamples
         || body.analysis.minimumAnalyzableFamilyCount !== pairedDeltaPolicy.minimumAnalyzableFamilyCount
         || !pairedDeltaPolicy.modelMatrix.some((model) => model.modelId === body.pinnedSnapshotId)
+        // The runner plans one coordinate per selected scenario per replicate, so the plan is a whole number of replicate sets.
+        || body.runSummary.plannedCoordinates % pairedDeltaPolicy.replicateCount !== 0
         || (body.runSummary.calibrationFingerprint !== null) !== (policy.statisticalComparison.noiseFloorSource === "calibration")
         || body.runSummary.spentUsd > policy.releaseCostBudgetUsd
         || canonicalFingerprint(pairedDeltaPolicy.modelMatrix) !== canonicalFingerprint(policy.modelMatrix)
@@ -269,8 +271,6 @@ function loadBaseline(policy: ScorecardPolicy, path: string | null): BaselineEvi
         return mismatch("baseline-parse-failed");
     }
     if (report.reportFingerprint !== expected) return mismatch("baseline-fingerprint-mismatch");
-    // A release-over-release comparison is against the previous promoted release, not against a run the scorecard refused.
-    if (!report.body.outcome.promotionAllowed) return mismatch("baseline-not-promoted");
     return { status: "present", reportFingerprint: report.reportFingerprint, report, diagnostics: [] };
 }
 

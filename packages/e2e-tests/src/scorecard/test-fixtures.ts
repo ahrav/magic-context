@@ -535,21 +535,6 @@ export function scorecardReportFixture(policy: ScorecardPolicy = policyFixture()
     return { schema: SCORECARD_REPORT_SCHEMA, body, reportFingerprint: canonicalFingerprint(body) };
 }
 
-/** A promotable report under an unpinned policy that requires no slots: every lane present, every gate passed, no regressions. */
-export function promotedScorecardReportFixture(): ScorecardReport {
-    const policy = policyFixture({ requiredMetricSlots: [] });
-    const unmeasured = scorecardReportFixture(policy).body;
-    return scorecardReportFixture(policy, {
-        evidence: {
-            lanes: unmeasured.evidence.lanes.map((row, index) => ({ ...row, status: "present", reportFingerprint: String(index).repeat(64), diagnostics: [] })),
-            baseline: { status: "absent", reportFingerprint: null },
-        },
-        safetyGates: unmeasured.safetyGates.map((row) => ({
-            ...row, status: "passed", observedCount: 0, evidenceFingerprint: String(LANE_IDS.indexOf("metamorphic")).repeat(64), sourceLane: "metamorphic", diagnostic: null,
-        })),
-    });
-}
-
 // ---------------------------------------------------------------------------
 // A release-shaped directory tree: approved freeze manifest, both policy-owner
 // documents, the bound paired-delta policy, and one artifact per lane.

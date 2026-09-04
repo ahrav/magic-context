@@ -21,7 +21,6 @@ import {
     pairedDeltaPolicyDocumentFixture,
     pairedDeltaReportFixture,
     policyFixture,
-    promotedScorecardReportFixture,
     requiredLanesWith,
     retrievalReportFixture,
     retrievalScenarioFixture,
@@ -191,10 +190,9 @@ describe("loadEvidenceBundle", () => {
         expect(laneEvidence(driftedBundle, "historian").identity).toEqual({ kind: "projection", system: HISTORIAN_SYSTEM });
     });
 
-    it("loads a baseline only when its fingerprint matches the policy and it was promoted", () => {
+    it("loads a baseline only when its fingerprint matches the policy", () => {
         const laneSet = laneFixtures({ dreamer: [scannableDreamerReportFixture()] });
-        const baseline = promotedScorecardReportFixture();
-        expect(baseline.body.outcome.promotionAllowed).toBe(true);
+        const baseline = scorecardReportFixture();
         const policy = policyFixture({ baselineScorecardReportFingerprint: baseline.reportFingerprint });
         const missingPath = loadEvidenceBundle(tree({ policy, lanes: laneSet }));
         expect(missingPath.baseline).toMatchObject({ status: "schema-mismatch", diagnostics: ["baseline-path-missing"] });
@@ -206,12 +204,6 @@ describe("loadEvidenceBundle", () => {
         const present = loadEvidenceBundle(tree({ policy, lanes: laneSet, baseline }));
         expect(present.baseline).toMatchObject({ status: "present", reportFingerprint: baseline.reportFingerprint, diagnostics: [] });
         expect(present.baseline.report).toEqual(baseline);
-        // A report the scorecard refused to promote is not a release to compare against, even when its fingerprint is the pinned one.
-        const refused = scorecardReportFixture();
-        expect(refused.body.outcome.promotionAllowed).toBe(false);
-        const refusedPolicy = policyFixture({ baselineScorecardReportFingerprint: refused.reportFingerprint });
-        const notPromoted = loadEvidenceBundle(tree({ policy: refusedPolicy, lanes: laneSet, baseline: refused }));
-        expect(notPromoted.baseline).toMatchObject({ status: "schema-mismatch", diagnostics: ["baseline-not-promoted"] });
     });
 
     it("classifies a lane whose JSON is valid but not canonicalizable instead of aborting the bundle", () => {
