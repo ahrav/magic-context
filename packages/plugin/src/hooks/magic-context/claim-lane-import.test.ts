@@ -270,6 +270,59 @@ describe("claim-lane import", () => {
         expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
     });
 
+    test("a reauthorized shared claim re-imports under a fresh generation after its revocation", async () => {
+        const { db, kernel, client } = harness();
+        db.exec(
+            `INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+             VALUES (1, 'shared', 0, 0, '["CONSTRAINTS"]');
+             INSERT INTO workspace_members
+                 (workspace_id, project_path, display_name, display_path, added_at)
+             VALUES
+                 (1, '${PROJECT}', 'own', '${PROJECT}', 0),
+                 (1, '${OTHER_PROJECT}', 'foreign', '${OTHER_PROJECT}', 0);`,
+        );
+        const sharedId = seedClaim(
+            db,
+            OTHER_PROJECT,
+            "b",
+            "Shared constraint.",
+            "CONSTRAINTS",
+            "shareable",
+        );
+        const run = () =>
+            importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            });
+        expect(await run()).toBe("done");
+        const original = importedObjectId(sharedId, ROOT);
+        expect(kernel.liveRows().map((row) => row.object_id)).toContain(original);
+
+        db.exec(`UPDATE workspaces SET share_categories = '[]' WHERE id = 1`);
+        expect(await run()).toBe("done");
+        expect(kernel.liveRows().map((row) => row.object_id)).not.toContain(original);
+
+        // Reauthorization must restore the memory: the retired stable id is sticky, so the re-import lands under the next recorded generation.
+        db.exec(`UPDATE workspaces SET share_categories = '["CONSTRAINTS"]' WHERE id = 1`);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(false);
+        expect(await run()).toBe("done");
+        const regenerated = importedObjectId(sharedId, ROOT, 1);
+        const live = kernel.liveRows().map((row) => row.object_id);
+        expect(live).toContain(regenerated);
+        expect(live).not.toContain(original);
+        expect(
+            kernel.liveRows().find((row) => row.object_id === regenerated)?.decision?.payload
+                .summary,
+        ).toBe("Shared constraint.");
+
+        db.exec(`UPDATE workspaces SET share_categories = '[]' WHERE id = 1`);
+        expect(await run()).toBe("done");
+        expect(kernel.liveRows().map((row) => row.object_id)).not.toContain(regenerated);
+    });
+
     test("a foreign member's new shared claim invalidates the done marker and imports", async () => {
         const { db, kernel, client } = harness();
         db.exec(

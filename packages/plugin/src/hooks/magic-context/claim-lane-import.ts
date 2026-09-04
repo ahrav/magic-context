@@ -244,9 +244,64 @@ export function listClaimLaneMemories(
         .sort((left, right) => left.publicClaimId.localeCompare(right.publicClaimId));
 }
 
-/** Stable across runs so a partial import resumes; the root keeps ids distinct across kernel scopes because object ids are unique store-wide. commentlint: allow(JUDGE) */
-export function importedObjectId(publicClaimId: string, projectRoot: string): string {
-    return deriveObjectId("mem", CLAIM_LANE_IMPORT_SOURCE_ID, projectRoot, publicClaimId);
+/** Stable across runs so a partial import resumes; the root keeps ids distinct across kernel scopes because object ids are unique store-wide. A non-zero `generation` derives a fresh id for a claim re-imported after a policy revocation: retired ids are sticky in the registry, so the reauthorized claim needs an identity its own revocation has not burned. commentlint: allow(JUDGE) */
+export function importedObjectId(
+    publicClaimId: string,
+    projectRoot: string,
+    generation = 0,
+): string {
+    return generation === 0
+        ? deriveObjectId("mem", CLAIM_LANE_IMPORT_SOURCE_ID, projectRoot, publicClaimId)
+        : deriveObjectId(
+              "mem",
+              CLAIM_LANE_IMPORT_SOURCE_ID,
+              projectRoot,
+              publicClaimId,
+              `regen${generation}`,
+          );
+}
+
+const REGEN_PREFIX = "kernel_claim_lane_regen:";
+
+function regenKey(projectPath: string, projectRoot: string): string {
+    return `${REGEN_PREFIX}${sha256Hex(`${projectPath}\u001f${projectRoot}`).slice(0, 32)}`;
+}
+
+/** Revocation generations by public claim id: the importer records every policy revocation it performs so a later reauthorization can re-import under a fresh identity, while an archive the importer did not perform stays sticky. commentlint: allow(JUDGE) */
+export function readImportRegenerations(
+    db: Database,
+    projectPath: string,
+    projectRoot: string,
+): Record<string, number> {
+    if (!hasMetaTable(db)) return {};
+    const row = db
+        .prepare("SELECT value FROM context_store_meta WHERE key = ?")
+        .get(regenKey(projectPath, projectRoot)) as { value?: string } | undefined;
+    if (row?.value === undefined) return {};
+    try {
+        const parsed = JSON.parse(row.value) as Record<string, unknown>;
+        const generations: Record<string, number> = {};
+        for (const [publicId, generation] of Object.entries(parsed)) {
+            if (typeof generation === "number" && Number.isInteger(generation) && generation > 0) {
+                generations[publicId] = generation;
+            }
+        }
+        return generations;
+    } catch {
+        return {};
+    }
+}
+
+function writeImportRegenerations(
+    db: Database,
+    projectPath: string,
+    projectRoot: string,
+    generations: Record<string, number>,
+): void {
+    if (!hasMetaTable(db)) return;
+    db.prepare(
+        "INSERT INTO context_store_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    ).run(regenKey(projectPath, projectRoot), JSON.stringify(generations));
 }
 
 /** The lane keeps anti-memory expiry in a column while kernel read surfaces read it from the rendered "Expires at:" line, so the imported summary re-renders the lane payload with the lane's expiry. Content that does not parse as an anti-memory payload imports verbatim instead of aborting the lane. commentlint: allow(JUDGE) */
@@ -277,16 +332,27 @@ function claimAutoEligible(claim: ProjectMemoryClaimSnapshot): boolean {
 export function claimLaneImportSpec(
     claim: ProjectMemoryClaimSnapshot,
     projectRoot: string,
+    generation = 0,
 ): DecisionSpecInput {
     return {
-        decision_id: deriveObjectId(
-            "dec",
-            CLAIM_LANE_IMPORT_SOURCE_ID,
-            projectRoot,
-            claim.publicClaimId,
-            claim.revisionLocator,
-        ),
-        object_id: importedObjectId(claim.publicClaimId, projectRoot),
+        decision_id:
+            generation === 0
+                ? deriveObjectId(
+                      "dec",
+                      CLAIM_LANE_IMPORT_SOURCE_ID,
+                      projectRoot,
+                      claim.publicClaimId,
+                      claim.revisionLocator,
+                  )
+                : deriveObjectId(
+                      "dec",
+                      CLAIM_LANE_IMPORT_SOURCE_ID,
+                      projectRoot,
+                      claim.publicClaimId,
+                      claim.revisionLocator,
+                      `regen${generation}`,
+                  ),
+        object_id: importedObjectId(claim.publicClaimId, projectRoot, generation),
         domain_id: CTX_MEMORY_DOMAIN_ID,
         decision_kind: claim.category,
         payload: { summary: claimLaneImportSummary(claim), rationale: "" },
@@ -306,11 +372,12 @@ export function liveMemoryContentKeys(rows: readonly ReadRow[]): Set<string> {
     );
 }
 
-/** Import ids derivable from the project's own lane claims across every lifecycle state. Reconciliation excludes these so a lane lifecycle change on an own claim never reaches back into the kernel copy; `null` means the projection answered stale. commentlint: allow(JUDGE) */
+/** Import ids derivable from the project's own lane claims across every lifecycle state and revocation generation. Reconciliation excludes these so a lane lifecycle change on an own claim never reaches back into the kernel copy; `null` means the projection answered stale. commentlint: allow(JUDGE) */
 function listOwnClaimImportIds(
     db: Database,
     projectPath: string,
     projectRoot: string,
+    regenerations: Record<string, number>,
 ): Set<string> | null {
     if (!hasClaimMemoryFragment(db)) return new Set();
     const ws = claimLaneWorkspace(db, projectPath);
@@ -322,7 +389,30 @@ function listOwnClaimImportIds(
         lifecycleStates: CLAIM_MEMORY_LIFECYCLE_STATES,
     });
     if (result.status !== "ok") return null;
-    return new Set(result.items.map((item) => importedObjectId(item.publicClaimId, projectRoot)));
+    const ids = new Set<string>();
+    for (const item of result.items) {
+        for (const id of importIdsThroughGeneration(
+            item.publicClaimId,
+            projectRoot,
+            regenerations[item.publicClaimId] ?? 0,
+        )) {
+            ids.add(id);
+        }
+    }
+    return ids;
+}
+
+/** Every id this claim's imports have ever derived, oldest generation first. */
+function importIdsThroughGeneration(
+    publicClaimId: string,
+    projectRoot: string,
+    generation: number,
+): string[] {
+    const ids: string[] = [];
+    for (let current = 0; current <= generation; current += 1) {
+        ids.push(importedObjectId(publicClaimId, projectRoot, current));
+    }
+    return ids;
 }
 
 /** The marker is written only after every batch is `available` and only under the generation the run started at; a partial or fenced run resumes from the kernel's live rows. commentlint: allow(JUDGE) */
@@ -375,10 +465,14 @@ export async function importClaimLaneMemories(args: {
         return "deferred";
     }
     // Reconciliation retires foreign imports the current workspace policy no longer authorizes. Own-claim import ids (every lifecycle state) are excluded so the kernel keeps owning the lifecycle of the project's own bridged rows; a row outside both sets can only be a foreign import whose sharing was revoked or whose member left. commentlint: allow(JUDGE)
+    const regenerations = readImportRegenerations(db, projectPath, projectRoot);
+    const generationOf = (publicClaimId: string): number => regenerations[publicClaimId] ?? 0;
     const authorizedIds = new Set(
-        claims.map((claim) => importedObjectId(claim.publicClaimId, projectRoot)),
+        claims.map((claim) =>
+            importedObjectId(claim.publicClaimId, projectRoot, generationOf(claim.publicClaimId)),
+        ),
     );
-    const ownImportIds = listOwnClaimImportIds(db, projectPath, projectRoot);
+    const ownImportIds = listOwnClaimImportIds(db, projectPath, projectRoot, regenerations);
     if (ownImportIds === null) {
         sessionLog(
             sessionId,
@@ -386,15 +480,22 @@ export async function importClaimLaneMemories(args: {
         );
         return "deferred";
     }
-    // Reconciliation may touch only rows the importer derivably created: a revise or merge of an imported row writes a successor under an identity-derived id that no claim maps to, and retiring it would destroy a user's edit. The universe spans every project and lifecycle state so a removed member's imports stay reachable. commentlint: allow(JUDGE)
-    const derivableImportIds = new Set(
-        listAllPublicClaimIds(db).map((publicId) => importedObjectId(publicId, projectRoot)),
-    );
+    // Reconciliation may touch only rows the importer derivably created: a revise or merge of an imported row writes a successor under an identity-derived id that no claim maps to, and retiring it would destroy a user's edit. The universe spans every project, lifecycle state, and revocation generation so a removed member's imports stay reachable. commentlint: allow(JUDGE)
+    const claimIdByImportId = new Map<string, string>();
+    for (const publicId of listAllPublicClaimIds(db)) {
+        for (const id of importIdsThroughGeneration(
+            publicId,
+            projectRoot,
+            generationOf(publicId),
+        )) {
+            claimIdByImportId.set(id, publicId);
+        }
+    }
     const revocable = existing.rows.filter(
         (row) =>
             row.object.domain_id === CTX_MEMORY_DOMAIN_ID &&
             row.object.source_id === CLAIM_LANE_IMPORT_SOURCE_ID &&
-            derivableImportIds.has(row.object.object_id) &&
+            claimIdByImportId.has(row.object.object_id) &&
             !authorizedIds.has(row.object.object_id) &&
             !ownImportIds.has(row.object.object_id),
     );
@@ -413,6 +514,12 @@ export async function importClaimLaneMemories(args: {
             );
             return "deferred";
         }
+        // Recording the importer's own revocation is what makes it reversible: retired ids are sticky, so a reauthorized claim re-imports under the next generation, while an archive the importer never performed keeps its stable id burned. commentlint: allow(JUDGE)
+        const publicId = claimIdByImportId.get(row.object.object_id);
+        if (publicId !== undefined) {
+            regenerations[publicId] = generationOf(publicId) + 1;
+            writeImportRegenerations(db, projectPath, projectRoot, regenerations);
+        }
         revoked += 1;
     }
     const present = new Set(existing.rows.map((row) => row.object.object_id));
@@ -422,8 +529,13 @@ export async function importClaimLaneMemories(args: {
     const presentContent = liveMemoryContentKeys(existing.rows);
     const pending = claims.filter(
         (claim) =>
-            !present.has(importedObjectId(claim.publicClaimId, projectRoot)) &&
-            !presentContent.has(`${claim.category}\u001f${claimLaneImportSummary(claim)}`),
+            !present.has(
+                importedObjectId(
+                    claim.publicClaimId,
+                    projectRoot,
+                    generationOf(claim.publicClaimId),
+                ),
+            ) && !presentContent.has(`${claim.category}\u001f${claimLaneImportSummary(claim)}`),
     );
     let imported = 0;
     let retired = 0;
@@ -431,13 +543,21 @@ export async function importClaimLaneMemories(args: {
     // re-inserts as `already_exists`. Committing claims individually treats
     // that answer as already imported and keeps it from aborting later claims.
     for (const claim of pending) {
+        const claimGeneration = generationOf(claim.publicClaimId);
         const result = await client.commit({
             actor: CLAIM_LANE_IMPORT_ACTOR,
-            operationId: `import\u001f${claim.publicClaimId}\u001f${claim.revisionLocator}`,
+            // The generation rides in the operation key: a reauthorized re-import is a new operation, not a redelivery of the original insert, whose digest no longer matches. commentlint: allow(JUDGE)
+            operationId:
+                claimGeneration === 0
+                    ? `import\u001f${claim.publicClaimId}\u001f${claim.revisionLocator}`
+                    : `import\u001f${claim.publicClaimId}\u001f${claim.revisionLocator}\u001fregen${claimGeneration}`,
             cause: `claim-lane import ${claim.publicClaimId}`,
             sourceKind: "model",
             operations: [
-                { op: "insert_decision" as const, spec: claimLaneImportSpec(claim, projectRoot) },
+                {
+                    op: "insert_decision" as const,
+                    spec: claimLaneImportSpec(claim, projectRoot, claimGeneration),
+                },
             ],
         });
         if (!isAvailable(result)) {
