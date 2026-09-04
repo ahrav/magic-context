@@ -28,8 +28,8 @@ use serde_json::{json, Value};
 
 use super::project::IntentRequest;
 use super::{
-    blocking, kernel_response, state_only, InvalidReason, KernelOpenCoordinator, KernelOutcome,
-    UnavailableReason,
+    blocking, kernel_response, parse_request_body, state_only, InvalidReason,
+    KernelOpenCoordinator, KernelOutcome, UnavailableReason,
 };
 use crate::dispatch::PreparedOutcome;
 use crate::{sha256_hex, McHandler};
@@ -133,6 +133,7 @@ impl Default for StagingBudget {
 /// Everything `ArtifactIngestRequest` carries besides the intent and the
 /// bytes, as the wire spells it.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ArtifactRequest {
     evidence_id: String,
     object_id: String,
@@ -152,6 +153,7 @@ struct ArtifactRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProvenanceRequest {
     repository_id: String,
     revision: String,
@@ -166,6 +168,7 @@ fn parse_provider_egress(value: &str) -> Option<ProviderEgress> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BeginRequest {
     upload_id: String,
     total_bytes: u64,
@@ -176,6 +179,7 @@ struct BeginRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PageRequest {
     upload_id: String,
     index: u32,
@@ -184,6 +188,7 @@ struct PageRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FinishRequest {
     upload_id: String,
 }
@@ -582,15 +587,11 @@ impl McHandler {
     pub(crate) async fn handle_kernel_ingest_begin(
         &self,
         channel: RouteHandle,
-        request: &Value,
+        request: Value,
     ) -> PreparedOutcome {
-        let scope = match self.kernel_route_scope(channel, request, BEGIN) {
-            Ok(scope) => scope,
+        let (scope, parsed) = match self.kernel_request::<BeginRequest>(channel, request, BEGIN) {
+            Ok(bound) => bound,
             Err(outcome) => return outcome,
-        };
-        let parsed = match BeginRequest::deserialize(request) {
-            Ok(parsed) => parsed,
-            Err(error) => return crate::invalid_params_error(format!("invalid {BEGIN}: {error}")),
         };
         if parsed.upload_id.is_empty() || parsed.upload_id.len() > MAX_UPLOAD_ID_BYTES {
             return crate::invalid_params_error(format!(
@@ -676,9 +677,9 @@ impl McHandler {
         if let Err(outcome) = self.kernel_route_scope(channel, &request, PAGE) {
             return outcome;
         }
-        let parsed = match serde_json::from_value::<PageRequest>(request) {
+        let parsed = match parse_request_body::<PageRequest>(request, PAGE) {
             Ok(parsed) => parsed,
-            Err(error) => return crate::invalid_params_error(format!("invalid {PAGE}: {error}")),
+            Err(outcome) => return outcome,
         };
         if !is_sha256_hex(&parsed.page_digest) {
             return crate::invalid_params_error(format!(
@@ -769,15 +770,11 @@ impl McHandler {
     pub(crate) async fn handle_kernel_ingest_finish(
         &self,
         channel: RouteHandle,
-        request: &Value,
+        request: Value,
     ) -> PreparedOutcome {
-        let scope = match self.kernel_route_scope(channel, request, FINISH) {
-            Ok(scope) => scope,
+        let (scope, parsed) = match self.kernel_request::<FinishRequest>(channel, request, FINISH) {
+            Ok(bound) => bound,
             Err(outcome) => return outcome,
-        };
-        let parsed = match FinishRequest::deserialize(request) {
-            Ok(parsed) => parsed,
-            Err(error) => return crate::invalid_params_error(format!("invalid {FINISH}: {error}")),
         };
         let upload = match self
             .kernel

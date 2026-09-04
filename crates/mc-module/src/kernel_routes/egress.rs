@@ -38,6 +38,18 @@ pub enum RefusalReason {
 }
 
 impl RefusalReason {
+    /// Every refusal, so a wire test covers each one the route can answer.
+    pub const ALL: &'static [Self] = &[
+        Self::UnderDeclared,
+        Self::WrongScope,
+        Self::OwnerSensitive,
+        Self::Eligibility(EligibilityDeniedReason::UnknownSensitive),
+        Self::Eligibility(EligibilityDeniedReason::SensitiveRemote),
+        Self::Eligibility(EligibilityDeniedReason::ProviderRestricted),
+        Self::Eligibility(EligibilityDeniedReason::Secret),
+        Self::Eligibility(EligibilityDeniedReason::Tombstoned),
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::UnderDeclared => "under_declared",
@@ -93,6 +105,7 @@ pub fn decide_egress(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EgressRequest {
     artifact_digest: String,
     destination: String,
@@ -170,18 +183,13 @@ impl McHandler {
     pub(crate) async fn handle_kernel_egress_decide(
         &self,
         channel: RouteHandle,
-        request: &Value,
+        request: Value,
     ) -> PreparedOutcome {
-        let scope = match self.kernel_route_scope(channel, request, OPERATION) {
-            Ok(scope) => scope,
-            Err(outcome) => return outcome,
-        };
-        let parsed = match EgressRequest::deserialize(request) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                return crate::invalid_params_error(format!("invalid {OPERATION}: {error}"))
-            }
-        };
+        let (scope, parsed) =
+            match self.kernel_request::<EgressRequest>(channel, request, OPERATION) {
+                Ok(bound) => bound,
+                Err(outcome) => return outcome,
+            };
         let Some(destination) = parse_destination(&parsed.destination) else {
             return crate::invalid_params_error(format!(
                 "{OPERATION} destination must be local or remote"
@@ -309,16 +317,39 @@ mod tests {
     #[test]
     fn wire_shape_is_allowed_or_a_snake_case_refusal() {
         assert_eq!(EgressDecision::Allowed.to_json(), json!("allowed"));
-        assert_eq!(
-            EgressDecision::Refused(RefusalReason::UnderDeclared).to_json(),
-            json!({"refused": "under_declared"})
-        );
-        assert_eq!(
-            EgressDecision::Refused(RefusalReason::Eligibility(
-                EligibilityDeniedReason::UnknownSensitive
-            ))
-            .to_json(),
-            json!({"refused": "unknown_sensitive"})
-        );
+        let expected = [
+            (RefusalReason::UnderDeclared, "under_declared"),
+            (RefusalReason::WrongScope, "wrong_scope"),
+            (RefusalReason::OwnerSensitive, "owner_sensitive"),
+            (
+                RefusalReason::Eligibility(EligibilityDeniedReason::UnknownSensitive),
+                "unknown_sensitive",
+            ),
+            (
+                RefusalReason::Eligibility(EligibilityDeniedReason::SensitiveRemote),
+                "sensitive_remote",
+            ),
+            (
+                RefusalReason::Eligibility(EligibilityDeniedReason::ProviderRestricted),
+                "provider_restricted",
+            ),
+            (
+                RefusalReason::Eligibility(EligibilityDeniedReason::Secret),
+                "secret",
+            ),
+            (
+                RefusalReason::Eligibility(EligibilityDeniedReason::Tombstoned),
+                "tombstoned",
+            ),
+        ];
+        assert_eq!(expected.len(), RefusalReason::ALL.len());
+        for (reason, name) in expected {
+            assert!(RefusalReason::ALL.contains(&reason), "{name}");
+            assert_eq!(reason.as_str(), name);
+            assert_eq!(
+                EgressDecision::Refused(reason).to_json(),
+                json!({"refused": name})
+            );
+        }
     }
 }

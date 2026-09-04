@@ -1,5 +1,5 @@
-//! Numeric serving policy from kh8.1 R12d: a gated read past either lag
-//! threshold is served as stale or abstained rather than fresh.
+//! Numeric serving policy: a gated read past either lag threshold is served
+//! as stale or abstained rather than fresh.
 //!
 //! The store phase is judged before any read reaches this module, by
 //! [`super::KernelOpenCoordinator::kernel_store`]; the policy here starts from

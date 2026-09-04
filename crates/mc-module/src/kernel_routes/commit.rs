@@ -51,6 +51,7 @@ const PROJECTED_DEPENDENCY_KINDS: [&str; 2] = [
 ];
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CommitRequest {
     intent: IntentRequest,
     #[serde(default)]
@@ -66,13 +67,14 @@ struct CommitRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TokenRequest {
     object_id: String,
     known_as_of: i64,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
     InsertDecision {
         spec: DecisionRequest,
@@ -92,6 +94,7 @@ enum Operation {
 /// A decision as the wire carries it: `source_kind` comes from the request
 /// and `scope_id` from the binding, so neither is accepted per row.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DecisionRequest {
     decision_id: String,
     object_id: String,
@@ -131,6 +134,7 @@ impl DecisionRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ObservationRequest {
     observation_id: String,
     object_id: String,
@@ -153,6 +157,7 @@ struct ObservationRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DependencyRequest {
     dependency_object_id: String,
     dependency_kind: String,
@@ -354,20 +359,36 @@ fn admit(
     Ok(())
 }
 
-/// Materializes the project scope the first time an operation needs it; the
-/// check and the insert share the envelope's transaction, so two commits for
-/// a new project cannot both insert it.
+/// The domain every route-materialized project scope belongs to. Scopes are
+/// route-owned rows, so they hang off a route-owned domain that callers
+/// cannot write into. Scope rows created under an earlier layout keep their
+/// domain; the scope check compares terms only.
+const PROJECT_SCOPES_DOMAIN_ID: &str = "project-scopes";
+
+/// A caller-named domain; the route-owned one is refused as invalid input.
+fn caller_domain(domain_id: &str) -> Result<&str, KernelError> {
+    if domain_id == PROJECT_SCOPES_DOMAIN_ID {
+        return Err(KernelError::InvalidInput);
+    }
+    Ok(domain_id)
+}
+
+/// Materializes the project scope, and the route-owned domain it belongs to,
+/// the first time an operation needs it; the checks and the inserts share the
+/// envelope's transaction, so two commits for a new project cannot both
+/// insert either row.
 fn ensure_scope(
     envelope: &mut Envelope<'_>,
     project: &ProjectBinding,
-    domain_id: &str,
     ready: &mut bool,
+    domains_ready: &mut HashSet<String>,
     refused: &mut Option<CommitFailure>,
 ) -> Result<(), KernelError> {
     if *ready {
         return Ok(());
     }
-    let expected = project.scope_spec(domain_id);
+    ensure_domain(envelope, PROJECT_SCOPES_DOMAIN_ID, domains_ready)?;
+    let expected = project.scope_spec(PROJECT_SCOPES_DOMAIN_ID);
     match envelope.scope_terms(&expected.scope_id)? {
         None => {
             envelope.insert_scope(expected)?;
@@ -445,12 +466,16 @@ fn apply(
     for operation in &plan.operations {
         match operation {
             Operation::InsertDecision { spec } => {
-                ensure_domain(envelope, &spec.domain_id, &mut domains_ready)?;
+                ensure_domain(
+                    envelope,
+                    caller_domain(&spec.domain_id)?,
+                    &mut domains_ready,
+                )?;
                 ensure_scope(
                     envelope,
                     &plan.project,
-                    &spec.domain_id,
                     &mut scope_ready,
+                    &mut domains_ready,
                     refused,
                 )?;
                 let spec = spec.clone().into_spec(&plan.source_kind, &scope_id);
@@ -462,12 +487,16 @@ fn apply(
                 replaced_object_id,
                 spec,
             } => {
-                ensure_domain(envelope, &spec.domain_id, &mut domains_ready)?;
+                ensure_domain(
+                    envelope,
+                    caller_domain(&spec.domain_id)?,
+                    &mut domains_ready,
+                )?;
                 ensure_scope(
                     envelope,
                     &plan.project,
-                    &spec.domain_id,
                     &mut scope_ready,
+                    &mut domains_ready,
                     refused,
                 )?;
                 let predecessor = scoped_object_state(envelope, filter, replaced_object_id)?;
@@ -482,6 +511,17 @@ fn apply(
                         Some(state) => {
                             scoped_object_state(envelope, filter, &spec.object_id)?;
                             if state.object.invalidated_commit_seq.is_none() {
+                                // A fold discards the spec and keeps the
+                                // survivor's stored label, so the floor is
+                                // judged against that label instead.
+                                if state
+                                    .object
+                                    .sensitivity
+                                    .restrictive(predecessor.object.sensitivity)
+                                    != state.object.sensitivity
+                                {
+                                    return Err(KernelError::AdmissionPolicy);
+                                }
                                 (true, state.object.source_revision)
                             } else {
                                 (false, spec.source_revision)
@@ -493,7 +533,11 @@ fn apply(
                     *refused = Some(CommitFailure::RevisionNotAdvanced);
                     return Err(KernelError::Conflict);
                 }
-                let spec = spec.clone().into_spec(&plan.source_kind, &scope_id);
+                let mut spec = spec.clone().into_spec(&plan.source_kind, &scope_id);
+                // The label floor is enforced here as well as in the client:
+                // a successor may raise its predecessor's sensitivity but not
+                // lower it.
+                spec.sensitivity = spec.sensitivity.restrictive(predecessor.object.sensitivity);
                 let outcome = envelope.supersede_decision(replaced_object_id, spec)?;
                 if replacement_live {
                     result.merged.push(outcome.object_id.clone());
@@ -509,12 +553,16 @@ fn apply(
                 result.touched.push(object_id.clone());
             }
             Operation::InsertObservation { spec } => {
-                ensure_domain(envelope, &spec.domain_id, &mut domains_ready)?;
+                ensure_domain(
+                    envelope,
+                    caller_domain(&spec.domain_id)?,
+                    &mut domains_ready,
+                )?;
                 ensure_scope(
                     envelope,
                     &plan.project,
-                    &spec.domain_id,
                     &mut scope_ready,
+                    &mut domains_ready,
                     refused,
                 )?;
                 // The alignment projection pairs an observation with the
@@ -578,18 +626,13 @@ impl McHandler {
     pub(crate) async fn handle_kernel_commit(
         &self,
         channel: RouteHandle,
-        request: &Value,
+        request: Value,
     ) -> PreparedOutcome {
-        let scope = match self.kernel_route_scope(channel, request, OPERATION) {
-            Ok(scope) => scope,
-            Err(outcome) => return outcome,
-        };
-        let parsed = match CommitRequest::deserialize(request) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                return crate::invalid_params_error(format!("invalid {OPERATION}: {error}"))
-            }
-        };
+        let (scope, parsed) =
+            match self.kernel_request::<CommitRequest>(channel, request, OPERATION) {
+                Ok(bound) => bound,
+                Err(outcome) => return outcome,
+            };
         if parsed.operations.len() > MAX_OPERATIONS {
             return crate::invalid_params_error(format!(
                 "{OPERATION} carries at most {MAX_OPERATIONS} operations"

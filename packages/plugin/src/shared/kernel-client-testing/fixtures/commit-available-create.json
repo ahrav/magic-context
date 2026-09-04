@@ -1,0 +1,17 @@
+{
+  "known_as_of": 2,
+  "merged": [],
+  "receipt": {
+    "commit_seq": 2,
+    "replayed": false
+  },
+  "state": {
+    "kind": "available"
+  },
+  "tokens": [
+    {
+      "known_as_of": 2,
+      "object_id": "decision-object-1"
+    }
+  ]
+}
