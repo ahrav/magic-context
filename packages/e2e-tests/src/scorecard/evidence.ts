@@ -232,14 +232,19 @@ function loadPairedDeltaPolicy(path: string, expectedFingerprint: string): Paire
 
 type JsonArtifact = { kind: "missing" } | { kind: "unparseable" } | { kind: "json"; raw: unknown };
 
-/** Published reports are read whitespace-insensitively; their fingerprint is of the parsed value, not the bytes. */
+/**
+ * Published reports are read whitespace-insensitively; their fingerprint is of the parsed value, not the bytes.
+ * An absent file is a lane outcome. Any other read failure is an infrastructure fault, which must not read as a
+ * behavioral failure of the lane, so it aborts the bundle under the module's own error class.
+ */
 function readJsonArtifact(path: string): JsonArtifact {
     let text: string;
     try {
         text = readFileSync(path, "utf8");
     } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
-        throw error;
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") return { kind: "missing" };
+        throw new ScorecardContractError([`artifact: unreadable-${(code ?? "unknown").toLowerCase()}`]);
     }
     try {
         return { kind: "json", raw: JSON.parse(text) as unknown };

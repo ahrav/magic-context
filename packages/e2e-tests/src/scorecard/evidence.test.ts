@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -242,6 +242,15 @@ describe("loadEvidenceBundle", () => {
     it("refuses a paired-delta policy document that carries sensitive content", () => {
         const leaked = { ...pairedDeltaPolicyDocumentFixture(), owner: "/home/operator/magic-context-x4l.14" } as unknown as PolicyOwnerDocument;
         expect(() => loadEvidenceBundle(tree({ pairedDeltaPolicyDocument: leaked }))).toThrow(/paired-delta-policy: privacy-rejected/);
+    });
+
+    it("aborts the bundle under the scorecard error class when a lane artifact cannot be read", () => {
+        const sources = tree();
+        const path = join(sources.artifactsDir, "incident-report.json");
+        rmSync(path, { force: true });
+        mkdirSync(path);
+        expect(() => loadEvidenceBundle(sources)).toThrow(ScorecardContractError);
+        expect(() => loadEvidenceBundle(sources)).toThrow(/artifact: unreadable-eisdir/);
     });
 
     it("leaves the artifacts directory untouched", () => {
