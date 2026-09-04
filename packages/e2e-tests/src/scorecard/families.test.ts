@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { PARITY_FAMILY_ID, buildScoreFamilies, familyEstimateRows } from "./families";
+import { buildScoreFamilies, familyEstimateRows } from "./families";
 import { SCORE_FAMILY_IDS, SLOT_IDS_BY_FAMILY, type MetricSlotId } from "./policy";
 import type { MetricSlot } from "./report-contract";
 import {
@@ -66,16 +66,17 @@ describe("buildScoreFamilies", () => {
         ]);
     });
 
-    it("computes the false-authoritative memory rate from summed per-scenario counts, apart from the scenario rate", () => {
+    it("reads the historian aggregate rates and leaves the per-memory false-authoritative rate to its producer", () => {
         const historian = historianReportFixture([
             scenarioScoreFixture("hse-a", { visibleClaimsTotal: 4 }),
-            scenarioScoreFixture("hse-b", { verdict: "FAIL", failReasons: ["false-authoritative"], falseAuthoritativeMatches: ["abs-x"], visibleClaimsTotal: 4 }),
+            // One visible claim can match several absent predicates, so summing match ids would overstate this scenario.
+            scenarioScoreFixture("hse-b", { verdict: "FAIL", failReasons: ["false-authoritative"], falseAuthoritativeMatches: ["abs-x", "abs-y"], visibleClaimsTotal: 1 }),
             scenarioScoreFixture("hse-c", { verdict: "ERROR", errorReason: "run-never-fired", precision: null, recall: null, visibleClaimsTotal: 100 }),
         ]);
         const families = buildScoreFamilies(bundleFixture({ lanes: { historian } }));
-        expect(value(families.formation.slots, "false-authoritative-memory-rate")).toBeCloseTo(1 / 8);
         expect(value(families.formation.slots, "false-authoritative-scenario-rate")).toBeCloseTo(1 / 2);
         expect(value(families.formation.slots, "active-claim-precision")).toBe(historian.aggregate.precision!);
+        expect(slot(families.formation.slots, "false-authoritative-memory-rate")).toEqual({ id: "false-authoritative-memory-rate", status: "not-measured", reason: "producer-pending" });
         expect(slot(families.formation.slots, "supersession-latency")).toMatchObject({ status: "not-measured", reason: "producer-pending" });
     });
 
@@ -123,23 +124,22 @@ describe("buildScoreFamilies", () => {
         expect(() => buildScoreFamilies(bundleFixture({ lanes: { "paired-delta": report } }))).toThrow(/familyId/);
     });
 
-    it("measures cross-harness parity from incident-pool parity cases when present", () => {
+    it("counts incident-pool results and leaves cross-harness parity to its producer", () => {
         const incident = incidentReportFixture([
             incidentResultFixture(),
-            incidentResultFixture({ family_id: PARITY_FAMILY_ID, variant_id: "var-parity-one" }),
+            incidentResultFixture({ variant_id: "var-two" }),
             incidentResultFixture({
-                family_id: PARITY_FAMILY_ID, variant_id: "var-parity-two",
+                variant_id: "var-three",
                 behavioral_verdict: "assertion_fail", baseline_comparison: "regression", failed_checks: ["check-a"], observation_signature: "e".repeat(64),
             }),
         ]);
         const families = buildScoreFamilies(bundleFixture({ lanes: { incident } }));
-        expect(value(families.reliability.slots, "cross-harness-parity-pass-rate")).toBeCloseTo(0.5);
         expect(value(families.reliability.slots, "incident-baseline-mismatches")).toBe(1);
         expect(value(families.reliability.slots, "incident-results-total")).toBe(3);
-        const withoutParity = buildScoreFamilies(bundleFixture());
-        expect(slot(withoutParity.reliability.slots, "cross-harness-parity-pass-rate")).toMatchObject({ status: "not-measured", reason: "no-parity-cases" });
-        expect(value(withoutParity.reliability.slots, "dreamer-runs-total")).toBe(1);
-        expect(slot(withoutParity.context.slots, "ctx-expand-recovery")).toMatchObject({ reason: "producer-pending" });
+        expect(slot(families.reliability.slots, "cross-harness-parity-pass-rate")).toEqual({ id: "cross-harness-parity-pass-rate", status: "not-measured", reason: "producer-pending" });
+        const defaults = buildScoreFamilies(bundleFixture());
+        expect(value(defaults.reliability.slots, "dreamer-runs-total")).toBe(1);
+        expect(slot(defaults.context.slots, "ctx-expand-recovery")).toMatchObject({ reason: "producer-pending" });
     });
 
     it("is byte-stable under permuted input arrays", () => {

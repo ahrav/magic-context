@@ -19,9 +19,6 @@ import {
 } from "./policy";
 import { estimateId, type FamilyEstimateRow, type MetricSlot, type ScoreFamilySection, type UtilitySection } from "./report-contract";
 
-/** The incident-pool family whose cases compare the same scenario across harnesses. */
-export const PARITY_FAMILY_ID = "fam-parity-harness-gaps";
-
 const SECONDARY_UNITS: Readonly<Record<SecondaryMetricKey, MetricUnit>> = {
     invalidSuccessRateByArm: "ratio",
     finalAttemptTokensByArm: "tokens",
@@ -39,10 +36,6 @@ function ratio(value: number | null, absent: string): Reading {
 
 function count(value: number): Reading {
     return { value, unit: "count" };
-}
-
-function mean(values: readonly number[]): number | null {
-    return values.length === 0 ? null : values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
 type Reader<L extends LaneId> = (report: LaneReports[L], id: MetricSlotId) => Reading;
@@ -95,12 +88,8 @@ function formationReading(report: HistorianReport, id: MetricSlotId): Reading {
             return ratio(report.aggregate.recall, "no-expected-claims");
         case "false-authoritative-scenario-rate":
             return ratio(report.aggregate.falseAuthoritativeRate, "no-scored-scenarios");
-        case "false-authoritative-memory-rate": {
-            const scored = report.scenarios.filter((scenario) => scenario.verdict !== "ERROR");
-            const visible = scored.reduce((sum, scenario) => sum + scenario.visibleClaimsTotal, 0);
-            const matches = scored.reduce((sum, scenario) => sum + scenario.falseAuthoritativeMatches.length, 0);
-            return visible === 0 ? { reason: "no-visible-claims" } : { value: matches / visible, unit: "ratio" };
-        }
+        // `falseAuthoritativeMatches` lists matched expected-absent predicate ids, and one visible claim can
+        // match several, so the lane report carries no count of offending claims for a per-memory rate.
         default:
             return PENDING;
     }
@@ -148,13 +137,9 @@ function incidentReliability(report: IncidentPoolReport, id: MetricSlotId): Read
             return count(report.results.length);
         case "incident-results-unhealthy":
             return count(report.results.filter((result) => result.run_health !== "completed").length);
-        case "incident-baseline-mismatches":
+        default:
             return count(report.results.filter((result) =>
                 result.baseline_comparison === "regression" || result.baseline_comparison === "unexpected_failure").length);
-        default: {
-            const parity = report.results.filter((result) => result.family_id === PARITY_FAMILY_ID);
-            return ratio(mean(parity.map((result) => (result.behavioral_verdict === "pass" ? 1 : 0))), "no-parity-cases");
-        }
     }
 }
 
@@ -173,11 +158,12 @@ function reliabilitySlot(bundle: ScorecardEvidenceBundle, id: MetricSlotId): Met
         case "incident-results-total":
         case "incident-results-unhealthy":
         case "incident-baseline-mismatches":
-        case "cross-harness-parity-pass-rate":
             return laneSlot(bundle, "incident", true, incidentReliability, id);
         case "dreamer-runs-total":
         case "dreamer-runs-not-passed":
             return laneSlot(bundle, "dreamer", true, dreamerReliability, id);
+        // `cross-harness-parity-pass-rate` has no producer: the catalog's parity family holds only
+        // adjudication-only variants, which the incident runner never schedules.
         default:
             return { id, status: "not-measured", reason: "producer-pending" };
     }
