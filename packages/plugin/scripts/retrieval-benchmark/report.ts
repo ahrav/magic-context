@@ -292,6 +292,7 @@ export function aggregateReportQuality(report: BenchmarkReport): MacroAggregate[
                     recallAt50: scenario.metrics.recallAt50,
                     reciprocalRank: scenario.metrics.reciprocalRank,
                     ndcgAt10: scenario.metrics.ndcgAt10,
+                    duplicateRateAt50: scenario.metrics.duplicateRateAt50,
                 },
             })),
     );

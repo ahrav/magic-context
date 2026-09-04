@@ -153,62 +153,67 @@ export type MetricUnit = (typeof METRIC_UNITS)[number];
 export interface SlotContract {
     /** A `ratio` lies in [0, 1], a `delta` in [-1, 1], `count` and `tokens` are non-negative integers, and `milliseconds` is non-negative. */
     unit: MetricUnit;
-    /** The one lane whose report the slot is read from; `null` when no lane produces the slot, so it cannot be measured. */
+    /** The one lane whose report the slot is read from; `null` when no lane carries the slot's evidence. */
     lane: LaneId | null;
+    /**
+     * Whether a reader exists that measures the slot from its lane. A slot with a lane but no reader reads
+     * `producer-pending`; requiring it would deny mandatory evidence to every report until the reader lands.
+     */
+    produced: boolean;
 }
 
 export const SLOT_CONTRACTS: Readonly<Record<MetricSlotId, SlotContract>> = {
-    "valid-success-delta-mc-on-vs-mc-off": { unit: "delta", lane: "paired-delta" },
-    "valid-success-delta-mc-on-vs-compaction": { unit: "delta", lane: "paired-delta" },
-    "valid-failure-rate": { unit: "ratio", lane: "paired-delta" },
-    "invalid-failure-rate": { unit: "ratio", lane: "paired-delta" },
-    "invalid-success-rate-mc-on": { unit: "ratio", lane: "paired-delta" },
-    "invalid-success-rate-mc-off": { unit: "ratio", lane: "paired-delta" },
-    "invalid-success-rate-compaction": { unit: "ratio", lane: "paired-delta" },
-    "final-attempt-tokens-mc-on": { unit: "tokens", lane: "paired-delta" },
-    "final-attempt-tokens-mc-off": { unit: "tokens", lane: "paired-delta" },
-    "final-attempt-tokens-compaction": { unit: "tokens", lane: "paired-delta" },
-    "final-attempt-wall-clock-ms-mc-on": { unit: "milliseconds", lane: "paired-delta" },
-    "final-attempt-wall-clock-ms-mc-off": { unit: "milliseconds", lane: "paired-delta" },
-    "final-attempt-wall-clock-ms-compaction": { unit: "milliseconds", lane: "paired-delta" },
-    "final-attempt-turns-mc-on": { unit: "count", lane: "paired-delta" },
-    "final-attempt-turns-mc-off": { unit: "count", lane: "paired-delta" },
-    "final-attempt-turns-compaction": { unit: "count", lane: "paired-delta" },
-    "active-claim-precision": { unit: "ratio", lane: "historian" },
-    "active-claim-recall": { unit: "ratio", lane: "historian" },
-    "false-authoritative-scenario-rate": { unit: "ratio", lane: "historian" },
-    "false-authoritative-memory-rate": { unit: "ratio", lane: "historian" },
-    "supersession-latency": { unit: "milliseconds", lane: "historian" },
-    "pollution-duplication": { unit: "ratio", lane: "historian" },
-    "recall-at-10-explicit": { unit: "ratio", lane: "retrieval" },
-    "recall-at-50-explicit": { unit: "ratio", lane: "retrieval" },
-    "reciprocal-rank-explicit": { unit: "ratio", lane: "retrieval" },
-    "ndcg-at-10-explicit": { unit: "ratio", lane: "retrieval" },
-    "duplicate-rate-at-50-explicit": { unit: "ratio", lane: "retrieval" },
-    "recall-at-10-automatic": { unit: "ratio", lane: "retrieval" },
-    "recall-at-50-automatic": { unit: "ratio", lane: "retrieval" },
-    "reciprocal-rank-automatic": { unit: "ratio", lane: "retrieval" },
-    "ndcg-at-10-automatic": { unit: "ratio", lane: "retrieval" },
-    "duplicate-rate-at-50-automatic": { unit: "ratio", lane: "retrieval" },
-    currentness: { unit: "ratio", lane: "retrieval" },
-    "rejection-recall": { unit: "ratio", lane: "retrieval" },
-    "literal-recall": { unit: "ratio", lane: "retrieval" },
-    "abstention-accuracy": { unit: "ratio", lane: "retrieval" },
-    "post-compaction-probe-accuracy": { unit: "ratio", lane: null },
-    "ctx-expand-recovery": { unit: "ratio", lane: null },
-    "input-token-reduction": { unit: "ratio", lane: null },
-    "cache-write-preservation": { unit: "ratio", lane: null },
-    "paired-delta-planned-coordinates": { unit: "count", lane: "paired-delta" },
-    "paired-delta-healthy-coordinates": { unit: "count", lane: "paired-delta" },
-    "paired-delta-excluded-cells": { unit: "count", lane: "paired-delta" },
-    "incident-results-total": { unit: "count", lane: "incident" },
-    "incident-results-unhealthy": { unit: "count", lane: "incident" },
-    "incident-baseline-mismatches": { unit: "count", lane: "incident" },
-    "cross-harness-parity-pass-rate": { unit: "ratio", lane: "incident" },
-    "dreamer-runs-total": { unit: "count", lane: "dreamer" },
-    "dreamer-runs-not-passed": { unit: "count", lane: "dreamer" },
-    "restart-scenarios": { unit: "count", lane: null },
-    "contention-failures": { unit: "count", lane: null },
+    "valid-success-delta-mc-on-vs-mc-off": { unit: "delta", lane: "paired-delta", produced: true },
+    "valid-success-delta-mc-on-vs-compaction": { unit: "delta", lane: "paired-delta", produced: true },
+    "valid-failure-rate": { unit: "ratio", lane: "paired-delta", produced: false },
+    "invalid-failure-rate": { unit: "ratio", lane: "paired-delta", produced: false },
+    "invalid-success-rate-mc-on": { unit: "ratio", lane: "paired-delta", produced: true },
+    "invalid-success-rate-mc-off": { unit: "ratio", lane: "paired-delta", produced: true },
+    "invalid-success-rate-compaction": { unit: "ratio", lane: "paired-delta", produced: true },
+    "final-attempt-tokens-mc-on": { unit: "tokens", lane: "paired-delta", produced: true },
+    "final-attempt-tokens-mc-off": { unit: "tokens", lane: "paired-delta", produced: true },
+    "final-attempt-tokens-compaction": { unit: "tokens", lane: "paired-delta", produced: true },
+    "final-attempt-wall-clock-ms-mc-on": { unit: "milliseconds", lane: "paired-delta", produced: true },
+    "final-attempt-wall-clock-ms-mc-off": { unit: "milliseconds", lane: "paired-delta", produced: true },
+    "final-attempt-wall-clock-ms-compaction": { unit: "milliseconds", lane: "paired-delta", produced: true },
+    "final-attempt-turns-mc-on": { unit: "count", lane: "paired-delta", produced: true },
+    "final-attempt-turns-mc-off": { unit: "count", lane: "paired-delta", produced: true },
+    "final-attempt-turns-compaction": { unit: "count", lane: "paired-delta", produced: true },
+    "active-claim-precision": { unit: "ratio", lane: "historian", produced: true },
+    "active-claim-recall": { unit: "ratio", lane: "historian", produced: true },
+    "false-authoritative-scenario-rate": { unit: "ratio", lane: "historian", produced: true },
+    "false-authoritative-memory-rate": { unit: "ratio", lane: "historian", produced: false },
+    "supersession-latency": { unit: "milliseconds", lane: "historian", produced: false },
+    "pollution-duplication": { unit: "ratio", lane: "historian", produced: false },
+    "recall-at-10-explicit": { unit: "ratio", lane: "retrieval", produced: true },
+    "recall-at-50-explicit": { unit: "ratio", lane: "retrieval", produced: true },
+    "reciprocal-rank-explicit": { unit: "ratio", lane: "retrieval", produced: true },
+    "ndcg-at-10-explicit": { unit: "ratio", lane: "retrieval", produced: true },
+    "duplicate-rate-at-50-explicit": { unit: "ratio", lane: "retrieval", produced: true },
+    "recall-at-10-automatic": { unit: "ratio", lane: "retrieval", produced: true },
+    "recall-at-50-automatic": { unit: "ratio", lane: "retrieval", produced: true },
+    "reciprocal-rank-automatic": { unit: "ratio", lane: "retrieval", produced: true },
+    "ndcg-at-10-automatic": { unit: "ratio", lane: "retrieval", produced: true },
+    "duplicate-rate-at-50-automatic": { unit: "ratio", lane: "retrieval", produced: true },
+    currentness: { unit: "ratio", lane: "retrieval", produced: false },
+    "rejection-recall": { unit: "ratio", lane: "retrieval", produced: false },
+    "literal-recall": { unit: "ratio", lane: "retrieval", produced: false },
+    "abstention-accuracy": { unit: "ratio", lane: "retrieval", produced: false },
+    "post-compaction-probe-accuracy": { unit: "ratio", lane: null, produced: false },
+    "ctx-expand-recovery": { unit: "ratio", lane: null, produced: false },
+    "input-token-reduction": { unit: "ratio", lane: null, produced: false },
+    "cache-write-preservation": { unit: "ratio", lane: null, produced: false },
+    "paired-delta-planned-coordinates": { unit: "count", lane: "paired-delta", produced: true },
+    "paired-delta-healthy-coordinates": { unit: "count", lane: "paired-delta", produced: true },
+    "paired-delta-excluded-cells": { unit: "count", lane: "paired-delta", produced: true },
+    "incident-results-total": { unit: "count", lane: "incident", produced: true },
+    "incident-results-unhealthy": { unit: "count", lane: "incident", produced: true },
+    "incident-baseline-mismatches": { unit: "count", lane: "incident", produced: true },
+    "cross-harness-parity-pass-rate": { unit: "ratio", lane: "incident", produced: false },
+    "dreamer-runs-total": { unit: "count", lane: "dreamer", produced: true },
+    "dreamer-runs-not-passed": { unit: "count", lane: "dreamer", produced: true },
+    "restart-scenarios": { unit: "count", lane: null, produced: false },
+    "contention-failures": { unit: "count", lane: null, produced: false },
 };
 
 export const PRIMARY_ENDPOINT_SLOTS: Readonly<Record<PrimaryEndpoint, UtilitySlotId>> = {
@@ -394,8 +399,8 @@ export function parseScorecardPolicy(raw: unknown): ScorecardPolicy {
     if (secondaryMetricSlots.some((slot) => SECONDARY_SLOT_SOURCES[slot] === undefined)) fail("policy.secondaryMetricSlots: not-secondary");
     const requiredMetricSlots = idArray(root.requiredMetricSlots, "policy.requiredMetricSlots", REASON_CODE_RE)
         .map((slot, index) => enumeration(slot, METRIC_SLOT_IDS, `policy.requiredMetricSlots[${index}]`));
-    // A slot no lane produces can never be measured, so requiring it would deny mandatory evidence to every report.
-    if (requiredMetricSlots.some((slot) => SLOT_CONTRACTS[slot].lane === null)) fail("policy.requiredMetricSlots: slot-unproduced");
+    // A slot without a reader can never be measured, so requiring it would deny mandatory evidence to every report.
+    if (requiredMetricSlots.some((slot) => !SLOT_CONTRACTS[slot].produced)) fail("policy.requiredMetricSlots: slot-unproduced");
     const primaryEndpoint = enumeration(root.primaryEndpoint, PRIMARY_ENDPOINTS, "policy.primaryEndpoint");
     // Promotion reads the primary endpoint's delta, so a policy that does not require that slot
     // pre-registers a decision on a metric the evidence is allowed to omit.

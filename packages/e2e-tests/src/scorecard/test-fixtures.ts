@@ -30,7 +30,7 @@ import type { PairedCaseFact } from "../prospective-holdout/comparison";
 import { POLICY_OWNER_SCHEMA, type PolicyOwnerDocument } from "../prospective-holdout/contract";
 import { pairedFactsFingerprint } from "../prospective-holdout/report";
 import { cellResultFixture, freezeManifest, readyPolicies } from "../prospective-holdout/test-fixtures";
-import type { EvidenceSources } from "./evidence";
+import type { EvidenceSources, LaneEvidence, ScorecardEvidenceBundle } from "./evidence";
 import {
     LANE_IDS,
     LANE_REPORT_SCHEMAS,
@@ -45,8 +45,10 @@ import {
     type ScorecardPolicy,
 } from "./policy";
 import {
+    RUN_INCOMPLETE,
     SCORECARD_REPORT_SCHEMA,
     deriveOutcome,
+    type LaneStatus,
     type ScoreFamilySection,
     type ScorecardReport,
     type ScorecardReportBody,
@@ -415,14 +417,20 @@ export function incidentReportFixture(results: readonly IncidentCaseResult[] = [
 
 export function retrievalScenarioFixture(
     queryId: string,
-    overrides: { mode?: ReportScenario["mode"]; partition?: ReportScenario["partition"]; metricValue?: number; duplicateRateAt50?: number | null } = {},
+    overrides: {
+        mode?: ReportScenario["mode"];
+        partition?: ReportScenario["partition"];
+        paraphraseGroup?: string;
+        metricValue?: number;
+        duplicateRateAt50?: number | null;
+    } = {},
 ): ReportScenario {
     const metricValue = overrides.metricValue ?? 1;
     return {
         queryId,
         mode: overrides.mode ?? "explicit",
         partition: overrides.partition ?? "holdout",
-        paraphraseGroup: `pg-${queryId}`,
+        paraphraseGroup: overrides.paraphraseGroup ?? `pg-${queryId}`,
         rankedPhysical: ["memory:1", "memory:2"],
         deliveredPhysical: ["memory:1"],
         deliveredTokens: 120,
@@ -444,7 +452,17 @@ export function retrievalScenarioFixture(
     };
 }
 
-export function retrievalReportFixture(options: { status?: BenchmarkReport["status"]; scenarios?: ReportScenario[] } = {}): BenchmarkReport {
+export function retrievalReportFixture(options: {
+    status?: BenchmarkReport["status"];
+    scenarios?: ReportScenario[];
+    /** Case ids whose queries the lane treats as diagnostic and excludes from gate aggregates. */
+    laneRestrictedCaseIds?: readonly string[];
+} = {}): BenchmarkReport {
+    const scenarios = options.scenarios ?? [
+        retrievalScenarioFixture("case-1:q-1", { mode: "explicit" }),
+        retrievalScenarioFixture("case-1:q-2", { mode: "automatic", metricValue: 0.5, duplicateRateAt50: 0.2 }),
+    ];
+    const caseIds = [...new Set(scenarios.map((scenario) => scenario.queryId.split(":", 1)[0]!))].sort();
     return parseRetrievalReport({
         schemaVersion: RETRIEVAL_REPORT_SCHEMA_VERSION,
         status: options.status ?? "complete",
@@ -463,21 +481,18 @@ export function retrievalReportFixture(options: { status?: BenchmarkReport["stat
                 workingDirectory: null,
                 diagnostics: [],
             }],
-            scenarios: options.scenarios ?? [
-                retrievalScenarioFixture("case-1:q-1", { mode: "explicit" }),
-                retrievalScenarioFixture("case-1:q-2", { mode: "automatic", metricValue: 0.5, duplicateRateAt50: 0.2 }),
-            ],
-            cases: [{
-                caseId: "case-1",
+            scenarios,
+            cases: caseIds.map((caseId) => ({
+                caseId,
                 workerCount: 1,
                 warmups: 1,
                 samplesPerQuery: 3,
                 fixture: { manifestFingerprint: H4, indexBuildMs: 250, snapshotBytes: 4096 },
                 selectivityObserved: { preFilterDenominator: 100, eligibleCount: 100 },
                 cacheLayers: [],
-                laneRestricted: false,
+                laneRestricted: options.laneRestrictedCaseIds?.includes(caseId) ?? false,
                 latencySummary: null,
-            }],
+            })),
         },
         candidatePool: {
             schemaVersion: CANDIDATE_POOL_SCHEMA_VERSION,
@@ -615,5 +630,48 @@ export function writeReleaseTree(root: string, options: ReleaseTreeOptions = {})
         pairedDeltaPolicyPath: paths.pairedDeltaPolicy,
         artifactsDir: paths.artifactsDir,
         baselinePath: options.baseline === undefined ? null : paths.baseline,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// An in-memory evidence bundle, for the pure stages after the loader.
+// ---------------------------------------------------------------------------
+
+export interface BundleFixtureOptions {
+    policy?: ScorecardPolicy;
+    lanes?: Partial<LaneFixtureSet>;
+    statuses?: Partial<Record<LaneId, LaneStatus>>;
+    /** Diagnostics for a lane whose status is not `present`; defaults to the loader's `run-incomplete` for `incomplete` lanes. */
+    diagnostics?: Partial<Record<LaneId, string[]>>;
+    baseline?: ScorecardReport | null;
+    freezeManifestFingerprint?: string;
+}
+
+export function bundleFixture(options: BundleFixtureOptions = {}): ScorecardEvidenceBundle {
+    const policy = options.policy ?? policyFixture();
+    const fixtures = laneFixtures(options.lanes);
+    const lanes = LANE_IDS.map((lane): LaneEvidence => {
+        const status = options.statuses?.[lane] ?? "present";
+        const report = fixtures[lane];
+        const retained = status === "present" || status === "incomplete";
+        return {
+            lane,
+            status,
+            reportFingerprint: status === "missing" ? null : canonicalFingerprint(report),
+            identity: null,
+            diagnostics: status === "present" ? [] : options.diagnostics?.[lane] ?? [status === "incomplete" ? RUN_INCOMPLETE : `fixture-${status}`],
+            report: retained ? report : null,
+        } as LaneEvidence;
+    });
+    const baseline = options.baseline ?? null;
+    return {
+        freezeManifestFingerprint: options.freezeManifestFingerprint ?? H1,
+        policy,
+        policyFingerprint: canonicalFingerprint(policy),
+        lanes,
+        baseline: baseline === null
+            ? { status: "absent", reportFingerprint: null, report: null, diagnostics: [] }
+            : { status: "present", reportFingerprint: baseline.reportFingerprint, report: baseline, diagnostics: [] },
+        limitations: policy.requiredLanes.filter((row) => row.identity.kind === "identityless").map((row) => `identity-unverified-${row.lane}`),
     };
 }

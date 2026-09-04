@@ -740,7 +740,7 @@ function buildScenario(
             recallAt50: values.recallAt50,
             reciprocalRank: values.reciprocalRank,
             ndcgAt10: values.ndcgAt10,
-            duplicateRateAt50: at50.duplicateRate,
+            duplicateRateAt50: values.duplicateRateAt50,
             contextTokensPerUsefulResult: contextTokensPerUsefulResult(
                 outcome.delivery.tokenCount,
                 deliveredResolved,

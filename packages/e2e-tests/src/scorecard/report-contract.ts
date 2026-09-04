@@ -41,13 +41,20 @@ export const GATE_STATUSES = ["passed", "failed", "not-observed", "errored"] as 
 export type GateStatus = (typeof GATE_STATUSES)[number];
 
 /** The one lane whose report can observe each gate; `null` when no lane produces the gate's evidence, so it cannot be observed. */
-export const GATE_SOURCE_LANES: Readonly<Record<GateId, LaneId | null>> = {
+export const GATE_SOURCE_LANES = {
     "gate-cross-project-leak": null,
     "gate-unrelated-scope-secret": null,
     "gate-injection-promoted": "metamorphic",
     "gate-false-enforced-policy": null,
     "gate-database-corruption": null,
-};
+} as const satisfies Readonly<Record<GateId, LaneId | null>>;
+
+/** The gates some lane produces; the extractor table in `gates.ts` is keyed by this so it cannot name a gate this table leaves unproduced. */
+export type ProducedGateId = { [G in GateId]: (typeof GATE_SOURCE_LANES)[G] extends LaneId ? G : never }[GateId];
+
+export function isProducedGate(gateId: GateId): gateId is ProducedGateId {
+    return GATE_SOURCE_LANES[gateId] !== null;
+}
 
 /** Flat on the wire: every key is present on every row, with `null` where the status carries no value. */
 export interface GateRow {
@@ -127,6 +134,16 @@ export interface EvidenceRow {
     diagnostics: string[];
 }
 
+export const RUN_INCOMPLETE = "run-incomplete";
+
+/**
+ * A retained incomplete report is evidence for this scorecard only when it stopped early on this target.
+ * A build-identity or conformance diagnostic means it may describe another target, so it is excluded.
+ */
+export function interruptedOnThisTarget(lane: Pick<EvidenceRow, "status" | "diagnostics">): boolean {
+    return lane.status === "incomplete" && lane.diagnostics.every((code) => code === RUN_INCOMPLETE);
+}
+
 export interface ScorecardReportBody {
     /** The policy terms the outcome depends on are restated here so a reader can recompute it from the report alone. */
     target: {
@@ -171,6 +188,10 @@ export const REPORT_BODY_KEYS = [
 
 const NOISE_LABELS = ["no-noise-floor", "inside-floor", "outside-floor"] as const satisfies readonly NoiseComparison[];
 const ESTIMATE_FAMILY_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+export function estimateId(value: unknown, label: string): string {
+    return staticId(value, label, ESTIMATE_FAMILY_ID_RE);
+}
 
 /** Every paired-delta estimate is a difference of two binary outcomes or two fractions, so it lies in [-1, 1]. */
 const deltaNumber = (value: unknown, label: string): number => number(value, label, { minimum: -1, maximum: 1 });
@@ -263,7 +284,7 @@ function parseFamilyEstimateRow(raw: unknown, label: string): FamilyEstimateRow 
     exact(value, ["endpoint", "familyId", "pointEstimate", "interval", "noiseLabel"], label);
     return {
         endpoint: enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`),
-        familyId: staticId(value.familyId, `${label}.familyId`, ESTIMATE_FAMILY_ID_RE),
+        familyId: estimateId(value.familyId, `${label}.familyId`),
         pointEstimate: deltaNumber(value.pointEstimate, `${label}.pointEstimate`),
         interval: parseInterval(value.interval, `${label}.interval`, deltaNumber),
         noiseLabel: enumeration(value.noiseLabel, NOISE_LABELS, `${label}.noiseLabel`),
@@ -274,7 +295,7 @@ function parseDeltaRow(raw: unknown, label: string): DeltaRow {
     const value = record(raw, label);
     const status = enumeration(value.status, ["compared", "no-baseline"] as const, `${label}.status`);
     const endpoint = enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`);
-    const familyId = staticId(value.familyId, `${label}.familyId`, ESTIMATE_FAMILY_ID_RE);
+    const familyId = estimateId(value.familyId, `${label}.familyId`);
     if (status === "compared") {
         exact(value, ["endpoint", "familyId", "status", "baselinePointEstimate", "delta", "interval", "noiseLabel"], label);
         return {
@@ -309,7 +330,7 @@ function parseAdverseRow(raw: unknown, index: number): AdverseRow {
     const value = record(raw, label);
     exact(value, ["familyId", "endpoint", "kind", "noiseLabel", "delta", "interval", "blocking"], label);
     const row: AdverseRow = {
-        familyId: staticId(value.familyId, `${label}.familyId`, ESTIMATE_FAMILY_ID_RE),
+        familyId: estimateId(value.familyId, `${label}.familyId`),
         endpoint: enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`),
         kind: enumeration(value.kind, ADVERSE_KINDS, `${label}.kind`),
         noiseLabel: nullable(value.noiseLabel, (noise) => enumeration(noise, NOISE_LABELS, `${label}.noiseLabel`)),
@@ -331,8 +352,8 @@ function parseRegretRow(raw: unknown, index: number): RawRegretLadder {
     const rung = (field: "retrieval" | "formation" | "representation"): number | null =>
         nullable(value[field], (delta) => deltaNumber(delta, `${label}.${field}`));
     return {
-        coordinateId: staticId(value.coordinateId, `${label}.coordinateId`, ESTIMATE_FAMILY_ID_RE),
-        familyId: staticId(value.familyId, `${label}.familyId`, ESTIMATE_FAMILY_ID_RE),
+        coordinateId: estimateId(value.coordinateId, `${label}.coordinateId`),
+        familyId: estimateId(value.familyId, `${label}.familyId`),
         retrieval: rung("retrieval"),
         formation: rung("formation"),
         representation: rung("representation"),
@@ -363,6 +384,11 @@ export function estimateKey(row: { endpoint: PrimaryEndpoint; familyId: string }
     return tupleKey(row.endpoint, row.familyId);
 }
 
+/** Every gate that is not `passed` blocks promotion: `not-observed` and `errored` count as failures, not as unknowns. */
+export function hardGateFailures(rows: readonly GateRow[]): GateId[] {
+    return rows.filter((row) => row.status !== "passed").map((row) => row.gateId).sort();
+}
+
 /** Whether every row and slot the policy requires supports promotion. Recomputed by the parser so a report cannot claim what its own rows deny. */
 export function deriveOutcome(input: {
     gates: readonly GateRow[];
@@ -373,7 +399,7 @@ export function deriveOutcome(input: {
     adverseDeltas: readonly AdverseRow[];
     maxToleratedRegressions: number;
 }): ScorecardReportBody["outcome"] {
-    const hardGateFailures = input.gates.filter((row) => row.status !== "passed").map((row) => row.gateId).sort();
+    const failures = hardGateFailures(input.gates);
     const measured = new Set(input.families.flatMap((family) => family.slots)
         .filter((slot) => slot.status === "measured").map((slot) => slot.id));
     // A pinned baseline that did not load leaves the release-over-release comparison unmade.
@@ -382,11 +408,11 @@ export function deriveOutcome(input: {
         && input.requiredMetricSlots.every((slot) => measured.has(slot));
     const blockingRegressionCount = input.adverseDeltas.filter((row) => row.blocking).length;
     return {
-        promotionAllowed: hardGateFailures.length === 0
+        promotionAllowed: failures.length === 0
             && mandatoryEvidenceComplete
             && blockingRegressionCount <= input.maxToleratedRegressions,
         mandatoryEvidenceComplete,
-        hardGateFailures,
+        hardGateFailures: failures,
         blockingRegressionCount,
     };
 }
@@ -397,16 +423,19 @@ function verifyEvidenceBindings(body: ScorecardReportBody): void {
     for (const [index, gate] of body.safetyGates.entries()) {
         if (gate.sourceLane === null) continue;
         const lane = lanes.get(gate.sourceLane);
-        if (lane?.status !== "present" || lane.reportFingerprint !== gate.evidenceFingerprint) {
+        // A pass needs the whole run; a failure is evidence even when the run stopped at the observation,
+        // which is how the live metamorphic runner reports a canary hit.
+        const bound = lane !== undefined && (lane.status === "present" || (gate.status === "failed" && interruptedOnThisTarget(lane)));
+        if (!bound || lane.reportFingerprint !== gate.evidenceFingerprint) {
             fail(`report.body.safetyGates[${index}]: evidence-binding-invalid`);
         }
     }
     for (const family of familySections(body)) {
         for (const [index, slot] of family.slots.entries()) {
             if (slot.status !== "measured") continue;
-            // Reliability slots read run-health counts from a lane that did not finish, so `incomplete` also sources a measurement.
+            // Reliability slots read run-health counts from a lane that did not finish, so an interrupted lane also sources a measurement.
             const lane = lanes.get(slot.sourceLane);
-            const parsed = lane?.status === "present" || lane?.status === "incomplete";
+            const parsed = lane !== undefined && (lane.status === "present" || interruptedOnThisTarget(lane));
             if (!parsed || lane.reportFingerprint !== slot.sourceFingerprint) {
                 fail(`report.body.${family.family}.slots[${index}]: evidence-binding-invalid`);
             }
