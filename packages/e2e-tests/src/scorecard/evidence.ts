@@ -18,6 +18,7 @@ import { PairedDeltaContractError, parsePairedDeltaPolicy } from "../paired-delt
 import { parsePairedDeltaReport, type PairedDeltaReport } from "../paired-delta/report";
 import { HoldoutContractError, parsePolicyOwnerDocument } from "../prospective-holdout/contract";
 import { loadFreeze, loadPolicyDocuments } from "../prospective-holdout/freeze";
+import { pairedFactsFingerprint } from "../prospective-holdout/report";
 import {
     LANE_IDS,
     ScorecardContractError,
@@ -155,13 +156,24 @@ function contradictionReasons(parsed: ParsedLane): string[] {
     return computeRetrievalReportStatus({ expectedQueryIds: [], scenarios, attempts }) === "invalid" ? ["report-parse-failed"] : [];
 }
 
+/** The live paired-delta lane analyses its own rollouts and binds the empty prospective pair set. */
+const LIVE_PAIRED_FACTS_FINGERPRINT = pairedFactsFingerprint([]);
+
 /**
- * The metamorphic lane is the live run. Its producer resolves a system tuple before it scores, while the raw-output
- * scoring seam publishes none, so a report without a system did not come from the lane. The historian parser
- * already refuses raw-output scores itself.
+ * Each lane's report must come from that lane's live producer. The metamorphic producer resolves a system tuple
+ * before it scores, while the raw-output scoring seam publishes none; the paired-delta producer binds the empty
+ * pair set, while a prospective comparison binds the pairs it compared. The historian parser already refuses
+ * raw-output scores itself.
  */
 function producerReasons(parsed: ParsedLane): string[] {
-    return parsed.lane === "metamorphic" && parsed.report.system === null ? ["producer-mismatch"] : [];
+    switch (parsed.lane) {
+        case "metamorphic":
+            return parsed.report.system === null ? ["producer-mismatch"] : [];
+        case "paired-delta":
+            return parsed.report.body.analysis.pairedFactsFingerprint === LIVE_PAIRED_FACTS_FINGERPRINT ? [] : ["producer-mismatch"];
+        default:
+            return [];
+    }
 }
 
 /** The report's binding fields must name the paired-delta policy the scorecard policy pinned, and that policy's pool. */
@@ -230,12 +242,17 @@ function loadPairedDeltaPolicy(path: string, expectedFingerprint: string): Paire
     };
 }
 
-type JsonArtifact = { kind: "missing" } | { kind: "unparseable" } | { kind: "json"; raw: unknown };
+type JsonArtifact = { kind: "missing" } | { kind: "unparseable" } | { kind: "non-canonical" } | { kind: "json"; raw: unknown };
+
+/** The two indentations the repository's publishers write: `publishJsonAtomically` (four) and the runners' direct writes (two). */
+const PUBLISHER_INDENTS = [2, 4] as const;
 
 /**
- * Published reports are read whitespace-insensitively; their fingerprint is of the parsed value, not the bytes.
- * An absent file is a lane outcome. Any other read failure is an infrastructure fault, which must not read as a
- * behavioral failure of the lane, so it aborts the bundle under the module's own error class.
+ * A published report must be the bytes one of the repository's publishers writes for its parsed value. Any other
+ * byte sequence, such as a duplicate member that `JSON.parse` silently drops, would carry content the privacy scan
+ * and the fingerprint never see, so it is refused rather than read. An absent file is a lane outcome. Any other read
+ * failure is an infrastructure fault, which must not read as a behavioral failure of the lane, so it aborts the
+ * bundle under the module's own error class.
  */
 function readJsonArtifact(path: string): JsonArtifact {
     let text: string;
@@ -246,17 +263,14 @@ function readJsonArtifact(path: string): JsonArtifact {
         if (code === "ENOENT") return { kind: "missing" };
         throw new ScorecardContractError([`artifact: unreadable-${(code ?? "unknown").toLowerCase()}`]);
     }
+    let raw: unknown;
     try {
-        return { kind: "json", raw: JSON.parse(text) as unknown };
+        raw = JSON.parse(text) as unknown;
     } catch {
         return { kind: "unparseable" };
     }
-}
-
-/** `scannedFingerprint` returns `null` for sensitive content and throws when `canonicalFingerprint` rejects parsed JSON. */
-function scannedFingerprint(raw: unknown): string | null {
-    if (scanForSensitiveContent(raw).length > 0) return null;
-    return canonicalFingerprint(raw);
+    if (!PUBLISHER_INDENTS.some((indent) => `${JSON.stringify(raw, null, indent)}\n` === text)) return { kind: "non-canonical" };
+    return { kind: "json", raw };
 }
 
 function loadLane(required: RequiredLane, policy: ScorecardPolicy, pairedDeltaPolicy: PairedDeltaPolicyView, artifactsDir: string): LaneEvidence {
@@ -266,13 +280,10 @@ function loadLane(required: RequiredLane, policy: ScorecardPolicy, pairedDeltaPo
     const artifact = readJsonArtifact(join(artifactsDir, laneArtifactName(lane)));
     if (artifact.kind === "missing") return rejected("missing", ["artifact-missing"]);
     if (artifact.kind === "unparseable") return rejected("schema-mismatch", ["artifact-invalid-json"]);
-    let reportFingerprint: string | null;
-    try {
-        reportFingerprint = scannedFingerprint(artifact.raw);
-    } catch {
-        return rejected("schema-mismatch", ["artifact-invalid-json"]);
-    }
-    if (reportFingerprint === null) return rejected("schema-mismatch", ["privacy-rejected"]);
+    if (artifact.kind === "non-canonical") return rejected("schema-mismatch", ["artifact-non-canonical"]);
+    if (scanForSensitiveContent(artifact.raw).length > 0) return rejected("schema-mismatch", ["privacy-rejected"]);
+    // A value that round-tripped through `JSON.stringify` has nothing `canonicalFingerprint` refuses.
+    const reportFingerprint = canonicalFingerprint(artifact.raw);
     let parsed: ParsedLane;
     try {
         parsed = parseLane(lane, artifact.raw);
@@ -302,6 +313,7 @@ function loadBaseline(policy: ScorecardPolicy, path: string | null): BaselineEvi
     const artifact = readJsonArtifact(path);
     if (artifact.kind === "missing") return mismatch("baseline-unreadable");
     if (artifact.kind === "unparseable") return mismatch("baseline-invalid-json");
+    if (artifact.kind === "non-canonical") return mismatch("baseline-non-canonical");
     let report: ScorecardReport;
     if (scanForSensitiveContent(artifact.raw).length > 0) return mismatch("baseline-privacy-rejected");
     try {

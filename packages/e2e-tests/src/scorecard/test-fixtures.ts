@@ -150,6 +150,8 @@ export interface PairedDeltaFixtureOptions {
     pinnedSnapshotId?: string;
     /** Declared alongside a policy document whose own minimum matches it, or the builder refuses the report. */
     minimumAnalyzableFamilyCount?: number;
+    /** The live lane binds no prospective pairs; a prospective comparison binds the pairs it compared. */
+    pairs?: readonly PairedCaseFact[];
     /** Per-family valid-success deltas at `mc-on-vs-mc-off`; the compaction endpoint sits 0.02 below each so the two are distinguishable. */
     familyDeltas?: Readonly<Record<string, number>>;
     noiseFloors?: readonly FamilyNoiseFloor[];
@@ -162,6 +164,7 @@ export function pairedDeltaReportFixture(options: PairedDeltaFixtureOptions = {}
     const policyDocument = options.policyDocument ?? pairedDeltaPolicyDocumentFixture();
     const poolManifestFingerprint = options.poolManifestFingerprint ?? H1;
     const pinnedSnapshotId = options.pinnedSnapshotId ?? "fixture-model";
+    const pairs = options.pairs ?? [];
     const familyDeltas = options.familyDeltas ?? { "fam-a": 0.3, "fam-b": 0.1 };
     const analysis = estimateFamilyDeltas({
         observations: Object.entries(familyDeltas).flatMap(([familyId, delta]) => [
@@ -178,7 +181,7 @@ export function pairedDeltaReportFixture(options: PairedDeltaFixtureOptions = {}
             poolManifestFingerprint,
             pinnedSnapshotId,
             policyFingerprint: policyDocument.policyFingerprint!,
-            pairedFactsFingerprint: pairedFactsFingerprint(PAIRED_FACTS),
+            pairedFactsFingerprint: pairedFactsFingerprint(pairs),
         },
         ...(options.noiseFloors === undefined ? {} : { noiseFloors: options.noiseFloors }),
     });
@@ -188,7 +191,7 @@ export function pairedDeltaReportFixture(options: PairedDeltaFixtureOptions = {}
         policyDocument,
         implementationDigest: "impl-digest-fixture",
         limitations: ["fixture caveat"],
-        pairs: PAIRED_FACTS,
+        pairs,
         analysis,
         runSummary: {
             status: "completed",

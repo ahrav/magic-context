@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -13,6 +13,7 @@ import {
     HISTORIAN_SYSTEM,
     PAIRED_DELTA_POLICY,
     PAIRED_DELTA_POLICY_FP,
+    PAIRED_FACTS,
     dreamerReportFixture,
     historianReportFixture,
     incidentReportFixture,
@@ -111,6 +112,27 @@ describe("loadEvidenceBundle", () => {
         const bundle = loadEvidenceBundle(tree({ lanes: { "paired-delta": pairedDeltaReportFixture({ runSummary: { evidenceComplete: false } }) } }));
         expect(laneEvidence(bundle, "paired-delta")).toMatchObject({ diagnostics: ["run-incomplete"] });
         expect(laneEvidence(bundle, "paired-delta").report).not.toBeNull();
+    });
+
+    it("refuses an artifact whose bytes no publisher would write, so no member can hide from the scan", () => {
+        const sources = tree();
+        const incident = JSON.parse(readFileSync(join(sources.artifactsDir, "incident-report.json"), "utf8")) as Record<string, unknown>;
+        // A duplicated member: JSON.parse keeps the last value, so the first would never reach the scan or the fingerprint.
+        const shadowed = `{"harness": "/home/operator/secret", ${JSON.stringify(incident, null, 4).slice(1)}`;
+        writeFileSync(join(sources.artifactsDir, "incident-report.json"), `${shadowed}\n`);
+        expect(laneEvidence(loadEvidenceBundle(sources), "incident")).toMatchObject({ status: "schema-mismatch", diagnostics: ["artifact-non-canonical"], reportFingerprint: null });
+        // Both publisher indentations are accepted; any other whitespace is not.
+        writeFileSync(join(sources.artifactsDir, "incident-report.json"), `${JSON.stringify(incident, null, 2)}\n`);
+        expect(laneEvidence(loadEvidenceBundle(sources), "incident").status).toBe("present");
+        writeFileSync(join(sources.artifactsDir, "incident-report.json"), JSON.stringify(incident));
+        expect(laneEvidence(loadEvidenceBundle(sources), "incident")).toMatchObject({ status: "schema-mismatch", diagnostics: ["artifact-non-canonical"] });
+    });
+
+    it("rejects a paired-delta report bound to a prospective pair set", () => {
+        // The live lane binds the empty pair set; a report that compared release pairs came from the holdout comparison.
+        const prospective = pairedDeltaReportFixture({ pairs: PAIRED_FACTS });
+        const bundle = loadEvidenceBundle(tree({ lanes: { "paired-delta": prospective } }));
+        expect(laneEvidence(bundle, "paired-delta")).toMatchObject({ status: "schema-mismatch", diagnostics: ["producer-mismatch"], report: null });
     });
 
     it("rejects a metamorphic report from the raw-output scoring seam", () => {
@@ -223,10 +245,10 @@ describe("loadEvidenceBundle", () => {
 
     it("classifies a lane whose JSON is valid but not canonicalizable instead of aborting the bundle", () => {
         const sources = tree();
-        // `JSON.parse` reads `1e999` as `Infinity`, which `canonicalFingerprint` rejects.
-        writeFileSync(join(sources.artifactsDir, "incident-report.json"), '{"schema": "incident-pool-report/v1", "spent": 1e999}\n');
+        // `JSON.parse` reads `1e999` as `Infinity`, which no publisher can serialize back, so the bytes fail the round trip.
+        writeFileSync(join(sources.artifactsDir, "incident-report.json"), '{\n    "schema": "incident-pool-report/v1",\n    "spent": 1e999\n}\n');
         const bundle = loadEvidenceBundle(sources);
-        expect(laneEvidence(bundle, "incident")).toMatchObject({ status: "schema-mismatch", diagnostics: ["artifact-invalid-json"], reportFingerprint: null });
+        expect(laneEvidence(bundle, "incident")).toMatchObject({ status: "schema-mismatch", diagnostics: ["artifact-non-canonical"], reportFingerprint: null });
         expect(laneEvidence(bundle, "historian").status).toBe("present");
     });
 
