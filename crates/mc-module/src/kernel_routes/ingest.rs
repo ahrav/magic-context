@@ -211,6 +211,13 @@ struct Page {
     bytes: Vec<u8>,
 }
 
+/// Why a page's bytes were refused before staging, in the order the checks run.
+enum PageRejection {
+    NotBase64,
+    TooLarge,
+    DigestMismatch,
+}
+
 /// One route's in-flight upload: the declared layout, the pages received so
 /// far by index, and the request the assembled bytes will be ingested under.
 struct Upload {
@@ -706,38 +713,41 @@ impl McHandler {
             bytes: decode_bytes,
         };
         // Decoding and hashing a page is CPU work proportional to the frame,
-        // so it runs off the async workers and before the coordinator lock.
-        // The reservation rides in each job's result: a dropped
-        // `spawn_blocking` handle does not stop its worker, so a cancelled
-        // handler must not release the charge while the worker still holds
-        // the bytes.
+        // so both run in one hop off the async workers and before the
+        // coordinator lock. The reservation rides in the job's result: a
+        // dropped `spawn_blocking` handle does not stop its worker, so a
+        // cancelled handler must not release the charge while the worker still
+        // holds the bytes.
         let decoded = blocking(move || {
-            let decoded = base64_simd::STANDARD
+            let page = base64_simd::STANDARD
                 .decode_to_vec(parsed.bytes_base64.as_bytes())
-                .map(|bytes| (parsed.upload_id, parsed.index, parsed.page_digest, bytes));
-            (decoded, decoding)
+                .map_err(|_| PageRejection::NotBase64)
+                .and_then(|bytes| {
+                    if bytes.len() as u64 > PAGE_BYTES_MAX {
+                        return Err(PageRejection::TooLarge);
+                    }
+                    let digest = sha256_hex(&bytes);
+                    if digest != parsed.page_digest {
+                        return Err(PageRejection::DigestMismatch);
+                    }
+                    Ok((parsed.upload_id, parsed.index, Page { digest, bytes }))
+                });
+            (page, decoding)
         })
         .await;
-        let (upload_id, index, declared_digest, bytes, decoding) = match decoded {
-            Ok((Ok((upload_id, index, digest, bytes)), decoding)) => {
-                (upload_id, index, digest, bytes, decoding)
-            }
-            Ok((Err(_), _)) => {
+        let (upload_id, index, page, _decoding) = match decoded {
+            Ok((Ok((upload_id, index, page)), decoding)) => (upload_id, index, page, decoding),
+            Ok((Err(PageRejection::NotBase64), _)) => {
                 return crate::invalid_params_error(format!(
                     "{PAGE} bytes_base64 is not standard base64"
                 ))
             }
-            Err(outcome) => return state_only(outcome),
-        };
-        if bytes.len() as u64 > PAGE_BYTES_MAX {
-            return state_only(KernelOutcome::invalid(InvalidReason::PageTooLarge));
-        }
-        let hashed = blocking(move || (sha256_hex(&bytes), bytes, decoding)).await;
-        let (page, _decoding) = match hashed {
-            Ok((digest, bytes, decoding)) if digest == declared_digest => {
-                (Page { digest, bytes }, decoding)
+            Ok((Err(PageRejection::TooLarge), _)) => {
+                return state_only(KernelOutcome::invalid(InvalidReason::PageTooLarge))
             }
-            Ok(_) => return state_only(KernelOutcome::invalid(InvalidReason::PageDigest)),
+            Ok((Err(PageRejection::DigestMismatch), _)) => {
+                return state_only(KernelOutcome::invalid(InvalidReason::PageDigest))
+            }
             Err(outcome) => return state_only(outcome),
         };
         // Bound to a local so the coordinator guard is released before the
