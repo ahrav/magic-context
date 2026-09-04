@@ -41,7 +41,6 @@ import {
     setEmergencyDropSample,
 } from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
-import { seedProjectMemoryClaim } from "../../features/magic-context/test-claim-database";
 import { recordToolDefinition } from "../../features/magic-context/tool-definition-tokens";
 import {
     scheduleOpenCodeTransformDecisionWrite,
@@ -50,19 +49,34 @@ import {
 import type { ContextUsage } from "../../features/magic-context/types";
 import { buildSidebarSnapshot } from "../../plugin/rpc-handlers";
 import type { PluginContext } from "../../plugin/types";
+import { KernelClient, type KernelClientResolver } from "../../shared/kernel-client";
+import { FakeKernel, FakeKernelTransport } from "../../shared/kernel-client-testing/fake-kernel";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { getSlot, resetLkgSlotsForTest } from "./lkg-slot";
 import { createTransform } from "./transform";
 
+/** The daemon stand-in the memory-injection transform reads from. */
+const kernel = new FakeKernel();
+let seededMemories = 0;
+
+const kernelClient: KernelClientResolver = ({ sessionId, projectRoot }) =>
+    new KernelClient({
+        transport: new FakeKernelTransport(kernel),
+        enabled: true,
+        sessionId,
+        projectRoot,
+    });
+
 function insertMemory(
-    db: Database,
+    _db: Database,
     input: { projectPath: string; category: string; content: string },
 ): void {
-    seedProjectMemoryClaim(db, {
-        projectIdentity: input.projectPath,
-        category: [
+    seededMemories += 1;
+    kernel.seedDecision({
+        object_id: `mem_${seededMemories.toString(16).padStart(32, "0")}`,
+        decision_kind: [
             "PROJECT_RULES",
             "ARCHITECTURE",
             "CONSTRAINTS",
@@ -71,7 +85,7 @@ function insertMemory(
         ].includes(input.category)
             ? input.category
             : "PROJECT_RULES",
-        content: input.content,
+        summary: input.content,
     });
 }
 
@@ -1397,6 +1411,7 @@ describe("createTransform", () => {
             protectedTags: 0,
             directory: "/repo/project",
             memoryConfig: { enabled: true, injectionBudgetTokens: 500, autoPromote: true },
+            kernelClient,
         });
         const messages: TestMessage[] = [
             {

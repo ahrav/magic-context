@@ -24,12 +24,15 @@ import {
 	appendCompartments,
 	getCompartments,
 } from "@magic-context/core/features/magic-context/compartment-storage";
-import { promoteSessionFactsDurable } from "@magic-context/core/features/magic-context/memory";
 import {
-	readAuthorizedClaimMemorySnapshot,
-	renderClaimMemoryBlock,
-} from "@magic-context/core/features/magic-context/memory/claim-memory-render";
-import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+	type HistorianPromotionIdentity,
+	type PromotedMemoryRef,
+	promoteSessionFactsDurable,
+} from "@magic-context/core/features/magic-context/memory";
+import {
+	resolveProjectIdentityForSession,
+	resolveProjectRootDirectory,
+} from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	clearEmergencyDrainLatch,
 	clearEmergencyRecovery,
@@ -54,6 +57,7 @@ import { updateSessionMeta } from "@magic-context/core/features/magic-context/st
 import { insertPrimerCandidates } from "@magic-context/core/features/magic-context/storage-primers";
 import { getLatestHistorianInvocationId } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
 import { insertUserMemoryCandidates } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
+import { resetClaimLaneImportMarkerInCurrentTransaction } from "@magic-context/core/hooks/magic-context/claim-lane-import";
 import {
 	buildCompartmentAgentPrompt,
 	buildHistorianEditorPrompt,
@@ -75,6 +79,8 @@ import {
 	isTransientHistorianPromptError,
 	MAX_HISTORIAN_RETRIES,
 } from "@magic-context/core/hooks/magic-context/historian-retry-policy";
+import { commitPromotedFactsToKernel } from "@magic-context/core/hooks/magic-context/kernel-memory-promotion";
+import { readHistorianMemoryBlock } from "@magic-context/core/hooks/magic-context/kernel-memory-render";
 import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudger";
 import {
 	createDefaultBoundarySnapshotForTests,
@@ -92,6 +98,7 @@ import {
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { buildReferenceBlocks } from "@magic-context/core/hooks/magic-context/reference-retrieval";
 import { describeError } from "@magic-context/core/shared/error-message";
+import type { KernelClientResolver } from "@magic-context/core/shared/kernel-client";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import type {
@@ -318,6 +325,8 @@ export interface PiHistorianDeps {
 	thinkingLevel?: string;
 	/** `memory.enabled` enables cross-session memory. */
 	memoryEnabled?: boolean;
+	/** Serves the project-memory block the historian deduplicates against; absent when no daemon transport exists. */
+	kernelClient?: KernelClientResolver;
 	/** allowHomeProject permits sessions started exactly in the canonical home directory only when user-level configuration enables it. */
 	allowHomeProject?: boolean;
 	/* */
@@ -373,6 +382,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		twoPass,
 		thinkingLevel,
 		memoryEnabled,
+		kernelClient,
 		allowHomeProject,
 		autoPromote,
 		userMemoriesEnabled,
@@ -615,24 +625,19 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				rollbackDrainReservation();
 				return;
 			}
-			const memorySnapshot = readAuthorizedClaimMemorySnapshot(db, {
-				authorizedIdentities: [projectPath],
-				ownIdentities: [projectPath],
-				sharedCategories: [],
-				workspaceEpoch: `pi-historian:${sessionId}:${chunk.startIndex}-${chunk.endIndex}`,
-			});
-			if (!memorySnapshot) {
-				sessionLog(
-					sessionId,
-					"pi historian claim snapshot remained stale; omitting memories",
-				);
-			}
-			const memoryBlock =
-				renderClaimMemoryBlock(memorySnapshot?.items ?? []) ?? undefined;
+			const projectMemory =
+				memoryEnabled !== false
+					? await readHistorianMemoryBlock({
+							client: kernelClient?.({
+								sessionId,
+								projectRoot: resolveProjectRootDirectory(directory),
+							}),
+							sessionId,
+						})
+					: "";
 
 			// The historian receives bounded reference blocks instead of all prior compartments.
 			// The historian receives four rotating cross-project seed examples for importance-band calibration and the last six same-session compartments for continuity.
-			const projectMemory = memoryBlock ?? "";
 			const references = buildReferenceBlocks({
 				sessionId,
 				chunkStart: chunk.startIndex,
@@ -1033,6 +1038,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				return true;
 			});
 			let persistedIds: number[] = [];
+			let promotionIdentity: HistorianPromotionIdentity | null = null;
+			let promotedRefs: PromotedMemoryRef[] = [];
 
 			// The transaction atomically publishes appended compartments, durable facts, events, the drop queue, and failure-state clearing.
 			// Stage the Pi-native compaction marker payload in the transaction so a crash cannot leave compartments without a marker queued for deferred materialization.
@@ -1065,18 +1072,19 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				// Promote only facts from this chunk; do not replace the session fact list.
 				// Promotion and boundary-floor updates commit or roll back together.
 				if (promotionActive && !skipUnanchoredPromotion) {
-					promoteSessionFactsDurable(
+					promotionIdentity = {
+						producer: "pi-historian",
+						runId: `${sessionId}:${chunk.startIndex}:${chunk.endIndex}`,
+						leaseKey: `compartment:${sessionId}`,
+						leaseGeneration: compartmentLeaseHolderId,
+						batchId: `${chunk.startIndex}-${lastNewEnd}`,
+					};
+					promotedRefs = promoteSessionFactsDurable(
 						db,
 						sessionId,
 						projectPath,
 						validatedPass.facts ?? [],
-						{
-							producer: "pi-historian",
-							runId: `${sessionId}:${chunk.startIndex}:${chunk.endIndex}`,
-							leaseKey: `compartment:${sessionId}`,
-							leaseGeneration: compartmentLeaseHolderId,
-							batchId: `${chunk.startIndex}-${lastNewEnd}`,
-						},
+						promotionIdentity,
 					);
 				}
 
@@ -1116,6 +1124,14 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						publishedAt: Date.now(),
 					});
 				}
+				// The kernel promotion runs after COMMIT, so a crash in between would strand the just-published facts in the claim lane behind a done import marker; arming the bridge inside the same transaction makes the import replay them after restart. commentlint: allow(JUDGE)
+				if (promotionIdentity && promotedRefs.length > 0 && projectPath) {
+					resetClaimLaneImportMarkerInCurrentTransaction(
+						db,
+						projectPath,
+						resolveProjectRootDirectory(directory),
+					);
+				}
 				db.exec("COMMIT");
 				published = true;
 			} finally {
@@ -1130,6 +1146,22 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// The transaction contains all publish-visible durable state; embedding registration and provider calls run post-commit on a best-effort basis.
 			onPublished?.();
 			completedSuccessfully = true;
+
+			if (promotionIdentity && promotedRefs.length > 0) {
+				const promotionProjectRoot = resolveProjectRootDirectory(directory);
+				await commitPromotedFactsToKernel({
+					client: kernelClient?.({
+						sessionId,
+						projectRoot: promotionProjectRoot,
+					}),
+					db,
+					projectPath,
+					projectRoot: promotionProjectRoot,
+					sessionId,
+					refs: promotedRefs,
+					identity: promotionIdentity,
+				});
+			}
 
 			sessionLog(
 				sessionId,

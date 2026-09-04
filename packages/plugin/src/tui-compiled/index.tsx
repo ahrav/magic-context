@@ -14,6 +14,7 @@ import packageJson from "../../package.json";
 import { closeRpc, dismissUpgradeReminder, getAnnouncement, getCompartmentCount, getRpcGeneration, initRpcClient, loadEmbedDetail, loadStatusDetail, loadToastDurationMs, markAnnounced, requestRecomp, requestUpgrade } from "./data/context-db";
 import { startNotificationSocket, stopNotificationSocket } from "./data/notification-socket";
 import { formatThresholdPercent } from "../shared/format-threshold";
+import { formatMemoryCount } from "../shared/rpc-types";
 import { formatTailHygiene } from "../shared/tail-hygiene-status";
 import { formatWindowDerivationLine } from "../shared/window-geometry";
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "./compaction-off";
@@ -679,10 +680,10 @@ const StatusDialog = props => {
           },
           l: "Active",
           get v() {
-            return String(s().memoryCount);
+            return _$memo(() => !!(s().memoryState && s().memoryState !== "available"))() ? String(s().memoryState) : formatMemoryCount(s());
           },
           get fg() {
-            return t().accent;
+            return _$memo(() => !!(s().memoryState && s().memoryState !== "available"))() ? t().warning : t().accent;
           }
         }), null);
         _$insert(_el$47, _$createComponent(R, {

@@ -552,8 +552,8 @@ export function scorecardReportFixture(policy: ScorecardPolicy = policyFixture()
         evidence: {
             lanes: LANE_IDS.map((lane) => ({ lane, status: "missing", reportFingerprint: null, identity: null, diagnostics: ["artifact-missing"] })),
             baseline: policy.baselineScorecardReportFingerprint === null
-                ? { status: "absent", reportFingerprint: null }
-                : { status: "present", reportFingerprint: policy.baselineScorecardReportFingerprint },
+                ? { status: "absent", reportFingerprint: null, estimatesStatus: null }
+                : { status: "present", reportFingerprint: policy.baselineScorecardReportFingerprint, estimatesStatus: "present" },
         },
         ...overrides,
     };
@@ -562,7 +562,7 @@ export function scorecardReportFixture(policy: ScorecardPolicy = policyFixture()
         outcome: overrides.outcome ?? deriveOutcome({
             gates: rows.safetyGates,
             lanes: rows.evidence.lanes,
-            baseline: rows.evidence.baseline.status,
+            baseline: rows.evidence.baseline,
             families: SCORE_FAMILY_IDS.map((family) => rows[family]),
             adverseDeltas: rows.adverseDeltas,
             requiredMetricSlots: rows.target.requiredMetricSlots,
@@ -664,14 +664,18 @@ export function bundleFixture(options: BundleFixtureOptions = {}): ScorecardEvid
         } as LaneEvidence;
     });
     const baseline = options.baseline ?? null;
+    // Mirrors `loadBaseline`: a pinned baseline that was not supplied is a mismatch, not an absence.
+    const baselineEvidence = baseline !== null
+        ? { status: "present" as const, reportFingerprint: baseline.reportFingerprint, report: baseline, diagnostics: [] }
+        : policy.baselineScorecardReportFingerprint === null
+            ? { status: "absent" as const, reportFingerprint: null, report: null, diagnostics: [] }
+            : { status: "schema-mismatch" as const, reportFingerprint: null, report: null, diagnostics: ["baseline-path-missing"] };
     return {
         freezeManifestFingerprint: options.freezeManifestFingerprint ?? H1,
         policy,
         policyFingerprint: canonicalFingerprint(policy),
         lanes,
-        baseline: baseline === null
-            ? { status: "absent", reportFingerprint: null, report: null, diagnostics: [] }
-            : { status: "present", reportFingerprint: baseline.reportFingerprint, report: baseline, diagnostics: [] },
+        baseline: baselineEvidence,
         limitations: policy.requiredLanes.filter((row) => row.identity.kind === "identityless").map((row) => `identity-unverified-${row.lane}`),
     };
 }

@@ -117,6 +117,14 @@ impl PreparedOutput {
         })
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn json_for_test(&self) -> Option<&Value> {
+        match &self.source {
+            PreparedSource::Json(value) => Some(value),
+            PreparedSource::Exact(_) | PreparedSource::Transform(_) => None,
+        }
+    }
+
     /// Measures this immutable source exactly before output reservation.
     ///
     /// JSON measurement does not retain encoded bytes because it precedes the host's resident-byte reservation.
@@ -289,7 +297,7 @@ fn checked_body_len(
 /// Measures a JSON value's exact encoded length without retaining the bytes.
 ///
 /// Serialization stops when encoded output exceeds `MAX_WIRE_BODY_BYTES`.
-fn measure_json(value: &Value) -> Result<usize, PreparedOutputError> {
+pub(crate) fn measure_json(value: &Value) -> Result<usize, PreparedOutputError> {
     let mut writer = CountingWriter::default();
     let result = serde_json::to_writer(&mut writer, value).map_err(PreparedOutputError::Serialize);
     let writer = finish_count(writer, result)?;

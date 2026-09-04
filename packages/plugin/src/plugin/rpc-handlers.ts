@@ -8,7 +8,10 @@ import {
     CANONICAL_DREAM_TASKS,
     type DreamTaskBacklogMap,
 } from "../features/magic-context/dreamer/task-registry";
-import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
+import {
+    resolveProjectIdentity,
+    resolveProjectRootDirectory,
+} from "../features/magic-context/memory/project-identity";
 import { getMural } from "../features/magic-context/mural/storage-mural";
 import { getEmbeddingCoverageStatus } from "../features/magic-context/project-embedding-registry";
 import { parseCacheTtl } from "../features/magic-context/scheduler";
@@ -35,7 +38,7 @@ import {
 } from "../hooks/magic-context/event-resolvers";
 import { formatEmbedStatusText } from "../hooks/magic-context/format-embed-status";
 import { getLiveNotificationParams } from "../hooks/magic-context/hook-handlers";
-import { readProjectClaimLaneSnapshot } from "../hooks/magic-context/inject-compartments";
+import { kernelClientResolver } from "../hooks/magic-context/kernel-transport";
 import type { LiveSessionState } from "../hooks/magic-context/live-session-state";
 import { computeM0BlockTokens } from "../hooks/magic-context/m0-token-breakdown";
 import {
@@ -56,6 +59,13 @@ import {
     markAnnouncementSeen,
     shouldShowAnnouncement,
 } from "../shared/announcement";
+import {
+    disabled,
+    isServedMemoryDecisionRow,
+    type KernelMemorySnapshot,
+    kernelMemorySnapshotFrom,
+    stateKey,
+} from "../shared/kernel-client";
 import { getLoggerDiagnostics, log } from "../shared/logger";
 import type { MagicContextRpcServer } from "../shared/rpc-server";
 import type { EmbedDetail, SidebarSnapshot, StatusDetail } from "../shared/rpc-types";
@@ -69,6 +79,51 @@ import { applyStickySnapshotCache } from "./sidebar-snapshot-cache";
 // A restart discards the in-memory carry; the next poll cold-starts from persisted session metadata.
 const workMetricsCarryBySession = new Map<string, WorkMetricsCarry>();
 const RUST_STATUS_CACHE_TTL_MS = 2_000;
+/** Live entries per poll cache. Each open sidebar pane polls one `(session, directory)` pair, so the cap covers concurrent panes while bounding growth across sessions and projects. commentlint: allow(JUDGE) */
+const POLL_CACHE_MAX_ENTRIES = 32;
+
+/** Every `get` and `set` sweeps expired entries, and a full cache evicts its oldest entry before inserting, so a long-lived RPC server polling many sessions never accumulates dead snapshots. commentlint: allow(JUDGE) */
+export class BoundedTtlCache<V> {
+    private readonly entries = new Map<string, { value: V; cachedAt: number }>();
+
+    constructor(
+        private readonly ttlMs: number,
+        private readonly maxEntries: number,
+    ) {}
+
+    private sweep(nowMs: number): void {
+        for (const [key, entry] of this.entries) {
+            if (nowMs - entry.cachedAt >= this.ttlMs) this.entries.delete(key);
+        }
+    }
+
+    get(key: string, nowMs = Date.now()): V | undefined {
+        this.sweep(nowMs);
+        return this.entries.get(key)?.value;
+    }
+
+    set(key: string, value: V, nowMs = Date.now()): void {
+        this.sweep(nowMs);
+        this.entries.delete(key);
+        if (this.entries.size >= this.maxEntries) {
+            let oldestKey: string | undefined;
+            let oldestAt = Number.POSITIVE_INFINITY;
+            for (const [candidate, entry] of this.entries) {
+                if (entry.cachedAt < oldestAt) {
+                    oldestAt = entry.cachedAt;
+                    oldestKey = candidate;
+                }
+            }
+            if (oldestKey !== undefined) this.entries.delete(oldestKey);
+        }
+        this.entries.set(key, { value, cachedAt: nowMs });
+    }
+
+    get size(): number {
+        return this.entries.size;
+    }
+}
+
 export interface RustSessionStatus {
     usage?: { current_total_input_tokens?: number; context_limit_tokens?: number };
     tail_hygiene?: WireTailHygieneBaseline | null;
@@ -83,7 +138,10 @@ export interface RustSessionStatus {
     wrapup_active?: boolean;
     wrapup_rounds?: number | null;
 }
-const rustStatusCache = new Map<string, { status: RustSessionStatus; cachedAt: number }>();
+const rustStatusCache = new BoundedTtlCache<RustSessionStatus>(
+    RUST_STATUS_CACHE_TTL_MS,
+    POLL_CACHE_MAX_ENTRIES,
+);
 
 /**
  * When OpenCode's DB is unavailable or unreadable, the sidebar returns the persisted fallback.
@@ -130,8 +188,8 @@ async function loadRustSessionStatus(
 ): Promise<RustSessionStatus | undefined> {
     if (!client) return undefined;
     const cached = rustStatusCache.get(sessionId);
-    if (cached && Date.now() - cached.cachedAt < RUST_STATUS_CACHE_TTL_MS) {
-        return cached.status;
+    if (cached !== undefined) {
+        return cached;
     }
     try {
         const response = await client.call({
@@ -148,7 +206,7 @@ async function loadRustSessionStatus(
                 : raw;
         if (value.error || value.ok === false) return undefined;
         const status = value as RustSessionStatus;
-        rustStatusCache.set(sessionId, { status, cachedAt: Date.now() });
+        rustStatusCache.set(sessionId, status);
         return status;
     } catch (error) {
         log(`[rpc] Rust session.status unavailable for ${sessionId}:`, error);
@@ -190,7 +248,7 @@ export function buildSidebarSnapshot(
     sessionId: string,
     directory: string,
     liveSessionState?: LiveSessionState,
-    injectionBudgetTokens?: number,
+    memory?: KernelMemorySnapshot,
     // The optional execute-threshold config lets the sidebar display the effective threshold with usagePercentage.
     // If the execute-threshold config is omitted, the snapshot uses the 65% runtime default.
     config?: Record<string, unknown>,
@@ -256,15 +314,13 @@ export function buildSidebarSnapshot(
                 ? moduleStatus.compartment_count
                 : archivedCompartmentCount;
 
-        const claimLane = projectIdentity
-            ? readProjectClaimLaneSnapshot(db, projectIdentity)
-            : null;
-        const memoryClaims = (claimLane?.items ?? []).map((item) => ({
-            publicClaimId: item.publicClaimId,
-            revisionLocator: item.revisionLocator,
-        }));
-        const memoryCount = memoryClaims.length;
-        const memorySnapshotVector = claimLane?.snapshotVector ?? null;
+        // Expired anti-memories stay out of the count, matching the surface filter list and search apply.
+        const memoryNowMs = Date.now();
+        const memoryCount = memory
+            ? memory.rows.filter((row) => isServedMemoryDecisionRow(row, memoryNowMs)).length
+            : 0;
+        const memoryTruncated = memory?.truncated === true;
+        const memoryState = memory ? stateKey(memory.state) : null;
 
         let pendingOpsCount = 0;
         try {
@@ -314,9 +370,6 @@ export function buildSidebarSnapshot(
                   : "";
         const m0Blocks = computeM0BlockTokens(db, sessionId, {
             m0Text,
-            projectIdentity,
-            injectionBudgetTokens,
-            memoryBlockCount,
             compartmentTokensOverride: moduleStatus?.compartment_tokens,
         });
         const compartmentTokens = m0Blocks.compartmentTokens;
@@ -468,8 +521,8 @@ export function buildSidebarSnapshot(
             compartmentCount,
             archivedCompartmentCount,
             memoryCount,
-            memoryClaims,
-            memorySnapshotVector,
+            ...(memoryTruncated ? { memoryTruncated } : {}),
+            memoryState,
             memoryBlockCount,
             pendingOpsCount,
             historianRunning: moduleStatus?.wrapup_active === true || compartmentInProgress,
@@ -529,7 +582,7 @@ export function buildSidebarSnapshotRpcResponse(
     sessionId: string,
     directory: string,
     liveSessionState?: LiveSessionState,
-    injectionBudgetTokens?: number,
+    memory?: KernelMemorySnapshot,
     config?: Record<string, unknown>,
     moduleStatus?: RustSessionStatus,
     compactionEnabled = true,
@@ -541,7 +594,7 @@ export function buildSidebarSnapshotRpcResponse(
             sessionId,
             directory,
             liveSessionState,
-            injectionBudgetTokens,
+            memory,
             config,
             moduleStatus,
             compactionEnabled,
@@ -558,7 +611,7 @@ export function buildStatusDetail(
     modelKey?: string,
     config?: Record<string, unknown>,
     liveSessionState?: LiveSessionState,
-    injectionBudgetTokens?: number,
+    memory?: KernelMemorySnapshot,
     moduleStatus?: RustSessionStatus,
     compactionEnabled = true,
 ): StatusDetail {
@@ -567,7 +620,7 @@ export function buildStatusDetail(
         sessionId,
         directory,
         liveSessionState,
-        injectionBudgetTokens,
+        memory,
         config,
         moduleStatus,
         compactionEnabled,
@@ -817,23 +870,48 @@ export function registerRpcHandlers(
             config.toast_duration_ms,
         );
 
-    const injectionBudgetTokens = config.memory?.injection_budget_tokens;
+    // The status surface reports what an explicit search would see, lag included,
+    // so the sidebar shows `stale` when the projector is behind.
+    const kernelClient = kernelClientResolver(config);
+    // The cache reuses snapshots for `RUST_STATUS_CACHE_TTL_MS` to avoid a daemon read on each sidebar poll. commentlint: allow(JUDGE)
+    const memorySnapshotCache = new BoundedTtlCache<KernelMemorySnapshot>(
+        RUST_STATUS_CACHE_TTL_MS,
+        POLL_CACHE_MAX_ENTRIES,
+    );
+    const readMemory = async (sessionId: string, dir: string): Promise<KernelMemorySnapshot> => {
+        if (config.memory?.enabled === false) {
+            return { state: disabled(), rows: [], knownAsOf: null };
+        }
+        const cacheKey = `${sessionId}\u001f${dir}`;
+        const cached = memorySnapshotCache.get(cacheKey);
+        if (cached !== undefined) {
+            return cached;
+        }
+        const client = kernelClient({ sessionId, projectRoot: resolveProjectRootDirectory(dir) });
+        const snapshot = kernelMemorySnapshotFrom(
+            await client.read({ surface: "explicit_search", gated: true }),
+        );
+        memorySnapshotCache.set(cacheKey, snapshot);
+        return snapshot;
+    };
 
     rpcServer.handle("sidebar-snapshot", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
         const db = getDb();
         if (!db || !sessionId) return { error: "unavailable" };
-        const moduleStatus =
+        const [moduleStatus, memory] = await Promise.all([
             config.transform_mode === "rust"
-                ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
-                : undefined;
+                ? loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
+                : Promise.resolve(undefined),
+            readMemory(sessionId, dir),
+        ]);
         return buildSidebarSnapshotRpcResponse(
             db,
             sessionId,
             dir,
             liveSessionState,
-            injectionBudgetTokens,
+            memory,
             rawConfig,
             moduleStatus,
             compactionEnabled,
@@ -846,10 +924,12 @@ export function registerRpcHandlers(
         const modelKey = params.modelKey ? String(params.modelKey) : undefined;
         const db = getDb();
         if (!db || !sessionId) return { error: "unavailable" };
-        const moduleStatus =
+        const [moduleStatus, memory] = await Promise.all([
             config.transform_mode === "rust"
-                ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
-                : undefined;
+                ? loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
+                : Promise.resolve(undefined),
+            readMemory(sessionId, dir),
+        ]);
         return buildStatusDetail(
             db,
             sessionId,
@@ -857,7 +937,7 @@ export function registerRpcHandlers(
             modelKey,
             rawConfig,
             liveSessionState,
-            injectionBudgetTokens,
+            memory,
             moduleStatus,
             compactionEnabled,
         ) as unknown as Record<string, unknown>;

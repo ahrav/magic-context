@@ -13,9 +13,9 @@ import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
-import { recordDeliveredAntiMemoryUsage } from "../../features/magic-context/memory/storage-claim-operations";
-import { autoSearchHintFragmentsStillEligible } from "../../features/magic-context/memory/storage-claim-visibility";
+import { resolveProjectRootDirectory } from "../../features/magic-context/memory/project-identity";
 import type {
+    SearchSource,
     UnifiedSearchOptions,
     UnifiedSearchResult,
 } from "../../features/magic-context/search";
@@ -25,9 +25,16 @@ import {
     appendAutoSearchHintDecision,
     getAutoSearchHintDecisions,
 } from "../../features/magic-context/storage-meta-persisted";
+import {
+    type KernelClient,
+    type KernelClientResolver,
+    type KernelMemorySnapshot,
+    kernelMemorySnapshotFrom,
+} from "../../shared/kernel-client";
 import { log, sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
-import { collectAntiMemoryWarningFragments, packAutoSearchHint } from "./auto-search-hint";
+import { searchKernelMemoryRows } from "../../tools/ctx-search/kernel-memory-search";
+import { collectMemoryHintFragments, packAutoSearchHint } from "./auto-search-hint";
 import {
     AUTO_SEARCH_RESULT_LIMIT,
     AUTO_SEARCH_SOURCES,
@@ -38,24 +45,43 @@ import {
     hasStackedAugmentation,
     unifiedSearchWithTimeout,
 } from "./auto-search-shared";
+import {
+    MEMORY_READ_SURFACE,
+    withholdLaggingMemory,
+    withoutSensitiveRows,
+} from "./kernel-memory-render";
 import { hasMeaningfulUserText } from "./read-session-formatting";
 import { appendReminderToUserMessageById } from "./transform-message-helpers";
 import type { MessageLike } from "./transform-operations";
 
 export type AutoSearchOutcome =
     | { ok: true }
-    | { ok: false; kind: "timeout" | "search-failure" | "cas-exhaustion" };
+    | {
+          ok: false;
+          kind:
+              | "timeout"
+              | "search-failure"
+              | "cas-exhaustion"
+              | "memory-abstained"
+              | "memory-truncated"
+              | "memory-unavailable";
+      };
 
 const AUTO_SEARCH_OK: AutoSearchOutcome = { ok: true };
 
 export type AutoSearchDeliveryReason =
     | "delivered"
     | "empty"
+    | "memory-abstained"
+    | "memory-truncated"
+    | "memory-unavailable"
     | "below-threshold"
     | "packer-empty"
     | "timeout";
 
-/** Below-threshold, empty, packer-empty, and timeout are completed empty-delivery outcomes.
+/** Below-threshold, empty, and packer-empty are completed empty-delivery outcomes.
+ * The two memory reasons replace `empty` when the kernel withheld or could not serve memory.
+ * Like timeout, memory reasons are transient evidence: the runner persists nothing and later re-evaluates the message after the daemon recovers.
  * Search failures are incomplete evidence, not empty rankings.
  * The delivered variant carries a non-null hint because the packer-empty branch rejects a null pack.
  *  `reason`. */
@@ -99,6 +125,29 @@ function emptyDelivery(
  * `runAutoSearchHint` gives structured callers the transform's source restrictions, timeout, and packing.
  * Persistence and message mutation stay with the transform caller.
  */
+/** The `memory` source is served by the kernel; every other source still reads the local database. */
+function localSources(sources: readonly SearchSource[]): SearchSource[] {
+    return sources.filter((source) => source !== "memory");
+}
+
+/** The no-hint reason an empty turn records, given how the kernel answered. Every non-`available` state is withheld memory — `invalid` and `cancelled` reads served no rows just as `unavailable` does — so only a served-and-empty read records the project as having nothing relevant. commentlint: allow(JUDGE) */
+function emptyReason(
+    memory: KernelMemorySnapshot | null,
+): "empty" | "memory-abstained" | "memory-truncated" | "memory-unavailable" {
+    if (memory === null) return "empty";
+    if (memory.state.kind === "available") {
+        // A truncated snapshot is a capped prefix: a relevant memory can live entirely in the omitted older rows, so an empty or below-threshold ranking over it is incomplete evidence, not a completed no-hint outcome. commentlint: allow(JUDGE)
+        return memory.truncated ? "memory-truncated" : "empty";
+    }
+    if (memory.state.kind === "abstained") return "memory-abstained";
+    return "memory-unavailable";
+}
+
+/** The `explicit_search` surface serves `sensitive` rows and answers `stale` under lag; this automatic consumer re-imposes the daemon's auto-surface rules — withhold a lagging snapshot, drop `sensitive` rows — before any row is scored. Both steps are idempotent, and an injection snapshot that already passed through them re-sanitizes to itself. commentlint: allow(JUDGE) */
+function automaticSurfaceMemoryView(snapshot: KernelMemorySnapshot): KernelMemorySnapshot {
+    return withoutSensitiveRows(withholdLaggingMemory(snapshot));
+}
+
 export async function executeAutoSearchDelivery(args: {
     db: Database;
     sessionId: string;
@@ -106,32 +155,67 @@ export async function executeAutoSearchDelivery(args: {
     prompt: string;
     searchOptions: UnifiedSearchOptions;
     scoreThreshold: number;
+    /** Serves the `memory` source; absent when memory is disabled or the `memory` source is not requested. */
+    kernelClient?: KernelClient;
+    /** The gated `explicit_search` injection read taken earlier in the same pass; when present, the `memory` source consumes it and issues no `kernel.read`. The injection read shares this path's surface, gating, and withholding, and the value substitutes for the RPC. commentlint: allow(JUDGE) */
+    memorySnapshot?: KernelMemorySnapshot;
     timeoutMs?: number;
     /** The reference clock defaults to the live clock for hint-age wording.
      * */
     packNowMs?: number;
 }): Promise<AutoSearchDelivery> {
-    let results: UnifiedSearchResult[] | null;
+    // An undefined source list takes the auto-search defaults; `unifiedSearch` gives an
+    // empty list the "no sources" meaning, not the default set. commentlint: allow(JUDGE)
+    const sources: readonly SearchSource[] = args.searchOptions.sources ?? AUTO_SEARCH_SOURCES;
+    const memoryRequested = sources.includes("memory");
+    const kernelClient = memoryRequested ? args.kernelClient : undefined;
+    const memorySnapshot = memoryRequested ? args.memorySnapshot : undefined;
+    const limit = args.searchOptions.limit ?? AUTO_SEARCH_RESULT_LIMIT;
+    let timed: { results: UnifiedSearchResult[]; memory: KernelMemorySnapshot | null } | null;
     try {
-        results = await unifiedSearchWithTimeout(
+        timed = await unifiedSearchWithTimeout(
             args.db,
             args.sessionId,
             args.projectPath,
             args.prompt,
-            args.searchOptions,
+            { ...args.searchOptions, sources: localSources(sources) },
             args.timeoutMs ?? AUTO_SEARCH_TIMEOUT_MS,
+            memorySnapshot !== undefined
+                ? async () => automaticSurfaceMemoryView(memorySnapshot)
+                : kernelClient
+                  ? async (signal, deadlineMs) =>
+                        automaticSurfaceMemoryView(
+                            kernelMemorySnapshotFrom(
+                                await kernelClient.read({
+                                    surface: MEMORY_READ_SURFACE,
+                                    gated: true,
+                                    signal,
+                                    deadlineMs,
+                                }),
+                            ),
+                        )
+                  : undefined,
         );
     } catch (error) {
         return { status: "incomplete", kind: "search-failure", error };
     }
-    if (results === null) {
+    if (timed === null) {
         return emptyDelivery("timeout", []);
     }
+    const memoryHits =
+        timed.memory === null
+            ? null
+            : searchKernelMemoryRows({ rows: timed.memory.rows, query: args.prompt, limit });
+    const results = [...(memoryHits ?? []), ...timed.results]
+        .sort((left, right) => right.score - left.score)
+        .slice(0, limit);
     if (results.length === 0) {
-        return emptyDelivery("empty", results);
+        return emptyDelivery(emptyReason(timed.memory), results);
     }
     if (results[0].score < args.scoreThreshold) {
-        return emptyDelivery("below-threshold", results);
+        // A withheld memory lane overrides `below-threshold`: the memory reasons stay retryable after the daemon recovers, while `below-threshold` persists a completed no-hint decision. commentlint: allow(JUDGE)
+        const reason = emptyReason(timed.memory);
+        return emptyDelivery(reason === "empty" ? "below-threshold" : reason, results);
     }
     const packed = packAutoSearchHint(results, {
         warningScoreThreshold: args.scoreThreshold,
@@ -158,9 +242,24 @@ export interface AutoSearchRunnerOptions {
     directory?: string;
     projectPath: string;
     ensureProjectRegistered?: (directory: string, db: Database) => Promise<void>;
+    /** Serves the `memory` source; absent when no daemon transport exists. */
+    kernelClient?: KernelClientResolver;
+    /** The pass's injection memory snapshot; the delivery consumes it instead of re-reading. */
+    memorySnapshot?: KernelMemorySnapshot;
     memoryEnabled?: boolean;
     embeddingEnabled?: boolean;
     gitCommitsEnabled?: boolean;
+}
+
+/**
+ * A persisted hint replays only when it carries no memory-backed fragments.
+ * Anti-memory warnings and kernel memory hits persist fragments because the rows they were read from can be archived or revised between passes, and a stored rendering would replay stale memory as authoritative context. commentlint: allow(JUDGE)
+ * Hints built from non-memory sources persist an empty fragment list and stay replayable. commentlint: allow(JUDGE)
+ */
+export function autoSearchHintReplayable(
+    decision: Extract<AutoSearchHintDecision, { decision: "hint" }>,
+): boolean {
+    return decision.memoryFragments !== undefined && decision.memoryFragments.length === 0;
 }
 
 export function collectUserPromptParts(message: MessageLike): string {
@@ -212,25 +311,34 @@ export async function runAutoSearchHint(args: {
     if (!userMsg || typeof userMsg.info.id !== "string") return AUTO_SEARCH_OK;
     const userMsgId = userMsg.info.id;
 
-    // Persisted anti-memory warnings never replay; each warning requires a fresh search.
-    // Ordinary hints carry no memory fragments and can replay.
     const replayHintIfEligible = (decision: AutoSearchHintDecision): void => {
         if (decision.decision !== "hint") return;
-        if (!autoSearchHintFragmentsStillEligible(db, decision.memoryFragments)) {
-            sessionLog(
-                sessionId,
-                `auto-search: suppressing persisted anti-memory warning for ${decision.messageId} — fresh search required`,
-            );
+        if (autoSearchHintReplayable(decision)) {
+            appendReminderToUserMessageById(messages, decision.messageId, decision.text);
             return;
         }
-        appendReminderToUserMessageById(messages, decision.messageId, decision.text);
+        sessionLog(
+            sessionId,
+            `auto-search: suppressing persisted memory-backed hint for ${decision.messageId} — fresh search required`,
+        );
     };
 
     const existing = getAutoSearchHintDecisions(db, sessionId);
     const existingForMessage = existing.find((decision) => decision.messageId === userMsgId);
-    if (existingForMessage) {
+    // A memory-backed hint decision never replays, and the message it belongs to can be transformed again after a restart or retry reconstructs it; returning here would lose the hint permanently instead of running the promised fresh search. Only the final-message and stacked-augmentation guards below may still withhold it. commentlint: allow(JUDGE)
+    const rerunForMessage =
+        existingForMessage !== undefined &&
+        existingForMessage.decision === "hint" &&
+        !autoSearchHintReplayable(existingForMessage);
+    if (existingForMessage && !rerunForMessage) {
         replayHintIfEligible(existingForMessage);
         return AUTO_SEARCH_OK;
+    }
+    if (rerunForMessage) {
+        sessionLog(
+            sessionId,
+            `auto-search: persisted memory-backed hint for ${userMsgId} cannot replay — running a fresh search`,
+        );
     }
 
     // The transform creates hints only for the final message because mutating an earlier message invalidates cached later messages.
@@ -301,6 +409,18 @@ export async function runAutoSearchHint(args: {
             prompt: rawPrompt,
             searchOptions,
             scoreThreshold: options.scoreThreshold,
+            // The snapshot substitutes for the kernel read, so it forwards without a resolver or directory; tying it to client resolution would drop the pass's injection read and record the project as empty. commentlint: allow(JUDGE)
+            ...(memoryEnabled !== false && options.memorySnapshot !== undefined
+                ? { memorySnapshot: options.memorySnapshot }
+                : {}),
+            ...(memoryEnabled !== false && options.kernelClient && options.directory
+                ? {
+                      kernelClient: options.kernelClient({
+                          sessionId,
+                          projectRoot: resolveProjectRootDirectory(options.directory),
+                      }),
+                  }
+                : {}),
         });
     } catch (error) {
         delivery = { status: "incomplete", kind: "search-failure", error };
@@ -324,8 +444,23 @@ export async function runAutoSearchHint(args: {
     }
 
     const results = delivery.prePack;
-    if (delivery.reason === "empty" || delivery.reason === "packer-empty") {
+    if (delivery.reason === "packer-empty") {
         return writeNoHintAndReconcile("empty");
+    }
+    if (
+        delivery.reason === "memory-abstained" ||
+        delivery.reason === "memory-truncated" ||
+        delivery.reason === "memory-unavailable"
+    ) {
+        // A withheld memory lane is transient evidence like a timeout: the pass persists no decision, so a later pass re-evaluates the message once the daemon recovers.
+        sessionLog(
+            sessionId,
+            `auto-search: memory lane ${delivery.reason}, skipping hint for this turn (will retry)`,
+        );
+        return { ok: false, kind: delivery.reason };
+    }
+    if (delivery.reason === "empty") {
+        return writeNoHintAndReconcile(delivery.reason);
     }
     if (delivery.reason === "below-threshold") {
         sessionLog(
@@ -338,10 +473,8 @@ export async function runAutoSearchHint(args: {
     const hintText = delivery.hintText;
 
     const payload = `\n\n${hintText}`;
-    // Any anti-memory fragment marks the persisted decision as non-replayable.
-    const { warningResults, memoryFragments } = collectAntiMemoryWarningFragments(
-        delivery.delivered,
-    );
+    // Any memory-backed fragment — an anti-memory warning or a positive kernel hit — marks the persisted decision as non-replayable; hints from non-memory sources persist an empty list and replay. commentlint: allow(JUDGE)
+    const { memoryFragments } = collectMemoryHintFragments(delivery.delivered);
     const outcome = appendAutoSearchHintDecision(db, sessionId, {
         messageId: userMsgId,
         decision: "hint",
@@ -352,9 +485,9 @@ export async function runAutoSearchHint(args: {
         sessionLog(sessionId, `auto-search: CAS exhausted for ${userMsgId}; skipping wire append`);
         return { ok: false, kind: "cas-exhaustion" };
     }
-    if (outcome.kind === "appended" && warningResults.length > 0) {
+    if (outcome.kind === "appended" || rerunForMessage) {
+        // A fresh delivery appends directly because a memory-backed decision bypasses replay; a rerun for an existing memory-backed decision appends the freshly searched hint the append answered "already-present" for. commentlint: allow(JUDGE)
         appendReminderToUserMessageById(messages, userMsgId, payload);
-        recordDeliveredAntiMemoryUsage(db, warningResults);
     } else {
         replayHintIfEligible(outcome.decision);
     }

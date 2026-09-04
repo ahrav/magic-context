@@ -1,4 +1,5 @@
 import type { PluginContext } from "../../plugin/types";
+import type { KernelClientResolver } from "../../shared/kernel-client";
 import type { Database } from "../../shared/sqlite";
 import type { ParsedEvent } from "./compartment-parser";
 import type {
@@ -92,6 +93,8 @@ export interface CompartmentRunnerDeps {
      * and must NOT generate or store embeddings.
      */
     memoryEnabled?: boolean;
+    /** Serves the `<project-memory>` block the historian deduplicates against; absent when no daemon transport exists. */
+    kernelClient?: KernelClientResolver;
     /**
      * Automatic-promotion gate (`memory.auto_promote` config). When false (and
      * memory is otherwise enabled), tools and search still work, but historian

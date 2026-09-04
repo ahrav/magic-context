@@ -74,19 +74,19 @@ See `incidents/README.md` for approved registration and append-only rules.
 
 ## Architecture
 
-- **`src/mock-provider/server.ts`** — Anthropic-compatible mock HTTP server. Accepts
+- **`src/mock-provider/server.ts`**: Anthropic-compatible mock HTTP server. Accepts
   POST `/messages`, supports both SSE streaming (default for OpenCode) and single-shot
   JSON, lets tests script responses with precise control over
   `input_tokens` / `output_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens`.
   Captures every request body for assertions.
 
-- **`src/opencode-runner/spawn.ts`** — Subprocess runner that launches `opencode serve`
+- **`src/opencode-runner/spawn.ts`**: Subprocess runner that launches `opencode serve`
   with an isolated config/data/cache directory, a custom `mock-anthropic` provider
   pointed at the mock, and the magic-context plugin loaded from local source via
   `file://` spec. No npm install required; the plugin is loaded directly from
   `packages/plugin/src/index.ts`.
 
-- **`src/pi-runner/`** + **`src/pi-harness.ts`** — Pi-flavored counterpart to the
+- **`src/pi-runner/`** + **`src/pi-harness.ts`**: Pi-flavored counterpart to the
   OpenCode runner. Spawns a real Pi child process pointed at the same mock
   Anthropic server and loads the Pi plugin from local source.
 
@@ -180,7 +180,7 @@ entire default provider map. Include a complete `mock-anthropic` entry beside
 the live provider if later prompts still use the mock. Also,
 `RustTestHarness.restart()` drops `openCodeConfigExtra`; rebuild or reapply the
 recipe after a restart. Keep the recipe's `hostname: "127.0.0.1"` when spawning
-with a real key — other spawns bind all interfaces with no authentication,
+with a real key; other spawns bind all interfaces with no authentication,
 which would expose the live credential to anyone who can reach the port.
 `hostname` accepts only `"0.0.0.0"` and `"127.0.0.1"`, the two addresses the
 fixed `http://127.0.0.1:${port}` client URL can reach. The shipped test only
@@ -213,12 +213,12 @@ RPC mode is available in the installed Pi peer range. The current peer is
 packaged docs specify the JSONL RPC protocol, and the changelog shows the
 current JSON protocol was introduced in `0.16.0`.
 
-- **`tests/*.test.ts`** — Test suites. OpenCode-flavored suites use `harness.ts` /
+- **`tests/*.test.ts`**: Test suites. OpenCode-flavored suites use `harness.ts` /
   `opencode-runner`; Pi-flavored suites (`tests/pi-*.test.ts`) use `pi-harness.ts` /
   `pi-runner`. Each test creates a session, sends prompts, and asserts against
   SQLite state, log output, and captured mock requests.
 
-- **`tests/rust-*.test.ts`** — Rust-mode lane. Starts the repository-local
+- **`tests/rust-*.test.ts`**: Rust-mode lane. Starts the repository-local
   `direct_host_fixture`, then drives OpenCode → plugin → `McHostModuleTransport`
   → real `McHandler`. `src/rust-runner/hermetic-mc-host.ts` owns fixture build,
   managed-client readiness, bounded backend controls, and teardown. Run the broad
@@ -252,13 +252,119 @@ by SHRINKING the context limit against REAL message bytes, never by inflating
 reported usage. The two techniques are not interchangeable: inflated usage moves
 only fill-keyed conditions (execute thresholds, force bands) while every
 real-byte-keyed condition (reclaimable-tail pressure, tail-size trigger floors,
-chunk substance) stays silently unreachable — a harness built that way passes
+chunk substance) stays silently unreachable; a harness built that way passes
 every fill-keyed test honestly while structurally unable to exercise the other
 axis, with nothing announcing the gap. (Observed live 2026-08-14 in a peer
 gateway's drive container: 44 passes, fill 80→86%, `eligible_chunk_tokens`
 pinned at exactly 0.0 the whole time.) If a scenario needs a shortcut, shrink
 the window; if you must inflate, document which asserted conditions become
 unreachable.
+
+### Scorecard
+
+`src/scorecard/` joins the archived lane reports into one release decision. It
+reads, it never re-runs: every value in the report is a count, ratio, or
+fingerprint taken from a lane report, and every gate is either observed by a
+lane or listed as not observed.
+
+**Pre-registration.** `prospective-holdout/policies/scorecard-policy.json` is
+the `magic-context-x4l.15` policy-owner document. Its `policy` payload
+(`scorecard-policy/v1`) fixes the primary endpoint, secondary metric slots, the
+five gate ids, the injection canary scenario ids, the tolerated regression
+count, the bootstrap resample count and noise-floor source, the model matrix,
+replicate count, and release cost budget, the required lanes with their report
+schema and build-identity projection, the required metric slots, the bound
+paired-delta policy fingerprint, and the baseline scorecard report fingerprint
+(`null` for the first release). The freeze manifest records the document's
+fingerprint, so a run refuses (`policy-not-frozen`) when the policy on disk is
+not the one the approved freeze binds. A paired-delta report bound to another
+paired-delta policy fingerprint is `schema-mismatch`; one whose run settings or
+spend differ from the pre-registered values is `incomplete` with
+`pre-registration-mismatch`.
+
+**Gate statuses.** Each of `gate-cross-project-leak`,
+`gate-unrelated-scope-secret`, `gate-injection-promoted`,
+`gate-false-enforced-policy`, and `gate-database-corruption` is `passed`,
+`failed`, `not-observed`, or `errored`. Only `passed` supports promotion. A gate
+with no producing lane is `not-observed` with `no-producing-lane`; there is no
+exemption. `gate-injection-promoted` is observed from the metamorphic report
+when every pre-registered canary scenario has at least one applied transform;
+partial coverage is `not-observed` with `canary-coverage-incomplete`.
+
+**Lane statuses and reason codes.** Each required lane is `present`,
+`missing`, `incomplete`, or `schema-mismatch`. Only `present` counts toward
+`mandatoryEvidenceComplete`. Diagnostics and limitations are closed-vocabulary
+kebab-case codes (`run-incomplete`, `privacy-rejected`, `report-parse-failed`,
+`build-identity-mismatch`, `identity-unverified-<lane>`, `no-baseline`,
+`baseline-not-comparable`, `hard-gates-unobserved`, ...); the report never carries free text, scenario
+content, paths, or raw intake. Every lane artifact is privacy-scanned before it
+is parsed, so an archived report that embeds an absolute path or an XML manifest
+lowers its lane to `schema-mismatch` with `privacy-rejected`.
+
+**Exit codes.** `2` when any gate is non-passing, the run was refused
+(`policy-not-frozen`, `privacy-rejected`), or usage was requested or malformed
+(`--help` shares this code so a stray help flag in CI can never read as a
+promotion);
+`1` when `outcome.promotionAllowed` is false for any other reason: evidence is
+incomplete, the policy pins a baseline the run cannot compare against
+(`baseline-not-comparable`), or blocking regressions exceed the tolerance; `0`
+exactly when `outcome.promotionAllowed` is true. The prospective-holdout adapter
+attests the same `promotionAllowed`, so the CLI and the holdout validator never
+disagree about a report. Until the four unproduced gate probes exist, every
+release-grade run exits `2` with four `not-observed` gates listed. That is the
+fail-closed default, not a bug.
+
+**Operator steps.**
+
+1. Freeze: write `scorecard-policy.json` as `ready`, compute its fingerprint,
+   record it in the freeze manifest, and collect the two approvals through the
+   holdout freeze path.
+2. Collect: the loader reads exactly `<lane>-report.json` at the top level of
+   the artifacts directory for each of `paired-delta`, `historian`,
+   `metamorphic`, `dreamer`, `incident`, and `retrieval`. A lane whose file is
+   absent under that name is `missing`, which is indistinguishable from a lane
+   that never ran, so rename after download. The lane workflows archive under
+   their own names:
+
+   | Lane | Archived artifact | Archived file |
+   |---|---|---|
+   | `paired-delta` | `paired-delta-<mode>-<run-id>-<attempt>` | `paired-delta-<mode>-report.json` |
+   | `historian` | `historian-eval-report` | `historian-eval-report.json` |
+   | `metamorphic` | `historian-eval-metamorphic-report` | `metamorphic-eval-live-report.json` |
+   | `dreamer` | `dreamer-eval-report` | `<group>/<run-id>.json` per run, plus `<group>/variance.json` |
+   | `incident` | `incident-pool-ts` | `incident-pool-ts-report.json` |
+   | `retrieval` | `retrieval-benchmark-ci` | `retrieval-check-report-<n>.json` |
+
+   ```sh
+   mkdir -p artifacts
+   gh run download <run-id> --name <artifact> --dir downloads/<artifact>/
+   mv -f downloads/historian-eval-report/historian-eval-report.json artifacts/historian-report.json
+   # ... one rename per lane; pick one retrieval candidate report.
+   # dreamer expects one JSON array of the nested `<group>/<run-id>.json` run reports.
+   # -mindepth 2 skips the top-level coverage.json; the name filter skips variance.json.
+   # sort -z fixes the array order, so the same run reports always give the same lane fingerprint.
+   find downloads/dreamer-eval-report -mindepth 2 -name '*.json' ! -name variance.json -print0 \
+     | sort -z | xargs -0 jq -s '.' > artifacts/dreamer-report.json
+   ```
+
+3. Score:
+
+   ```sh
+   bun scripts/run-scorecard.ts \
+     --freeze <freeze-manifest-dir> \
+     --freeze-fingerprint <trusted-manifest-fingerprint> \
+     --artifacts artifacts/ \
+     --out scorecard-report.json \
+     [--baseline <previous-scorecard-report.json>]
+   ```
+
+   The script prints the `outcome` section and the report fingerprint, writes
+   the report as canonical two-space JSON, and exits per the table above.
+4. Review: read `safetyGates` first, then blocking rows in `adverseDeltas`,
+   then the five score families, then `limitations`. Cite `reportFingerprint`
+   in the promote or hold decision.
+
+Unit suite: `bun run test:scorecard-unit`.
 
 ### CI
 
@@ -273,7 +379,7 @@ separate from U7.
 - Bun.
 - For the Rust-mode lane (`tests/rust-*.test.ts`): Unix sockets, `cargo` on PATH,
   and the current repository checkout. Fixture builds on demand.
-- No `OPENCODE_SERVER_PASSWORD` required — the spawner explicitly strips it so the
+- No `OPENCODE_SERVER_PASSWORD` required; the spawner explicitly strips it so the
   test server runs unsecured on a random localhost port.
 
 ## Writing a test

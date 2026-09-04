@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type {
+    AntiMemorySearchResult,
     MemorySearchResult,
     MessageSearchResult,
     NoteSearchResult,
@@ -61,6 +62,24 @@ function noteResult(id: number, anchorOrdinal: number | null): NoteSearchResult 
     };
 }
 
+function antiMemoryResult(rationale?: string): AntiMemorySearchResult {
+    return {
+        source: "anti_memory",
+        score: 0.5,
+        publicClaimId: `mem_${"c".repeat(32)}`,
+        revisionLocator: `mem_${"c".repeat(32)}@1`,
+        contentDigest: "d".repeat(64),
+        claimId: -1,
+        normalizedHash: "d".repeat(64),
+        trigger: "session caching",
+        rejectedStrategy: "Redis",
+        rejectionReason: "it creates split ownership",
+        saferAlternative: null,
+        matchType: "lexical",
+        ...(rationale ? { rationale } : {}),
+    };
+}
+
 describe("boundDynamicField", () => {
     it("returns short fields unchanged", () => {
         expect(boundDynamicField("short")).toBe("short");
@@ -99,6 +118,19 @@ describe("packed search text rendering", () => {
         expect(formatSearchResults("nothing", [], SESSION)).toBe(
             'No results found for "nothing" across notes, memories, primers, git commits, or message history.',
         );
+    });
+
+    it("renders an anti-memory rationale after the warning line and omits it when absent", () => {
+        const withRationale = formatSearchResults(
+            "nonce",
+            [antiMemoryResult("the nonce handshake stalls under load")],
+            SESSION,
+        );
+        expect(withRationale).toContain("⚠ Previously rejected: Redis.");
+        expect(withRationale).toContain("Rationale: the nonce handshake stalls under load");
+
+        const withoutRationale = formatSearchResults("nonce", [antiMemoryResult()], SESSION);
+        expect(withoutRationale).not.toContain("Rationale:");
     });
 
     it("emits the note expand hint only for current-session anchored notes", () => {

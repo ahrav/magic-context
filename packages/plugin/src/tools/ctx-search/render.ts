@@ -47,6 +47,8 @@ function formatResult(
         return [
             `[${index}] [anti-memory warning] score=${result.score.toFixed(2)} id=${result.publicClaimId} match=${result.matchType}${policy}`,
             renderAntiMemoryWarning(result),
+            // The rationale renders only in this full-result view; the compact auto-search hint keeps the warning-line field set.
+            ...(result.rationale ? [`Rationale: ${boundDynamicField(result.rationale)}`] : []),
         ].join("\n");
     }
     if (result.source === "memory") {

@@ -1,12 +1,20 @@
 import { describe, expect, it } from "bun:test";
+import { renderAntiMemoryContent } from "@magic-context/core/features/magic-context/memory/anti-memory-content";
+import { ANTI_MEMORY_CATEGORY } from "@magic-context/core/features/magic-context/memory/constants";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { setSessionWorkMetrics } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { buildStatusDetails } from "../commands/ctx-status";
 import {
 	clearPiChannel1State,
 	setPiChannel1Baseline,
 } from "../ctx-reduce-nudge-pi";
-import { assistantMessage, createTestDb, fakeContext } from "../test-utils";
+import {
+	assistantMessage,
+	createTestDb,
+	fakeContext,
+	fakeKernelResolver,
+} from "../test-utils";
 import { buildPiStatusDetail, showStatusDialog } from "./status-dialog";
 
 describe("Pi status dialog", () => {
@@ -35,9 +43,11 @@ describe("Pi status dialog", () => {
 				ctx as never,
 				{
 					db,
+					kernelClient: fakeKernelResolver().kernelClient,
 					projectIdentity: resolveProjectIdentity(process.cwd()),
 				},
 				sessionId,
+				fakeKernelResolver().kernel.snapshot("explicit_search"),
 			);
 			expect(detail.contextLimit).toBe(80_000);
 			expect(detail.usagePercentage).toBe(62.5);
@@ -100,9 +110,11 @@ describe("Pi status dialog", () => {
 				} as never,
 				{
 					db,
+					kernelClient: fakeKernelResolver().kernelClient,
 					projectIdentity: resolveProjectIdentity(process.cwd()),
 				},
 				sessionId,
+				fakeKernelResolver().kernel.snapshot("explicit_search"),
 			);
 
 			expect(schedulerPercentage).toBeCloseTo(61.1, 1);
@@ -163,6 +175,7 @@ describe("Pi status dialog", () => {
 
 			await showStatusDialog({ getAllTools: () => [] } as never, ctx as never, {
 				db,
+				kernelClient: fakeKernelResolver().kernelClient,
 				projectIdentity: resolveProjectIdentity(process.cwd()),
 			});
 
@@ -212,6 +225,7 @@ describe("Pi status dialog", () => {
 
 			await showStatusDialog({ getAllTools: () => [] } as never, ctx as never, {
 				db,
+				kernelClient: fakeKernelResolver().kernelClient,
 				projectIdentity: resolveProjectIdentity(process.cwd()),
 			});
 
@@ -219,6 +233,185 @@ describe("Pi status dialog", () => {
 			expect(text).toContain("Work tokens 1.2K new · 9.8K total input");
 			expect(text).toContain("Window ");
 			expect(text).not.toContain("Context:");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("reports the kernel state and row count instead of claim-lane counts", async () => {
+		const db = createTestDb();
+		try {
+			const sessionId = "ses-status-kernel";
+			const fake = fakeKernelResolver();
+			fake.kernel.seedDecision({
+				object_id: `mem_${"1".repeat(32)}`,
+				decision_kind: "NAMING",
+				summary: "One memory.",
+			});
+			const rendered: string[][] = [];
+			const ctx = {
+				...fakeContext(sessionId),
+				ui: {
+					async custom(factory: unknown) {
+						const makeComponent = factory as (
+							tui: { requestRender: () => void },
+							theme: {
+								fg: (_name: string, text: string) => string;
+								bold: (text: string) => string;
+							},
+							keybindings: unknown,
+							done: (value: undefined) => void,
+						) => { render: (width: number) => string[]; dispose?: () => void };
+						const component = makeComponent(
+							{ requestRender: () => undefined },
+							{ fg: (_name, text) => text, bold: (text) => text },
+							undefined,
+							() => undefined,
+						);
+						rendered.push(component.render(90));
+						component.dispose?.();
+						return undefined;
+					},
+				},
+				getSystemPrompt: () => "system prompt",
+			};
+
+			await showStatusDialog({ getAllTools: () => [] } as never, ctx as never, {
+				db,
+				kernelClient: fake.kernelClient,
+				projectIdentity: resolveProjectIdentity(process.cwd()),
+			});
+			const text = rendered.flat().join("\n");
+			expect(text).toContain("1 memories (0 injected, available)");
+			expect(fake.transport.calls[0]?.body).toMatchObject({
+				surface: "explicit_search",
+				gated: true,
+			});
+
+			fake.transport.fileExists = false;
+			rendered.length = 0;
+			await showStatusDialog({ getAllTools: () => [] } as never, ctx as never, {
+				db,
+				kernelClient: fake.kernelClient,
+				projectIdentity: resolveProjectIdentity(process.cwd()),
+			});
+			expect(rendered.flat().join("\n")).toContain(
+				"0 memories (0 injected, unavailable:daemon_absent)",
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("marks a truncated read's memory count as a lower bound", async () => {
+		const db = createTestDb();
+		try {
+			const sessionId = "ses-status-truncated";
+			const fake = fakeKernelResolver();
+			fake.kernel.seedDecision({
+				object_id: `mem_${"2".repeat(32)}`,
+				decision_kind: "NAMING",
+				summary: "One memory.",
+			});
+			fake.kernel.readTruncated = true;
+			const rendered: string[][] = [];
+			const ctx = {
+				...fakeContext(sessionId),
+				ui: {
+					async custom(factory: unknown) {
+						const makeComponent = factory as (
+							tui: { requestRender: () => void },
+							theme: {
+								fg: (_name: string, text: string) => string;
+								bold: (text: string) => string;
+							},
+							keybindings: unknown,
+							done: (value: undefined) => void,
+						) => { render: (width: number) => string[]; dispose?: () => void };
+						const component = makeComponent(
+							{ requestRender: () => undefined },
+							{ fg: (_name, text) => text, bold: (text) => text },
+							undefined,
+							() => undefined,
+						);
+						rendered.push(component.render(90));
+						component.dispose?.();
+						return undefined;
+					},
+				},
+				getSystemPrompt: () => "system prompt",
+			};
+
+			await showStatusDialog({ getAllTools: () => [] } as never, ctx as never, {
+				db,
+				kernelClient: fake.kernelClient,
+				projectIdentity: resolveProjectIdentity(process.cwd()),
+			});
+			expect(rendered.flat().join("\n")).toContain(
+				"1+ memories (0 injected, available)",
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+	it("an expired anti-memory stays out of the memory count on both Pi surfaces", () => {
+		const db = createTestDb();
+		try {
+			const sessionId = "ses-status-expired-anti";
+			const fake = fakeKernelResolver();
+			fake.kernel.seedDecision({
+				object_id: `mem_${"a".repeat(32)}`,
+				decision_kind: "PROJECT_RULES",
+				summary: "Always use Bun for builds",
+			});
+			fake.kernel.seedDecision({
+				object_id: `mem_${"b".repeat(32)}`,
+				decision_kind: ANTI_MEMORY_CATEGORY,
+				summary: renderAntiMemoryContent({
+					trigger: "asked to bypass the daemon",
+					rejectedStrategy: "write straight to the store",
+					rejectionReason: "the daemon owns commit ordering",
+					expiresAt: 1,
+				}),
+			});
+			fake.kernel.seedDecision({
+				object_id: `mem_${"c".repeat(32)}`,
+				decision_kind: ANTI_MEMORY_CATEGORY,
+				summary: renderAntiMemoryContent({
+					trigger: "asked to fork the schema",
+					rejectedStrategy: "fork the schema",
+					rejectionReason: "one schema serves both hosts",
+					expiresAt: Date.now() + 60_000,
+				}),
+			});
+			const memory = fake.kernel.snapshot("explicit_search");
+
+			const dialogDetail = buildPiStatusDetail(
+				{ getAllTools: () => [] } as never,
+				{
+					...fakeContext(sessionId),
+					getSystemPrompt: () => "system prompt",
+				} as never,
+				{
+					db,
+					kernelClient: fake.kernelClient,
+					projectIdentity: resolveProjectIdentity(process.cwd()),
+				},
+				sessionId,
+				memory,
+			);
+			expect(dialogDetail.memoryCount).toBe(2);
+
+			const commandDetails = buildStatusDetails(
+				{
+					db,
+					kernelClient: fake.kernelClient,
+					projectIdentity: resolveProjectIdentity(process.cwd()),
+				},
+				sessionId,
+				memory,
+			);
+			expect(commandDetails.memoryCount).toBe(2);
 		} finally {
 			closeQuietly(db);
 		}

@@ -32,6 +32,7 @@ import {
     CLAIM_REQUEST_ENCODING_VERSION,
     CLAIM_RESULT_ENCODING_VERSION,
     type ClaimMutationToken,
+    ClaimOperationInputError,
     type ClaimOperationResult,
     type ClaimOperationResultEffect,
     canonicalJsonEncode,
@@ -90,14 +91,7 @@ export class ClaimOperationKeyReuseError extends Error {
     }
 }
 
-/** ClaimOperationInputError reports unknown claims, duplicate collisions, and malformed input.
- * ClaimOperationInputError is thrown before any receipt exists, so the transaction rolls back entirely. */
-export class ClaimOperationInputError extends Error {
-    constructor(message: string) {
-        super(message);
-        this.name = "ClaimOperationInputError";
-    }
-}
+export { ClaimOperationInputError };
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -2043,27 +2037,6 @@ export function recordClaimUsage(
             update.run(nowMs, nowMs, publicClaimId);
         }
     }).immediate();
-}
-
-/**
- *
- */
-export function recordDeliveredAntiMemoryUsage(
-    db: Database,
-    delivered: readonly { source: string; publicClaimId?: string }[],
-    nowMs?: number,
-): void {
-    const publicClaimIds = delivered.flatMap((result) =>
-        result.source === "anti_memory" && result.publicClaimId !== undefined
-            ? [result.publicClaimId]
-            : [],
-    );
-    if (publicClaimIds.length === 0) return;
-    recordClaimUsage(db, {
-        publicClaimIds,
-        kind: "retrieved",
-        ...(nowMs === undefined ? {} : { nowMs }),
-    });
 }
 
 // ---------------------------------------------------------------------------

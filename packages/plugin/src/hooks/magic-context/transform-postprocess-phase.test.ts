@@ -34,6 +34,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import { available, type KernelMemorySnapshot } from "../../shared/kernel-client";
 import * as loggerModule from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
@@ -66,6 +67,9 @@ import {
     runPostTransformPhase,
     runRustModePostprocess,
 } from "./transform-postprocess-phase";
+
+/** The snapshot of a session whose project has no memories; the block renders only its marker. */
+const EMPTY_MEMORY: KernelMemorySnapshot = { state: available(), rows: [], knownAsOf: 0 };
 
 const SESSION_ID = "ses-postprocess-drift";
 const tempDirs: string[] = [];
@@ -800,6 +804,7 @@ describe("deferred compaction marker representation", () => {
                     rebuiltFromDb: true,
                 },
                 m0M1: {
+                    memory: EMPTY_MEMORY,
                     projectDirectory: dataHome,
                     injectDocs: false,
                 },
@@ -871,6 +876,7 @@ describe("deferred compaction marker representation", () => {
                 messageTagNumbers: taggedDefer.messageTagNumbers,
                 batch: taggedDefer.batch,
                 m0M1: {
+                    memory: EMPTY_MEMORY,
                     projectDirectory: dataHome,
                     injectDocs: false,
                 },
@@ -1886,6 +1892,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         // A marker change triggers a hard fold on subsequent passes.
         injectM0M1({
             db,
+            memory: EMPTY_MEMORY,
             sessionId,
             state: getOrCreateSessionMeta(db, sessionId),
             projectPath: FOLD_PROJECT,
@@ -1907,6 +1914,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         const directMessages: MessageLike[] = [];
         const direct = injectM0M1({
             db,
+            memory: EMPTY_MEMORY,
             sessionId: directSession,
             messages: directMessages,
             state: getOrCreateSessionMeta(db, directSession),
@@ -1922,6 +1930,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 schedulerDecision: "defer",
                 contextUsage: { percentage: 40, inputTokens: 4000 },
                 m0M1: {
+                    memory: EMPTY_MEMORY,
                     projectPath: FOLD_PROJECT,
                     projectDirectory: FOLD_PROJECT,
                     historyBudgetTokens: 98_000,
@@ -1957,6 +1966,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, [], {
                 m0M1: {
+                    memory: EMPTY_MEMORY,
                     projectPath: FOLD_PROJECT,
                     projectDirectory: FOLD_PROJECT,
                     historyBudgetTokens: 98_000,
@@ -1987,6 +1997,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 targets,
                 currentTurnId: "turn-hardfold",
                 m0M1: {
+                    memory: EMPTY_MEMORY,
                     projectPath: FOLD_PROJECT,
                     projectDirectory: FOLD_PROJECT,
                     historyBudgetTokens: 98_000,
@@ -2030,6 +2041,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 currentTurnId: "turn-hardfold-historian",
                 canRunCompartments: true,
                 m0M1: {
+                    memory: EMPTY_MEMORY,
                     projectPath: FOLD_PROJECT,
                     projectDirectory: FOLD_PROJECT,
                     historyBudgetTokens: 98_000,
@@ -2076,6 +2088,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 targets,
                 currentTurnId: "turn-hardfold-reclaim",
                 m0M1: {
+                    memory: EMPTY_MEMORY,
                     projectPath: FOLD_PROJECT,
                     projectDirectory: FOLD_PROJECT,
                     historyBudgetTokens: 98_000,
@@ -2137,6 +2150,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 currentTurnId: "turn-nofold-historian",
                 canRunCompartments: true,
                 m0M1: {
+                    memory: EMPTY_MEMORY,
                     projectPath: FOLD_PROJECT,
                     projectDirectory: FOLD_PROJECT,
                     historyBudgetTokens: 98_000,
@@ -2168,6 +2182,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 targets,
                 currentTurnId: "turn-nofold",
                 m0M1: {
+                    memory: EMPTY_MEMORY,
                     projectPath: FOLD_PROJECT,
                     projectDirectory: FOLD_PROJECT,
                     historyBudgetTokens: 98_000,

@@ -1,4 +1,5 @@
 import type { Database } from "../../shared/sqlite";
+import type { KernelClientResolver } from "../ctx-memory/types";
 import type { ImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 
 /** Facts always render in `<session-history>` in `message[0]`; searching them returns content already visible in context.
@@ -15,6 +16,8 @@ export interface CtxSearchArgs extends ImitatedReducedArgs {
 
 export interface CtxSearchToolDeps {
     db: Database;
+    /** Serves the `memory` source; every other source still reads the local database. */
+    kernelClient: KernelClientResolver;
     ensureProjectRegistered?: (directory: string, db: Database) => Promise<void>;
     /**
      * Resolve the project identity for the session's directory at call time.

@@ -26,6 +26,7 @@ import {
     createOpenCodeTestDb,
 } from "../../features/magic-context/test-database";
 import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
+import { available, type KernelMemorySnapshot } from "../../shared/kernel-client";
 import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -34,6 +35,9 @@ import {
 } from "./compaction-marker-manager";
 import { clearInjectionCache, prepareCompartmentInjection } from "./inject-compartments";
 import type { MessageLike } from "./tag-messages";
+
+/** The snapshot of a session whose project has no memories; the block renders only its marker. */
+const EMPTY_MEMORY: KernelMemorySnapshot = { state: available(), rows: [], knownAsOf: 0 };
 
 const SESSION_ID = "ses_degraded_reanchor";
 
@@ -286,7 +290,13 @@ describe("Layer A — fork-orphan marker hygiene (#263)", () => {
             userMessage("msg_later_1", "later one"),
             userMessage("msg_later_2", "later two"),
         ];
-        const pass1 = prepareCompartmentInjection(db, SESSION_ID, pass1Messages, true);
+        const pass1 = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: pass1Messages,
+            isCacheBusting: true,
+            memory: EMPTY_MEMORY,
+        });
         expect(pass1?.compartmentEndMessageId).toBeNull();
         // `reconcileForkOrphanedCompactionMarkers` removed the orphan during the degraded pass.
         const remaining = listSessionCompactionMarkers(SESSION_ID);
@@ -300,7 +310,13 @@ describe("Layer A — fork-orphan marker hygiene (#263)", () => {
             userMessage("msg_comp_end", "compartment end"),
             userMessage("msg_later_1", "later one"),
         ];
-        const pass2 = prepareCompartmentInjection(db, SESSION_ID, pass2Messages, true);
+        const pass2 = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: pass2Messages,
+            isCacheBusting: true,
+            memory: EMPTY_MEMORY,
+        });
         expect(pass2?.compartmentEndMessageId).toBe("msg_comp_end");
         expect(pass2?.skippedVisibleMessages).toBe(2);
         expect(pass2Messages.length).toBe(1);
@@ -348,13 +364,25 @@ describe("Layer B — degraded-mode re-anchor (#264)", () => {
 
         // The first cache-busting pass detects degradation; `reconcileForkOrphanedCompactionMarkers` finds no orphaned marker.
         // The first degraded bust pass records count 1 and does not re-anchor.
-        const pass1 = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
+        const pass1 = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: makeVisible(),
+            isCacheBusting: true,
+            memory: EMPTY_MEMORY,
+        });
         expect(pass1?.compartmentEndMessageId).toBeNull();
         expect(pass1?.skippedVisibleMessages).toBe(0);
 
         // The second degraded bust pass reaches the threshold and splices at the visible `msg_c1_end` boundary.
         const pass2Messages = makeVisible();
-        const pass2 = prepareCompartmentInjection(db, SESSION_ID, pass2Messages, true);
+        const pass2 = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: pass2Messages,
+            isCacheBusting: true,
+            memory: EMPTY_MEMORY,
+        });
         expect(pass2?.compartmentEndMessageId).toBe("msg_c1_end");
         expect(pass2?.compartmentEndMessage).toBe(5);
         expect(pass2?.skippedVisibleMessages).toBe(1);
@@ -372,7 +400,13 @@ describe("Layer B — degraded-mode re-anchor (#264)", () => {
 
         // Store A's first degraded bust pass records count 1, below the threshold.
         seedTwoCompartments();
-        const storeAPass = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
+        const storeAPass = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: makeVisible(),
+            isCacheBusting: true,
+            memory: EMPTY_MEMORY,
+        });
         expect(storeAPass?.compartmentEndMessageId).toBeNull();
 
         const storeA = db;
@@ -381,7 +415,13 @@ describe("Layer B — degraded-mode re-anchor (#264)", () => {
             db = storeB;
             seedTwoCompartments();
             const messages = makeVisible();
-            const storeBPass = prepareCompartmentInjection(storeB, SESSION_ID, messages, true);
+            const storeBPass = prepareCompartmentInjection({
+                db: storeB,
+                sessionId: SESSION_ID,
+                messages,
+                isCacheBusting: true,
+                memory: EMPTY_MEMORY,
+            });
             // Store B's first degraded pass must not re-anchor or splice messages.
             expect(storeBPass?.compartmentEndMessageId).toBeNull();
             expect(storeBPass?.skippedVisibleMessages).toBe(0);
@@ -398,7 +438,13 @@ describe("Layer B — degraded-mode re-anchor (#264)", () => {
             userMessage("msg_c1_end", "compartment one end"),
             userMessage("msg_x", "x"),
         ];
-        const pass1 = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
+        const pass1 = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: makeVisible(),
+            isCacheBusting: true,
+            memory: EMPTY_MEMORY,
+        });
         expect(pass1?.compartmentEndMessageId).toBeNull();
         expect(pass1?.skippedVisibleMessages).toBe(0);
     });
@@ -409,8 +455,20 @@ describe("Layer B — degraded-mode re-anchor (#264)", () => {
             userMessage("msg_unrelated", "unrelated"),
             userMessage("msg_x", "x"),
         ];
-        prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
-        const pass2 = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
+        prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: makeVisible(),
+            isCacheBusting: true,
+            memory: EMPTY_MEMORY,
+        });
+        const pass2 = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: makeVisible(),
+            isCacheBusting: true,
+            memory: EMPTY_MEMORY,
+        });
         expect(pass2?.compartmentEndMessageId).toBeNull();
         expect(pass2?.needsFreshMaterialization).toBe(true);
     });
@@ -449,14 +507,32 @@ describe("Byte stability — defer passes during degraded mode", () => {
         ];
 
         // Bust pass establishes the degraded cache (count=1).
-        const bust = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
+        const bust = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: makeVisible(),
+            isCacheBusting: true,
+            memory: EMPTY_MEMORY,
+        });
         expect(bust?.compartmentEndMessageId).toBeNull();
 
         // Two defer passes rebuild from the degraded cache without applying a re-anchor and preserve byte-identical rendered blocks.
         const defer1Messages = makeVisible();
-        const defer1 = prepareCompartmentInjection(db, SESSION_ID, defer1Messages, false);
+        const defer1 = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: defer1Messages,
+            isCacheBusting: false,
+            memory: EMPTY_MEMORY,
+        });
         const defer2Messages = makeVisible();
-        const defer2 = prepareCompartmentInjection(db, SESSION_ID, defer2Messages, false);
+        const defer2 = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: defer2Messages,
+            isCacheBusting: false,
+            memory: EMPTY_MEMORY,
+        });
 
         expect(defer1?.block).toBe(bust?.block);
         expect(defer2?.block).toBe(bust?.block);

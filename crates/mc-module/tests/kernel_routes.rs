@@ -117,8 +117,6 @@ async fn activation_opens_the_kernel_store_beside_the_cache_store() {
         0o700
     );
     assert!(daemon.handler.kernel_store_for_test().is_some());
-    let _ = &daemon.route;
-    let _ = &daemon.project;
 
     daemon.handler.shutdown().await.unwrap();
     assert_eq!(daemon.handler.kernel_state(), KernelState::Unavailable);
@@ -133,8 +131,24 @@ async fn a_second_daemon_on_the_same_root_starts_until_the_first_releases_its_le
         .await
         .unwrap();
     PrimaryComponent::activate(&second).await.unwrap();
-    // The cache store lease is held, so the kernel behind it has not opened.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The coordinator starts in `Starting`, so the assertion only proves the
+    // kernel waited if the cache-store lease wait is already observable.
+    let started = Instant::now();
+    loop {
+        let health = second.health().await;
+        let waiting = health
+            .metrics
+            .as_ref()
+            .is_some_and(|metrics| metrics["storage_lease_wait_elapsed_ms"].is_number());
+        if waiting {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "second daemon never entered the storage lease wait: {health:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(second.kernel_state(), KernelState::Starting);
     assert!(second.kernel_store_for_test().is_none());
 
@@ -224,6 +238,215 @@ fn insert_domains(store: &mc_kernel::KernelStore, first: i64, count: i64) -> i64
         .commit_seq
 }
 
+fn sanitized_kernel_block(health: &mc_host::HealthReport) -> serde_json::Value {
+    let composite = mc_host::HealthReport {
+        status: health.status,
+        detail: health.detail.clone(),
+        metrics: Some(serde_json::json!({
+            "components": {
+                "magic-context": {
+                    "status": match health.status {
+                        mc_host::HealthStatus::Ok => "ok",
+                        mc_host::HealthStatus::Degraded => "degraded",
+                        mc_host::HealthStatus::Failing => "failing",
+                    },
+                    "metrics": health.metrics.clone(),
+                }
+            }
+        })),
+    };
+    let response: serde_json::Value = serde_json::from_slice(&mc_host::host_status_response_json(
+        &composite,
+        serde_json::json!({"state": "healthy"}),
+    ))
+    .expect("status JSON");
+    response["metrics"]["components"]["magic-context"]["metrics"]["kernel"].clone()
+}
+
+/// Fields whose values depend on the run; the fixture pins their presence and
+/// type, not their value.
+const VOLATILE_KERNEL_FIELDS: &[&str] = &[
+    "sampled_at_ms",
+    "core_file_bytes",
+    "artifact_usage_bytes",
+    "artifact_cap_bytes",
+    "outbox_position_lag",
+    "oldest_unconsumed_age_ms",
+    "retained_outbox_rows",
+];
+
+/// Asserts `actual` has exactly the fixture's keys, equal stable values, and
+/// the same JSON type (null or number) on every volatile field.
+fn assert_matches_fixture(actual: &serde_json::Value, expected: &serde_json::Value, name: &str) {
+    let actual = actual
+        .as_object()
+        .unwrap_or_else(|| panic!("{name}: {actual}"));
+    let expected = expected.as_object().unwrap();
+    let mut actual_keys: Vec<_> = actual.keys().collect();
+    let mut expected_keys: Vec<_> = expected.keys().collect();
+    actual_keys.sort();
+    expected_keys.sort();
+    assert_eq!(actual_keys, expected_keys, "{name}: key set");
+    for (key, want) in expected {
+        let got = &actual[key];
+        if VOLATILE_KERNEL_FIELDS.contains(&key.as_str()) {
+            assert_eq!(
+                got.is_null(),
+                want.is_null(),
+                "{name}.{key}: {got} vs {want}"
+            );
+            assert_eq!(
+                got.is_number(),
+                want.is_number(),
+                "{name}.{key}: {got} vs {want}"
+            );
+        } else {
+            assert_eq!(got, want, "{name}.{key}");
+        }
+    }
+}
+
+/// The fixture `managed-policy.test.ts` classifies; a field renamed in Rust,
+/// the sanitizer, or TypeScript fails one side or the other.
+#[tokio::test]
+async fn sanitized_kernel_blocks_match_the_shared_readiness_fixture() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packages/plugin/src/shared/mc-host-lifecycle/fixtures/kernel-health-blocks.json"
+    )))
+    .unwrap();
+
+    let daemon = Daemon::start().await;
+    daemon.handler.sample_kernel_health_for_test(now_ms()).await;
+    assert_matches_fixture(
+        &sanitized_kernel_block(&daemon.handler.health().await),
+        &fixture["no_required_consumer"],
+        "no_required_consumer",
+    );
+
+    let store = daemon.handler.kernel_store_for_test().unwrap();
+    daemon.register_caught_up_consumer("projector");
+    let acked = insert_domains(&store, 1, 1);
+    store.mark_outbox_published_through(2, 1).unwrap();
+    store.acknowledge_outbox("projector", acked, 1).unwrap();
+    daemon.handler.sample_kernel_health_for_test(now_ms()).await;
+    assert_matches_fixture(
+        &sanitized_kernel_block(&daemon.handler.health().await),
+        &fixture["healthy"],
+        "healthy",
+    );
+
+    insert_domains(&store, 2, 1);
+    store.mark_outbox_published_through(3, 1).unwrap();
+    let created_at = now_ms();
+    daemon
+        .handler
+        .sample_kernel_health_for_test(created_at + 120_000)
+        .await;
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Degraded, "{health:?}");
+    assert_matches_fixture(
+        &sanitized_kernel_block(&health),
+        &fixture["kernel_lagging"],
+        "kernel_lagging",
+    );
+
+    daemon.handler.shutdown().await.unwrap();
+    assert_matches_fixture(
+        &sanitized_kernel_block(&daemon.handler.health().await),
+        &fixture["kernel_unavailable"],
+        "kernel_unavailable",
+    );
+
+    // Construct `KernelHealthBlock` directly because the test daemon cannot
+    // reach the fixed 1 GiB warning limits.
+    for (name, core_file_warn, artifact_warn) in [
+        ("kernel_capacity_warn_core_file", true, false),
+        ("kernel_capacity_warn_artifact", false, true),
+    ] {
+        assert_matches_fixture(
+            &sanitized_kernel_block(&capacity_warn_health(core_file_warn, artifact_warn)),
+            &fixture[name],
+            name,
+        );
+    }
+}
+
+fn capacity_warn_health(core_file_warn: bool, artifact_warn: bool) -> mc_host::HealthReport {
+    use mc_module::kernel_routes::health::{KernelFactsBlock, KernelHealthBlock};
+    let cap = 1u64 << 30;
+    let block = KernelHealthBlock {
+        kernel_state: KernelState::Ready,
+        unavailable_reason: None,
+        sampled_at_ms: Some(now_ms()),
+        facts: Some(KernelFactsBlock {
+            core_file_bytes: if core_file_warn {
+                mc_kernel::MAIN_FILE_WARN_BYTES
+            } else {
+                65_536
+            },
+            core_file_warn,
+            artifact_usage_bytes: if artifact_warn { cap - cap / 5 } else { 0 },
+            artifact_cap_bytes: cap,
+            artifact_warn,
+            outbox_position_lag: Some(0),
+            oldest_unconsumed_age_ms: None,
+            retained_outbox_rows: 1,
+            required_consumer_count: 1,
+            lag_threshold_tripped: false,
+        }),
+    };
+    mc_host::HealthReport {
+        status: mc_host::HealthStatus::Ok,
+        detail: None,
+        metrics: Some(serde_json::json!({
+            "storage_state": "ready",
+            "kernel": block.to_json(),
+        })),
+    }
+}
+
+#[tokio::test]
+async fn a_kernel_lease_held_by_another_opener_degrades_health_while_starting() {
+    let data = tempfile::tempdir().unwrap();
+    let descriptor = dev_descriptor_at(data.path().to_str().unwrap());
+    let root = kernel_root(&descriptor);
+    fs::create_dir_all(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let holder = mc_kernel::KernelStore::open(&root).unwrap();
+
+    let handler = McHandler::new();
+    PrimaryComponent::initialize(&handler, init(&descriptor))
+        .await
+        .unwrap();
+    PrimaryComponent::activate(&handler).await.unwrap();
+    // The cache store opens on its own; the kernel behind it stays `Starting`
+    // while the lease is held, and health says so once storage is ready.
+    let started = Instant::now();
+    let health = loop {
+        let health = handler.health().await;
+        if health.metrics.as_ref().expect("health metrics")["storage_state"] == "ready" {
+            break health;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "cache store never opened: {health:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(handler.kernel_state(), KernelState::Starting);
+    assert_eq!(health.status, mc_host::HealthStatus::Degraded, "{health:?}");
+    assert!(health
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.ends_with("kernel store is opening")));
+    assert_eq!(kernel_block(&health)["kernel_state"], "starting");
+
+    drop(holder);
+    wait_for_state(&handler, KernelState::Ready).await;
+    handler.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn health_reads_the_sampled_kernel_block_without_touching_the_store() {
     let daemon = Daemon::start().await;
@@ -242,21 +465,13 @@ async fn health_reads_the_sampled_kernel_block_without_touching_the_store() {
     assert!(kernel["artifact_cap_bytes"].as_u64().unwrap() > 0);
     assert_eq!(kernel["retained_outbox_rows"], 0);
 
-    // Dropping the slot on shutdown republishes the phase; the sampler holds no
-    // strong reference between ticks, so the successor can take the lease.
+    // Dropping the slot on shutdown republishes the phase.
     daemon.handler.shutdown().await.unwrap();
     let after = daemon.handler.health().await;
     let kernel = kernel_block(&after);
     assert_eq!(kernel["kernel_state"], "unavailable");
     assert_eq!(kernel["unavailable_reason"], "store_unavailable");
     assert!(kernel.get("core_file_bytes").is_none());
-    let successor = McHandler::new();
-    PrimaryComponent::initialize(&successor, init(&daemon.descriptor))
-        .await
-        .unwrap();
-    PrimaryComponent::activate(&successor).await.unwrap();
-    wait_for_state(&successor, KernelState::Ready).await;
-    successor.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -284,18 +499,7 @@ async fn an_empty_required_consumer_set_raises_a_daemon_health_warning() {
 async fn crossing_the_lag_threshold_raises_a_daemon_health_warning() {
     let daemon = Daemon::start().await;
     let store = daemon.handler.kernel_store_for_test().unwrap();
-    let registered = store
-        .commit(intent("register"), |envelope| {
-            envelope.register_outbox_consumer("projector", 1)?;
-            Ok(String::new())
-        })
-        .unwrap()
-        .commit_seq;
-    // The registration's own control row sits at position 1; acknowledging that
-    // commit leaves only the domain rows at positions 2..=10_000 unconsumed.
-    store
-        .acknowledge_outbox("projector", registered, 1)
-        .unwrap();
+    let registered = daemon.register_caught_up_consumer("projector");
     let mut next = 1;
     while next <= 9_999 {
         let count = (9_999 - next + 1).min(2_500);
@@ -740,6 +944,25 @@ fn ingest(key: &str, payload: &[u8], sensitivity: Sensitivity) -> ArtifactIngest
 }
 
 #[tokio::test]
+async fn a_commit_on_a_fresh_store_provisions_the_referenced_domain() {
+    let daemon = Daemon::start().await;
+    // No seeded domain: the first commit materializes its referenced domain.
+    let first = daemon
+        .commit("fresh-1", vec![insert_decision(1)], vec![])
+        .await;
+    assert_state(&first, "available", None);
+    let read = daemon.read("explicit_search", None).await;
+    assert_eq!(object_ids(&read), ["decision-object-1"]);
+
+    // The provisioned domain row backs later commits without a second insert.
+    let again = daemon
+        .commit("fresh-2", vec![insert_decision(2)], vec![])
+        .await;
+    assert_state(&again, "available", None);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn replayed_intents_return_one_receipt_and_projects_never_collide() {
     let daemon = Daemon::start().await;
     seed_domain(&daemon.store());
@@ -1002,6 +1225,15 @@ async fn a_plugin_route_cannot_declare_a_class_above_the_derived_one() {
     // Inference-class writes serve labeled on explicit search and never on
     // the automatic surfaces.
     assert_eq!(read["rows"][0]["labeled"], true);
+    // A decision object carries its decision row so the client can render
+    // the text from the read alone.
+    assert_eq!(
+        read["rows"][0]["decision"],
+        json!({
+            "decision_kind": "memory",
+            "payload": {"summary": "decision 1", "rationale": "because 1"},
+        })
+    );
     assert!(object_ids(&daemon.read("auto_inject", None).await).is_empty());
     assert!(object_ids(&daemon.read("auto_search", None).await).is_empty());
     daemon.handler.shutdown().await.unwrap();
@@ -1286,6 +1518,209 @@ async fn reads_at_a_snapshot_return_what_was_visible_then() {
 
     let future = daemon.read("auto_inject", Some(daemon.tip() + 1)).await;
     assert_state(&future, "unavailable", Some("snapshot_diverged"));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+fn insert_decision_with_summary(index: i64, summary: &str) -> Value {
+    let mut operation = insert_decision(index);
+    operation["spec"]["payload"]["summary"] = json!(summary);
+    operation
+}
+
+#[tokio::test]
+async fn a_read_over_the_row_cap_serves_the_newest_rows_and_flags_truncation() {
+    use mc_module::kernel_routes::read::MAX_READ_ROWS;
+
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    // Indices ascend with commit order, so higher indices are newer.
+    let total = MAX_READ_ROWS + 1;
+    let mut index = 0i64;
+    let mut batch = 0usize;
+    while (index as usize) < total {
+        let operations: Vec<Value> = (0..256.min(total - index as usize))
+            .map(|offset| insert_decision(index + offset as i64))
+            .collect();
+        index += operations.len() as i64;
+        let response = daemon
+            .commit(&format!("bulk-{batch}"), operations, vec![])
+            .await;
+        assert_state(&response, "available", None);
+        batch += 1;
+    }
+
+    let read = daemon.read("explicit_search", None).await;
+    assert_state(&read, "available", None);
+    assert_eq!(read["truncated"], true, "{}", read["truncated"]);
+    let rows = read["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), MAX_READ_ROWS);
+    assert_eq!(
+        rows[0]["object"]["object_id"],
+        format!("decision-object-{}", total - 1)
+    );
+    let served: std::collections::HashSet<String> = object_ids(&read).into_iter().collect();
+    let missing: Vec<i64> = (0..total as i64)
+        .filter(|index| !served.contains(&format!("decision-object-{index}")))
+        .collect();
+    // The dropped row comes from the oldest commit, the first batch of 256.
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert!(missing[0] < 256, "{missing:?}");
+    let sequences: Vec<i64> = rows
+        .iter()
+        .map(|row| row["object"]["created_commit_seq"].as_i64().unwrap())
+        .collect();
+    assert!(sequences.windows(2).all(|pair| pair[0] >= pair[1]));
+
+    // The filter returns the dropped row without truncation.
+    let dropped = format!("decision-object-{}", missing[0]);
+    let newest = format!("decision-object-{}", total - 1);
+    let mut filtered = read_request(&daemon.project, "explicit_search", None);
+    filtered["object_ids"] = json!([dropped, newest]);
+    let filtered = daemon.call(daemon.route, filtered).await;
+    assert_state(&filtered, "available", None);
+    assert_eq!(filtered["truncated"], false, "{}", filtered["truncated"]);
+    let mut expected = vec![dropped, newest];
+    expected.sort();
+    assert_eq!(object_ids(&filtered), expected);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_filtered_read_serves_exactly_the_named_visible_objects() {
+    use mc_module::kernel_routes::read::MAX_READ_OBJECT_IDS;
+
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    for index in 1..=3 {
+        let response = daemon
+            .commit(
+                &format!("seed-{index}"),
+                vec![insert_decision(index)],
+                vec![],
+            )
+            .await;
+        assert_state(&response, "available", None);
+    }
+
+    // Named ids scope the read; an id no visible row carries yields nothing.
+    let mut request = read_request(&daemon.project, "explicit_search", None);
+    request["object_ids"] = json!(["decision-object-1", "decision-object-3", "absent-object"]);
+    let read = daemon.call(daemon.route, request).await;
+    assert_state(&read, "available", None);
+    assert_eq!(read["truncated"], false, "{}", read["truncated"]);
+    assert_eq!(
+        object_ids(&read),
+        ["decision-object-1", "decision-object-3"]
+    );
+    // Filtered rows keep the newest-first serving order.
+    assert_eq!(read["rows"][0]["object"]["object_id"], "decision-object-3");
+
+    // More than MAX_READ_OBJECT_IDS ids returns invalid_params.
+    let ids: Vec<String> = (0..=MAX_READ_OBJECT_IDS)
+        .map(|index| format!("decision-object-{index}"))
+        .collect();
+    let mut over = read_request(&daemon.project, "explicit_search", None);
+    over["object_ids"] = json!(ids);
+    assert!(matches!(
+        daemon.handler.dispatch_value_for_test(daemon.route, over).await,
+        PreparedOutcome::Error { code, .. } if code == "invalid_params"
+    ));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+fn synthetic_visible_row(created_commit_seq: i64, object_id: String) -> mc_kernel::VisibleRow {
+    mc_kernel::VisibleRow {
+        object: mc_kernel::ObjectRow {
+            object_id,
+            object_kind: "decision".to_string(),
+            domain_id: DOMAIN.to_string(),
+            source_kind: "fixture".to_string(),
+            source_id: "memory-lineage".to_string(),
+            source_revision: 1,
+            created_commit_seq,
+            invalidated_commit_seq: None,
+            superseded_by: None,
+            sensitivity: Sensitivity::Normal,
+        },
+        visibility: mc_kernel::SurfaceVisibility::Visible,
+        labeled: false,
+        scope_id: None,
+    }
+}
+
+proptest::proptest! {
+    #[test]
+    fn bounded_selection_matches_a_full_sort_and_truncate(
+        keys in proptest::collection::vec((0i64..48, 0u16..256), 0..768),
+        cap in 0usize..40,
+    ) {
+        use mc_module::kernel_routes::read::NewestRows;
+
+        let rows: Vec<mc_kernel::VisibleRow> = keys
+            .into_iter()
+            .map(|(seq, id)| synthetic_visible_row(seq, format!("object-{id}")))
+            .collect();
+        let mut reference = rows.clone();
+        reference.sort_by(|left, right| {
+            right
+                .object
+                .created_commit_seq
+                .cmp(&left.object.created_commit_seq)
+                .then_with(|| left.object.object_id.cmp(&right.object.object_id))
+        });
+        let reference_dropped = reference.len() > cap;
+        reference.truncate(cap);
+
+        let mut newest = NewestRows::new(cap);
+        for row in rows {
+            newest.push(row);
+        }
+        let (selected, dropped) = newest.finish();
+        proptest::prop_assert_eq!(dropped, reference_dropped);
+        proptest::prop_assert_eq!(selected, reference);
+    }
+}
+
+#[tokio::test]
+async fn a_read_over_the_byte_budget_serves_the_newest_rows_that_fit() {
+    use mc_module::kernel_routes::read::MAX_READ_ROW_BYTES;
+
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let small = daemon
+        .commit("small", vec![insert_decision(0)], vec![])
+        .await;
+    assert_state(&small, "available", None);
+    let baseline = daemon.read("explicit_search", None).await;
+    assert_eq!(baseline["truncated"], false, "{}", baseline["truncated"]);
+
+    // Rows of ~480 KiB each, one commit apiece so each is strictly newer than the last; enough of them exceed the byte budget while every summary stays under the 512 KiB redaction limit. commentlint: allow(JUDGE)
+    let row_bytes = 480 * 1024;
+    let total = MAX_READ_ROW_BYTES / row_bytes + 3;
+    let summary = "s".repeat(row_bytes);
+    for index in 1..=total as i64 {
+        let response = daemon
+            .commit(
+                &format!("big-{index}"),
+                vec![insert_decision_with_summary(index, &summary)],
+                vec![],
+            )
+            .await;
+        assert_state(&response, "available", None);
+    }
+
+    let read = daemon.read("explicit_search", None).await;
+    assert_state(&read, "available", None);
+    assert_eq!(read["truncated"], true, "{}", read["truncated"]);
+    let served = object_ids(&read);
+    assert!(!served.is_empty());
+    assert!(served.len() < total + 1, "{}", served.len());
+    // The served set is a contiguous run of the newest commits; the small oldest row is past the stopping point even though it would fit. commentlint: allow(JUDGE)
+    let mut expected: Vec<String> = (0..served.len())
+        .map(|offset| format!("decision-object-{}", total - offset))
+        .collect();
+    expected.sort();
+    assert_eq!(served, expected);
     daemon.handler.shutdown().await.unwrap();
 }
 
@@ -1699,6 +2134,16 @@ impl Daemon {
             .commit_seq
     }
 
+    /// Registers `consumer` and acknowledges its own registration row, so
+    /// only later domain rows count as lag.
+    fn register_caught_up_consumer(&self, consumer: &str) -> i64 {
+        let registered = self.register_consumer(consumer);
+        self.store()
+            .acknowledge_outbox(consumer, registered, 1)
+            .unwrap();
+        registered
+    }
+
     fn deregister_consumer(&self, consumer: &str) {
         self.store()
             .commit(intent(&format!("deregister-{consumer}")), |envelope| {
@@ -1752,10 +2197,7 @@ async fn search_returns_stale_marker_and_injection_abstains_past_threshold() {
     );
 
     // A consumer caught up to its registration, then 9,999 published rows.
-    let registered = daemon.register_consumer("projector");
-    store
-        .acknowledge_outbox("projector", registered, 1)
-        .unwrap();
+    let registered = daemon.register_caught_up_consumer("projector");
     daemon.publish_domains(1, 9_999);
     let created_at = oldest_unconsumed_created_at(&daemon, registered);
     let below = daemon
@@ -3406,6 +3848,80 @@ async fn a_page_for_an_unknown_upload_or_an_oversized_frame_is_refused_before_de
         .ingest_paged(daemon.route, "framed", &payload, 100)
         .await;
     assert_state(&finished, "available", None);
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+/// The page decoder accepts only canonical, padded, standard-alphabet base64.
+#[tokio::test]
+async fn a_begun_upload_refuses_a_page_that_is_not_canonical_standard_base64() {
+    use base64::Engine as _;
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    // 0xFB 0xFF 0xBF encodes as "+/+/", the standard-only '+' and '/'.
+    let payload: Vec<u8> = [0xfb, 0xff, 0xbf]
+        .iter()
+        .copied()
+        .cycle()
+        .take(300)
+        .collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&payload[..100]);
+    assert!(encoded.contains('+') && encoded.contains('/'));
+
+    assert_state(
+        &daemon
+            .ingest_begin(daemon.route, "framed", &payload, 3)
+            .await,
+        "available",
+        None,
+    );
+
+    let malformed = [
+        format!("!{}", &encoded[1..]),
+        encoded.replace('+', "-").replace('/', "_"),
+        "QUJDRA".to_string(),
+        "QUJDRA===".to_string(),
+        "QUJDR===".to_string(),
+        "QUJDRA=A".to_string(),
+        // 'B' leaves four low bits set that no output byte accounts for.
+        "QUJDRB==".to_string(),
+        "QUJD\nRA==".to_string(),
+        "QUJDRA==\n".to_string(),
+        "QUJDRA==QUJDRA==".to_string(),
+    ];
+    for text in &malformed {
+        // The handler must reject every input that `STANDARD.decode` rejects.
+        assert!(
+            base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .is_err(),
+            "{text:?} is accepted by the reference decoder"
+        );
+        let mut page = ingest_page_request(&daemon.project, "framed", 0, &payload[..100]);
+        page["bytes_base64"] = json!(text);
+        match daemon
+            .handler
+            .dispatch_value_for_test(daemon.route, page)
+            .await
+        {
+            PreparedOutcome::Error { code, message } => {
+                assert_eq!(code, "invalid_params", "{text:?}: {message}");
+                assert!(
+                    message.ends_with("bytes_base64 is not standard base64"),
+                    "{text:?}: {message}"
+                );
+            }
+            other => panic!("{text:?} was not refused: {other:?}"),
+        }
+    }
+    // Each refusal released its decode reservation and left the upload live.
+    assert_eq!(daemon.handler.staging_budget_for_test(), (300, 1));
+
+    let finished = daemon
+        .ingest_paged(daemon.route, "framed", &payload, 100)
+        .await;
+    assert_state(&finished, "available", None);
+    assert_eq!(daemon.read_artifact(&finished), payload);
     assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
     daemon.handler.shutdown().await.unwrap();
 }

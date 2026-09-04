@@ -265,7 +265,9 @@ impl KernelOpenCoordinator {
         policy: StoreOpenPolicy,
         cancel: CancellationToken,
     ) {
-        let started = Instant::now();
+        // The paused test clock moves this `Instant`; `std::time::Instant` would
+        // hold the window open forever under `start_paused`.
+        let started = tokio::time::Instant::now();
         let mut backoff = policy.initial_backoff;
         let mut attempt = 0usize;
         let mut waiting = false;
@@ -409,4 +411,150 @@ pub(crate) async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|_| KernelOutcome::unavailable(UnavailableReason::StoreUnavailable))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn policy(wait_window: Duration) -> StoreOpenPolicy {
+        StoreOpenPolicy {
+            wait_window,
+            initial_backoff: Duration::from_millis(250),
+            max_backoff: Duration::from_secs(1),
+        }
+    }
+
+    /// Opens a kernel store in a fresh directory and returns both, so the
+    /// returned store holds the directory's lease until dropped.
+    fn held_root() -> (tempfile::TempDir, KernelStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = KernelStore::open(dir.path()).unwrap();
+        assert!(
+            matches!(KernelStore::open(dir.path()), Err(KernelError::Held)),
+            "a second opener in the same process must see Held"
+        );
+        (dir, holder)
+    }
+
+    /// `wait_for_first_backoff` resolves after the spawned opener receives `Held` from `open_once` and parks in its first backoff `select!`.
+    ///
+    /// The paused clock does not auto-advance during a `spawn_blocking` task, and the opener's backoff timer lies past this 1ms deadline.
+    /// The runtime therefore cannot reach this deadline before the opener is parked.
+    async fn wait_for_first_backoff() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_lease_past_the_wait_window_is_store_unavailable() {
+        let (dir, _holder) = held_root();
+        let coordinator = KernelOpenCoordinator::new();
+        let started = tokio::time::Instant::now();
+        coordinator
+            .open(
+                dir.path().to_path_buf(),
+                policy(Duration::from_secs(60)),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(coordinator.state(), KernelState::Unavailable);
+        assert_eq!(
+            coordinator.unavailable_reason(),
+            UnavailableReason::StoreUnavailable
+        );
+        assert!(coordinator.kernel_store().is_err());
+        // Exactly the window: the final backoff is clamped to the remaining window, so the opener never sleeps past the configured wait.
+        // Without the clamp the jittered backoffs would overshoot to 60.79s.
+        assert_eq!(started.elapsed(), Duration::from_secs(60));
+        let block = &coordinator.health_block().block;
+        assert_eq!(block.kernel_state, KernelState::Unavailable);
+        assert_eq!(
+            block.unavailable_reason,
+            Some(UnavailableReason::StoreUnavailable)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_waiting_open_is_store_unavailable() {
+        let (dir, _holder) = held_root();
+        let coordinator = Arc::new(KernelOpenCoordinator::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            let cancel = cancel.clone();
+            let root = dir.path().to_path_buf();
+            async move {
+                coordinator
+                    .open(root, policy(Duration::from_secs(60)), cancel)
+                    .await
+            }
+        });
+        wait_for_first_backoff().await;
+        assert_eq!(coordinator.state(), KernelState::Starting);
+        let cancelled_at = tokio::time::Instant::now();
+        cancel.cancel();
+        task.await.unwrap();
+        // Cancellation interrupted the backoff: no timer had to fire for the opener to finish, so the clock never auto-advanced.
+        // If the opener only noticed the token after its sleep, this would read 249ms.
+        assert_eq!(cancelled_at.elapsed(), Duration::ZERO);
+        assert_eq!(coordinator.state(), KernelState::Unavailable);
+        assert_eq!(
+            coordinator.unavailable_reason(),
+            UnavailableReason::StoreUnavailable
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_released_during_the_wait_opens_the_store() {
+        let (dir, holder) = held_root();
+        let coordinator = Arc::new(KernelOpenCoordinator::new());
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            let root = dir.path().to_path_buf();
+            async move {
+                coordinator
+                    .open(
+                        root,
+                        policy(Duration::from_secs(60)),
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        wait_for_first_backoff().await;
+        assert_eq!(coordinator.state(), KernelState::Starting);
+        drop(holder);
+        task.await.unwrap();
+        assert_eq!(coordinator.state(), KernelState::Ready);
+        assert!(coordinator.kernel_store().is_ok());
+        // The store opened on the retry after the first 250ms backoff, not on the initial attempt.
+        assert_eq!(started.elapsed(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn open_failure_kind_names_exactly_the_unsupported_errors() {
+        // Only these errors map to Unsupported; every other KernelError variant
+        // maps to Store, so a new variant is checked without being listed.
+        let unsupported = [
+            KernelError::EngineUnsupported,
+            KernelError::Foreign,
+            KernelError::Inconclusive,
+            KernelError::IdentityMismatch,
+            KernelError::CorruptCanonicalRow,
+        ];
+        for error in KernelError::ALL {
+            let expected = if unsupported.contains(error) {
+                UnavailableKind::Unsupported
+            } else {
+                UnavailableKind::Store
+            };
+            assert_eq!(open_failure_kind(*error), expected, "{error:?}");
+        }
+        for error in unsupported {
+            assert!(KernelError::ALL.contains(&error), "{error:?} not in ALL");
+        }
+    }
 }

@@ -37,8 +37,8 @@ Magic Context control metadata is not reply syntax. Never reproduce \`<system-re
 
 /** ctx_memory-specific guidance. Gated out when `memory.enabled: false`: with
  * memory off, the `<project-memory>` block is never injected. */
-const MEMORY_GUIDANCE = `Use \`ctx_memory\` for durable project knowledge: create what future sessions must know, then revise, archive, restore, or merge claims shown in \`<project-memory>\` when they drift. Claims persist across sessions and every new session starts with them.
-Claims use opaque \`mcm_…\` public IDs. Pass the current mutation token returned by create/get/list when changing a claim; stale tokens make no change.
+const MEMORY_GUIDANCE = `Use \`ctx_memory\` for durable project knowledge: create what future sessions must know, then revise, archive, or merge claims shown in \`<project-memory>\` when they drift. Claims persist across sessions and every new session starts with them.
+Claims use opaque \`mem_…\` object ids. Pass the object id when changing a claim; revise and merge return the survivor's new id, and no token is passed.
 **Save durable knowledge proactively**: If you spent multiple turns finding something (a file path, a DB location, a config pattern, a workaround), create a claim so future sessions don't repeat the search. Examples:
 - Found a project's source code path after searching → \`ctx_memory(action="create", category="CONFIG_VALUES", content="OpenCode source is at ~/Work/OSS/opencode")\`
 - Discovered a non-obvious build/test command → \`ctx_memory(action="create", category="PROJECT_RULES", content="Always run the full release checklist before publishing")\`

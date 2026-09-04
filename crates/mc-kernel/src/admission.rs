@@ -2171,7 +2171,7 @@ impl KernelStore {
         surface: Surface,
         requested: i64,
     ) -> Result<VisibleAsOf, KernelError> {
-        self.visible_as_of_in_scope(surface, requested, None)
+        self.visible_as_of_in_scope(surface, requested, None, None)
     }
 
     /// [`Self::visible_as_of`] restricted to rows whose scope carries a term
@@ -2180,14 +2180,20 @@ impl KernelStore {
     /// The restriction is a superset of the scope algebra's verdict: a term
     /// on the dimension whose operator the query cannot evaluate is kept for
     /// the caller to judge.
+    ///
+    /// `ids` narrows the read to the named objects before any row leaves SQL, so a targeted lookup stays cheap in a large scope. commentlint: allow(JUDGE)
     pub fn visible_as_of_in_scope(
         &self,
         surface: Surface,
         requested: i64,
+        ids: Option<&[String]>,
         scope: Option<ScopeTermFilter<'_>>,
     ) -> Result<VisibleAsOf, KernelError> {
+        let ids = ids
+            .map(|ids| serde_json::to_string(ids).map_err(|_| KernelError::InvalidInput))
+            .transpose()?;
         let (tip, rows) = self.read_snapshot(requested, |tx| {
-            let rows = served_rows(tx, surface, requested, None, scope)?
+            let rows = served_rows(tx, surface, requested, ids.as_deref(), scope)?
                 .into_iter()
                 .filter_map(|(object, visibility, scope_id)| match visibility {
                     SurfaceVisibility::Hidden => None,
@@ -2416,6 +2422,7 @@ fn served_rows(
              ORDER BY o.object_id"
         ))
         .map_err(map_sqlite)?;
+    assert_served_columns(&statement);
     let rows = statement
         .query_map(
             rusqlite::named_params! {
@@ -2459,6 +2466,75 @@ fn served_rows(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(map_sqlite)?;
     Ok(rows)
+}
+
+/// Fail-stop guard for the positional reads in `decided_row`: every offset
+/// constant must name the alias it was written against. Runs in release
+/// builds too — the columns adjacent to each offset are all TEXT, so a
+/// desynced constant reads a type-compatible wrong value and misgates
+/// visibility instead of erroring. A few string compares per call is
+/// negligible next to the multi-join query this guards.
+fn assert_served_columns(statement: &rusqlite::Statement<'_>) {
+    // Per-field checks catch swapped interior aliases that count and
+    // block-anchor checks miss.
+    let expected = [
+        (OWN_DECISION_COLUMNS.maturity, "d_maturity"),
+        (
+            OWN_DECISION_COLUMNS.effective_maturity,
+            "d_effective_maturity",
+        ),
+        (OWN_DECISION_COLUMNS.disposition, "d_disposition"),
+        (OWN_DECISION_COLUMNS.visibility, "d_visibility"),
+        (OWN_DECISION_COLUMNS.taint_class, "d_taint_class"),
+        (OWN_DECISION_COLUMNS.source_class, "d_source_class"),
+        (OWN_DECISION_COLUMNS.policy_revision, "d_policy_revision"),
+        (
+            OWN_DECISION_COLUMNS.sensitivity_class,
+            "d_sensitivity_class",
+        ),
+        (
+            OWN_DECISION_COLUMNS.approval_object_id,
+            "d_approval_object_id",
+        ),
+        (LINEAGE_DECISION_COLUMNS.maturity, "s_maturity"),
+        (
+            LINEAGE_DECISION_COLUMNS.effective_maturity,
+            "s_effective_maturity",
+        ),
+        (LINEAGE_DECISION_COLUMNS.disposition, "s_disposition"),
+        (LINEAGE_DECISION_COLUMNS.visibility, "s_visibility"),
+        (LINEAGE_DECISION_COLUMNS.taint_class, "s_taint_class"),
+        (LINEAGE_DECISION_COLUMNS.source_class, "s_source_class"),
+        (
+            LINEAGE_DECISION_COLUMNS.policy_revision,
+            "s_policy_revision",
+        ),
+        (
+            LINEAGE_DECISION_COLUMNS.sensitivity_class,
+            "s_sensitivity_class",
+        ),
+        (
+            LINEAGE_DECISION_COLUMNS.approval_object_id,
+            "s_approval_object_id",
+        ),
+        (ACCEPTED_DECISION_COLUMN, "accepted_decision"),
+        (HISTORY_SENSITIVITY_COLUMN, "history_sensitivity_class"),
+        (OWN_HISTORY_INCONSISTENT_COLUMN, "own_history_inconsistent"),
+        (SCOPE_ID_COLUMN, "scope_id"),
+    ];
+    assert_eq!(
+        statement.column_count(),
+        SCOPE_ID_COLUMN + 1,
+        "served_rows must select exactly {} columns",
+        SCOPE_ID_COLUMN + 1
+    );
+    for (index, alias) in expected {
+        assert_eq!(
+            statement.column_name(index).ok(),
+            Some(alias),
+            "served_rows column {index} must be {alias}"
+        );
+    }
 }
 
 impl SourceClass {

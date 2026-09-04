@@ -35,7 +35,7 @@ import { isSystemDirective } from "../../../plugin/src/shared/system-directive";
 import { estimateTokens } from "../../../plugin/src/shared/token-estimator";
 import { V2_MEMORY_CATEGORIES } from "../../../plugin/src/features/magic-context/memory/constants";
 import { ballastProse } from "../ballast";
-import { HEX64_RE, makeContractPrimitives } from "../contract-primitives";
+import { HEX64_RE, makeContractError, makeContractPrimitives } from "../contract-primitives";
 
 /**
  * `PROBE_PROMPT_SHARED` contains the fixed text that `buildProbePrompt` places around every probe question.
@@ -89,14 +89,7 @@ export const PROBE_ANSWER_TYPES = ["exact", "multiple-choice", "claim-id"] as co
 /* */
 const MEMORY_CATEGORIES: readonly string[] = V2_MEMORY_CATEGORIES;
 
-export class HistorianEvalContractError extends Error {
-    readonly diagnostics: readonly string[];
-
-    constructor(diagnostics: readonly string[]) {
-        super([...diagnostics].sort().join("; "));
-        this.diagnostics = [...diagnostics].sort();
-    }
-}
+export const HistorianEvalContractError = makeContractError("HistorianEvalContractError");
 
 const primitives = makeContractPrimitives(HistorianEvalContractError);
 const { fail, record, exact, string, staticId, hex64, array, integer, unique } = primitives;

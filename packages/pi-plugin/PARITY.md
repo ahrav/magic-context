@@ -155,7 +155,11 @@ shared resolver's log-only dubious-ownership warning while still using the same
   **stdin** (Pi concatenates stdin + positional) to avoid Linux `MAX_ARG_STRLEN`
   / E2BIG; the positional is omitted when piping.
 - `--no-session` keeps subagent JSONL out of the user's session picker.
-- Claim writes are intentionally not divergent. OpenCode and Pi wrappers keep harness-specific authorization, formatting, and post-commit embedding/module dispatch, but both call the same transaction-local claim kernel. Same operation commits crosswalk, immutable revision metadata, outbox, and generation. Public-tool e2e covers OpenCode→Pi and Pi→OpenCode writes against shared DB.
+- Project memory is not divergent. Every memory surface on both harnesses (`ctx_memory`, the `memory` source of `ctx_search`, the m[0] `<project-memory>` block, auto-search, the historian's baseline block, and the status views) reads and writes through the shared kernel client in `packages/plugin/src/shared/kernel-client`, which Pi imports through the `@magic-context/core/*` alias. Pi and OpenCode wrappers parse their own tool argument shapes and call the same `executeCtxMemory` and `executeCtxSearch`, so tool text, state markers, and conflict wording are byte-identical. The m[0] read and the historian baseline share `readInjectionMemorySnapshot` and `readHistorianMemoryBlock` in `hooks/magic-context/kernel-memory-render.ts`; each host maps only its own config flag onto the shared `memoryEnabled` argument. No memory content is ever served from the claim-lane tables on the memory path. One telemetry bridge does touch the lane: after an explicit `ctx_search` delivers kernel memory hits, `hooks/magic-context/kernel-claim-usage.ts` lists the lane's claims to map the hits' derived object ids back to public claim ids and bumps their `retrieval_count`, a write-only usage signal the Dreamer's curate pass reads. The lane rows it lists never enter the search results. Biome `noRestrictedImports` overrides in both packages forbid claim-lane imports on memory-path files; the bridge carries the single sanctioned inline suppression.
+- Every memory reader dials `explicit_search` (`MEMORY_READ_SURFACE`). The daemon admits `kernel.commit` writes at `Candidate` maturity and hides them on `auto_inject` and `auto_search`, so those surfaces would return no plugin-written memory. Rows render with their `labeled` flag. Auto-search reads gated and withholds a `stale` answer as `abstained`, which is what the daemon answers for its own automatic surfaces.
+- Claim-lane memories that predate the kernel cutover are imported once per project by `hooks/magic-context/claim-lane-import.ts`, scheduled from the first memory read of a session on both hosts. The import commits the project's own active claims as kernel decisions with ids derived from the public claim id, so a partial run resumes, and records a marker in `context_store_meta` when every batch is `available`. The historian still stages promoted facts into the claim lane inside its publish transaction and then forwards them to the kernel after `COMMIT` through `hooks/magic-context/kernel-memory-promotion.ts`, so a kernel failure never rolls back a published compartment.
+- Workspace sharing does not cross the kernel boundary. A route is bound to exactly one project root and serves only rows whose scope names that root, so the m[0] block, auto-search, and `ctx_memory` show a project's own memories only. The claim lane's `expandedIdentities` / `shareCategories` sharing of sibling-project memories into m[0] has no kernel equivalent and is not rendered on either host.
+- `ctx_memory` mutation targets (`revise`, `archive`, `merge`) must appear in the project-scoped read; a target the project cannot see is refused before any commit. The kernel client also refuses to commit when a target still has no mutation token after its refresh read. There is no `restore` action: the daemon rejects a supersede of an invalidated object.
 - Ship Pi, OpenCode, CLI, and the directly linked mc-host component from the same revision. There is no migration or backfill lane: the claims-only direct format is the only database family this binary opens, and every other shape is refused before SQLite recovery. A refused family is abandoned with `magic-context doctor reset-db` (or repaired with `magic-context doctor repair-db`), then both harnesses restart. Archive/delete retire claim visibility and retain claim history; no Pi or OpenCode response promises erasure.
 
 ---
@@ -772,6 +776,12 @@ copy compartments, tags, reductions, and deferred Pi marker state while filterin
 them to the copied prefix. OpenCode re-mints message ids during `/fork`, making
 entry-id-keyed migration unsafe there. OpenCode fork inheritance therefore needs
 a separate future design based on a stable cross-fork identity.
+
+Kernel token state is not inherited. A forked Pi session gets its own
+`TokenCache` (`kernel-client-pi.ts`), so it starts with no mutation tokens and no
+cached `known_as_of`; its first read fetches from the daemon tip. The copied
+session rows carry no cached m[0], so the first pass re-renders memory from that
+read.
 
 ---
 

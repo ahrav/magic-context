@@ -14,6 +14,10 @@
 //! arrival model is not applicable: one caller, no concurrency, so the
 //! reported time is service time of one logical request.
 //!
+//! A refusal (`conflict`, `invalid`, `unavailable`) returns before the work a
+//! case names, so a timed refusal would read as a speedup. `Daemon::call`
+//! panics unless the prepared value's `state.kind` is `available`.
+//!
 //! Warm state: the store is open, every SQLite page touched by the case is in
 //! the page cache, the secret scanner is constructed, and the tokio runtime
 //! and blocking pool are warm. Cold variants are named `cold` and clear the
@@ -22,16 +26,22 @@
 //!
 //! Input distributions:
 //! - `read/{n}-rows/{narrow,wide}-scope`: `n` live decisions, each admitted
-//!   for `explicit_search`. `narrow` gives every row the route's own project
-//!   scope so the filter visits one scope and every row serializes; `wide`
-//!   spreads rows over 64 distinct scopes, one of which is the project's, so
-//!   the filter loads 64 scopes and serializes `n/64` rows. `n` bounds the
-//!   registry the route reads; a plugin session reads a project's whole
-//!   surface at once, so the row count is the production knob.
+//!   for `explicit_search`. `narrow` puts every row on the project scope.
+//!   `wide` distributes rows across 64 scopes, including the route's project
+//!   scope, so the kernel's `scope_term` subquery narrows an `n`-row registry
+//!   to `n/64` rows before the route sees them. The route-local scope filter
+//!   resolves one scope in both shapes because the subquery excludes every
+//!   foreign row. `n` bounds the registry the route reads; a plugin session
+//!   reads a project's whole surface at once, so the row count is the
+//!   production knob.
 //! - `commit/{k}-ops`: one envelope of `k` operations, three quarters
 //!   `insert_decision`, one quarter `insert_observation`, with one token per
 //!   16 operations naming a pre-existing row. Each iteration uses a fresh
 //!   operation key and fresh object ids, so the envelope is never replayed.
+//!   Fresh commits permanently append rows, and commit time increases with
+//!   row count. Rebuild the daemon and store before every sample and after a
+//!   fixed number of commits so every sample follows the same row-count
+//!   trajectory whatever the binary's speed.
 //! - `commit/replay`: the same envelope re-sent; the route answers from the
 //!   receipt without entering the operation.
 //! - `eligibility/{n}-candidates/{cold,warm}`: `n` candidates from a
@@ -40,11 +50,15 @@
 //!   batch twice and times the second.
 //! - `egress/decide/{outcome}`: one decision per outcome the gate can produce,
 //!   so a refusal path is never mistaken for the allow path.
+//! - `ingest/begin/2-pages`: one `begin` declaring a two-page upload under a
+//!   fresh upload id. The route replaces the previous pending upload on the
+//!   same route, so the store never grows.
 //! - `ingest/page/{bytes}`: one `page` call carrying `bytes` of base64 text,
 //!   staged against an upload begun in the batch setup.
 //! - `ingest/finish/{bytes}`: `begin` + pages run in setup; the timed call is
-//!   `finish`: assemble, digest, redact, `ingest_artifact`. The store's CAS
-//!   fills by `bytes` per iteration, so the group runs few samples.
+//!   `finish`: assemble, digest, redact, `ingest_artifact`. Each finish adds
+//!   `bytes` to the CAS and one evidence row, so the daemon is rebuilt on a
+//!   fixed cycle as the fresh commits are.
 //! - `redaction/{clean,dense}/{bytes}`: the kernel's windowed redactor over
 //!   `bytes` of UTF-8 with zero or one keyed secret per 4 KiB, timed directly
 //!   through `mc_core::redaction::redact_windowed_durable_text` since the
@@ -58,7 +72,12 @@
 //! subsample and is not the keep/discard evidence.
 //!
 //! `MC_KERNEL_ROUTES_PROFILE=<case-prefix>` bypasses Criterion and repeats the
-//! named case for ten seconds so `perf record` has a stable window.
+//! named case for ten seconds so `perf record` has a stable window. Groups and
+//! cases the prefix cannot match skip their fixture setup, so the recorded
+//! process contains only the target's work. For `commit/*-ops` and
+//! `ingest/finish` that work includes the fixture rebuilds and, for finish,
+//! the `begin` and `page` routes each `finish` requires; filter the profile by
+//! the route's symbols to isolate it.
 
 use std::cell::RefCell;
 use std::fs;
@@ -68,14 +87,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput,
+};
 use mc_host::{
     BindOutcome, CompositeComponent, HostInit, PrimaryComponent, RouteHandle, RouteIdentity,
 };
 use mc_kernel::{
-    AdmissionEvent, AdmissionRequest, ArtifactIngestRequest, CommitIntent, DecisionPayload,
-    DecisionSpec, DomainSpec, EventKind, KernelStore, ProviderEgress, RepositoryProvenance,
-    ScopeSpec, ScopeTermSpec, Sensitivity, SourceClass, TaintClass,
+    AdmissionEvent, AdmissionRequest, ArtifactDeletionIdentity, ArtifactDeletionKind,
+    ArtifactDeletionRequest, ArtifactIngestRequest, CommitIntent, DecisionPayload, DecisionSpec,
+    DomainSpec, EventKind, KernelStore, ProviderEgress, RepositoryProvenance, ScopeSpec,
+    ScopeTermSpec, Sensitivity, SourceClass, TaintClass,
 };
 use mc_module::dispatch::PreparedOutcome;
 use mc_module::kernel_routes::KernelState;
@@ -87,7 +109,16 @@ const SESSION: &str = "session-bench";
 const DOMAIN: &str = "domain";
 const SECRET_LINE: &str = "password=hunter-two-very-secret-value-0123456789\n";
 const FILLER_LINE: &str = "plain filler line without any credential words 0123\n";
+/// `PAGE_BYTES_MAX` stays independent of the production cap so baseline and
+/// candidate binaries time the same byte count.
 const PAGE_BYTES_MAX: usize = 16 * 1024 * 1024;
+const _: () = assert!(
+    PAGE_BYTES_MAX as u64 <= mc_module::kernel_routes::ingest::PAGE_BYTES_MAX,
+    "the production page cap fell below the frozen bench page size; add a new case"
+);
+/// Width of the zero-padded iteration counter `ingest/finish` writes into the
+/// last line of each payload.
+const COUNTER_TAG_BYTES: usize = 16;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(bytes))
@@ -183,6 +214,10 @@ impl Daemon {
             .block_on(self.handler.dispatch_value_for_test(self.route, request));
         match outcome {
             PreparedOutcome::Response(output) => {
+                let body = output.json_for_test().expect("kernel route answers JSON");
+                if body["state"]["kind"] != "available" {
+                    panic!("kernel route did not answer available: {}", body["state"]);
+                }
                 let mut encoded = self.encoded.borrow_mut();
                 encoded.clear();
                 let measured = output.measure().expect("response measures");
@@ -478,10 +513,17 @@ fn text_payload(total: usize, secret_every: usize) -> Vec<u8> {
 /// `MC_KERNEL_ROUTES_GROUPS=read,commit` limits the run to the named groups
 /// so a filtered run does not pay every other group's fixture setup.
 fn group_enabled(group: &str) -> bool {
-    match std::env::var("MC_KERNEL_ROUTES_GROUPS") {
+    let listed = match std::env::var("MC_KERNEL_ROUTES_GROUPS") {
         Ok(list) if !list.is_empty() => list.split(',').any(|g| g.trim() == group),
         _ => true,
-    }
+    };
+    // A group cannot contain the profiled case unless either name prefixes
+    // the other.
+    let profiled = match profile_target() {
+        Some(target) => target.starts_with(group) || group.starts_with(target.as_str()),
+        None => true,
+    };
+    listed && profiled
 }
 
 fn profile_target() -> Option<String> {
@@ -490,13 +532,19 @@ fn profile_target() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Callers check this before building a case's fixture so `perf record` sees
+/// only the target case's work.
+fn profile_skips(case: &str) -> bool {
+    profile_target().is_some_and(|target| !case.starts_with(target.as_str()))
+}
+
 /// When a profile target is set, runs `body` for ten seconds if `case` matches
 /// it and returns `true` either way so the caller skips Criterion.
 fn profile_or_bench(case: &str, mut body: impl FnMut()) -> bool {
-    let Some(target) = profile_target() else {
+    if profile_target().is_none() {
         return false;
-    };
-    if !case.starts_with(target.as_str()) {
+    }
+    if profile_skips(case) {
         return true;
     }
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -520,6 +568,10 @@ fn bench_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("read");
     for rows in [10usize, 1_000, 50_000] {
         for (shape, scope_count) in [("narrow-scope", 1usize), ("wide-scope", 64)] {
+            let case = format!("read/{rows}-rows/{shape}");
+            if profile_skips(&case) {
+                continue;
+            }
             let daemon = Daemon::start();
             let own_scope = daemon.project_scope_id();
             let mut scopes = vec![own_scope];
@@ -532,7 +584,6 @@ fn bench_read(c: &mut Criterion) {
             let served = response["rows"].as_array().unwrap().len();
             // One seed row plus every row on the project's own scope.
             assert_eq!(served, 1 + rows.div_ceil(scope_count), "{shape} {rows}");
-            let case = format!("read/{rows}-rows/{shape}");
             if profile_or_bench(&case, || {
                 black_box(daemon.call(request.clone()));
             }) {
@@ -544,7 +595,13 @@ fn bench_read(c: &mut Criterion) {
             group.bench_with_input(
                 BenchmarkId::new(format!("{rows}-rows"), shape),
                 &request,
-                |b, request| b.iter(|| black_box(daemon.call(request.clone()))),
+                |b, request| {
+                    b.iter_batched(
+                        || request.clone(),
+                        |request| black_box(daemon.call(request)),
+                        BatchSize::PerIteration,
+                    )
+                },
             );
             daemon.shutdown();
         }
@@ -574,49 +631,111 @@ fn commit_envelope(daemon: &Daemon, key: &str, ops: usize, token_ids: &[(String,
     commit_request(daemon, key, operations, tokens)
 }
 
+struct Cycled<S, B: FnMut() -> (Daemon, S)> {
+    build: B,
+    reset_every: usize,
+    fixture: Option<(Daemon, S)>,
+    used: usize,
+}
+
+/// `Cycled` rebuilds its daemon and fixture state every `reset_every` uses.
+impl<S, B: FnMut() -> (Daemon, S)> Cycled<S, B> {
+    fn new(reset_every: usize, build: B) -> Self {
+        assert!(reset_every > 0, "a cycle must allow at least one use");
+        Self {
+            build,
+            reset_every,
+            fixture: None,
+            used: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        if let Some((daemon, _)) = self.fixture.take() {
+            daemon.shutdown();
+        }
+        self.used = 0;
+    }
+
+    /// `stage` runs outside the timed region and returns the fixture for the
+    /// next use with that use's 1-based index within the current cycle.
+    fn stage(&mut self) -> (&Daemon, &S, usize) {
+        if self.fixture.is_none() || self.used >= self.reset_every {
+            self.reset();
+            self.fixture = Some((self.build)());
+        }
+        self.used += 1;
+        let (daemon, state) = self.fixture.as_ref().expect("fixture built");
+        (daemon, state, self.used)
+    }
+}
+
+/// Times `call` over `iters` staged uses of `cycle`, restarting the cycle
+/// first so every Criterion sample starts at use 1.
+fn time_cycled<S, B: FnMut() -> (Daemon, S)>(
+    cycle: &mut Cycled<S, B>,
+    iters: u64,
+    mut call: impl FnMut(&Daemon, &S, usize) -> Value,
+) -> Duration {
+    cycle.reset();
+    let mut elapsed = Duration::ZERO;
+    for _ in 0..iters {
+        let (daemon, state, n) = cycle.stage();
+        let request = call(daemon, state, n);
+        let started = Instant::now();
+        black_box(daemon.call(request));
+        elapsed += started.elapsed();
+    }
+    elapsed
+}
+
+fn commit_fixture() -> (Daemon, Vec<(String, i64)>) {
+    let daemon = Daemon::start();
+    let own_scope = daemon.project_scope_id();
+    // Token targets: rows the route may mutate, with the tip they were read at.
+    let targets = seed_decisions(&daemon.store(), 0, 16, std::slice::from_ref(&own_scope));
+    let tip = daemon.store().tip().unwrap();
+    let token_ids = targets.into_iter().map(|id| (id, tip)).collect();
+    (daemon, token_ids)
+}
+
 fn bench_commit(c: &mut Criterion) {
     if !group_enabled("commit") {
         return;
     }
     let mut group = c.benchmark_group("commit");
-    for ops in [1usize, 16, 128] {
-        let daemon = Daemon::start();
-        let own_scope = daemon.project_scope_id();
-        // Token targets: rows the route may mutate, with the tip they were read at.
-        let targets = seed_decisions(&daemon.store(), 0, 16, std::slice::from_ref(&own_scope));
-        let tip = daemon.store().tip().unwrap();
-        let token_ids: Vec<(String, i64)> = targets.into_iter().map(|id| (id, tip)).collect();
-        let mut counter = 0usize;
+    for (ops, reset_every) in [(1usize, 64usize), (16, 16), (128, 4)] {
         let case = format!("commit/{ops}-ops");
+        if profile_skips(&case) {
+            continue;
+        }
+        let mut cycle = Cycled::new(reset_every, commit_fixture);
+        let envelope = |daemon: &Daemon, token_ids: &Vec<(String, i64)>, n: usize| {
+            commit_envelope(daemon, &format!("k{n}"), ops, token_ids)
+        };
         if profile_or_bench(&case, || {
-            counter += 1;
-            let request = commit_envelope(&daemon, &format!("p{counter}"), ops, &token_ids);
-            black_box(daemon.call(request));
+            let (daemon, token_ids, n) = cycle.stage();
+            black_box(daemon.call(envelope(daemon, token_ids, n)));
         }) {
-            daemon.shutdown();
+            cycle.reset();
             continue;
         }
         group.sample_size(if ops >= 128 { 10 } else { 20 });
+        group.sampling_mode(SamplingMode::Flat);
         group.throughput(Throughput::Elements(ops as u64));
         group.bench_function(BenchmarkId::new(format!("{ops}-ops"), "fresh"), |b| {
-            b.iter_batched(
-                || {
-                    counter += 1;
-                    commit_envelope(&daemon, &format!("k{counter}"), ops, &token_ids)
-                },
-                |request| black_box(daemon.call(request)),
-                BatchSize::PerIteration,
-            )
+            b.iter_custom(|iters| time_cycled(&mut cycle, iters, envelope))
         });
-        daemon.shutdown();
+        cycle.reset();
     }
+    group.sampling_mode(SamplingMode::Auto);
 
     // Replay: the receipt answers without entering the operation.
-    let daemon = Daemon::start();
-    let own_scope = daemon.project_scope_id();
-    let targets = seed_decisions(&daemon.store(), 0, 16, std::slice::from_ref(&own_scope));
-    let tip = daemon.store().tip().unwrap();
-    let token_ids: Vec<(String, i64)> = targets.into_iter().map(|id| (id, tip)).collect();
+    if profile_skips("commit/replay") {
+        group.finish();
+        return;
+    }
+    let (daemon, token_ids) = commit_fixture();
     let request = commit_envelope(&daemon, "replayed", 16, &token_ids);
     let first = daemon.assert_available(request.clone());
     assert_eq!(first["receipt"]["replayed"], false);
@@ -626,10 +745,17 @@ fn bench_commit(c: &mut Criterion) {
         black_box(daemon.call(request.clone()));
     }) {
         group.sample_size(20);
+        group.throughput(Throughput::Elements(16));
         group.bench_with_input(
             BenchmarkId::new("replay", "16-ops"),
             &request,
-            |b, request| b.iter(|| black_box(daemon.call(request.clone()))),
+            |b, request| {
+                b.iter_batched(
+                    || request.clone(),
+                    |request| black_box(daemon.call(request)),
+                    BatchSize::PerIteration,
+                )
+            },
         );
     }
     daemon.shutdown();
@@ -653,6 +779,11 @@ fn bench_eligibility(c: &mut Criterion) {
     }
     let mut group = c.benchmark_group("eligibility");
     for count in [1usize, 64, 1024] {
+        let cold = format!("eligibility/{count}-candidates/cold");
+        let warm_case = format!("eligibility/{count}-candidates/warm");
+        if profile_skips(&cold) && profile_skips(&warm_case) {
+            continue;
+        }
         let daemon = Daemon::start();
         let own_scope = daemon.project_scope_id();
         let store = daemon.store();
@@ -704,7 +835,6 @@ fn bench_eligibility(c: &mut Criterion) {
         assert!(verdicts.iter().all(|v| v["verdict"] == "ok"), "{response}");
         drop(store);
 
-        let cold = format!("eligibility/{count}-candidates/cold");
         if !profile_or_bench(&cold, || {
             daemon.handler.clear_eligibility_cache_for_test();
             black_box(daemon.call(request.clone()));
@@ -728,7 +858,6 @@ fn bench_eligibility(c: &mut Criterion) {
         }
         let warm = daemon.assert_available(request.clone());
         assert_eq!(warm["cache_hits"], count, "{warm}");
-        let warm_case = format!("eligibility/{count}-candidates/warm");
         if profile_or_bench(&warm_case, || {
             black_box(daemon.call(request.clone()));
         }) {
@@ -740,7 +869,13 @@ fn bench_eligibility(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new(format!("{count}-candidates"), "warm"),
             &request,
-            |b, request| b.iter(|| black_box(daemon.call(request.clone()))),
+            |b, request| {
+                b.iter_batched(
+                    || request.clone(),
+                    |request| black_box(daemon.call(request)),
+                    BatchSize::PerIteration,
+                )
+            },
         );
         daemon.shutdown();
     }
@@ -787,6 +922,9 @@ fn bench_egress(c: &mut Criterion) {
         ingest_request("local-only", b"local bytes", "evidence-local-only");
     local_only_request.provider_egress = ProviderEgress::LocalOnly;
     let local_only = store.ingest_artifact(local_only_request).unwrap();
+    let purged = store
+        .ingest_artifact(ingest_request("purged", b"purged bytes", "evidence-purged"))
+        .unwrap();
     let foreign_scope = seed_foreign_scopes(&store, 1).remove(0);
     store
         .commit(intent("seed-owners"), |envelope| {
@@ -796,6 +934,7 @@ fn bench_egress(c: &mut Criterion) {
                 ("evidence-secret", &own_scope),
                 ("evidence-local-only", &own_scope),
                 ("evidence-normal", &foreign_scope),
+                ("evidence-normal", &own_scope),
             ]
             .into_iter()
             .enumerate()
@@ -804,9 +943,26 @@ fn bench_egress(c: &mut Criterion) {
                 spec.object_id = format!("owner-{n}");
                 spec.decision_id = format!("owner-decision-{n}");
                 envelope.insert_decision(spec)?;
-                envelope.record_admission(admission(&format!("owner-{n}")))?;
+                let mut admitted = admission(&format!("owner-{n}"));
+                // A personal taint classes the served owner `sensitive` while
+                // the artifact it cites stays `normal`.
+                if n == 5 {
+                    admitted.taint_class = Some(TaintClass::Personal);
+                }
+                envelope.record_admission(admitted)?;
             }
             Ok(String::new())
+        })
+        .unwrap();
+    store
+        .delete_artifact(ArtifactDeletionRequest {
+            intent: intent("purge"),
+            identity: ArtifactDeletionIdentity::Digest(purged.digest.clone()),
+            kind: ArtifactDeletionKind::Purge,
+            operator_id: Some("bench".to_string()),
+            target_locator: Some("bench://purge".to_string()),
+            reason: Some("bench".to_string()),
+            deleted_at: 1,
         })
         .unwrap();
     drop(store);
@@ -847,6 +1003,16 @@ fn bench_egress(c: &mut Criterion) {
             egress_request(&daemon, &"0".repeat(64), "remote", "normal", "owner-0"),
             json!({"refused": "unknown_sensitive"}),
         ),
+        (
+            "owner_sensitive",
+            egress_request(&daemon, &normal.digest, "remote", "normal", "owner-5"),
+            json!({"refused": "owner_sensitive"}),
+        ),
+        (
+            "tombstoned",
+            egress_request(&daemon, &purged.digest, "remote", "normal", "owner-0"),
+            json!({"refused": "tombstoned"}),
+        ),
     ];
     group.sample_size(30);
     for (name, request, expected) in cases {
@@ -859,7 +1025,11 @@ fn bench_egress(c: &mut Criterion) {
             continue;
         }
         group.bench_with_input(BenchmarkId::new("decide", name), &request, |b, request| {
-            b.iter(|| black_box(daemon.call(request.clone())))
+            b.iter_batched(
+                || request.clone(),
+                |request| black_box(daemon.call(request)),
+                BatchSize::PerIteration,
+            )
         });
     }
     daemon.shutdown();
@@ -924,6 +1094,42 @@ fn rekey_begin(begin: &Value, upload_id: &str) -> Value {
     begin
 }
 
+fn bench_ingest_begin(c: &mut Criterion) {
+    if !group_enabled("ingest/begin") {
+        return;
+    }
+    let mut group = c.benchmark_group("ingest/begin");
+    let daemon = Daemon::start();
+    // The request declares two 4 KiB pages. A fresh id per call replaces the
+    // previous pending upload on this route, so no upload ever completes.
+    let payload = text_payload(8 * 1024, 0);
+    let begin = ingest_begin_request(&daemon, "u", &payload, 2);
+    let started = daemon.assert_available(begin.clone());
+    assert_eq!(started["upload_id"], "u", "{started}");
+    let mut counter = 0usize;
+    if profile_or_bench("ingest/begin/2-pages", || {
+        counter += 1;
+        black_box(daemon.call(rekey_begin(&begin, &format!("u{counter}"))));
+    }) {
+        daemon.shutdown();
+        group.finish();
+        return;
+    }
+    group.sample_size(30);
+    group.bench_function(BenchmarkId::new("begin", "2-pages"), |b| {
+        b.iter_batched(
+            || {
+                counter += 1;
+                rekey_begin(&begin, &format!("u{counter}"))
+            },
+            |begin| black_box(daemon.call(begin)),
+            BatchSize::PerIteration,
+        )
+    });
+    daemon.shutdown();
+    group.finish();
+}
+
 fn bench_ingest_page(c: &mut Criterion) {
     if !group_enabled("ingest/page") {
         return;
@@ -934,6 +1140,10 @@ fn bench_ingest_page(c: &mut Criterion) {
         ("256k", 256 * 1024),
         ("PAGE_BYTES_MAX", PAGE_BYTES_MAX),
     ] {
+        let case = format!("ingest/page/{label}");
+        if profile_skips(&case) {
+            continue;
+        }
         let daemon = Daemon::start();
         // One page of `bytes` inside a two-page upload, so `page` never
         // completes it and `finish` is never reached. Each iteration begins a
@@ -947,7 +1157,6 @@ fn bench_ingest_page(c: &mut Criterion) {
         let staged = daemon.assert_available(page.clone());
         assert_eq!(staged["received_pages"], 1, "{staged}");
         let mut counter = 0usize;
-        let case = format!("ingest/page/{label}");
         if profile_or_bench(&case, || {
             counter += 1;
             let id = format!("u{counter}");
@@ -985,64 +1194,81 @@ fn bench_ingest_finish(c: &mut Criterion) {
         return;
     }
     let mut group = c.benchmark_group("ingest/finish");
-    for (label, bytes) in [("1MiB", 1usize << 20), ("64MiB", 64usize << 20)] {
-        let daemon = Daemon::start();
+    for (label, bytes, reset_every) in
+        [("1MiB", 1usize << 20, 16usize), ("64MiB", 64usize << 20, 4)]
+    {
+        let case = format!("ingest/finish/{label}");
+        if profile_skips(&case) {
+            continue;
+        }
         let payload = text_payload(bytes, 0);
+        assert!(
+            payload.len() > COUNTER_TAG_BYTES,
+            "ingest/finish/{label} payload must hold a {COUNTER_TAG_BYTES}-byte tag plus newline"
+        );
         let page_count = bytes.div_ceil(PAGE_BYTES_MAX) as u32;
-        let pages: Vec<Value> = payload
-            .chunks(PAGE_BYTES_MAX)
-            .enumerate()
-            .map(|(i, chunk)| ingest_page_request(&daemon, "u", i as u32, chunk))
+        let mut cycle = Cycled::new(reset_every, || {
+            let daemon = Daemon::start();
+            let pages: Vec<Value> = payload
+                .chunks(PAGE_BYTES_MAX)
+                .enumerate()
+                .map(|(i, chunk)| ingest_page_request(&daemon, "u", i as u32, chunk))
+                .collect();
+            let begin = ingest_begin_request(&daemon, "u", &payload, page_count);
+            (daemon, (pages, begin))
+        });
+        // The per-use tag changes the payload and final-page digests,
+        // preventing CAS deduplication. The digests and final-page Base64 text
+        // are precomputed outside measured and profiled code.
+        let variants: Vec<(String, String, String)> = (1..=reset_every)
+            .map(|n| {
+                let mut payload = payload.clone();
+                let tag = format!("{n:0COUNTER_TAG_BYTES$}");
+                let len = payload.len();
+                payload[len - 1 - COUNTER_TAG_BYTES..len - 1].copy_from_slice(tag.as_bytes());
+                let last = payload
+                    .chunks(PAGE_BYTES_MAX)
+                    .last()
+                    .expect("payload has a page");
+                (
+                    sha256_hex(&payload),
+                    base64::engine::general_purpose::STANDARD.encode(last),
+                    sha256_hex(last),
+                )
+            })
             .collect();
-        let begin = ingest_begin_request(&daemon, "u", &payload, page_count);
-        let mut counter = 0usize;
-        // Every iteration ingests distinct bytes so the CAS never dedups: the
-        // last line carries the counter, which changes the payload digest and
-        // the last page's digest.
-        let stage = |daemon: &Daemon, counter: usize| -> Value {
-            let id = format!("u{counter}");
-            let mut payload = payload.clone();
-            let tag = format!("{counter:016}");
-            let n = payload.len();
-            payload[n - 17..n - 1].copy_from_slice(tag.as_bytes());
-            let mut begin = rekey_begin(&begin, &id);
-            begin["payload_digest"] = json!(sha256_hex(&payload));
+        let stage = |daemon: &Daemon, (pages, begin): &(Vec<Value>, Value), n: usize| -> Value {
+            let id = format!("u{n}");
+            let (payload_digest, last_base64, last_digest) = &variants[n - 1];
+            let mut begin = rekey_begin(begin, &id);
+            begin["payload_digest"] = json!(payload_digest);
             daemon.assert_available(begin);
             let last = pages.len() - 1;
-            for (i, chunk) in payload.chunks(PAGE_BYTES_MAX).enumerate() {
-                let mut page = pages[i].clone();
+            for (i, template) in pages.iter().enumerate() {
+                let mut page = template.clone();
                 page["upload_id"] = json!(id);
                 if i == last {
-                    page["bytes_base64"] =
-                        json!(base64::engine::general_purpose::STANDARD.encode(chunk));
-                    page["page_digest"] = json!(sha256_hex(chunk));
+                    page["bytes_base64"] = json!(last_base64);
+                    page["page_digest"] = json!(last_digest);
                 }
                 daemon.assert_available(page);
             }
             ingest_finish_request(daemon, &id)
         };
-        let case = format!("ingest/finish/{label}");
         if profile_or_bench(&case, || {
-            counter += 1;
-            let finish = stage(&daemon, counter);
-            black_box(daemon.call(finish));
+            let (daemon, state, n) = cycle.stage();
+            black_box(daemon.call(stage(daemon, state, n)));
         }) {
-            daemon.shutdown();
+            cycle.reset();
             continue;
         }
         group.sample_size(10);
+        group.sampling_mode(SamplingMode::Flat);
         group.throughput(Throughput::Bytes(bytes as u64));
         group.bench_function(BenchmarkId::new("finish", label), |b| {
-            b.iter_batched(
-                || {
-                    counter += 1;
-                    stage(&daemon, counter)
-                },
-                |finish| black_box(daemon.call(finish)),
-                BatchSize::PerIteration,
-            )
+            b.iter_custom(|iters| time_cycled(&mut cycle, iters, stage))
         });
-        daemon.shutdown();
+        cycle.reset();
     }
     group.finish();
 }
@@ -1098,6 +1324,6 @@ criterion_group! {
     name = benches;
     config = configure();
     targets = bench_read, bench_commit, bench_eligibility, bench_egress,
-              bench_ingest_page, bench_ingest_finish, bench_redaction
+              bench_ingest_begin, bench_ingest_page, bench_ingest_finish, bench_redaction
 }
 criterion_main!(benches);

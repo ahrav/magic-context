@@ -1,0 +1,127 @@
+[
+  {
+    "kind": "available"
+  },
+  {
+    "kind": "stale",
+    "lag_positions": 0,
+    "oldest_unconsumed_age_ms": 0
+  },
+  {
+    "kind": "abstained",
+    "lag_positions": 0,
+    "oldest_unconsumed_age_ms": 0
+  },
+  {
+    "kind": "unavailable",
+    "reason": "store_starting"
+  },
+  {
+    "kind": "unavailable",
+    "reason": "store_unavailable"
+  },
+  {
+    "kind": "unavailable",
+    "reason": "store_unsupported"
+  },
+  {
+    "kind": "unavailable",
+    "reason": "store_busy"
+  },
+  {
+    "kind": "unavailable",
+    "reason": "no_required_consumer"
+  },
+  {
+    "kind": "unavailable",
+    "reason": "snapshot_diverged"
+  },
+  {
+    "kind": "unavailable",
+    "reason": "queue_full"
+  },
+  {
+    "kind": "conflict",
+    "reason": "known_as_of_advanced"
+  },
+  {
+    "kind": "conflict",
+    "reason": "retracted"
+  },
+  {
+    "kind": "conflict",
+    "reason": "superseded"
+  },
+  {
+    "kind": "invalid",
+    "reason": "project_mismatch"
+  },
+  {
+    "kind": "invalid",
+    "reason": "operation_key_reused"
+  },
+  {
+    "kind": "invalid",
+    "reason": "class_over_declared"
+  },
+  {
+    "kind": "invalid",
+    "reason": "invalid_input"
+  },
+  {
+    "kind": "invalid",
+    "reason": "admission_policy"
+  },
+  {
+    "kind": "invalid",
+    "reason": "not_found"
+  },
+  {
+    "kind": "invalid",
+    "reason": "already_exists"
+  },
+  {
+    "kind": "invalid",
+    "reason": "revision_not_advanced"
+  },
+  {
+    "kind": "invalid",
+    "reason": "scope_reserved"
+  },
+  {
+    "kind": "invalid",
+    "reason": "payload_too_large"
+  },
+  {
+    "kind": "invalid",
+    "reason": "page_digest"
+  },
+  {
+    "kind": "invalid",
+    "reason": "page_index"
+  },
+  {
+    "kind": "invalid",
+    "reason": "page_too_large"
+  },
+  {
+    "kind": "invalid",
+    "reason": "payload_digest"
+  },
+  {
+    "kind": "invalid",
+    "reason": "upload_not_found"
+  },
+  {
+    "kind": "invalid",
+    "reason": "ingestion_fail_closed"
+  },
+  {
+    "kind": "invalid",
+    "reason": "artifact_unusable"
+  },
+  {
+    "kind": "invalid",
+    "reason": "internal"
+  }
+]

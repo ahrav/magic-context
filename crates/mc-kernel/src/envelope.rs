@@ -10,6 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use super::admission::{AdmissionKey, StoredAdmission};
@@ -231,6 +232,19 @@ impl Envelope<'_> {
         }
         let outcome = self.insert_domain_inner(spec);
         self.poison(outcome)
+    }
+
+    /// Returns whether a live domain row exists within the transaction.
+    pub fn domain_exists(&self, domain_id: &str) -> Result<bool, KernelError> {
+        self.tx
+            .query_row(
+                "SELECT 1 FROM domains WHERE domain_id=?1 AND invalidated_commit_seq IS NULL",
+                [domain_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|_| KernelError::Io)
+            .map(|row| row.is_some())
     }
 
     fn insert_domain_inner(&mut self, spec: DomainSpec) -> Result<(), KernelError> {
@@ -840,7 +854,7 @@ pub(super) fn replace_alignment_projection_tx(
     let removed = truncate_alignment_projection(tx)?;
     {
         let mut statement = tx
-            .prepare(
+            .prepare_cached(
                 "INSERT INTO alignment_projection(
                      decision_id,observation_id,alignment_kind,alignment_payload,
                      built_through_commit_seq
@@ -1386,7 +1400,11 @@ pub(super) fn load_object_state(
     tx: &Transaction<'_>,
     object_id: &str,
 ) -> Result<Option<ObjectState>, KernelError> {
-    tx.prepare_cached(&object_state_sql("o.object_id=?1"))
+    // The query text embeds only constants, so it is identical on every call.
+    // A per-call `format!` would allocate a string only to hash it against the
+    // same `prepare_cached` entry every time.
+    static SQL: LazyLock<String> = LazyLock::new(|| object_state_sql("o.object_id=?1"));
+    tx.prepare_cached(SQL.as_str())
         .and_then(|mut statement| {
             statement
                 .query_row([object_id], object_state_from)
@@ -1401,11 +1419,9 @@ pub(super) fn load_object_states(
     tx: &Transaction<'_>,
     ids: &str,
 ) -> Result<HashMap<String, ObjectState>, KernelError> {
-    let mut statement = tx
-        .prepare_cached(&object_state_sql(
-            "o.object_id IN (SELECT value FROM json_each(?1))",
-        ))
-        .map_err(map_sqlite)?;
+    static SQL: LazyLock<String> =
+        LazyLock::new(|| object_state_sql("o.object_id IN (SELECT value FROM json_each(?1))"));
+    let mut statement = tx.prepare_cached(SQL.as_str()).map_err(map_sqlite)?;
     let states = statement
         .query_map([ids], object_state_from)
         .map_err(map_sqlite)?

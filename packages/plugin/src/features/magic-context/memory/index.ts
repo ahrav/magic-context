@@ -3,7 +3,7 @@ export * from "./constants";
 export * from "./embedding";
 export * from "./normalize-hash";
 export * from "./project-identity";
-export type { PromotedMemoryRef } from "./promotion";
+export type { HistorianPromotionIdentity, PromotedMemoryRef } from "./promotion";
 export { promoteSessionFactsDurable } from "./promotion";
 export * from "./storage-anti-memory";
 export * from "./storage-claim-autonomous";

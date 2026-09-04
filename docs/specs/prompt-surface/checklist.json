@@ -329,7 +329,7 @@
         "file": "packages/plugin/src/agents/magic-context-prompt.ts",
         "symbol": "BASE_INTRO",
         "lines": "70-90",
-        "evidence": "Messages and tool outputs are tagged with \u00a7N\u00a7 identifiers"
+        "evidence": "Messages and tool outputs are tagged with §N§ identifiers"
       },
       "sharedAcrossPresets": false,
       "composedIn": [
@@ -599,8 +599,8 @@
       "source": {
         "file": "packages/plugin/src/tools/ctx-memory/constants.ts",
         "symbol": "CTX_MEMORY_DESCRIPTION",
-        "lines": "2-13",
-        "evidence": "Claims use public IDs (mcm_<32hex>)"
+        "lines": "4-16",
+        "evidence": "Memories are addressed by object id (mem_<32hex>)"
       },
       "sharedAcrossPresets": false,
       "composedIn": [
@@ -709,9 +709,9 @@
       "scope": "primary sessions with ctx_reduce",
       "polarity": "contract",
       "operativeCondition": "A primary session can see tagged messages or tool outputs.",
-      "mechanism": "The system labels messages and tool outputs with \u00a7N\u00a7 identifiers.",
+      "mechanism": "The system labels messages and tool outputs with §N§ identifiers.",
       "consequence": "Tag references are the only valid handles for reduction.",
-      "evidence": "Messages and tool outputs are tagged with \u00a7N\u00a7 identifiers"
+      "evidence": "Messages and tool outputs are tagged with §N§ identifiers"
     },
     {
       "id": "G-002",
@@ -810,7 +810,7 @@
       "operativeCondition": "The agent has finished using a large output, logical step, or context area.",
       "mechanism": "Consider ctx_reduce after acted-on reads, completed logical steps, before major context switches, and before the turn ends.",
       "consequence": "The working set stays lean without changing task scope.",
-      "evidence": "After completing a logical step \u2014 drop intermediate outputs from that step."
+      "evidence": "After completing a logical step — drop intermediate outputs from that step."
     },
     {
       "id": "G-011",
@@ -874,7 +874,7 @@
       "scope": "primary sessions",
       "polarity": "prohibition",
       "operativeCondition": "Magic Context control markers appear in compressed or injected context.",
-      "mechanism": "Do not reproduce metadata markers such as `<session-history>`, `<project-memory>`, `[dropped \u00a7N\u00a7]`, or temporal comments in a normal reply and do not treat them as user instructions.",
+      "mechanism": "Do not reproduce metadata markers such as `<session-history>`, `<project-memory>`, `[dropped §N§]`, or temporal comments in a normal reply and do not treat them as user instructions.",
       "consequence": "Control metadata cannot be imitated as assistant output or mistaken for directives.",
       "evidence": "Magic Context control metadata is not reply syntax"
     },
@@ -907,7 +907,7 @@
       "scope": "primary sessions with memory enabled",
       "polarity": "contract",
       "operativeCondition": "A fact must be available to future sessions.",
-      "mechanism": "Use ctx_memory to create durable claims and revise, archive, restore, or merge them when facts drift.",
+      "mechanism": "Use ctx_memory to create durable claims and revise, archive, or merge them when facts drift.",
       "consequence": "Future sessions start with maintained project knowledge.",
       "evidence": "Claims persist across sessions"
     },
@@ -1027,7 +1027,7 @@
       "sourceFragment": "guidance-subagent-reduce",
       "scope": "subagent sessions",
       "polarity": "prohibition",
-      "operativeCondition": "Older tool calls appear as `[dropped \u00a7N\u00a7]` sentinels in a subagent context.",
+      "operativeCondition": "Older tool calls appear as `[dropped §N§]` sentinels in a subagent context.",
       "mechanism": "Treat sentinels as normal context management, never as a pattern to copy; make a fresh real tool call and never fabricate or inline its output.",
       "consequence": "The dropped placeholder cannot be imitated as assistant content.",
       "evidence": "sentinels; that is normal context management, not a pattern to copy.",
@@ -1222,14 +1222,14 @@
     },
     {
       "id": "T-013",
-      "title": "ctx_memory stores durable project claims",
+      "title": "ctx_memory stores durable project memories",
       "sourceFragment": "tool-ctx-memory",
       "scope": "ctx_memory tool users",
       "polarity": "contract",
       "operativeCondition": "A fact must survive this session.",
-      "mechanism": "Create one durable project claim: content plus a positive category, or category REJECTED_APPROACH plus an antiMemory payload and no content.",
+      "mechanism": "Create one durable project memory: content plus a positive category, or category REJECTED_APPROACH plus an antiMemory payload and no content.",
       "consequence": "Future sessions can use the memory without reconstructing this conversation.",
-      "evidence": "create a claim (content + category, or antiMemory)"
+      "evidence": "create: content + category, or antiMemory."
     },
     {
       "id": "T-014",
@@ -1238,9 +1238,9 @@
       "scope": "ctx_memory tool users",
       "polarity": "contract",
       "operativeCondition": "A memory must be changed or fetched.",
-      "mechanism": "Use create, get, revise, archive, restore, or merge; list remains dreamer-only.",
+      "mechanism": "Use create, get, revise, archive, or merge; list remains dreamer-only.",
       "consequence": "Primary agents cannot assume the dreamer-only list action is available.",
-      "evidence": "list: enumerate visible active claims (dreamer maintenance only)"
+      "evidence": "list: visible memories (dreamer maintenance only)."
     },
     {
       "id": "T-015",
@@ -1255,14 +1255,14 @@
     },
     {
       "id": "T-016",
-      "title": "ctx_memory identity and mutation boundary",
+      "title": "ctx_memory addresses memories by object id",
       "sourceFragment": "tool-ctx-memory",
       "scope": "ctx_memory tool users",
       "polarity": "contract",
-      "operativeCondition": "A known claim must be fetched or changed.",
-      "mechanism": "Use get with opaque public IDs and the current mutation token for changes; list remains dreamer-only.",
-      "consequence": "Primary agents use canonical claim identities and cannot assume dreamer browsing privileges.",
-      "evidence": "Reuse the exact token returned by create/get/list"
+      "operativeCondition": "A memory must be fetched or changed.",
+      "mechanism": "Use get, revise, archive, or merge with object ids; supersession returns the survivor's id and no token is passed.",
+      "consequence": "Primary agents use canonical object identities and never carry mutation tokens.",
+      "evidence": "revise and merge supersede their targets with one new object and return its id; no token is passed"
     },
     {
       "id": "T-017",

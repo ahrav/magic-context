@@ -232,8 +232,11 @@ fn load_alignment_input(
         let mut next = Vec::new();
         for (object_id, history) in loaded {
             if let Some(successor) = history.superseded_by.as_deref() {
-                if !decisions.contains_key(successor) && !frontier.iter().any(|id| id == successor)
-                {
+                // Keep `frontier` sorted for `binary_search_by`.
+                let in_frontier = frontier
+                    .binary_search_by(|id| id.as_str().cmp(successor))
+                    .is_ok();
+                if !in_frontier && !decisions.contains_key(successor) {
                     next.push(successor.to_string());
                 }
             }

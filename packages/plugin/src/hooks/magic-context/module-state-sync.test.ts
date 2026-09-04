@@ -44,7 +44,6 @@ import {
     buildAuthorizedClaimMirrorSnapshot,
     buildModuleStateSyncPayload,
     buildPagedModuleStateSyncPayloads,
-    drainClaimEffectPrefix,
     loadModuleWatermarks,
     type ModuleStateSyncState,
     mirrorModuleCompartments,
@@ -1395,31 +1394,7 @@ function seedGroupedClaimEffects(db: Database, operationKey: string) {
     });
 }
 
-describe("claim effect prefix delivery", () => {
-    it("delivers earlier effects first and checkpoints each receipt group atomically", async () => {
-        const db = createContextDb();
-        const target = seedGroupedClaimEffects(db, "ordered");
-        const deliveries: Array<{ receiptId: number; effectIds: number[] }> = [];
-
-        const result = await drainClaimEffectPrefix({
-            db,
-            consumer: "u5-module",
-            throughReceiptId: target.receiptId,
-            deliver: async (receipt) => {
-                deliveries.push({
-                    receiptId: receipt.receiptId,
-                    effectIds: receipt.effects.map((effect) => effect.id),
-                });
-                return { ackedEffectId: receipt.effects.at(-1)?.id ?? 0 };
-            },
-        });
-
-        expect(deliveries.map((delivery) => delivery.effectIds.length)).toEqual([1, 2]);
-        expect(deliveries[1]?.effectIds).toEqual(target.effects.map((effect) => effect.id));
-        expect(result.reachedReceipt).toBe(true);
-        expect(result.deliveredReceipts).toBe(2);
-    });
-
+describe("claim outbox checkpoint atomicity", () => {
     it("rejects a checkpoint that would split a receipt group", () => {
         const db = createContextDb();
         const target = seedGroupedClaimEffects(db, "partial");

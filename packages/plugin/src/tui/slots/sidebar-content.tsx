@@ -4,6 +4,7 @@ import type { TuiSlotPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/
 import packageJson from "../../../package.json"
 import { badgeTextColor } from '../badge-contrast';
 import { loadSidebarSnapshot, type SidebarSnapshot } from "../data/context-db"
+import { formatMemoryCount } from "../../shared/rpc-types"
 import { formatThresholdPercent } from "../../shared/format-threshold"
 import { formatTailHygiene } from "../../shared/tail-hygiene-status"
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "../compaction-off"
@@ -748,10 +749,12 @@ const SidebarContent = (props: {
                             </Show>
                             <box width="100%" flexDirection="row" justifyContent="space-between">
                                 <text fg={props.theme.textMuted}>Memories</text>
-                                <text fg={props.theme.textMuted}>
-                                    {(s()?.memoryBlockCount ?? 0) > 0
-                                        ? `${s()!.memoryBlockCount}/${s()?.memoryCount ?? 0}`
-                                        : String(s()?.memoryCount ?? 0)}
+                                <text fg={s()?.memoryState && s()?.memoryState !== "available" ? props.theme.warning : props.theme.textMuted}>
+                                    {s()?.memoryState && s()?.memoryState !== "available"
+                                        ? String(s()!.memoryState)
+                                        : (s()?.memoryBlockCount ?? 0) > 0
+                                          ? `${s()!.memoryBlockCount}/${formatMemoryCount(s() ?? { memoryCount: 0 })}`
+                                          : formatMemoryCount(s() ?? { memoryCount: 0 })}
                                 </text>
                             </box>
                             <box width="100%" flexDirection="row" justifyContent="space-between">
@@ -816,7 +819,11 @@ const SidebarContent = (props: {
                     <StatRow
                         theme={props.theme}
                         label="Memories"
-                        value={String(s()?.memoryCount ?? 0)}
+                        value={
+                            s()?.memoryState && s()?.memoryState !== "available"
+                                ? String(s()!.memoryState)
+                                : formatMemoryCount(s() ?? { memoryCount: 0 })
+                        }
                         accent
                     />
                     {(s()?.memoryBlockCount ?? 0) > 0 && (

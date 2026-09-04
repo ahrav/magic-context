@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { createDirectTestDatabase } from "../test-database";
+import { antiMemoryExpired } from "./anti-memory-content";
 import {
     computeClaimOperationRequestDigest,
     formatRevisionLocator,
@@ -109,6 +110,48 @@ describe("anti-memory typed operations", () => {
     test("still rejects a non-empty line with no field label", () => {
         expect(() => parseAntiMemoryContent("Trigger: caching\nno label here")).toThrow(
             "invalid anti-memory content line",
+        );
+    });
+
+    test("an expiry timestamp round-trips through the rendered text", () => {
+        const rendered = renderAntiMemoryContent({
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            rejectionReason: "split ownership",
+            expiresAt: 1_700_000_000_000,
+        });
+        expect(rendered.split("\n")).toContain("Expires at: 1700000000000");
+        const parsed = parseAntiMemoryContent(rendered);
+        expect(parsed.expiresAt).toBe(1_700_000_000_000);
+        expect(renderAntiMemoryContent(parsed)).toBe(rendered);
+        expect(antiMemoryExpired(parsed, 1_700_000_000_000)).toBe(true);
+        expect(antiMemoryExpired(parsed, 1_699_999_999_999)).toBe(false);
+    });
+
+    test("a payload without an expiry renders no expiry line and never expires", () => {
+        const rendered = renderAntiMemoryContent({
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            rejectionReason: "split ownership",
+        });
+        expect(rendered).not.toContain("Expires at:");
+        expect(antiMemoryExpired(parseAntiMemoryContent(rendered), Number.MAX_SAFE_INTEGER)).toBe(
+            false,
+        );
+    });
+
+    test("a non-integer expiry is rejected in payloads and rendered text", () => {
+        const base = {
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            rejectionReason: "split ownership",
+        };
+        expect(() => renderAntiMemoryContent({ ...base, expiresAt: 1.5 })).toThrow(
+            "positive epoch-milliseconds integer",
+        );
+        const rendered = renderAntiMemoryContent(base);
+        expect(() => parseAntiMemoryContent(`${rendered}\nExpires at: soon`)).toThrow(
+            "positive epoch-milliseconds integer",
         );
     });
 

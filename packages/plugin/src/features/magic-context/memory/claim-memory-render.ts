@@ -187,62 +187,6 @@ export function trimClaimSnapshotsToBudget(
     return { selected, renderOrder: [...selected].sort(claimRenderOrder) };
 }
 
-export interface ClaimWorkspaceTrimContext {
-    /** The function returns canonical member identities in workspace order. */
-    identities: readonly string[];
-    /** The map associates each claim project ID with its canonical member identity. */
-    identityByProjectId: ReadonlyMap<number, string>;
-}
-
-/**
- * The trim reserves an equal token floor for each member identity before greedily allocating the remainder.
- * Greedy allocation after equal floors cannot let one member's pool starve the others.
- */
-export function trimWorkspaceClaimSnapshotsToBudget(
-    items: readonly ProjectMemoryClaimSnapshot[],
-    budgetTokens: number,
-    workspace: ClaimWorkspaceTrimContext,
-    renderOptions: ClaimMemoryRenderOptions = {},
-): TrimClaimSnapshotsResult {
-    const selected: ProjectMemoryClaimSnapshot[] = [];
-    const selectedIds = new Set<string>();
-    const accounting = createClaimBlockAccounting(renderOptions);
-    const floorTokens = budgetTokens / Math.max(1, workspace.identities.length);
-    const byIdentity = new Map<string, ProjectMemoryClaimSnapshot[]>();
-    for (const item of items) {
-        const identity = workspace.identityByProjectId.get(item.projectId);
-        if (!identity) continue;
-        const list = byIdentity.get(identity) ?? [];
-        list.push(item);
-        byIdentity.set(identity, list);
-    }
-    for (const identity of workspace.identities) {
-        let memberTokens = 0;
-        const candidates = (byIdentity.get(identity) ?? []).sort(claimSelectionOrder);
-        for (const item of candidates) {
-            if (selectedIds.has(item.publicClaimId)) continue;
-            const cost = accounting.candidateCost(item);
-            if (memberTokens + cost > floorTokens) continue;
-            if (accounting.usedTokens + cost > budgetTokens) continue;
-            selected.push(item);
-            selectedIds.add(item.publicClaimId);
-            accounting.admit(item, cost);
-            memberTokens += cost;
-        }
-    }
-    const remaining = items
-        .filter((item) => !selectedIds.has(item.publicClaimId))
-        .sort(claimSelectionOrder);
-    for (const item of remaining) {
-        const cost = accounting.candidateCost(item);
-        if (accounting.usedTokens + cost > budgetTokens) continue;
-        selected.push(item);
-        selectedIds.add(item.publicClaimId);
-        accounting.admit(item, cost);
-    }
-    return { selected, renderOrder: [...selected].sort(claimRenderOrder) };
-}
-
 /** The map associates each numeric project ID with its canonical project identity. */
 export function readProjectIdentityMap(
     db: Database,

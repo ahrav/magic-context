@@ -1,9 +1,13 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { UnifiedSearchResult } from "@magic-context/core/features/magic-context/search";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
+import { renderToolStateText } from "@magic-context/core/shared/kernel-client";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
-import { createTestDb, fakeContext } from "../test-utils";
+import {
+	createTestDb,
+	fakeContext,
+	fakeKernelResolver,
+} from "../test-utils";
 import { createCtxSearchTool } from "./ctx-search";
 
 describe("createCtxSearchTool", () => {
@@ -13,6 +17,7 @@ describe("createCtxSearchTool", () => {
 		try {
 			const tool = createCtxSearchTool({
 				db,
+				kernelClient: fakeKernelResolver().kernelClient,
 				memoryEnabled: true,
 				embeddingEnabled: false,
 				gitCommitsEnabled: false,
@@ -62,6 +67,7 @@ describe("createCtxSearchTool", () => {
 		try {
 			const tool = createCtxSearchTool({
 				db,
+				kernelClient: fakeKernelResolver().kernelClient,
 				memoryEnabled: false,
 				embeddingEnabled: false,
 				gitCommitsEnabled: false,
@@ -101,6 +107,7 @@ describe("createCtxSearchTool", () => {
 		try {
 			const tool = createCtxSearchTool({
 				db,
+				kernelClient: fakeKernelResolver().kernelClient,
 				memoryEnabled: false,
 				embeddingEnabled: false,
 				gitCommitsEnabled: false,
@@ -148,6 +155,7 @@ describe("createCtxSearchTool", () => {
 		try {
 			const tool = createCtxSearchTool({
 				db,
+				kernelClient: fakeKernelResolver().kernelClient,
 				memoryEnabled: false,
 				embeddingEnabled: false,
 				gitCommitsEnabled: false,
@@ -194,6 +202,7 @@ describe("createCtxSearchTool", () => {
 		try {
 			const tool = createCtxSearchTool({
 				db,
+				kernelClient: fakeKernelResolver().kernelClient,
 				memoryEnabled: false,
 				embeddingEnabled: false,
 				gitCommitsEnabled: false,
@@ -219,7 +228,7 @@ describe("createCtxSearchTool", () => {
 		}
 	});
 
-	it("invokes normal search exactly once when every requested id is missing (Pi parity)", async () => {
+	it("falls through to local search when no object id matches (Pi parity)", async () => {
 		const db = createTestDb();
 		let calls = 0;
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
@@ -227,11 +236,11 @@ describe("createCtxSearchTool", () => {
 				calls += 1;
 				return [
 					{
-						source: "memory",
+						source: "message",
 						content: "Fallback text search hit.",
 						score: 0.5,
-						memoryId: 1,
-						category: "USER_DIRECTIVES",
+						messageOrdinal: 4,
+						role: "user",
 						matchType: "fts",
 					},
 				] as UnifiedSearchResult[];
@@ -240,6 +249,7 @@ describe("createCtxSearchTool", () => {
 		try {
 			const tool = createCtxSearchTool({
 				db,
+				kernelClient: fakeKernelResolver().kernelClient,
 				memoryEnabled: true,
 				embeddingEnabled: false,
 				gitCommitsEnabled: false,
@@ -247,7 +257,7 @@ describe("createCtxSearchTool", () => {
 
 			const result = await tool.execute(
 				"call-id",
-				{ query: "999999 888888" },
+				{ query: `mem_${"9".repeat(32)} mem_${"8".repeat(32)}` },
 				new AbortController().signal,
 				undefined,
 				fakeContext("ses-search", process.cwd()) as never,
@@ -263,29 +273,26 @@ describe("createCtxSearchTool", () => {
 		}
 	});
 
-	it("resolves a locator query directly without calling unifiedSearch (Pi parity)", async () => {
-		// `createTestDb` already installs the claim-memory schema.
-		// Installing the claim-memory schema twice throws "table claim_public_ids already exists".
+	it("resolves an object-id query from the kernel without calling unifiedSearch (Pi parity)", async () => {
 		const db = createTestDb();
-		const { seedProjectMemoryClaim } = await import(
-			"@magic-context/core/features/magic-context/test-claim-database"
-		);
-		const projectIdentity = resolveProjectIdentity(process.cwd());
-		const claim = seedProjectMemoryClaim(db, {
-			projectIdentity,
-			category: "USER_DIRECTIVES",
-			content: "Direct id hit for the short-circuit.",
+		const fake = fakeKernelResolver();
+		const objectId = `mem_${"a".repeat(32)}`;
+		fake.kernel.seedDecision({
+			object_id: objectId,
+			decision_kind: "USER_DIRECTIVES",
+			summary: "Direct id hit for the short-circuit.",
 		});
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
 			async () => {
 				throw new Error(
-					"unifiedSearch must not run for locator-shaped queries",
+					"unifiedSearch must not run for object-id queries",
 				);
 			},
 		);
 		try {
 			const tool = createCtxSearchTool({
 				db,
+				kernelClient: fake.kernelClient,
 				memoryEnabled: true,
 				embeddingEnabled: false,
 				gitCommitsEnabled: false,
@@ -293,7 +300,7 @@ describe("createCtxSearchTool", () => {
 
 			const result = await tool.execute(
 				"call-id",
-				{ query: claim.publicClaimId },
+				{ query: objectId },
 				new AbortController().signal,
 				undefined,
 				fakeContext("ses-search", process.cwd()) as never,
@@ -301,8 +308,50 @@ describe("createCtxSearchTool", () => {
 
 			const text = result.content[0]?.text ?? "";
 			expect(text).toContain("[1] [memory]");
-			expect(text).toContain(`id=${claim.publicClaimId}`);
+			expect(text).toContain(objectId);
 			expect(text).toContain("Direct id hit for the short-circuit.");
+			expect(fake.transport.methods()).toEqual(["kernel.read"]);
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("renders the memory state text when the daemon is absent", async () => {
+		const db = createTestDb();
+		const fake = fakeKernelResolver();
+		fake.transport.fileExists = false;
+		const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
+		try {
+			const tool = createCtxSearchTool({
+				db,
+				kernelClient: fake.kernelClient,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				gitCommitsEnabled: false,
+			});
+			const memoryOnly = await tool.execute(
+				"call-absent",
+				{ query: "anything", sources: ["memory"] },
+				new AbortController().signal,
+				undefined,
+				fakeContext("ses-search", process.cwd()) as never,
+			);
+			expect(memoryOnly.isError).toBe(true);
+			expect(memoryOnly.content[0]?.text).toBe(
+				`Error: ${renderToolStateText({ kind: "unavailable", reason: "daemon_absent" })}`,
+			);
+			const mixed = await tool.execute(
+				"call-absent-mixed",
+				{ query: "anything" },
+				new AbortController().signal,
+				undefined,
+				fakeContext("ses-search", process.cwd()) as never,
+			);
+			expect(mixed.isError).toBeUndefined();
+			expect(mixed.content[0]?.text).toStartWith(
+				`Memory: ${renderToolStateText({ kind: "unavailable", reason: "daemon_absent" })}`,
+			);
 		} finally {
 			spy.mockRestore();
 			closeQuietly(db);

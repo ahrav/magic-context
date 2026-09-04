@@ -1,21 +1,24 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
-import {
-	createAntiMemory,
-	readAntiMemory,
-} from "@magic-context/core/features/magic-context/memory/storage-anti-memory";
-import { ensureProject } from "@magic-context/core/features/magic-context/memory/storage-claims";
+import { renderAntiMemoryContent } from "@magic-context/core/features/magic-context/memory/anti-memory-content";
+import { ANTI_MEMORY_CATEGORY } from "@magic-context/core/features/magic-context/memory/constants";
 import type { UnifiedSearchResult } from "@magic-context/core/features/magic-context/search";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
 import {
 	appendAutoSearchHintDecision,
 	getAutoSearchHintDecisions,
 } from "@magic-context/core/features/magic-context/storage";
+import { unavailable } from "@magic-context/core/shared/kernel-client";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	clearAutoSearchForPiSession,
 	runAutoSearchHintForPi,
 } from "./auto-search-pi";
-import { createTestDb, textOf, userMessage } from "./test-utils";
+import {
+	createTestDb,
+	fakeKernelResolver,
+	textOf,
+	userMessage,
+} from "./test-utils";
 
 const baseOptions = {
 	enabled: true,
@@ -111,7 +114,7 @@ describe("runAutoSearchHintForPi", () => {
 			});
 
 			const options = spy.mock.calls[0]?.[4];
-			expect(options?.sources).toEqual(["memory", "message", "git_commit"]);
+			expect(options?.sources).toEqual(["message", "git_commit"]);
 			expect(options?.memoryPolicySurface).toBe("auto_search");
 		} finally {
 			spy.mockRestore();
@@ -119,77 +122,226 @@ describe("runAutoSearchHintForPi", () => {
 		}
 	});
 
-	it("delivers anti-memory warnings and increments retrieval usage once", async () => {
+	it("a kernel memory row that matches the prompt becomes the hint", async () => {
 		const db = createTestDb();
-		const created = createAntiMemory(
-			db,
-			{ producer: "pi-runner-test", operationKey: "anti-warning" },
-			{
-				projectId: ensureProject(db, baseOptions.projectPath),
-				payload: {
-					trigger: "session caching",
-					rejectedStrategy: "Redis",
-					rejectionReason: "split ownership",
-					saferAlternative: "use SQLite",
-				},
-				provenance: {
-					sourceLocator: "test://pi/anti",
-					sourceContent: "Redis rejected",
-					extractor: "test",
-					extractorVersion: "1",
-					extractorRunId: "seed",
-					independenceKey: "pi-anti",
-					sourceTrustClass: "explicit_user",
-				},
-				actor: "user:test",
-			},
-		);
-		const publicClaimId = (
-			created.result.payload as { claim: { publicClaimId: string } }
-		).claim.publicClaimId;
-		const anti = readAntiMemory(db, publicClaimId);
-		if (anti === null) throw new Error("missing anti-memory");
-		const warning: UnifiedSearchResult = {
-			source: "anti_memory",
-			score: 0.95,
-			publicClaimId,
-			revisionLocator: anti.revisionLocator,
-			contentDigest: anti.contentDigest,
-			claimId: anti.claimId,
-			normalizedHash: anti.normalizedHash,
-			trigger: anti.payload.trigger,
-			rejectedStrategy: anti.payload.rejectedStrategy,
-			rejectionReason: anti.payload.rejectionReason,
-			saferAlternative: anti.payload.saferAlternative,
-			matchType: "lexical",
-		};
-		const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([
-			warning,
-		]);
+		const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
+		const fake = fakeKernelResolver();
+		fake.kernel.seedDecision({
+			object_id: `mem_${"a".repeat(32)}`,
+			decision_kind: "PROJECT_RULES",
+			summary:
+				"the historian decides to run when context passes the execute threshold",
+		});
 		try {
 			const messages = [
-				userMessage("please add Redis backed session caching", 1),
+				userMessage("please explain how the historian decides when to run", 1),
 			];
 			await runAutoSearchHintForPi({
 				sessionId: "ses-auto",
 				db,
 				messages,
-				options: baseOptions,
+				options: {
+					...baseOptions,
+					directory: "/tmp/auto-search",
+					kernelClient: fake.kernelClient,
+				},
 			});
-			expect(textOf(messages[0])).toContain("⚠ Previously rejected: Redis");
-			expect(
-				db
-					.prepare(
-						`SELECT usage.retrieval_count AS count FROM claim_usage_stats usage
-						  JOIN claim_public_ids public ON public.claim_id = usage.claim_id
-						 WHERE public.public_id = ?`,
-					)
-					.get(publicClaimId),
-			).toEqual({ count: 1 });
+			expect(textOf(messages[0])).toContain("<ctx-search-hint>");
+			expect(fake.transport.methods()).toEqual(["kernel.read"]);
+			expect(fake.transport.calls[0]?.body).toMatchObject({
+				surface: "explicit_search",
+				gated: true,
+			});
 			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]).toMatchObject({
 				decision: "hint",
-				memoryFragments: [{ id: anti.claimId, hash: anti.normalizedHash }],
+				memoryFragments: [{ id: -1, hash: `mem_${"a".repeat(32)}@1` }],
 			});
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("a provided memory snapshot serves the memory source with no kernel read", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
+		const fake = fakeKernelResolver();
+		fake.kernel.seedDecision({
+			object_id: `mem_${"c".repeat(32)}`,
+			decision_kind: "PROJECT_RULES",
+			summary:
+				"the historian decides to run when context passes the execute threshold",
+		});
+		try {
+			const messages = [
+				userMessage("please explain how the historian decides when to run", 1),
+			];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				options: {
+					...baseOptions,
+					directory: "/tmp/auto-search",
+					kernelClient: fake.kernelClient,
+					memorySnapshot: fake.kernel.snapshot("explicit_search"),
+				},
+			});
+			expect(textOf(messages[0])).toContain("<ctx-search-hint>");
+			expect(fake.transport.calls).toEqual([]);
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("a provided memory snapshot serves the memory source when no kernel client resolves", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
+		const fake = fakeKernelResolver();
+		fake.kernel.seedDecision({
+			object_id: `mem_${"d".repeat(32)}`,
+			decision_kind: "PROJECT_RULES",
+			summary:
+				"the historian decides to run when context passes the execute threshold",
+		});
+		try {
+			const messages = [
+				userMessage("please explain how the historian decides when to run", 1),
+			];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				options: {
+					...baseOptions,
+					memorySnapshot: fake.kernel.snapshot("explicit_search"),
+				},
+			});
+			expect(textOf(messages[0])).toContain("<ctx-search-hint>");
+			expect(fake.transport.calls).toEqual([]);
+			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]).toMatchObject({
+				decision: "hint",
+			});
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it.each([
+		[
+			"stale",
+			{ kind: "stale", lag_positions: 3, oldest_unconsumed_age_ms: 500 } as const,
+			"memory-abstained",
+		],		["unavailable", unavailable("store_busy"), "memory-unavailable"],
+	] as const)(
+		"a %s kernel persists nothing and appends nothing",
+		async (_label, state, _reason) => {
+			const db = createTestDb();
+			const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
+			const fake = fakeKernelResolver();
+			fake.kernel.seedDecision({
+				object_id: `mem_${"b".repeat(32)}`,
+				decision_kind: "PROJECT_RULES",
+				summary:
+					"the historian decides to run when context passes the execute threshold",
+			});
+			fake.kernel.surfaceStates.set("explicit_search", state);
+			try {
+				const messages = [
+					userMessage("please explain how the historian decides when to run", 1),
+				];
+				await runAutoSearchHintForPi({
+					sessionId: "ses-auto",
+					db,
+					messages,
+					options: {
+						...baseOptions,
+						directory: "/tmp/auto-search",
+						kernelClient: fake.kernelClient,
+					},
+				});
+				expect(textOf(messages[0])).not.toContain("<ctx-search-hint>");
+				expect(getAutoSearchHintDecisions(db, "ses-auto")).toEqual([]);
+
+				// The recovered kernel serves the withheld hint on the next pass because no decision pinned the message.
+				fake.kernel.surfaceStates.delete("explicit_search");
+				await runAutoSearchHintForPi({
+					sessionId: "ses-auto",
+					db,
+					messages,
+					options: {
+						...baseOptions,
+						directory: "/tmp/auto-search",
+						kernelClient: fake.kernelClient,
+					},
+				});
+				expect(textOf(messages[0])).toContain("<ctx-search-hint>");
+			} finally {
+				spy.mockRestore();
+				closeQuietly(db);
+			}
+		},
+	);
+
+	it("a delivered kernel anti-memory warning re-serves through a fresh search, never a stored replay", async () => {
+		const db = createTestDb();
+		const prompt = "please explain how the historian decides when to run";
+		const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
+		const fake = fakeKernelResolver();
+		fake.kernel.seedDecision({
+			object_id: `mem_${"e".repeat(32)}`,
+			decision_kind: ANTI_MEMORY_CATEGORY,
+			summary: renderAntiMemoryContent({
+				trigger: "historian scheduling",
+				rejectedStrategy: "polling the session table",
+				rejectionReason: "it starves the transform hot path",
+			}),
+			rationale: prompt,
+		});
+		const options = {
+			...baseOptions,
+			directory: "/tmp/auto-search",
+			kernelClient: fake.kernelClient,
+		};
+		try {
+			const messages = [userMessage(prompt, 1)];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				options,
+			});
+			expect(textOf(messages[0])).toContain("Previously rejected");
+
+			const decision = getAutoSearchHintDecisions(db, "ses-auto")[0];
+			expect(decision?.decision).toBe("hint");
+			if (decision?.decision !== "hint") return;
+			expect(decision.memoryFragments?.length).toBe(1);
+
+			// A reconstructed message re-runs the search: the live row re-delivers the warning freshly instead of replaying stored text.
+			const replayMessages = [userMessage(prompt, 1)];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages: replayMessages,
+				options,
+			});
+			expect(textOf(replayMessages[0])).toContain("Previously rejected");
+
+			// Archiving the row makes the fresh search find nothing; the stored decision must not resurrect it.
+			fake.kernel.objects.forEach((object) => {
+				object.invalidated_commit_seq = 1;
+			});
+			const archivedMessages = [userMessage(prompt, 1)];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages: archivedMessages,
+				options,
+			});
+			expect(textOf(archivedMessages[0])).not.toContain("<ctx-search-hint>");
 		} finally {
 			spy.mockRestore();
 			closeQuietly(db);
@@ -230,7 +382,7 @@ describe("runAutoSearchHintForPi", () => {
 			expect(textOf(messages[0])).toContain("<ctx-search-hint>");
 			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]).toMatchObject({
 				decision: "hint",
-				memoryFragments: [],
+				memoryFragments: [{ id: -1, hash: `mcm_1/r1/${"0".repeat(64)}` }],
 			});
 		} finally {
 			spy.mockRestore();

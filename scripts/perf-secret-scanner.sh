@@ -7,12 +7,14 @@ case "${1:-compare}" in
   baseline)
     cargo bench -p mc-secret-scanner --bench scanner -- --save-baseline main
     cargo bench -p mc-core --bench redaction -- --save-baseline main
+    cargo bench -p mc-core --bench windowed -- --save-baseline main
     ;;
   compare)
     cargo bench -p mc-secret-scanner --bench scanner -- --baseline main 1>&2
     cargo bench -p mc-core --bench redaction -- --baseline main 1>&2
+    cargo bench -p mc-core --bench windowed -- --baseline main 1>&2
     python3 scripts/perf-geomean.py target/criterion \
-      scan_comprehensive scan_conservative construction redaction
+      scan_comprehensive scan_conservative construction redaction windowed
     ;;
   *)
     echo "usage: $0 [baseline|compare]" >&2

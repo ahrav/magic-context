@@ -11,6 +11,7 @@ import packageJson from "../../package.json"
 import { closeRpc, dismissUpgradeReminder, getAnnouncement, getCompartmentCount, getRpcGeneration, initRpcClient, loadEmbedDetail, loadStatusDetail, loadToastDurationMs, markAnnounced, requestRecomp, requestUpgrade, type EmbedDetail, type StatusDetail } from "./data/context-db"
 import { startNotificationSocket, stopNotificationSocket, type SocketNotification } from "./data/notification-socket"
 import { formatThresholdPercent } from "../shared/format-threshold"
+import { formatMemoryCount } from "../shared/rpc-types"
 import { formatTailHygiene } from "../shared/tail-hygiene-status"
 import { formatWindowDerivationLine } from "../shared/window-geometry"
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "./compaction-off"
@@ -344,7 +345,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                             <box marginTop={1}>
                                 <text fg={t().text}><b>Memory</b></text>
                             </box>
-                            <R t={t()} l="Active" v={String(s().memoryCount)} fg={t().accent} />
+                            <R t={t()} l="Active" v={s().memoryState && s().memoryState !== "available" ? String(s().memoryState) : formatMemoryCount(s())} fg={s().memoryState && s().memoryState !== "available" ? t().warning : t().accent} />
                             <R t={t()} l="Injected" v={String(s().memoryBlockCount)} fg={t().textMuted} />
                         </box>
                         <box flexDirection="column" flexGrow={1} flexBasis={0}>

@@ -63,7 +63,7 @@ describe("parseScorecardReport", () => {
     const policy = policyFixture();
     const missingLanes = scorecardReportFixture(policy);
     const presentLanes = scorecardReportFixture(policy, {
-        evidence: { lanes: missingLanes.body.evidence.lanes.map(presentLane), baseline: { status: "absent", reportFingerprint: null } },
+        evidence: { lanes: missingLanes.body.evidence.lanes.map(presentLane), baseline: { status: "absent", reportFingerprint: null, estimatesStatus: null } },
         safetyGates: missingLanes.body.safetyGates.map(observedGate),
     });
 
@@ -96,7 +96,7 @@ describe("parseScorecardReport", () => {
         const deltas = [compared(current[0]!, 0.5), compared(current[1]!, 0.6)];
         const baseline = policyFixture({ requiredMetricSlots: [], baselineScorecardReportFingerprint: H2 });
         const regressed = scorecardReportFixture(baseline, {
-            evidence: { lanes: presentLanes.body.evidence.lanes, baseline: { status: "present", reportFingerprint: H2 } },
+            evidence: { lanes: presentLanes.body.evidence.lanes, baseline: { status: "present", reportFingerprint: H2, estimatesStatus: "present" } },
             safetyGates: presentLanes.body.safetyGates,
             utility: { ...presentLanes.body.utility, familyEstimates: current, deltas },
             adverseDeltas: deltas.map(adverse),
@@ -107,7 +107,7 @@ describe("parseScorecardReport", () => {
         const terms = {
             gates: regressed.body.safetyGates.map(allPassed),
             lanes: regressed.body.evidence.lanes,
-            baseline: "present" as const,
+            baseline: { status: "present" as const, estimatesStatus: "present" as const },
             families: [regressed.body.utility, regressed.body.formation, regressed.body.retrieval, regressed.body.context, regressed.body.reliability],
             requiredMetricSlots: [],
             adverseDeltas: regressed.body.adverseDeltas,
@@ -121,7 +121,7 @@ describe("parseScorecardReport", () => {
         const deltas = [compared(current[0]!, 0.5), compared(current[1]!, 0.5)];
         const baseline = policyFixture({ requiredMetricSlots: [], baselineScorecardReportFingerprint: H2 });
         const withBaseline = (overrides: Partial<ScorecardReportBody>): ScorecardReport => scorecardReportFixture(baseline, {
-            evidence: { lanes: presentLanes.body.evidence.lanes, baseline: { status: "present", reportFingerprint: H2 } },
+            evidence: { lanes: presentLanes.body.evidence.lanes, baseline: { status: "present", reportFingerprint: H2, estimatesStatus: "present" } },
             utility: { ...presentLanes.body.utility, familyEstimates: current, deltas },
             adverseDeltas: [adverse(deltas[0]!)],
             ...overrides,
@@ -181,20 +181,29 @@ describe("parseScorecardReport", () => {
     it("counts a pinned baseline that did not load as missing mandatory evidence", () => {
         const pinned = policyFixture({ requiredMetricSlots: [], baselineScorecardReportFingerprint: H2 });
         const loaded = scorecardReportFixture(pinned, {
-            evidence: { lanes: presentLanes.body.evidence.lanes, baseline: { status: "present", reportFingerprint: H2 } },
+            evidence: { lanes: presentLanes.body.evidence.lanes, baseline: { status: "present", reportFingerprint: H2, estimatesStatus: "present" } },
             safetyGates: presentLanes.body.safetyGates,
         });
         expect(parseScorecardReport(loaded).body.outcome.mandatoryEvidenceComplete).toBe(true);
         const unloaded = scorecardReportFixture(pinned, {
-            evidence: { lanes: presentLanes.body.evidence.lanes, baseline: { status: "schema-mismatch", reportFingerprint: null } },
+            evidence: { lanes: presentLanes.body.evidence.lanes, baseline: { status: "schema-mismatch", reportFingerprint: null, estimatesStatus: null } },
             safetyGates: presentLanes.body.safetyGates,
         });
         expect(parseScorecardReport(unloaded).body.outcome).toMatchObject({ promotionAllowed: false, mandatoryEvidenceComplete: false });
         expect(() => parseScorecardReport(edited(unloaded, (body) => { body.outcome.mandatoryEvidenceComplete = true; }))).toThrow(/outcome: cross-field-invalid/);
-        expect(() => parseScorecardReport(edited(loaded, (body) => { body.evidence.baseline = { status: "absent", reportFingerprint: null }; })))
+        expect(() => parseScorecardReport(edited(loaded, (body) => { body.evidence.baseline = { status: "absent", reportFingerprint: null, estimatesStatus: null }; })))
             .toThrow(/baseline.status: cross-field-invalid/);
         expect(() => parseScorecardReport(edited(loaded, (body) => { body.evidence.baseline.reportFingerprint = H3; }))).toThrow(/baseline.reportFingerprint: cross-field-invalid/);
-        expect(() => parseScorecardReport(edited(presentLanes, (body) => { body.evidence.baseline = { status: "present", reportFingerprint: H2 }; })))
+        const hollow = scorecardReportFixture(pinned, {
+            evidence: { lanes: presentLanes.body.evidence.lanes, baseline: { status: "present", reportFingerprint: H2, estimatesStatus: "incomplete" } },
+            safetyGates: presentLanes.body.safetyGates,
+        });
+        expect(parseScorecardReport(hollow).body.outcome).toMatchObject({ promotionAllowed: false, mandatoryEvidenceComplete: false });
+        expect(() => parseScorecardReport(edited(hollow, (body) => { body.outcome.mandatoryEvidenceComplete = true; }))).toThrow(/outcome: cross-field-invalid/);
+        expect(() => parseScorecardReport(edited(loaded, (body) => { body.evidence.baseline.estimatesStatus = null; }))).toThrow(/baseline: shape-invalid/);
+        expect(() => parseScorecardReport(edited(unloaded, (body) => { body.evidence.baseline.reportFingerprint = H2; }))).toThrow(/baseline: shape-invalid/);
+        expect(() => parseScorecardReport(edited(unloaded, (body) => { body.evidence.baseline.estimatesStatus = "present"; }))).toThrow(/baseline: shape-invalid/);
+        expect(() => parseScorecardReport(edited(presentLanes, (body) => { body.evidence.baseline = { status: "present", reportFingerprint: H2, estimatesStatus: "present" }; })))
             .toThrow(/baseline.status: cross-field-invalid/);
     });
 

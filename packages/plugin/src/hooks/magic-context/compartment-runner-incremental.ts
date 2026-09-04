@@ -5,12 +5,15 @@ import {
     appendCompartments,
     getCompartments,
 } from "../../features/magic-context/compartment-storage";
-import { promoteSessionFactsDurable } from "../../features/magic-context/memory";
 import {
-    readAuthorizedClaimMemorySnapshot,
-    renderClaimMemoryBlock,
-} from "../../features/magic-context/memory/claim-memory-render";
-import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+    type HistorianPromotionIdentity,
+    type PromotedMemoryRef,
+    promoteSessionFactsDurable,
+} from "../../features/magic-context/memory";
+import {
+    resolveProjectIdentity,
+    resolveProjectRootDirectory,
+} from "../../features/magic-context/memory/project-identity";
 import {
     clearEmergencyDrainLatch,
     clearEmergencyRecovery,
@@ -37,6 +40,7 @@ import { getLatestHistorianInvocationId } from "../../features/magic-context/sto
 import { insertUserMemoryCandidates } from "../../features/magic-context/user-memory/storage-user-memory";
 import { describeError } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
+import { resetClaimLaneImportMarkerInCurrentTransaction } from "./claim-lane-import";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
 import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
@@ -52,6 +56,8 @@ import {
 } from "./compartment-runner-validation";
 import { cleanupHistorianStateFile } from "./historian-state-file";
 import { clearInjectionCache } from "./inject-compartments";
+import { commitPromotedFactsToKernel } from "./kernel-memory-promotion";
+import { readHistorianMemoryBlock } from "./kernel-memory-render";
 import { onNoteTrigger } from "./note-nudger";
 import {
     createDefaultBoundarySnapshotForTests,
@@ -371,7 +377,6 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         //     compartments.
         // `<project-memory>` deduplicates facts.
         // serialization limits.
-        const projectPath = resolveProjectIdentity(directory ?? process.cwd());
 
         const references = buildReferenceBlocks({
             sessionId,
@@ -381,16 +386,16 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
 
         const sessionDirectory = await resolveSessionDirectory(client, sessionId, directory);
 
-        const memorySnapshot = readAuthorizedClaimMemorySnapshot(db, {
-            authorizedIdentities: [projectPath],
-            ownIdentities: [projectPath],
-            sharedCategories: [],
-            workspaceEpoch: `historian:${sessionId}:${chunk.startIndex}-${chunk.endIndex}`,
-        });
-        if (!memorySnapshot) {
-            sessionLog(sessionId, "historian claim snapshot remained stale; omitting memories");
-        }
-        const projectMemory = renderClaimMemoryBlock(memorySnapshot?.items ?? []) ?? "";
+        const projectMemory =
+            deps.memoryEnabled !== false
+                ? await readHistorianMemoryBlock({
+                      client: deps.kernelClient?.({
+                          sessionId,
+                          projectRoot: resolveProjectRootDirectory(sessionDirectory || directory),
+                      }),
+                      sessionId,
+                  })
+                : "";
 
         const prompt = buildCompartmentAgentPrompt({
             seedExamples: references.seedExamples,
@@ -530,6 +535,8 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             return true;
         });
         let persistedIds: number[] = [];
+        let promotionIdentity: HistorianPromotionIdentity | null = null;
+        let promotedRefs: PromotedMemoryRef[] = [];
 
         // The transaction atomically appends compartments and publishes synchronous durable side effects.
         // `BEGIN IMMEDIATE` makes the lease check and subsequent writes share a fresh write-locked snapshot across sibling processes.
@@ -561,18 +568,19 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             // Promotion and boundary-floor updates share one transaction so a crash cannot advance the boundary past unpersisted facts.
             // project memories.
             if (promotionActive && !skipUnanchoredPromotion) {
-                promoteSessionFactsDurable(
+                promotionIdentity = {
+                    producer: "opencode-historian",
+                    runId: `${sessionId}:${chunk.startIndex}:${chunk.endIndex}`,
+                    leaseKey: `compartment:${sessionId}`,
+                    leaseGeneration: holderId,
+                    batchId: `${chunk.startIndex}-${lastCompartmentEnd}`,
+                };
+                promotedRefs = promoteSessionFactsDurable(
                     db,
                     sessionId,
                     promotionProjectIdentity,
                     validatedPass.facts ?? [],
-                    {
-                        producer: "opencode-historian",
-                        runId: `${sessionId}:${chunk.startIndex}:${chunk.endIndex}`,
-                        leaseKey: `compartment:${sessionId}`,
-                        leaseGeneration: holderId,
-                        batchId: `${chunk.startIndex}-${lastCompartmentEnd}`,
-                    },
+                    promotionIdentity,
                 );
             }
 
@@ -605,6 +613,14 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                     publishedAt: Date.now(),
                 });
             }
+            // The kernel promotion runs after COMMIT, so a crash in between would strand the just-published facts in the claim lane behind a done import marker; arming the bridge inside the same transaction makes the import replay them after restart. commentlint: allow(JUDGE)
+            if (promotionIdentity && promotedRefs.length > 0 && promotionProjectIdentity) {
+                resetClaimLaneImportMarkerInCurrentTransaction(
+                    db,
+                    promotionProjectIdentity,
+                    resolveProjectRootDirectory(sessionDirectory || directory),
+                );
+            }
             db.exec("COMMIT");
             published = true;
         } finally {
@@ -628,6 +644,22 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // The transaction persists compartments, the boundary floor, promoted facts, event attempts, and the drop queue before publication is signaled.
         // Post-commit provider failures do not change the published state.
         deps.onCompartmentStatePublished?.(sessionId);
+
+        if (promotionIdentity && promotedRefs.length > 0) {
+            const promotionProjectRoot = resolveProjectRootDirectory(sessionDirectory || directory);
+            await commitPromotedFactsToKernel({
+                client: deps.kernelClient?.({
+                    sessionId,
+                    projectRoot: promotionProjectRoot,
+                }),
+                db,
+                projectPath: promotionProjectIdentity,
+                projectRoot: promotionProjectRoot,
+                sessionId,
+                refs: promotedRefs,
+                identity: promotionIdentity,
+            });
+        }
 
         // updateCompactionMarkerAfterPublication writes the compaction marker to OpenCode's DB.
         // When deferMarkerApplication is true, the transaction writes the pending marker before onDeferredMarkerPending signals the drain set.

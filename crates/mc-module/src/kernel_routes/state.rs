@@ -130,6 +130,110 @@ impl KernelOutcome {
     }
 }
 
+/// Every [`UnavailableReason`], in declaration order.
+pub(crate) const ALL_UNAVAILABLE: &[UnavailableReason] = &[
+    UnavailableReason::StoreStarting,
+    UnavailableReason::StoreUnavailable,
+    UnavailableReason::StoreUnsupported,
+    UnavailableReason::StoreBusy,
+    UnavailableReason::NoRequiredConsumer,
+    UnavailableReason::SnapshotDiverged,
+    UnavailableReason::QueueFull,
+];
+
+/// Every [`ConflictReason`], in declaration order.
+pub(crate) const ALL_CONFLICT: &[ConflictReason] = &[
+    ConflictReason::KnownAsOfAdvanced,
+    ConflictReason::Retracted,
+    ConflictReason::Superseded,
+];
+
+/// Every [`InvalidReason`], in declaration order.
+pub(crate) const ALL_INVALID: &[InvalidReason] = &[
+    InvalidReason::ProjectMismatch,
+    InvalidReason::OperationKeyReused,
+    InvalidReason::ClassOverDeclared,
+    InvalidReason::InvalidInput,
+    InvalidReason::AdmissionPolicy,
+    InvalidReason::NotFound,
+    InvalidReason::AlreadyExists,
+    InvalidReason::RevisionNotAdvanced,
+    InvalidReason::ScopeReserved,
+    InvalidReason::PayloadTooLarge,
+    InvalidReason::PageDigest,
+    InvalidReason::PageIndex,
+    InvalidReason::PageTooLarge,
+    InvalidReason::PayloadDigest,
+    InvalidReason::UploadNotFound,
+    InvalidReason::IngestionFailClosed,
+    InvalidReason::ArtifactUnusable,
+    InvalidReason::Internal,
+];
+
+// Compile-time guard for the `ALL_*` slices. Each match has no wildcard arm, so
+// a new reason variant fails to compile until it is given a slice position, and
+// the loops assert that every slice lists its variants at the matched position.
+const _: () = {
+    const fn position_of_unavailable(reason: UnavailableReason) -> usize {
+        match reason {
+            UnavailableReason::StoreStarting => 0,
+            UnavailableReason::StoreUnavailable => 1,
+            UnavailableReason::StoreUnsupported => 2,
+            UnavailableReason::StoreBusy => 3,
+            UnavailableReason::NoRequiredConsumer => 4,
+            UnavailableReason::SnapshotDiverged => 5,
+            UnavailableReason::QueueFull => 6,
+        }
+    }
+    const fn position_of_conflict(reason: ConflictReason) -> usize {
+        match reason {
+            ConflictReason::KnownAsOfAdvanced => 0,
+            ConflictReason::Retracted => 1,
+            ConflictReason::Superseded => 2,
+        }
+    }
+    const fn position_of_invalid(reason: InvalidReason) -> usize {
+        match reason {
+            InvalidReason::ProjectMismatch => 0,
+            InvalidReason::OperationKeyReused => 1,
+            InvalidReason::ClassOverDeclared => 2,
+            InvalidReason::InvalidInput => 3,
+            InvalidReason::AdmissionPolicy => 4,
+            InvalidReason::NotFound => 5,
+            InvalidReason::AlreadyExists => 6,
+            InvalidReason::RevisionNotAdvanced => 7,
+            InvalidReason::ScopeReserved => 8,
+            InvalidReason::PayloadTooLarge => 9,
+            InvalidReason::PageDigest => 10,
+            InvalidReason::PageIndex => 11,
+            InvalidReason::PageTooLarge => 12,
+            InvalidReason::PayloadDigest => 13,
+            InvalidReason::UploadNotFound => 14,
+            InvalidReason::IngestionFailClosed => 15,
+            InvalidReason::ArtifactUnusable => 16,
+            InvalidReason::Internal => 17,
+        }
+    }
+    assert!(ALL_UNAVAILABLE.len() == 7);
+    assert!(ALL_CONFLICT.len() == 3);
+    assert!(ALL_INVALID.len() == 18);
+    let mut index = 0;
+    while index < ALL_UNAVAILABLE.len() {
+        assert!(position_of_unavailable(ALL_UNAVAILABLE[index]) == index);
+        index += 1;
+    }
+    index = 0;
+    while index < ALL_CONFLICT.len() {
+        assert!(position_of_conflict(ALL_CONFLICT[index]) == index);
+        index += 1;
+    }
+    index = 0;
+    while index < ALL_INVALID.len() {
+        assert!(position_of_invalid(ALL_INVALID[index]) == index);
+        index += 1;
+    }
+};
+
 impl From<KernelError> for KernelOutcome {
     fn from(error: KernelError) -> Self {
         match error {
@@ -203,31 +307,6 @@ impl From<ArtifactErrorKind> for KernelOutcome {
 mod tests {
     use super::*;
 
-    const KERNEL_ERRORS: &[KernelError] = &[
-        KernelError::Held,
-        KernelError::EngineUnsupported,
-        KernelError::Foreign,
-        KernelError::Inconclusive,
-        KernelError::Io,
-        KernelError::Busy,
-        KernelError::IdentityMismatch,
-        KernelError::FenceLost,
-        KernelError::Conflict,
-        KernelError::CorruptCanonicalRow,
-        KernelError::InvalidInput,
-        KernelError::AdmissionPolicy,
-        KernelError::FutureSnapshot,
-        KernelError::NotFound,
-        KernelError::InvalidCheckpoint,
-        KernelError::NoRequiredConsumers,
-        KernelError::ConsumerPending,
-        KernelError::Fault,
-        KernelError::Deadline,
-        KernelError::UnsafeDestination,
-        KernelError::InvalidBackup,
-        KernelError::InvalidRestore,
-    ];
-
     const ARTIFACT_ERRORS: &[ArtifactErrorKind] = &[
         ArtifactErrorKind::PayloadTooLarge,
         ArtifactErrorKind::Capacity,
@@ -253,7 +332,7 @@ mod tests {
 
     #[test]
     fn every_kernel_error_serializes_to_a_tagged_non_available_state() {
-        for error in KERNEL_ERRORS {
+        for error in KernelError::ALL {
             let outcome = KernelOutcome::from(*error);
             assert!(!outcome.is_available(), "{error:?}");
             let value = serde_json::to_value(&outcome).unwrap();
@@ -298,6 +377,61 @@ mod tests {
         assert_eq!(
             serde_json::to_value(KernelOutcome::Available).unwrap(),
             serde_json::json!({"kind": "available"})
+        );
+    }
+
+    /// The TypeScript thin client checks its hand-written state vocabulary against this fixture.
+    const STATE_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packages/plugin/src/shared/kernel-client/daemon-states.fixture.json"
+    );
+
+    /// One representative per variant and reason, in declaration order, with
+    /// zeroed lag fields so the sample carries vocabulary rather than a
+    /// measurement.
+    fn all_outcomes() -> Vec<KernelOutcome> {
+        let mut outcomes = vec![
+            KernelOutcome::Available,
+            KernelOutcome::Stale {
+                lag_positions: 0,
+                oldest_unconsumed_age_ms: 0,
+            },
+            KernelOutcome::Abstained {
+                lag_positions: 0,
+                oldest_unconsumed_age_ms: 0,
+            },
+        ];
+        outcomes.extend(
+            ALL_UNAVAILABLE
+                .iter()
+                .copied()
+                .map(KernelOutcome::unavailable),
+        );
+        outcomes.extend(ALL_CONFLICT.iter().copied().map(KernelOutcome::conflict));
+        outcomes.extend(ALL_INVALID.iter().copied().map(KernelOutcome::invalid));
+        outcomes
+    }
+
+    #[test]
+    fn daemon_states_fixture_matches_the_serialized_outcome_vocabulary() {
+        let mut expected = serde_json::to_string_pretty(&all_outcomes()).unwrap();
+        expected.push('\n');
+        if std::env::var_os("UPDATE_KERNEL_STATE_FIXTURE").is_some_and(|value| value == "1") {
+            std::fs::write(STATE_FIXTURE, &expected).unwrap();
+            return;
+        }
+        let actual = std::fs::read_to_string(STATE_FIXTURE).unwrap_or_else(|error| {
+            panic!(
+                "cannot read {STATE_FIXTURE}: {error}; regenerate it with \
+                 UPDATE_KERNEL_STATE_FIXTURE=1 cargo test -p mc-module \
+                 daemon_states_fixture_matches_the_serialized_outcome_vocabulary"
+            )
+        });
+        assert_eq!(
+            actual, expected,
+            "daemon-states.fixture.json is out of date with KernelOutcome; regenerate it with \
+             UPDATE_KERNEL_STATE_FIXTURE=1 cargo test -p mc-module \
+             daemon_states_fixture_matches_the_serialized_outcome_vocabulary"
         );
     }
 }

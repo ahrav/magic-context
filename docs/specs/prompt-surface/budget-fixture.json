@@ -1,6 +1,6 @@
 {
   "artifactId": "prompt-surface-budget",
-  "revision": "s2-r3",
+  "revision": "s2-r6",
   "status": "PENDING-RATIFICATION",
   "policy": {
     "expression": "floor(0.50 * mutableProseBaseline)",
@@ -38,36 +38,36 @@
   "fullMeasurements": {
     "guidance": {
       "primary-full-reduce-memory-on": {
-        "chars": 8787,
-        "tokens": 2008
+        "chars": 8779,
+        "tokens": 2007
       },
       "primary-full-reduce-memory-off": {
         "chars": 7679,
         "tokens": 1744
       },
       "primary-full-no-reduce-memory-on": {
-        "chars": 6502,
-        "tokens": 1482
+        "chars": 6494,
+        "tokens": 1481
       },
       "primary-full-no-reduce-memory-off": {
         "chars": 5394,
         "tokens": 1218
       },
       "primary-full-reduce-dreamer-off": {
-        "chars": 8458,
-        "tokens": 1931
+        "chars": 8450,
+        "tokens": 1930
       },
       "primary-full-reduce-temporal-off": {
-        "chars": 8352,
-        "tokens": 1901
+        "chars": 8344,
+        "tokens": 1900
       },
       "primary-full-reduce-caveman-on": {
-        "chars": 9402,
-        "tokens": 2134
+        "chars": 9394,
+        "tokens": 2133
       },
       "primary-full-reduce-language-on": {
-        "chars": 8987,
-        "tokens": 2054
+        "chars": 8979,
+        "tokens": 2053
       },
       "subagent-reduce": {
         "chars": 679,
@@ -88,12 +88,12 @@
         "tokens": 391
       },
       "ctx_memory": {
-        "chars": 843,
-        "tokens": 200
+        "chars": 770,
+        "tokens": 179
       },
       "ctx_search": {
-        "chars": 1417,
-        "tokens": 335
+        "chars": 1373,
+        "tokens": 328
       }
     },
     "serializedParameterSchemas": {
@@ -110,18 +110,18 @@
         "tokens": 317
       },
       "ctx_memory": {
-        "chars": 2639,
-        "tokens": 620
+        "chars": 1766,
+        "tokens": 417
       },
       "ctx_search": {
-        "chars": 983,
-        "tokens": 226
+        "chars": 878,
+        "tokens": 207
       },
-      "totalTokens": 1371
+      "totalTokens": 1149
     },
-    "builtInProviderVisibleTotal": 5018
+    "builtInProviderVisibleTotal": 4767
   },
-  "mutableProseBaseline": 3647,
+  "mutableProseBaseline": 3618,
   "integerLightCeiling": 1825,
   "includedSurfaces": [
     "The primary built-in full guidance section for the exact feature variant above.",
