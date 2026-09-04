@@ -2271,19 +2271,33 @@ impl KernelStore {
                 .collect::<Result<Vec<_>, _>>()
         })?;
         let generation_after = self.classification_generation.load(Ordering::SeqCst);
-        // A seqlock read: an even, unchanged generation proves no classification
-        // merge ran during the snapshot.
-        let classification_generation = (generation_before == generation_after
-            && generation_before.is_multiple_of(2))
-        .then_some(generation_before);
         Ok((
             EgressSnapshot {
                 tip,
-                classification_generation,
+                classification_generation: stable_generation(generation_before, generation_after),
             },
             candidates,
         ))
     }
+
+    /// The state an egress verdict computed now would be keyed by, read
+    /// without loading any candidate: the tip plus the classification
+    /// generation, under the same seqlock discipline as `egress_candidates`.
+    pub fn egress_snapshot(&self) -> Result<EgressSnapshot, KernelError> {
+        let generation_before = self.classification_generation.load(Ordering::SeqCst);
+        let tip = self.tip()?;
+        let generation_after = self.classification_generation.load(Ordering::SeqCst);
+        Ok(EgressSnapshot {
+            tip,
+            classification_generation: stable_generation(generation_before, generation_after),
+        })
+    }
+}
+
+/// A seqlock read: an even, unchanged generation proves no classification
+/// merge ran during the snapshot.
+fn stable_generation(before: u64, after: u64) -> Option<u64> {
+    (before == after && before.is_multiple_of(2)).then_some(before)
 }
 
 /// Identifies the state [`KernelStore::egress_candidates`] read.
