@@ -159,8 +159,10 @@ function pairedDeltaBindingReasons(report: PairedDeltaReport, policy: ScorecardP
 /** A difference in a pre-registered run setting is a pre-registration mismatch, not a schema problem. */
 function pairedDeltaConformanceReasons(report: PairedDeltaReport, policy: ScorecardPolicy, pairedDeltaPolicy: PairedDeltaPolicyView): string[] {
     const body = report.body;
+    // The live runner pins the model it runs as the snapshot id, so the snapshot must name a model the policy pre-registered.
     const mismatched = body.analysis.bootstrapResamples !== policy.statisticalComparison.bootstrapResamples
         || body.analysis.minimumAnalyzableFamilyCount !== pairedDeltaPolicy.minimumAnalyzableFamilyCount
+        || !pairedDeltaPolicy.modelMatrix.some((model) => model.modelId === body.pinnedSnapshotId)
         || (body.runSummary.calibrationFingerprint !== null) !== (policy.statisticalComparison.noiseFloorSource === "calibration")
         || body.runSummary.spentUsd > policy.releaseCostBudgetUsd
         || canonicalFingerprint(pairedDeltaPolicy.modelMatrix) !== canonicalFingerprint(policy.modelMatrix)
@@ -267,6 +269,8 @@ function loadBaseline(policy: ScorecardPolicy, path: string | null): BaselineEvi
         return mismatch("baseline-parse-failed");
     }
     if (report.reportFingerprint !== expected) return mismatch("baseline-fingerprint-mismatch");
+    // A release-over-release comparison is against the previous promoted release, not against a run the scorecard refused.
+    if (!report.body.outcome.promotionAllowed) return mismatch("baseline-not-promoted");
     return { status: "present", reportFingerprint: report.reportFingerprint, report, diagnostics: [] };
 }
 

@@ -48,62 +48,65 @@ export interface GateRow {
 export const METRIC_UNITS = ["ratio", "count", "tokens", "milliseconds", "delta"] as const;
 export type MetricUnit = (typeof METRIC_UNITS)[number];
 
-/**
- * The one unit each slot is measured in. A `ratio` lies in [0, 1], a `delta` (a difference of two ratios) in
- * [-1, 1], `count` and `tokens` are non-negative integers, and `milliseconds` is non-negative.
- */
-export const SLOT_UNITS: Readonly<Record<MetricSlotId, MetricUnit>> = {
-    "valid-success-delta-mc-on-vs-mc-off": "delta",
-    "valid-success-delta-mc-on-vs-compaction": "delta",
-    "valid-failure-rate": "ratio",
-    "invalid-failure-rate": "ratio",
-    "invalid-success-rate-mc-on": "ratio",
-    "invalid-success-rate-mc-off": "ratio",
-    "invalid-success-rate-compaction": "ratio",
-    "final-attempt-tokens-mc-on": "tokens",
-    "final-attempt-tokens-mc-off": "tokens",
-    "final-attempt-tokens-compaction": "tokens",
-    "final-attempt-wall-clock-ms-mc-on": "milliseconds",
-    "final-attempt-wall-clock-ms-mc-off": "milliseconds",
-    "final-attempt-wall-clock-ms-compaction": "milliseconds",
-    "final-attempt-turns-mc-on": "count",
-    "final-attempt-turns-mc-off": "count",
-    "final-attempt-turns-compaction": "count",
-    "active-claim-precision": "ratio",
-    "active-claim-recall": "ratio",
-    "false-authoritative-scenario-rate": "ratio",
-    "false-authoritative-memory-rate": "ratio",
-    "supersession-latency": "milliseconds",
-    "pollution-duplication": "ratio",
-    "recall-at-10-explicit": "ratio",
-    "recall-at-50-explicit": "ratio",
-    "reciprocal-rank-explicit": "ratio",
-    "ndcg-at-10-explicit": "ratio",
-    "duplicate-rate-at-50-explicit": "ratio",
-    "recall-at-10-automatic": "ratio",
-    "recall-at-50-automatic": "ratio",
-    "reciprocal-rank-automatic": "ratio",
-    "ndcg-at-10-automatic": "ratio",
-    "duplicate-rate-at-50-automatic": "ratio",
-    currentness: "ratio",
-    "rejection-recall": "ratio",
-    "literal-recall": "ratio",
-    "abstention-accuracy": "ratio",
-    "post-compaction-probe-accuracy": "ratio",
-    "ctx-expand-recovery": "ratio",
-    "input-token-reduction": "ratio",
-    "cache-write-preservation": "ratio",
-    "paired-delta-planned-coordinates": "count",
-    "paired-delta-healthy-coordinates": "count",
-    "paired-delta-excluded-cells": "count",
-    "incident-results-total": "count",
-    "incident-results-unhealthy": "count",
-    "incident-baseline-mismatches": "count",
-    "cross-harness-parity-pass-rate": "ratio",
-    "dreamer-runs-total": "count",
-    "dreamer-runs-not-passed": "count",
-    "restart-scenarios": "count",
-    "contention-failures": "count",
+export interface SlotContract {
+    /** A `ratio` lies in [0, 1], a `delta` in [-1, 1], `count` and `tokens` are non-negative integers, and `milliseconds` is non-negative. */
+    unit: MetricUnit;
+    /** The one lane whose report the slot is read from; `null` when no lane produces the slot, so it cannot be measured. */
+    lane: LaneId | null;
+}
+
+export const SLOT_CONTRACTS: Readonly<Record<MetricSlotId, SlotContract>> = {
+    "valid-success-delta-mc-on-vs-mc-off": { unit: "delta", lane: "paired-delta" },
+    "valid-success-delta-mc-on-vs-compaction": { unit: "delta", lane: "paired-delta" },
+    "valid-failure-rate": { unit: "ratio", lane: "paired-delta" },
+    "invalid-failure-rate": { unit: "ratio", lane: "paired-delta" },
+    "invalid-success-rate-mc-on": { unit: "ratio", lane: "paired-delta" },
+    "invalid-success-rate-mc-off": { unit: "ratio", lane: "paired-delta" },
+    "invalid-success-rate-compaction": { unit: "ratio", lane: "paired-delta" },
+    "final-attempt-tokens-mc-on": { unit: "tokens", lane: "paired-delta" },
+    "final-attempt-tokens-mc-off": { unit: "tokens", lane: "paired-delta" },
+    "final-attempt-tokens-compaction": { unit: "tokens", lane: "paired-delta" },
+    "final-attempt-wall-clock-ms-mc-on": { unit: "milliseconds", lane: "paired-delta" },
+    "final-attempt-wall-clock-ms-mc-off": { unit: "milliseconds", lane: "paired-delta" },
+    "final-attempt-wall-clock-ms-compaction": { unit: "milliseconds", lane: "paired-delta" },
+    "final-attempt-turns-mc-on": { unit: "count", lane: "paired-delta" },
+    "final-attempt-turns-mc-off": { unit: "count", lane: "paired-delta" },
+    "final-attempt-turns-compaction": { unit: "count", lane: "paired-delta" },
+    "active-claim-precision": { unit: "ratio", lane: "historian" },
+    "active-claim-recall": { unit: "ratio", lane: "historian" },
+    "false-authoritative-scenario-rate": { unit: "ratio", lane: "historian" },
+    "false-authoritative-memory-rate": { unit: "ratio", lane: "historian" },
+    "supersession-latency": { unit: "milliseconds", lane: "historian" },
+    "pollution-duplication": { unit: "ratio", lane: "historian" },
+    "recall-at-10-explicit": { unit: "ratio", lane: "retrieval" },
+    "recall-at-50-explicit": { unit: "ratio", lane: "retrieval" },
+    "reciprocal-rank-explicit": { unit: "ratio", lane: "retrieval" },
+    "ndcg-at-10-explicit": { unit: "ratio", lane: "retrieval" },
+    "duplicate-rate-at-50-explicit": { unit: "ratio", lane: "retrieval" },
+    "recall-at-10-automatic": { unit: "ratio", lane: "retrieval" },
+    "recall-at-50-automatic": { unit: "ratio", lane: "retrieval" },
+    "reciprocal-rank-automatic": { unit: "ratio", lane: "retrieval" },
+    "ndcg-at-10-automatic": { unit: "ratio", lane: "retrieval" },
+    "duplicate-rate-at-50-automatic": { unit: "ratio", lane: "retrieval" },
+    currentness: { unit: "ratio", lane: "retrieval" },
+    "rejection-recall": { unit: "ratio", lane: "retrieval" },
+    "literal-recall": { unit: "ratio", lane: "retrieval" },
+    "abstention-accuracy": { unit: "ratio", lane: "retrieval" },
+    "post-compaction-probe-accuracy": { unit: "ratio", lane: null },
+    "ctx-expand-recovery": { unit: "ratio", lane: null },
+    "input-token-reduction": { unit: "ratio", lane: null },
+    "cache-write-preservation": { unit: "ratio", lane: null },
+    "paired-delta-planned-coordinates": { unit: "count", lane: "paired-delta" },
+    "paired-delta-healthy-coordinates": { unit: "count", lane: "paired-delta" },
+    "paired-delta-excluded-cells": { unit: "count", lane: "paired-delta" },
+    "incident-results-total": { unit: "count", lane: "incident" },
+    "incident-results-unhealthy": { unit: "count", lane: "incident" },
+    "incident-baseline-mismatches": { unit: "count", lane: "incident" },
+    "cross-harness-parity-pass-rate": { unit: "ratio", lane: "incident" },
+    "dreamer-runs-total": { unit: "count", lane: "dreamer" },
+    "dreamer-runs-not-passed": { unit: "count", lane: "dreamer" },
+    "restart-scenarios": { unit: "count", lane: null },
+    "contention-failures": { unit: "count", lane: null },
 };
 
 export type MetricSlot =
@@ -125,12 +128,20 @@ export interface FamilyEstimateRow {
 
 /**
  * A release-over-release comparison of one estimate family at one endpoint.
- * `delta` is the current point estimate minus the baseline point estimate and `interval` is the
- * current paired interval shifted by the baseline point estimate; the two releases carry no joint
- * distribution, so no narrower interval is claimed.
+ * `delta` is the current point estimate minus `baselinePointEstimate` and `interval` is the current
+ * paired interval shifted by `baselinePointEstimate`; the two releases carry no joint distribution, so
+ * no narrower interval is claimed.
  */
 export type DeltaRow =
-    | { endpoint: PrimaryEndpoint; familyId: string; status: "compared"; delta: number; interval: Interval; noiseLabel: NoiseComparison }
+    | {
+        endpoint: PrimaryEndpoint;
+        familyId: string;
+        status: "compared";
+        baselinePointEstimate: number;
+        delta: number;
+        interval: Interval;
+        noiseLabel: NoiseComparison;
+    }
     | { endpoint: PrimaryEndpoint; familyId: string; status: "no-baseline"; value: number };
 
 export const ADVERSE_KINDS = ["adverse-interval", "family-missing"] as const;
@@ -245,13 +256,14 @@ function parseGateRow(raw: unknown, index: number): GateRow {
         diagnostic: nullable(value.diagnostic, (code) => staticId(code, `${label}.diagnostic`, REASON_CODE_RE)),
     };
     if (row.gateId !== SCORECARD_GATE_IDS[index]) fail(`${label}.gateId: order-invalid`);
+    // An observed gate carries all three evidence fields and no diagnostic; an unobserved one carries none and a diagnostic.
     const observed = row.status === "passed" || row.status === "failed";
-    if (observed !== (row.observedCount !== null && row.evidenceFingerprint !== null && row.sourceLane !== null)) {
+    const evidence = [row.observedCount, row.evidenceFingerprint, row.sourceLane];
+    if (evidence.some((field) => (field !== null) !== observed) || (row.diagnostic !== null) === observed) {
         fail(`${label}: evidence-shape-invalid`);
     }
     if (row.status === "passed" && row.observedCount !== 0) fail(`${label}: passed-with-observations`);
     if (row.status === "failed" && row.observedCount === 0) fail(`${label}: failed-without-observations`);
-    if (!observed && row.diagnostic === null) fail(`${label}.diagnostic: required`);
     return row;
 }
 
@@ -278,14 +290,16 @@ function parseSlot(raw: unknown, family: ScoreFamilyId, index: number): MetricSl
     const id = expectedId as MetricSlotId;
     if (status === "measured") {
         exact(value, ["id", "status", "value", "unit", "sourceLane", "sourceFingerprint"], label);
-        const unit = SLOT_UNITS[id];
-        if (value.unit !== unit) fail(`${label}.unit: slot-unit-invalid`);
+        const contract = SLOT_CONTRACTS[id];
+        if (value.unit !== contract.unit) fail(`${label}.unit: slot-unit-invalid`);
+        const sourceLane = enumeration(value.sourceLane, LANE_IDS, `${label}.sourceLane`);
+        if (sourceLane !== contract.lane) fail(`${label}.sourceLane: slot-producer-invalid`);
         return {
             id,
             status,
-            value: measuredValue(value.value, unit, `${label}.value`),
-            unit,
-            sourceLane: enumeration(value.sourceLane, LANE_IDS, `${label}.sourceLane`),
+            value: measuredValue(value.value, contract.unit, `${label}.value`),
+            unit: contract.unit,
+            sourceLane,
             sourceFingerprint: hex64(value.sourceFingerprint, `${label}.sourceFingerprint`),
         };
     }
@@ -321,11 +335,12 @@ function parseDeltaRow(raw: unknown, label: string): DeltaRow {
     const endpoint = enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`);
     const familyId = staticId(value.familyId, `${label}.familyId`, ESTIMATE_FAMILY_ID_RE);
     if (status === "compared") {
-        exact(value, ["endpoint", "familyId", "status", "delta", "interval", "noiseLabel"], label);
+        exact(value, ["endpoint", "familyId", "status", "baselinePointEstimate", "delta", "interval", "noiseLabel"], label);
         return {
             endpoint,
             familyId,
             status,
+            baselinePointEstimate: finiteNumber(value.baselinePointEstimate, `${label}.baselinePointEstimate`),
             delta: finiteNumber(value.delta, `${label}.delta`),
             interval: parseInterval(value.interval, `${label}.interval`),
             noiseLabel: enumeration(value.noiseLabel, NOISE_LABELS, `${label}.noiseLabel`),
@@ -475,6 +490,12 @@ function verifyComparison(body: ScorecardReportBody): void {
         } else {
             if (!baselinePresent) fail(`${label}.status: baseline-required`);
             if (delta.noiseLabel !== estimate.noiseLabel) fail(`${label}.noiseLabel: cross-field-invalid`);
+            const shifted = delta.baselinePointEstimate;
+            if (delta.delta !== estimate.pointEstimate - shifted
+                || delta.interval.lower !== estimate.interval.lower - shifted
+                || delta.interval.upper !== estimate.interval.upper - shifted) {
+                fail(`${label}: cross-field-invalid`);
+            }
         }
     }
     const adverse = body.adverseDeltas;

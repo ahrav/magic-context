@@ -147,6 +147,7 @@ export const PAIRED_FACTS: PairedCaseFact[] = [pairedFact(9), pairedFact(7)];
 export interface PairedDeltaFixtureOptions {
     policyDocument?: PolicyOwnerDocument;
     poolManifestFingerprint?: string;
+    pinnedSnapshotId?: string;
     /** Declared alongside a policy document whose own minimum matches it, or the builder refuses the report. */
     minimumAnalyzableFamilyCount?: number;
     /** Per-family valid-success deltas applied at both primary endpoints. */
@@ -160,6 +161,7 @@ export interface PairedDeltaFixtureOptions {
 export function pairedDeltaReportFixture(options: PairedDeltaFixtureOptions = {}): PairedDeltaReport {
     const policyDocument = options.policyDocument ?? pairedDeltaPolicyDocumentFixture();
     const poolManifestFingerprint = options.poolManifestFingerprint ?? H1;
+    const pinnedSnapshotId = options.pinnedSnapshotId ?? "fixture-model";
     const familyDeltas = options.familyDeltas ?? { "fam-a": 0.3, "fam-b": 0.1 };
     const analysis = estimateFamilyDeltas({
         observations: Object.entries(familyDeltas).flatMap(([familyId, delta]) => [
@@ -174,7 +176,7 @@ export function pairedDeltaReportFixture(options: PairedDeltaFixtureOptions = {}
         bootstrapResamples: options.bootstrapResamples ?? 2000,
         lane: {
             poolManifestFingerprint,
-            pinnedSnapshotId: "fixture-model",
+            pinnedSnapshotId,
             policyFingerprint: policyDocument.policyFingerprint!,
             pairedFactsFingerprint: pairedFactsFingerprint(PAIRED_FACTS),
         },
@@ -182,7 +184,7 @@ export function pairedDeltaReportFixture(options: PairedDeltaFixtureOptions = {}
     });
     return buildPairedDeltaReport({
         poolManifestFingerprint,
-        pinnedSnapshotId: "fixture-model",
+        pinnedSnapshotId,
         policyDocument,
         implementationDigest: "impl-digest-fixture",
         limitations: ["fixture caveat"],
@@ -531,6 +533,21 @@ export function scorecardReportFixture(policy: ScorecardPolicy = policyFixture()
         }),
     };
     return { schema: SCORECARD_REPORT_SCHEMA, body, reportFingerprint: canonicalFingerprint(body) };
+}
+
+/** A promotable report under an unpinned policy that requires no slots: every lane present, every gate passed, no regressions. */
+export function promotedScorecardReportFixture(): ScorecardReport {
+    const policy = policyFixture({ requiredMetricSlots: [] });
+    const unmeasured = scorecardReportFixture(policy).body;
+    return scorecardReportFixture(policy, {
+        evidence: {
+            lanes: unmeasured.evidence.lanes.map((row, index) => ({ ...row, status: "present", reportFingerprint: String(index).repeat(64), diagnostics: [] })),
+            baseline: { status: "absent", reportFingerprint: null },
+        },
+        safetyGates: unmeasured.safetyGates.map((row) => ({
+            ...row, status: "passed", observedCount: 0, evidenceFingerprint: String(LANE_IDS.indexOf("metamorphic")).repeat(64), sourceLane: "metamorphic", diagnostic: null,
+        })),
+    });
 }
 
 // ---------------------------------------------------------------------------

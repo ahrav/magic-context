@@ -40,6 +40,7 @@ const compared = (row: FamilyEstimateRow, baselinePoint: number): ComparedDelta 
     endpoint: row.endpoint,
     familyId: row.familyId,
     status: "compared",
+    baselinePointEstimate: baselinePoint,
     delta: row.pointEstimate - baselinePoint,
     interval: { lower: row.interval.lower - baselinePoint, upper: row.interval.upper - baselinePoint },
     noiseLabel: row.noiseLabel,
@@ -120,6 +121,13 @@ describe("parseScorecardReport", () => {
             .toThrow(/deltas\[0\].noiseLabel: cross-field-invalid/);
         expect(() => parseScorecardReport(withBaseline({ utility: { ...presentLanes.body.utility, familyEstimates: current, deltas: deltas.slice(0, 1) } })))
             .toThrow(/deltas: estimate-mirror-invalid/);
+        // A delta that does not equal the current estimate minus the stated baseline point is refused, as is a shifted interval that does not.
+        const inflated = [{ ...deltas[0]!, delta: 0.1, interval: { lower: 0, upper: 0.2 } }, deltas[1]!];
+        expect(() => parseScorecardReport(withBaseline({ utility: { ...presentLanes.body.utility, familyEstimates: current, deltas: inflated }, adverseDeltas: [] })))
+            .toThrow(/deltas\[0\]: cross-field-invalid/);
+        const restated = [{ ...deltas[0]!, baselinePointEstimate: 0.4 }, deltas[1]!];
+        expect(() => parseScorecardReport(withBaseline({ utility: { ...presentLanes.body.utility, familyEstimates: current, deltas: restated } })))
+            .toThrow(/deltas\[0\]: cross-field-invalid/);
     });
 
     it("ties every compared delta and adverse row to a present baseline", () => {
@@ -177,6 +185,13 @@ describe("parseScorecardReport", () => {
         expect(() => parseScorecardReport(failed)).toThrow(/safetyGates\[0\]: evidence-binding-invalid/);
     });
 
+    it("requires the gate row shape its status tags", () => {
+        const gate = (report: ScorecardReport, edit: (row: GateRow) => void): ScorecardReport => edited(report, (body) => edit(body.safetyGates[0]!));
+        expect(() => parseScorecardReport(gate(presentLanes, (row) => { row.diagnostic = "lane-missing"; }))).toThrow(/safetyGates\[0\]: evidence-shape-invalid/);
+        expect(() => parseScorecardReport(gate(missingLanes, (row) => { row.sourceLane = "metamorphic"; row.evidenceFingerprint = FP; }))).toThrow(/safetyGates\[0\]: evidence-shape-invalid/);
+        expect(() => parseScorecardReport(gate(missingLanes, (row) => { row.diagnostic = null; }))).toThrow(/safetyGates\[0\]: evidence-shape-invalid/);
+    });
+
     it("binds every measured slot to a parsed lane row and to the slot's unit and domain", () => {
         const measured = (slot: Partial<Extract<MetricSlot, { status: "measured" }>>): ScorecardReport => edited(presentLanes, (body) => {
             body.utility.slots[0] = { id: "valid-success-delta-mc-on-vs-mc-off", status: "measured", value: 0.25, unit: "delta", sourceLane: "paired-delta", sourceFingerprint: FP, ...slot };
@@ -185,7 +200,13 @@ describe("parseScorecardReport", () => {
         });
         expect(parseScorecardReport(measured({})).body.outcome.mandatoryEvidenceComplete).toBe(true);
         expect(() => parseScorecardReport(measured({ sourceFingerprint: "c".repeat(64) }))).toThrow(/utility.slots\[0\]: evidence-binding-invalid/);
-        expect(() => parseScorecardReport(measured({ sourceLane: "historian" }))).toThrow(/utility.slots\[0\]: evidence-binding-invalid/);
+        expect(() => parseScorecardReport(measured({ sourceLane: "historian" }))).toThrow(/utility.slots\[0\].sourceLane: slot-producer-invalid/);
+        // The metamorphic row carries the same fingerprint as paired-delta, so only the producer rule can refuse it.
+        expect(() => parseScorecardReport(measured({ sourceLane: "metamorphic" }))).toThrow(/utility.slots\[0\].sourceLane: slot-producer-invalid/);
+        const unproduced = edited(presentLanes, (body) => {
+            body.context.slots[0] = { id: "post-compaction-probe-accuracy", status: "measured", value: 0.5, unit: "ratio", sourceLane: "paired-delta", sourceFingerprint: FP };
+        });
+        expect(() => parseScorecardReport(unproduced)).toThrow(/context.slots\[0\].sourceLane: slot-producer-invalid/);
         expect(() => parseScorecardReport(measured({ unit: "ratio" }))).toThrow(/utility.slots\[0\].unit: slot-unit-invalid/);
         expect(() => parseScorecardReport(measured({ value: 1.5 }))).toThrow(/utility.slots\[0\].value: number-invalid/);
         const incompleteSource = edited(measured({}), (body) => {
