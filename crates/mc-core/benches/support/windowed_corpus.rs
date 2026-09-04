@@ -1,8 +1,10 @@
-//! Deterministic corpora for the windowed redaction bench and its semantic oracle.
+//! Every generator yields the same corpus for a given `(size, seed)`.
+//! Credential shapes combine fragments so this file contains no complete detector-recognized secret literal.
 //!
-//! Every generator is a pure function of `(size, seed)`, so the bench and the
-//! oracle see identical bytes. Credential shapes are assembled from fragments
-//! so no literal here matches a detector.
+//! Verdict-only scans stop at the first finding, so secret-bearing corpora are excluded from verdict-only cells.
+//! The bench asserts each corpus classification at setup.
+
+use mc_core::redaction::{MAX_REDACTABLE_BYTES, WINDOW_OVERLAP_BYTES};
 
 /// Splitmix64: fixed-width, platform independent.
 pub struct Rng(u64);
@@ -233,7 +235,10 @@ pub fn json_config_clean(bytes: usize, seed: u64) -> String {
 fn secret_line(rng: &mut Rng, out: &mut String) {
     match rng.below(4) {
         0 => {
-            out.push_str("password=hunter7B9xQ");
+            // Split across pushes: `password=` joined to a value in one source literal matches the keyed-assignment rule.
+            out.push_str("password");
+            out.push('=');
+            out.push_str("hunter7B9xQ");
             rng.alnum(out, 12);
         }
         1 => {
@@ -261,7 +266,8 @@ pub fn secret_sparse(bytes: usize, seed: u64) -> String {
     let mut rng = Rng::new(seed);
     let mut out = String::with_capacity(bytes + 64);
     let stride = 4 * 1024 * 1024;
-    let mut next_secret = stride / 2;
+    // Corpora smaller than half a stride still carry one secret, at their midpoint.
+    let mut next_secret = (stride / 2).min(bytes / 2);
     while out.len() < bytes {
         if out.len() >= next_secret {
             secret_line(&mut rng, &mut out);
@@ -276,9 +282,10 @@ pub fn secret_sparse(bytes: usize, seed: u64) -> String {
     truncate(out, bytes)
 }
 
-/// One secret per 4 KiB, so a 64 MiB payload stays below the detection cap
-/// only when the caller passes a cap at least as large. The bench passes
-/// `usize::MAX`-like caps; the oracle records the cap it used.
+/// One secret per 4 KiB: 256 detections per MiB, 4096 at 16 MiB.
+///
+/// The bench redacts under the kernel's 4096-detection cap, so 16 MiB is the largest size
+/// that completes; larger inputs exit early with `DetectionLimit`.
 pub fn secret_dense(bytes: usize, seed: u64) -> String {
     let mut rng = Rng::new(seed);
     let mut out = String::with_capacity(bytes + 64);
@@ -353,13 +360,31 @@ pub fn short_lines(bytes: usize, seed: u64) -> String {
     truncate(out, bytes)
 }
 
-/// `code_keywords_clean` with 0.5% random invalid UTF-8 bytes: lossy path.
+/// Returns `code_keywords_clean` with invalid UTF-8 injected only into prose-only lines.
+///
+/// Only prose-only lines preserve the keyword-clean corpus invariant.
 pub fn invalid_utf8_bytes(bytes: usize, seed: u64) -> Vec<u8> {
     let mut rng = Rng::new(seed ^ 0x51);
     let mut out = code_keywords_clean(bytes, seed).into_bytes();
+    let mut safe_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut line_start = 0usize;
+    for (index, &byte) in out.iter().enumerate() {
+        if byte == b'\n' {
+            let line = &out[line_start..index];
+            if !line.is_empty() && line.iter().all(|&b| b.is_ascii_lowercase() || b == b' ') {
+                safe_ranges.push((line_start, index));
+            }
+            line_start = index + 1;
+        }
+    }
+    assert!(
+        !safe_ranges.is_empty(),
+        "code_keywords_clean produced no prose-only line to corrupt"
+    );
     let count = out.len() / 200;
     for _ in 0..count {
-        let at = rng.below(out.len());
+        let &(start, end) = rng.pick(&safe_ranges);
+        let at = start + rng.below(end - start);
         // Continuation or truncated lead bytes are never valid on their own.
         out[at] = match rng.below(3) {
             0 => 0x80 + (rng.below(64) as u8),
@@ -370,32 +395,42 @@ pub fn invalid_utf8_bytes(bytes: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-/// `π` and `\u{fffd}` runs positioned across every window boundary.
+/// Each line begins with a padded `π` or `\u{fffd}` run that places `MAX_REDACTABLE_BYTES % LINE` inside a glyph.
 ///
-/// Windows start on line boundaries, so the runs are laid down with newlines at
-/// intervals that keep the boundaries landing inside a run.
+/// `multibyte_edges` requires `scan_windows` in `mc_core::redaction` to start each window at a line start and end it `MAX_REDACTABLE_BYTES` later, clamped to a char boundary.
+/// Each line has `LINE` bytes, and `LINE` does not exceed the minimum window advance. Every window start is therefore a multiple of `LINE`, and every non-final window end sits at line offset `MAX_REDACTABLE_BYTES % LINE`, which the run covers mid-glyph.
 pub fn multibyte_edges(bytes: usize, seed: u64) -> String {
+    const LINE: usize = 48 * 1024;
+    const _: () = assert!(LINE <= (MAX_REDACTABLE_BYTES - WINDOW_OVERLAP_BYTES) / 2);
+    const END_OFFSET: usize = MAX_REDACTABLE_BYTES % LINE;
+    const RUN_END: usize = END_OFFSET + 4096;
+    const _: () = assert!(END_OFFSET >= 2 && RUN_END + 256 < LINE);
     let mut rng = Rng::new(seed);
-    let mut out = String::with_capacity(bytes + 64);
-    // 512 KiB windows, 96 KiB overlap: boundaries fall near every
-    // (512 - 96) KiB and within the MIN_WINDOW_ADVANCE range. A run every
-    // 64 KiB guarantees a run under each of them.
-    let run_stride = 64 * 1024;
-    let mut next_run = run_stride - 4 * 1024;
+    let mut out = String::with_capacity(bytes + LINE);
     while out.len() < bytes {
-        if out.len() >= next_run {
-            let glyph = if rng.below(2) == 0 { "π" } else { "\u{fffd}" };
-            for _ in 0..(8 * 1024 / glyph.len()) {
-                out.push_str(glyph);
-            }
-            out.push_str(" token=π\u{fffd}π ");
-            next_run += run_stride;
+        let glyph = if rng.below(2) == 0 { "π" } else { "\u{fffd}" };
+        let line_start = out.len();
+        // Glyph boundaries sit at `pad + k * glyph.len()`; one pad byte keeps `END_OFFSET` off them.
+        if END_OFFSET.is_multiple_of(glyph.len()) {
+            out.push('.');
         }
-        for _ in 0..8 {
-            out.push_str(rng.pick(PROSE_WORDS));
+        while out.len() - line_start < RUN_END {
+            out.push_str(glyph);
+        }
+        out.push(' ');
+        loop {
+            let word = rng.pick(PROSE_WORDS);
+            if out.len() - line_start + word.len() + 2 > LINE {
+                break;
+            }
+            out.push_str(word);
             out.push(' ');
         }
+        while out.len() - line_start < LINE - 1 {
+            out.push('.');
+        }
         out.push('\n');
+        debug_assert_eq!(out.len() - line_start, LINE);
     }
     truncate(out, bytes)
 }
@@ -411,16 +446,55 @@ fn truncate(mut text: String, bytes: usize) -> String {
 
 pub type Generator = fn(usize, u64) -> String;
 
+pub struct Corpus {
+    pub name: &'static str,
+    pub generate: Generator,
+    /// Whether the scanner reports nothing on the corpus, so a verdict-only scan walks every byte.
+    pub clean: bool,
+}
+
 /// Every text corpus by name, in bench order.
-pub const TEXT_CORPORA: &[(&str, Generator)] = &[
-    ("prose_clean", prose_clean),
-    ("code_keywords_clean", code_keywords_clean),
-    ("json_config_clean", json_config_clean),
-    ("secret_sparse", secret_sparse),
-    ("secret_dense", secret_dense),
-    ("single_long_line", single_long_line),
-    ("short_lines", short_lines),
-    ("multibyte_edges", multibyte_edges),
+pub const TEXT_CORPORA: &[Corpus] = &[
+    Corpus {
+        name: "prose_clean",
+        generate: prose_clean,
+        clean: true,
+    },
+    Corpus {
+        name: "code_keywords_clean",
+        generate: code_keywords_clean,
+        clean: true,
+    },
+    Corpus {
+        name: "json_config_clean",
+        generate: json_config_clean,
+        clean: true,
+    },
+    Corpus {
+        name: "secret_sparse",
+        generate: secret_sparse,
+        clean: false,
+    },
+    Corpus {
+        name: "secret_dense",
+        generate: secret_dense,
+        clean: false,
+    },
+    Corpus {
+        name: "single_long_line",
+        generate: single_long_line,
+        clean: true,
+    },
+    Corpus {
+        name: "short_lines",
+        generate: short_lines,
+        clean: true,
+    },
+    Corpus {
+        name: "multibyte_edges",
+        generate: multibyte_edges,
+        clean: true,
+    },
 ];
 
 pub const MIB: usize = 1024 * 1024;
@@ -431,7 +505,8 @@ pub const SIZES: &[usize] = &[MIB, 8 * MIB, 64 * MIB];
 /// Seed derivation keeps each (corpus, size) cell distinct and stable.
 pub fn seed_for(name: &str, size: usize) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in name.bytes().chain(size.to_le_bytes()) {
+    // Fixed width: `usize::to_le_bytes` differs between 32- and 64-bit targets.
+    for byte in name.bytes().chain((size as u64).to_le_bytes()) {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }

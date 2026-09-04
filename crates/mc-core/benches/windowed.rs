@@ -4,6 +4,11 @@
 //! (`Redactor::redact_windowed` with the kernel's detection cap) or
 //! `detect_bytes` (`Redactor::detect_windowed_bytes`).
 //!
+//! `detect_bytes` returns at the first finding, so it is measured only over
+//! clean corpora; on a secret-bearing corpus it would scan one window and be
+//! credited the whole input's bytes. Setup asserts each corpus is what its
+//! `clean` flag claims.
+//!
 //! `MC_WINDOWED_SIZES=1,8` restricts sizes (MiB); the Criterion filter
 //! argument restricts cells by name.
 
@@ -53,10 +58,16 @@ fn windowed(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(2));
     group.sample_size(10);
 
-    for (name, generate) in TEXT_CORPORA {
+    for corpus in TEXT_CORPORA {
+        let name = corpus.name;
         for size in cell_sizes(name) {
-            let input = generate(size, seed_for(name, size));
+            let input = (corpus.generate)(size, seed_for(name, size));
             let mib = size / MIB;
+            let found = redactor.detect_windowed(&input).unwrap();
+            assert_eq!(
+                found, !corpus.clean,
+                "{name}/{mib}: corpus classification does not match the scanner"
+            );
             group.throughput(Throughput::Bytes(input.len() as u64));
             group.bench_with_input(
                 BenchmarkId::new(format!("redact/{name}"), mib),
@@ -69,23 +80,29 @@ fn windowed(c: &mut Criterion) {
                     })
                 },
             );
-            group.bench_with_input(
-                BenchmarkId::new(format!("detect_bytes/{name}"), mib),
-                &input,
-                |b, input| {
-                    b.iter(|| {
-                        redactor
-                            .detect_windowed_bytes(black_box(input.as_bytes()))
-                            .unwrap()
-                    })
-                },
-            );
+            if corpus.clean {
+                group.bench_with_input(
+                    BenchmarkId::new(format!("detect_bytes/{name}"), mib),
+                    &input,
+                    |b, input| {
+                        b.iter(|| {
+                            redactor
+                                .detect_windowed_bytes(black_box(input.as_bytes()))
+                                .unwrap()
+                        })
+                    },
+                );
+            }
         }
     }
 
     for size in cell_sizes("invalid_utf8_bytes") {
         let input = invalid_utf8_bytes(size, seed_for("invalid_utf8_bytes", size));
         let mib = size / MIB;
+        assert!(
+            !redactor.detect_windowed_bytes(&input).unwrap(),
+            "invalid_utf8_bytes/{mib}: corpus is not clean"
+        );
         group.throughput(Throughput::Bytes(input.len() as u64));
         group.bench_with_input(
             BenchmarkId::new("detect_bytes/invalid_utf8_bytes", mib),
