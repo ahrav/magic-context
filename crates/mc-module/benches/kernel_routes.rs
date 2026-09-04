@@ -74,7 +74,10 @@
 //! `MC_KERNEL_ROUTES_PROFILE=<case-prefix>` bypasses Criterion and repeats the
 //! named case for ten seconds so `perf record` has a stable window. Groups and
 //! cases the prefix cannot match skip their fixture setup, so the recorded
-//! process contains only the target's work.
+//! process contains only the target's work. For `commit/*-ops` and
+//! `ingest/finish` that work includes the fixture rebuilds and, for finish,
+//! the `begin` and `page` routes each `finish` requires; filter the profile by
+//! the route's symbols to isolate it.
 
 use std::cell::RefCell;
 use std::fs;
@@ -1207,26 +1210,39 @@ fn bench_ingest_finish(c: &mut Criterion) {
             let begin = ingest_begin_request(&daemon, "u", &payload, page_count);
             (daemon, (pages, begin))
         });
-        // Every use ingests distinct bytes so the CAS never dedups: the last
-        // line carries the use index, which changes the payload digest and the
-        // last page's digest.
+        // The per-use tag changes the payload and final-page digests,
+        // preventing CAS deduplication. The digests and final-page Base64 text
+        // are precomputed outside measured and profiled code.
+        let variants: Vec<(String, String, String)> = (1..=reset_every)
+            .map(|n| {
+                let mut payload = payload.clone();
+                let tag = format!("{n:0COUNTER_TAG_BYTES$}");
+                let len = payload.len();
+                payload[len - 1 - COUNTER_TAG_BYTES..len - 1].copy_from_slice(tag.as_bytes());
+                let last = payload
+                    .chunks(PAGE_BYTES_MAX)
+                    .last()
+                    .expect("payload has a page");
+                (
+                    sha256_hex(&payload),
+                    base64::engine::general_purpose::STANDARD.encode(last),
+                    sha256_hex(last),
+                )
+            })
+            .collect();
         let stage = |daemon: &Daemon, (pages, begin): &(Vec<Value>, Value), n: usize| -> Value {
             let id = format!("u{n}");
-            let mut payload = payload.clone();
-            let tag = format!("{n:0COUNTER_TAG_BYTES$}");
-            let len = payload.len();
-            payload[len - 1 - COUNTER_TAG_BYTES..len - 1].copy_from_slice(tag.as_bytes());
+            let (payload_digest, last_base64, last_digest) = &variants[n - 1];
             let mut begin = rekey_begin(begin, &id);
-            begin["payload_digest"] = json!(sha256_hex(&payload));
+            begin["payload_digest"] = json!(payload_digest);
             daemon.assert_available(begin);
             let last = pages.len() - 1;
-            for (i, chunk) in payload.chunks(PAGE_BYTES_MAX).enumerate() {
-                let mut page = pages[i].clone();
+            for (i, template) in pages.iter().enumerate() {
+                let mut page = template.clone();
                 page["upload_id"] = json!(id);
                 if i == last {
-                    page["bytes_base64"] =
-                        json!(base64::engine::general_purpose::STANDARD.encode(chunk));
-                    page["page_digest"] = json!(sha256_hex(chunk));
+                    page["bytes_base64"] = json!(last_base64);
+                    page["page_digest"] = json!(last_digest);
                 }
                 daemon.assert_available(page);
             }
