@@ -120,14 +120,18 @@ function retrievalReader(): Reader<"retrieval"> {
     };
 }
 
+// Each reliability reader names every slot it serves; a slot routed to a reader without a case reads
+// `producer-pending` rather than a neighbouring slot's count.
 function pairedDeltaReliability(report: PairedDeltaReport, id: MetricSlotId): Reading {
     switch (id) {
         case "paired-delta-planned-coordinates":
             return count(report.body.runSummary.plannedCoordinates);
         case "paired-delta-healthy-coordinates":
             return count(report.body.runSummary.healthyCoordinates);
-        default:
+        case "paired-delta-excluded-cells":
             return count(report.body.exclusions.reduce((sum, exclusion) => sum + exclusion.count, 0));
+        default:
+            return PENDING;
     }
 }
 
@@ -137,16 +141,23 @@ function incidentReliability(report: IncidentPoolReport, id: MetricSlotId): Read
             return count(report.results.length);
         case "incident-results-unhealthy":
             return count(report.results.filter((result) => result.run_health !== "completed").length);
-        default:
+        case "incident-baseline-mismatches":
             return count(report.results.filter((result) =>
                 result.baseline_comparison === "regression" || result.baseline_comparison === "unexpected_failure").length);
+        default:
+            return PENDING;
     }
 }
 
 function dreamerReliability(runs: DreamerEvalRunReport[], id: MetricSlotId): Reading {
-    return id === "dreamer-runs-total"
-        ? count(runs.length)
-        : count(runs.filter((run) => run.status !== "PASS").length);
+    switch (id) {
+        case "dreamer-runs-total":
+            return count(runs.length);
+        case "dreamer-runs-not-passed":
+            return count(runs.filter((run) => run.status !== "PASS").length);
+        default:
+            return PENDING;
+    }
 }
 
 function reliabilitySlot(bundle: ScorecardEvidenceBundle, id: MetricSlotId): MetricSlot {
