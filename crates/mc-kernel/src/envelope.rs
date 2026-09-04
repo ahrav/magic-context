@@ -1360,31 +1360,31 @@ pub(super) fn load_object_state(
     tx: &Transaction<'_>,
     object_id: &str,
 ) -> Result<Option<ObjectState>, KernelError> {
-    tx.query_row(
-        &format!(
-            "SELECT {OBJECT_ROW_COLUMNS},
-                    COALESCE(dec.scope_id,obs.scope_id),
-                    (SELECT MAX(commit_seq) FROM change_event c WHERE c.object_id=o.object_id),
-                    em.artifact_digest
-             FROM object_registry o
-             LEFT JOIN decisions dec ON dec.object_id=o.object_id
-             LEFT JOIN observations obs ON obs.object_id=o.object_id
-             LEFT JOIN evidence_meta em
-                    ON em.evidence_id=COALESCE(dec.evidence_id,obs.evidence_id)
-                   AND em.invalidated_commit_seq IS NULL
-             WHERE o.object_id=?1"
-        ),
-        [object_id],
-        |row| {
-            Ok(ObjectState {
-                object: object_row_from(row)?,
-                scope_id: row.get(10)?,
-                latest_change_commit_seq: row.get(11)?,
-                artifact_digest: row.get(12)?,
+    tx.prepare_cached(&format!(
+        "SELECT {OBJECT_ROW_COLUMNS},
+                COALESCE(dec.scope_id,obs.scope_id),
+                (SELECT MAX(commit_seq) FROM change_event c WHERE c.object_id=o.object_id),
+                em.artifact_digest
+         FROM object_registry o
+         LEFT JOIN decisions dec ON dec.object_id=o.object_id
+         LEFT JOIN observations obs ON obs.object_id=o.object_id
+         LEFT JOIN evidence_meta em
+                ON em.evidence_id=COALESCE(dec.evidence_id,obs.evidence_id)
+               AND em.invalidated_commit_seq IS NULL
+         WHERE o.object_id=?1"
+    ))
+    .and_then(|mut statement| {
+        statement
+            .query_row([object_id], |row| {
+                Ok(ObjectState {
+                    object: object_row_from(row)?,
+                    scope_id: row.get(10)?,
+                    latest_change_commit_seq: row.get(11)?,
+                    artifact_digest: row.get(12)?,
+                })
             })
-        },
-    )
-    .optional()
+            .optional()
+    })
     .map_err(map_sqlite)
 }
 
