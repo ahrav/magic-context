@@ -11,6 +11,7 @@ import {
     SCORE_FAMILY_IDS,
     SLOT_IDS_BY_FAMILY,
     array,
+    boolean,
     enumeration,
     exact,
     fail,
@@ -231,24 +232,14 @@ export const REPORT_BODY_KEYS = [
 const NOISE_LABELS = ["no-noise-floor", "inside-floor", "outside-floor"] as const satisfies readonly NoiseComparison[];
 const ESTIMATE_FAMILY_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
-function finiteNumber(value: unknown, label: string): number {
-    if (typeof value !== "number" || !Number.isFinite(value)) fail(`${label}: number-invalid`);
-    return value as number;
-}
-
 function nullable<T>(value: unknown, parse: (raw: unknown) => T): T | null {
     return value === null ? null : parse(value);
-}
-
-function boolean(value: unknown, label: string): boolean {
-    if (typeof value !== "boolean") fail(`${label}: boolean-invalid`);
-    return value as boolean;
 }
 
 function parseInterval(raw: unknown, label: string): Interval {
     const value = record(raw, label);
     exact(value, ["lower", "upper"], label);
-    const interval = { lower: finiteNumber(value.lower, `${label}.lower`), upper: finiteNumber(value.upper, `${label}.upper`) };
+    const interval = { lower: number(value.lower, `${label}.lower`), upper: number(value.upper, `${label}.upper`) };
     if (interval.lower > interval.upper) fail(`${label}: bounds-inverted`);
     return interval;
 }
@@ -334,7 +325,7 @@ function parseFamilyEstimateRow(raw: unknown, label: string): FamilyEstimateRow 
     return {
         endpoint: enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`),
         familyId: staticId(value.familyId, `${label}.familyId`, ESTIMATE_FAMILY_ID_RE),
-        pointEstimate: finiteNumber(value.pointEstimate, `${label}.pointEstimate`),
+        pointEstimate: number(value.pointEstimate, `${label}.pointEstimate`),
         interval: parseInterval(value.interval, `${label}.interval`),
         noiseLabel: enumeration(value.noiseLabel, NOISE_LABELS, `${label}.noiseLabel`),
     };
@@ -351,14 +342,14 @@ function parseDeltaRow(raw: unknown, label: string): DeltaRow {
             endpoint,
             familyId,
             status,
-            baselinePointEstimate: finiteNumber(value.baselinePointEstimate, `${label}.baselinePointEstimate`),
-            delta: finiteNumber(value.delta, `${label}.delta`),
+            baselinePointEstimate: number(value.baselinePointEstimate, `${label}.baselinePointEstimate`),
+            delta: number(value.delta, `${label}.delta`),
             interval: parseInterval(value.interval, `${label}.interval`),
             noiseLabel: enumeration(value.noiseLabel, NOISE_LABELS, `${label}.noiseLabel`),
         };
     }
     exact(value, ["endpoint", "familyId", "status", "value"], label);
-    return { endpoint, familyId, status, value: finiteNumber(value.value, `${label}.value`) };
+    return { endpoint, familyId, status, value: number(value.value, `${label}.value`) };
 }
 
 function parseUtilitySection(raw: unknown): UtilitySection {
@@ -383,7 +374,7 @@ function parseAdverseRow(raw: unknown, index: number): AdverseRow {
         endpoint: enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`),
         kind: enumeration(value.kind, ADVERSE_KINDS, `${label}.kind`),
         noiseLabel: nullable(value.noiseLabel, (noise) => enumeration(noise, NOISE_LABELS, `${label}.noiseLabel`)),
-        delta: nullable(value.delta, (delta) => finiteNumber(delta, `${label}.delta`)),
+        delta: nullable(value.delta, (delta) => number(delta, `${label}.delta`)),
         interval: nullable(value.interval, (interval) => parseInterval(interval, `${label}.interval`)),
         blocking: boolean(value.blocking, `${label}.blocking`),
     };
@@ -399,7 +390,7 @@ function parseRegretRow(raw: unknown, index: number): RawRegretLadder {
     exact(value, ["coordinateId", "familyId", "retrieval", "formation", "representation", "label"], label);
     if (value.label !== "raw-non-inferential") fail(`${label}.label: literal-invalid`);
     const rung = (field: "retrieval" | "formation" | "representation"): number | null =>
-        nullable(value[field], (delta) => finiteNumber(delta, `${label}.${field}`));
+        nullable(value[field], (delta) => number(delta, `${label}.${field}`));
     return {
         coordinateId: staticId(value.coordinateId, `${label}.coordinateId`, ESTIMATE_FAMILY_ID_RE),
         familyId: staticId(value.familyId, `${label}.familyId`, ESTIMATE_FAMILY_ID_RE),

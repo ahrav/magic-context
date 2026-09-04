@@ -35,6 +35,7 @@ export const {
     hex64,
     enumeration,
     array,
+    boolean,
     number,
     integer,
     unique,
