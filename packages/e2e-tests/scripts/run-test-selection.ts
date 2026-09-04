@@ -128,10 +128,7 @@ export function scorecardUnitFiles(root: string = E2E_ROOT): string[] {
         onlyFiles: true,
     })];
     if (laneFiles.length === 0) throw new Error("scorecard unit selection is empty");
-    return assertPresent(
-        [...laneFiles, ...["scripts/run-scorecard.test.ts"].filter((file) => existsSync(resolve(root, file)))].sort(),
-        root,
-    );
+    return assertPresent([...laneFiles, "scripts/run-scorecard.test.ts"].sort(), root);
 }
 
 /**

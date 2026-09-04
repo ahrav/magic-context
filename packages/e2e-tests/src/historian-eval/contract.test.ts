@@ -29,6 +29,7 @@ import {
     parseModelRoute,
 } from "./contract";
 import { ballastProse } from "../ballast";
+import type { ContractError } from "../contract-primitives";
 import { estimateTokens } from "../../../plugin/src/shared/token-estimator";
 import { validScenario, validScenarioRaw } from "./test-support";
 
@@ -354,7 +355,7 @@ describe("parseScenario", () => {
             throw new Error("expected rejection");
         } catch (error) {
             expect(error).toBeInstanceOf(HistorianEvalContractError);
-            expect((error as HistorianEvalContractError).diagnostics.length).toBeGreaterThan(0);
+            expect((error as ContractError).diagnostics.length).toBeGreaterThan(0);
         }
     });
 });

@@ -1,4 +1,4 @@
-import { makeContractPrimitives } from "../contract-primitives";
+import { makeContractError, makeContractPrimitives } from "../contract-primitives";
 import { ANTI_MEMORY_CATEGORY } from "../../../plugin/src/features/magic-context/memory/constants";
 import {
     isValidPublicClaimId,
@@ -202,14 +202,7 @@ const TASK_FAIL_REASONS: Record<DreamerTask, readonly FailReason[]> = {
     "classify-memories": ["wrong-classification", "invalid-output"],
 };
 
-export class DreamerEvalContractError extends Error {
-    readonly diagnostics: readonly string[];
-
-    constructor(diagnostics: readonly string[]) {
-        super([...diagnostics].sort().join("; "));
-        this.diagnostics = [...diagnostics].sort();
-    }
-}
+export const DreamerEvalContractError = makeContractError("DreamerEvalContractError");
 
 const primitives = makeContractPrimitives(DreamerEvalContractError);
 const { fail, record, exact, string, staticId, enumeration, array, integer, boundedInteger, boolean, unique } = primitives;

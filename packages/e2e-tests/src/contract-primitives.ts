@@ -13,6 +13,23 @@ export interface ContractErrorConstructor {
     new (diagnostics: readonly string[]): Error;
 }
 
+export interface ContractError extends Error {
+    readonly diagnostics: readonly string[];
+}
+
+/** Sorting makes each error's message and `diagnostics` independent of check order. */
+export function makeContractError(name: string): new (diagnostics: readonly string[]) => ContractError {
+    return class extends Error implements ContractError {
+        readonly diagnostics: readonly string[];
+
+        constructor(diagnostics: readonly string[]) {
+            super([...diagnostics].sort().join("; "));
+            this.name = name;
+            this.diagnostics = [...diagnostics].sort();
+        }
+    };
+}
+
 /**
  * Builds a closed vocabulary from a `Record<T, true>` so the list is checked for completeness, not just membership.
  *

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
 import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory/storage-claims";
+import type { ContractError } from "../contract-primitives";
 import {
     DREAMER_EVAL_REPORT_SCHEMA,
     DREAMER_EVAL_SCENARIO_SCHEMA,
@@ -108,7 +109,7 @@ function expectDiagnostic(edit: (raw: Record<string, unknown>) => void, diagnost
         throw new Error("expected contract rejection");
     } catch (error) {
         expect(error).toBeInstanceOf(DreamerEvalContractError);
-        expect((error as DreamerEvalContractError).diagnostics).toContain(diagnostic);
+        expect((error as ContractError).diagnostics).toContain(diagnostic);
     }
 }
 
