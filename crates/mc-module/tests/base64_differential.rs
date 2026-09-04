@@ -94,6 +94,55 @@ fn mutated_encoding() -> impl Strategy<Value = Vec<u8>> {
     )
 }
 
+fn pseudo_random_bytes(len: usize, mut state: u64) -> Vec<u8> {
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 56) as u8
+        })
+        .collect()
+}
+
+#[test]
+fn production_sized_pages_decode_to_the_same_bytes() {
+    let page_max = mc_module::kernel_routes::ingest::PAGE_BYTES_MAX as usize;
+    let sizes = [
+        4096,
+        65_536 + 1,
+        65_536 + 2,
+        65_536 + 3,
+        262_144,
+        (1 << 20) + 17,
+        page_max - 1,
+        page_max,
+    ];
+    for (seed, &len) in sizes.iter().enumerate() {
+        let payload = pseudo_random_bytes(len, 0x9E37_79B9_7F4A_7C15 ^ seed as u64);
+        let text = base64::engine::general_purpose::STANDARD
+            .encode(&payload)
+            .into_bytes();
+        assert_eq!(optimized(&text), Ok(payload.clone()), "len {len}");
+        assert_eq!(reference(&text), Ok(payload), "len {len}");
+
+        for (at, byte) in [
+            (text.len() / 2, b'!'),
+            (text.len() - 5, b'='),
+            (text.len() - 1, b'B'),
+            (text.len() / 3, b'\n'),
+        ] {
+            let mut corrupted = text.clone();
+            corrupted[at] = byte;
+            assert_eq!(
+                optimized(&corrupted),
+                reference(&corrupted),
+                "len {len} byte {byte:?} at {at}"
+            );
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
     #[test]
