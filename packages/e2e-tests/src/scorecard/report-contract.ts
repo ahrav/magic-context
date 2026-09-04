@@ -7,6 +7,7 @@ import {
     GATE_ID_RE,
     LANE_IDS,
     METRIC_SLOT_IDS,
+    SLOT_CONTRACTS,
     REASON_CODE_RE,
     SCORECARD_GATE_IDS,
     SCORE_FAMILY_IDS,
@@ -30,6 +31,7 @@ import {
     type LaneId,
     type LaneIdentity,
     type MetricSlotId,
+    type MetricUnit,
     type ScoreFamilyId,
 } from "./policy";
 
@@ -56,70 +58,6 @@ export interface GateRow {
     sourceLane: LaneId | null;
     diagnostic: string | null;
 }
-
-export const METRIC_UNITS = ["ratio", "count", "tokens", "milliseconds", "delta"] as const;
-export type MetricUnit = (typeof METRIC_UNITS)[number];
-
-export interface SlotContract {
-    /** A `ratio` lies in [0, 1], a `delta` in [-1, 1], `count` and `tokens` are non-negative integers, and `milliseconds` is non-negative. */
-    unit: MetricUnit;
-    /** The one lane whose report the slot is read from; `null` when no lane produces the slot, so it cannot be measured. */
-    lane: LaneId | null;
-}
-
-export const SLOT_CONTRACTS: Readonly<Record<MetricSlotId, SlotContract>> = {
-    "valid-success-delta-mc-on-vs-mc-off": { unit: "delta", lane: "paired-delta" },
-    "valid-success-delta-mc-on-vs-compaction": { unit: "delta", lane: "paired-delta" },
-    "valid-failure-rate": { unit: "ratio", lane: "paired-delta" },
-    "invalid-failure-rate": { unit: "ratio", lane: "paired-delta" },
-    "invalid-success-rate-mc-on": { unit: "ratio", lane: "paired-delta" },
-    "invalid-success-rate-mc-off": { unit: "ratio", lane: "paired-delta" },
-    "invalid-success-rate-compaction": { unit: "ratio", lane: "paired-delta" },
-    "final-attempt-tokens-mc-on": { unit: "tokens", lane: "paired-delta" },
-    "final-attempt-tokens-mc-off": { unit: "tokens", lane: "paired-delta" },
-    "final-attempt-tokens-compaction": { unit: "tokens", lane: "paired-delta" },
-    "final-attempt-wall-clock-ms-mc-on": { unit: "milliseconds", lane: "paired-delta" },
-    "final-attempt-wall-clock-ms-mc-off": { unit: "milliseconds", lane: "paired-delta" },
-    "final-attempt-wall-clock-ms-compaction": { unit: "milliseconds", lane: "paired-delta" },
-    "final-attempt-turns-mc-on": { unit: "count", lane: "paired-delta" },
-    "final-attempt-turns-mc-off": { unit: "count", lane: "paired-delta" },
-    "final-attempt-turns-compaction": { unit: "count", lane: "paired-delta" },
-    "active-claim-precision": { unit: "ratio", lane: "historian" },
-    "active-claim-recall": { unit: "ratio", lane: "historian" },
-    "false-authoritative-scenario-rate": { unit: "ratio", lane: "historian" },
-    "false-authoritative-memory-rate": { unit: "ratio", lane: "historian" },
-    "supersession-latency": { unit: "milliseconds", lane: "historian" },
-    "pollution-duplication": { unit: "ratio", lane: "historian" },
-    "recall-at-10-explicit": { unit: "ratio", lane: "retrieval" },
-    "recall-at-50-explicit": { unit: "ratio", lane: "retrieval" },
-    "reciprocal-rank-explicit": { unit: "ratio", lane: "retrieval" },
-    "ndcg-at-10-explicit": { unit: "ratio", lane: "retrieval" },
-    "duplicate-rate-at-50-explicit": { unit: "ratio", lane: "retrieval" },
-    "recall-at-10-automatic": { unit: "ratio", lane: "retrieval" },
-    "recall-at-50-automatic": { unit: "ratio", lane: "retrieval" },
-    "reciprocal-rank-automatic": { unit: "ratio", lane: "retrieval" },
-    "ndcg-at-10-automatic": { unit: "ratio", lane: "retrieval" },
-    "duplicate-rate-at-50-automatic": { unit: "ratio", lane: "retrieval" },
-    currentness: { unit: "ratio", lane: "retrieval" },
-    "rejection-recall": { unit: "ratio", lane: "retrieval" },
-    "literal-recall": { unit: "ratio", lane: "retrieval" },
-    "abstention-accuracy": { unit: "ratio", lane: "retrieval" },
-    "post-compaction-probe-accuracy": { unit: "ratio", lane: null },
-    "ctx-expand-recovery": { unit: "ratio", lane: null },
-    "input-token-reduction": { unit: "ratio", lane: null },
-    "cache-write-preservation": { unit: "ratio", lane: null },
-    "paired-delta-planned-coordinates": { unit: "count", lane: "paired-delta" },
-    "paired-delta-healthy-coordinates": { unit: "count", lane: "paired-delta" },
-    "paired-delta-excluded-cells": { unit: "count", lane: "paired-delta" },
-    "incident-results-total": { unit: "count", lane: "incident" },
-    "incident-results-unhealthy": { unit: "count", lane: "incident" },
-    "incident-baseline-mismatches": { unit: "count", lane: "incident" },
-    "cross-harness-parity-pass-rate": { unit: "ratio", lane: "incident" },
-    "dreamer-runs-total": { unit: "count", lane: "dreamer" },
-    "dreamer-runs-not-passed": { unit: "count", lane: "dreamer" },
-    "restart-scenarios": { unit: "count", lane: null },
-    "contention-failures": { unit: "count", lane: null },
-};
 
 export type MetricSlot =
     | { id: MetricSlotId; status: "measured"; value: number; unit: MetricUnit; sourceLane: LaneId; sourceFingerprint: string }

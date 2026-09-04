@@ -264,6 +264,8 @@ export function metamorphicReportFixture(options: {
     extraEntries?: readonly MetamorphicReport["entries"][number][];
     /** Overrides applied to every derivative score, for a run whose derivative role errored. */
     derivativeScore?: Partial<ScenarioScore>;
+    /** Coverage violations recorded against the first covered scenario. */
+    coverageViolations?: readonly string[];
 } = {}): MetamorphicReport {
     const covered = options.coveredScenarioIds ?? CANARY_SCENARIO_IDS;
     const source = options.source ?? "run-record";
@@ -306,7 +308,7 @@ export function metamorphicReportFixture(options: {
         });
     return buildMetamorphicReport({
         entries: [...entries, ...(options.extraEntries ?? [])],
-        coverage: covered.map((scenarioId) => ({ scenarioId, applied: 1, inapplicable: [], violations: [] })),
+        coverage: covered.map((scenarioId, index) => ({ scenarioId, applied: 1, inapplicable: [], violations: index === 0 ? [...(options.coverageViolations ?? [])] : [] })),
         injectionCanaryHits: options.injectionCanaryHits ?? [],
         tierInvalidReason: options.tierInvalidReason ?? null,
         system: source === "run-record" ? HISTORIAN_SYSTEM : null,

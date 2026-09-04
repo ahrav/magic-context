@@ -108,6 +108,8 @@ describe("loadEvidenceBundle", () => {
         });
         expect(erroredRole.tierInvalidReason).toBeNull();
         expect(statuses(tree({ lanes: { metamorphic: erroredRole } })).metamorphic).toBe("incomplete");
+        const violated = metamorphicReportFixture({ coverageViolations: ["no transforms applied"] });
+        expect(statuses(tree({ lanes: { metamorphic: violated } })).metamorphic).toBe("incomplete");
         expect(statuses(tree({
             lanes: { historian: historianReportFixture([scenarioScoreFixture("hse-a", { verdict: "ERROR", errorReason: "run-never-fired", precision: null, recall: null })]) },
         })).historian).toBe("incomplete");

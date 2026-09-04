@@ -135,11 +135,14 @@ function runIncompleteReasons(parsed: ParsedLane): string[] {
             return parsed.report.aggregate.errors > 0 ? ["run-incomplete"] : [];
         case "metamorphic": {
             // A pair that threw, failed admission, was never scored, or whose role scored ERROR is one the run did not
-            // finish; a scored pair whose verdict is FAIL or whose invariants failed is a result.
-            const { tierInvalidReason, entries } = parsed.report;
+            // finish, and so is a scenario whose coverage records a violation; a scored pair whose verdict is FAIL or
+            // whose invariants failed is a result.
+            const { tierInvalidReason, entries, coverage } = parsed.report;
             const finished = (entry: MetamorphicReport["entries"][number]): boolean =>
                 entry.kind === "scored" && entry.baselineScore.verdict !== "ERROR" && entry.derivativeScore.verdict !== "ERROR";
-            return tierInvalidReason === null && entries.length > 0 && entries.every(finished) ? [] : ["run-incomplete"];
+            const complete = tierInvalidReason === null && entries.length > 0 && entries.every(finished)
+                && coverage.every((row) => row.violations.length === 0);
+            return complete ? [] : ["run-incomplete"];
         }
         case "dreamer":
             return parsed.report.length > 0 && parsed.report.every((run) => run.status !== "ERROR") ? [] : ["run-incomplete"];
