@@ -1,1 +1,0 @@
-{"version":3,"file":"storage-anti-memory-schema.d.ts","sourceRoot":"","sources":["../../../src/features/magic-context/storage-anti-memory-schema.ts"],"names":[],"mappings":"AAAA,2DAA2D;AAE3D,OAAO,KAAK,EAAE,QAAQ,EAAE,MAAM,qBAAqB,CAAC;AAGpD,eAAO,MAAM,kBAAkB,kDAAmD,CAAC;AAEnF,wBAAgB,sBAAsB,CAAC,EAAE,EAAE,QAAQ,GAAG,IAAI,CAmDzD"}

@@ -1,1 +1,0 @@
-{"version":3,"file":"emergency-fail-closed.d.ts","sourceRoot":"","sources":["../../../src/hooks/magic-context/emergency-fail-closed.ts"],"names":[],"mappings":"AAAA,qBAAa,wBAAyB,SAAQ,KAAK;IAC/C,QAAQ,CAAC,IAAI,2BAA2B;gBAE5B,OAAO,EAAE,MAAM,EAAE,OAAO,CAAC,EAAE;QAAE,KAAK,CAAC,EAAE,OAAO,CAAA;KAAE;CAI7D"}

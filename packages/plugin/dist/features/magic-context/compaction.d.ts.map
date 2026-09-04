@@ -1,1 +1,0 @@
-{"version":3,"file":"compaction.d.ts","sourceRoot":"","sources":["../../../src/features/magic-context/compaction.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,QAAQ,EAAE,MAAM,qBAAqB,CAAC;AAGpD,UAAU,iBAAiB;IACvB,WAAW,CAAC,SAAS,EAAE,MAAM,EAAE,EAAE,EAAE,QAAQ,GAAG,IAAI,CAAC;CACtD;AAED,wBAAgB,uBAAuB,IAAI,iBAAiB,CAY3D"}
