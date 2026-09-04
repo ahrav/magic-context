@@ -8,6 +8,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
+import type { KernelClientResolver } from "@magic-context/core/shared/kernel-client";
 import type { PromptSurfaceConfig } from "@magic-context/core/shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "@magic-context/core/shared/prompt-surface-runtime";
 import { createPromptSurfaceRuntime } from "@magic-context/core/shared/prompt-surface-runtime";
@@ -21,6 +22,8 @@ import { createTodowriteTool } from "./todowrite";
 
 export interface RegisterToolsOptions {
 	db: ContextDatabase;
+	/** Serves `ctx_memory` and the `memory` source of `ctx_search`. */
+	kernelClient: KernelClientResolver;
 	ensureProjectRegistered?: (
 		directory: string,
 		db: ContextDatabase,
@@ -94,6 +97,7 @@ export function registerMagicContextTools(
 		surfaceTool(
 			createCtxSearchTool({
 				db: opts.db,
+				kernelClient: opts.kernelClient,
 				ensureProjectRegistered: opts.ensureProjectRegistered,
 				memoryEnabled: opts.memoryEnabled,
 				embeddingEnabled: opts.embeddingEnabled,
@@ -108,6 +112,7 @@ export function registerMagicContextTools(
 			surfaceTool(
 				createCtxMemoryTool({
 					db: opts.db,
+					kernelClient: opts.kernelClient,
 					ensureProjectRegistered: opts.ensureProjectRegistered,
 					memoryEnabled: opts.memoryEnabled,
 					allowDreamerActions: opts.allowDreamerActions ?? false,

@@ -9,14 +9,15 @@
 //! classes, so visibility follows the kernel's admission rules rather than
 //! anything the caller asserts.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use mc_host::RouteHandle;
 use mc_kernel::{
     AdmissionEvent, AdmissionRequest, CommitIntent, CommitReceipt, DecisionPayload, DecisionSpec,
-    Envelope, EventKind, KernelError, KernelStore, ObjectState, ObservationDependencySpec,
-    ObservationPayload, ObservationSpec, Sensitivity, SourceClass, TaintClass, TokenCheck,
-    TokenConflict, ALIGNMENT_DEPENDENCY_KIND,
+    DomainSpec, Envelope, EventKind, KernelError, KernelStore, ObjectState,
+    ObservationDependencySpec, ObservationPayload, ObservationSpec, Sensitivity, SourceClass,
+    TaintClass, TokenCheck, TokenConflict, ALIGNMENT_DEPENDENCY_KIND,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -381,6 +382,33 @@ fn ensure_scope(
     Ok(())
 }
 
+const DOMAIN_SOURCE_KIND: &str = "kernel_route";
+
+/// The shared transaction prevents concurrent commits from inserting the same domain twice.
+fn ensure_domain(
+    envelope: &mut Envelope<'_>,
+    domain_id: &str,
+    ready: &mut HashSet<String>,
+) -> Result<(), KernelError> {
+    if ready.contains(domain_id) {
+        return Ok(());
+    }
+    if !envelope.domain_exists(domain_id)? {
+        let object_id = format!("domain:{domain_id}");
+        envelope.insert_domain(DomainSpec {
+            domain_id: domain_id.to_string(),
+            object_id: object_id.clone(),
+            name: domain_id.to_string(),
+            source_kind: DOMAIN_SOURCE_KIND.to_string(),
+            source_id: object_id,
+            source_revision: 1,
+            sensitivity: Sensitivity::Normal,
+        })?;
+    }
+    ready.insert(domain_id.to_string());
+    Ok(())
+}
+
 /// The object, when its scope names the bound project by the same algebra
 /// `kernel.read` serves rows with, so every row a read hands a token for is
 /// a row the same route may mutate. Returning `NotFound` for an out-of-scope
@@ -412,10 +440,12 @@ fn apply(
 ) -> Result<String, KernelError> {
     let scope_id = plan.project.scope_id();
     let mut scope_ready = false;
+    let mut domains_ready: HashSet<String> = HashSet::new();
     let mut result = CommitResult::default();
     for operation in &plan.operations {
         match operation {
             Operation::InsertDecision { spec } => {
+                ensure_domain(envelope, &spec.domain_id, &mut domains_ready)?;
                 ensure_scope(
                     envelope,
                     &plan.project,
@@ -432,6 +462,7 @@ fn apply(
                 replaced_object_id,
                 spec,
             } => {
+                ensure_domain(envelope, &spec.domain_id, &mut domains_ready)?;
                 ensure_scope(
                     envelope,
                     &plan.project,
@@ -478,6 +509,7 @@ fn apply(
                 result.touched.push(object_id.clone());
             }
             Operation::InsertObservation { spec } => {
+                ensure_domain(envelope, &spec.domain_id, &mut domains_ready)?;
                 ensure_scope(
                     envelope,
                     &plan.project,

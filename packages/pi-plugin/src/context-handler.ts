@@ -32,7 +32,6 @@ import {
 	resolveProjectIdentityForSession,
 	resolveProjectRootDirectory,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
-import { autoSearchHintFragmentsStillEligible } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
 import {
 	clearSessionTracking,
 	scheduleIncrementalIndex,
@@ -105,6 +104,7 @@ import {
 	applyPendingOperations,
 	RECENT_TOOL_SKELETON_WINDOW,
 } from "@magic-context/core/hooks/magic-context/apply-operations";
+import { autoSearchHintReplayable } from "@magic-context/core/hooks/magic-context/auto-search-runner";
 import {
 	applyMidTurnDeferral,
 	detectMidTurnBypassReason,
@@ -114,6 +114,7 @@ import {
 	rearmChannel2AfterCoverageAdvancingHardFold,
 	rearmChannel2AfterMeasuredCollapse,
 } from "@magic-context/core/hooks/magic-context/channel2-cycle";
+import { scheduleClaimLaneImport } from "@magic-context/core/hooks/magic-context/claim-lane-import";
 import { checkCompartmentTrigger } from "@magic-context/core/hooks/magic-context/compartment-trigger";
 import { evaluateChannel2 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
@@ -122,6 +123,7 @@ import {
 	resolveExecuteThreshold,
 } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import { foldExecutesThisPass } from "@magic-context/core/hooks/magic-context/fold-execution-gate";
+import { readInjectionMemorySnapshot } from "@magic-context/core/hooks/magic-context/kernel-memory-render";
 import {
 	markNoteNudgeDelivered,
 	onNoteTrigger,
@@ -151,6 +153,10 @@ import {
 } from "@magic-context/core/hooks/magic-context/tool-reclaim";
 import { escalationBands } from "@magic-context/core/shared/escalation-bands";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
+import type {
+	KernelClientResolver,
+	KernelMemorySnapshot,
+} from "@magic-context/core/shared/kernel-client";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
@@ -195,6 +201,7 @@ import {
 	type PiM0M1InjectionResult as PiInjectionResult,
 	trimPiMessagesToCachedBoundary,
 } from "./inject-compartments-pi";
+import { forgetPiSessionKernelTokens } from "./kernel-client-pi";
 import { hasVisibleNoteReadCallPi } from "./note-visibility-pi";
 import {
 	resolvePiUsableContextLimit,
@@ -869,6 +876,8 @@ export interface PiHistorianOptions {
 	thinkingLevel?: string;
 	/** `memoryEnabled` gates cross-session memory through `memory.enabled`. */
 	memoryEnabled?: boolean;
+	/** Serves the project-memory block the historian deduplicates against. */
+	kernelClient?: KernelClientResolver;
 	/** `allowHomeProject` permits sessions started exactly in the canonical home directory only when user-level configuration enables them. */
 	allowHomeProject?: boolean;
 	/** autoPromote gates automatic promotion through `memory.auto_promote`. */
@@ -946,6 +955,11 @@ export interface PiSchedulerOptions {
 
 export interface PiContextHandlerOptions {
 	db: ContextDatabase;
+	/**
+	 * Serves the m[0] memory read. Absent when no daemon transport exists, in
+	 * which case the injector renders the daemon-absent marker.
+	 */
+	kernelClient?: KernelClientResolver;
 	/** When enabled, smart drops reclaim tool output superseded by later calls in addition to age-based drops.
 	 * */
 	smartDrops?: boolean;
@@ -2460,6 +2474,36 @@ export function registerPiContextHandler(
 					: undefined;
 
 			logTransformTiming(sessionId, "prePipelineTotal", transformStartTime);
+			// One read serves this pass's m[0]/m[1] render; the pipeline takes it as a
+			// value and issues no memory RPC.
+			const tMemoryRead = performance.now();
+			const memoryProjectRoot = resolveProjectRootDirectory(projectDirectory);
+			if (
+				options.injection &&
+				options.injection.memoryEnabled !== false &&
+				projectIdentity.length > 0
+			) {
+				scheduleClaimLaneImport({
+					db: options.db,
+					client: options.kernelClient?.({
+						sessionId,
+						projectRoot: memoryProjectRoot,
+					}),
+					projectPath: projectIdentity,
+					projectRoot: memoryProjectRoot,
+					sessionId,
+				});
+			}
+			const memory = options.injection
+				? await readInjectionMemorySnapshot({
+						kernelClient: options.kernelClient,
+						memoryEnabled: options.injection.memoryEnabled !== false,
+						sessionId,
+						projectIdentity,
+						projectRoot: memoryProjectRoot,
+					})
+				: null;
+			logTransformTiming(sessionId, "kernelMemoryRead", tMemoryRead);
 			const tRunPipeline = performance.now();
 			const result = await runPipeline({
 				db: options.db,
@@ -2473,24 +2517,26 @@ export function registerPiContextHandler(
 				protectedTags: options.protectedTags ?? 20,
 				heuristics: options.heuristics,
 				emergencyCeilingTokens,
-				injection: options.injection
-					? {
-							...options.injection,
-							memoryEnabled: options.injection.memoryEnabled,
-							historyBudgetTokens: resolveHistoryBudgetTokensForPi({
-								historyBudgetPercentage:
-									options.historian?.historyBudgetPercentage,
-								usagePercentage,
-								usageInputTokens,
-								usageContextLimit,
-								executeThresholdPercentage:
-									options.historian?.executeThresholdPercentage,
-								executeThresholdTokens:
-									options.historian?.executeThresholdTokens,
-								modelKey: liveModelBySession.get(sessionId),
-							}),
-						}
-					: undefined,
+				injection:
+					options.injection && memory
+						? {
+								...options.injection,
+								memory,
+								memoryEnabled: options.injection.memoryEnabled,
+								historyBudgetTokens: resolveHistoryBudgetTokensForPi({
+									historyBudgetPercentage:
+										options.historian?.historyBudgetPercentage,
+									usagePercentage,
+									usageInputTokens,
+									usageContextLimit,
+									executeThresholdPercentage:
+										options.historian?.executeThresholdPercentage,
+									executeThresholdTokens:
+										options.historian?.executeThresholdTokens,
+									modelKey: liveModelBySession.get(sessionId),
+								}),
+							}
+						: undefined,
 				entryIds,
 				entryIdByRef,
 				reusableMessageIds,
@@ -2624,6 +2670,10 @@ export function registerPiContextHandler(
 							scoreThreshold: options.autoSearch.scoreThreshold,
 							minPromptChars: options.autoSearch.minPromptChars,
 							projectPath: projectIdentity,
+							directory: projectDirectory,
+							kernelClient: options.kernelClient,
+							// `memorySnapshot` prevents a second `kernel.read` for the same snapshot.
+							...(memory === null ? {} : { memorySnapshot: memory }),
 						},
 					});
 				} catch (err) {
@@ -3122,6 +3172,7 @@ function spawnPiHistorianRun(args: {
 				twoPass: historian.twoPass,
 				thinkingLevel: historian.thinkingLevel,
 				memoryEnabled: historian.memoryEnabled,
+				kernelClient: historian.kernelClient,
 				allowHomeProject: historian.allowHomeProject,
 				autoPromote: historian.autoPromote,
 				userMemoriesEnabled: historian.userMemoriesEnabled,
@@ -3565,6 +3616,11 @@ interface RunPipelineArgs {
 		/**
 		 * */
 		memoryEnabled?: boolean;
+		/**
+		 * The memory read taken before the pass's first `await`; the injector
+		 * renders this value and never reads memory itself.
+		 */
+		memory: KernelMemorySnapshot;
 		/** `injectDocs` defaults to true; when false, `m[0]` omits the `<project-docs>` block and docs hash. */
 		injectDocs?: boolean;
 		injectionBudgetTokens: number;
@@ -3741,6 +3797,7 @@ async function runCompactionOffPipeline(
 				sessionId: args.sessionId,
 				projectIdentity: args.projectIdentity,
 				projectDirectory: args.projectDirectory,
+				memory: args.injection.memory,
 				memoryEnabled: args.injection.memoryEnabled,
 				injectDocs: args.injection.injectDocs,
 				injectionBudgetTokens: args.injection.injectionBudgetTokens,
@@ -3881,6 +3938,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					sessionId: args.sessionId,
 					projectIdentity: args.projectIdentity,
 					projectDirectory: args.projectDirectory,
+					memory: args.injection.memory,
 					memoryEnabled: args.injection.memoryEnabled,
 					injectDocs: args.injection.injectDocs,
 					injectionBudgetTokens: args.injection.injectionBudgetTokens,
@@ -4908,10 +4966,8 @@ function applyNoteNudges(args: {
 		);
 	}
 	for (const decision of getAutoSearchHintDecisions(db, sessionId)) {
-		if (decision.decision === "hint") {
-			if (!autoSearchHintFragmentsStillEligible(db, decision.memoryFragments)) {
-				continue;
-			}
+		// Memory-backed hints require a fresh search; they never replay stored hint text. commentlint: allow(JUDGE)
+		if (decision.decision === "hint" && autoSearchHintReplayable(decision)) {
 			appendReminderToUserMessageByIdPi(
 				messages,
 				replayMessageIdByIndex,
@@ -5200,4 +5256,5 @@ export function clearContextHandlerSession(sessionId: string): void {
 	}
 	clearSessionTracking(sessionId);
 	clearPiEmbedSessionState(sessionId);
+	forgetPiSessionKernelTokens(sessionId);
 }

@@ -9,6 +9,7 @@ import {
     openDatabase,
 } from "../features/magic-context/storage";
 import { setCtxReduceRegisteredGlobally } from "../hooks/magic-context/ctx-reduce-availability";
+import { kernelClientResolver } from "../hooks/magic-context/kernel-transport";
 import { getErrorMessage } from "../shared/error-message";
 import { log } from "../shared/logger";
 import type { PromptSurfaceConfig } from "../shared/prompt-surface";
@@ -81,6 +82,8 @@ export function createToolRegistry(args: {
         resolveProjectIdentityForSession(directory, pluginConfig.allow_home_project);
 
     const memoryEnabled = pluginConfig.memory?.enabled !== false;
+    // Registration does not depend on daemon state; each call resolves its own client.
+    const kernelClient = kernelClientResolver(pluginConfig);
     const allTools: Record<string, ToolDefinition> = {
         ...(compactionOff
             ? {}
@@ -98,16 +101,19 @@ export function createToolRegistry(args: {
         }),
         ...createCtxSearchTools({
             db,
+            kernelClient,
             resolveProjectPath,
             ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+            memoryEnabled,
         }),
         ...(memoryEnabled
             ? createCtxMemoryTools({
-                  db,
+                  kernelClient,
                   resolveProjectPath,
-                  ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+                  ensureProjectRegistered: (directory) =>
+                      ensureProjectRegisteredFromOpenCodeDirectory(directory, db),
+                  memoryEnabled,
                   allowedActions: [...CTX_MEMORY_ACTIONS],
-                  rustToolBackends,
               })
             : {}),
     };

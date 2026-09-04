@@ -70,6 +70,15 @@ export function resolveProjectId(db: Database, identity: string): number | null 
     return typeof row?.project_id === "number" ? row.project_id : null;
 }
 
+/** Every public claim id in the store, across all projects and lifecycle states, including projects whose workspace membership was since removed. The claim-lane bridge derives its import object ids from these, so this list bounds which kernel rows reconciliation may touch. commentlint: allow(JUDGE) */
+export function listAllPublicClaimIds(db: Database): string[] {
+    return (
+        db.prepare("SELECT public_id FROM claim_public_ids").all() as Array<Record<string, unknown>>
+    )
+        .map((row) => row.public_id)
+        .filter((id): id is string => typeof id === "string" && id.length > 0);
+}
+
 // `assertCanonicalProjectIdentity` must match `isCanonicalProjectIdentity` in `storage-project-identities.ts`.
 function assertCanonicalProjectIdentity(canonicalIdentity: string): void {
     if (

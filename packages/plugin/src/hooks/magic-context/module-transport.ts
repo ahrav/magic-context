@@ -43,28 +43,12 @@ import { qualifiedHarnessClosures } from "../../shared/mc-host-lifecycle/generat
 import { defaultConnectionFilePath } from "../../shared/mc-host-lifecycle/paths";
 import { isRecord } from "../../shared/record-type-guard";
 import {
-    buildClaimEffectDeliveryWireBody,
-    buildClaimIntentAckWireBody,
-    buildClaimIntentInspectWireBody,
-    buildClaimIntentStageWireBody,
     buildClaimMirrorReceiptWireBody,
     buildClaimMirrorSnapshotWireBody,
-    type ClaimEffectDeliveryRequest,
-    type ClaimEffectDeliveryResponse,
-    type ClaimIntentAckRequest,
-    type ClaimIntentAckResponse,
-    type ClaimIntentInspectRequest,
-    type ClaimIntentInspectResponse,
-    type ClaimIntentStageRequest,
-    type ClaimIntentStageResponse,
     type ClaimMirrorReceiptRequest,
     type ClaimMirrorReceiptResponse,
     type ClaimMirrorSnapshotRequest,
     type ClaimMirrorSnapshotResponse,
-    decodeClaimEffectDeliveryResponse,
-    decodeClaimIntentAckResponse,
-    decodeClaimIntentInspectResponse,
-    decodeClaimIntentStageResponse,
     decodeClaimMirrorReceiptResponse,
     decodeClaimMirrorSnapshotResponse,
     type ModuleAuthorityMethod,
@@ -984,70 +968,6 @@ export class McHostModuleTransport {
         return { page: response.page as unknown as ChangefeedPage };
     }
 
-    async claimIntentStage(args: {
-        sessionId: string;
-        projectRoot: string;
-        request: ClaimIntentStageRequest;
-    }): Promise<ClaimIntentStageResponse> {
-        const response = await this.call({
-            sessionId: args.sessionId,
-            projectRoot: args.projectRoot,
-            method: "claim.intent.stage",
-            body: buildClaimIntentStageWireBody(args.request),
-        });
-        return decodeClaimIntentStageResponse(response, args.request);
-    }
-
-    async claimIntentInspect(args: {
-        sessionId: string;
-        projectRoot: string;
-        request: ClaimIntentInspectRequest;
-    }): Promise<ClaimIntentInspectResponse> {
-        const response = await this.call({
-            sessionId: args.sessionId,
-            projectRoot: args.projectRoot,
-            method: "claim.intent.inspect",
-            body: buildClaimIntentInspectWireBody(args.request),
-        });
-        return decodeClaimIntentInspectResponse(response);
-    }
-
-    async claimIntentAck(args: {
-        sessionId: string;
-        projectRoot: string;
-        request: ClaimIntentAckRequest;
-    }): Promise<ClaimIntentAckResponse> {
-        const response = await this.call({
-            sessionId: args.sessionId,
-            projectRoot: args.projectRoot,
-            method: "claim.intent.ack",
-            body: buildClaimIntentAckWireBody(args.request),
-        });
-        return decodeClaimIntentAckResponse(response, args.request);
-    }
-
-    async claimEffectsApply(args: {
-        sessionId: string;
-        projectRoot: string;
-        request: ClaimEffectDeliveryRequest;
-    }): Promise<ClaimEffectDeliveryResponse> {
-        // `receipt.effects` must be nonempty because its last effect is the delivery checkpoint.
-        // An empty `receipt.effects` list violates the upstream receipt contract; it is not a zero acknowledgement.
-        const expectedEffectId = args.request.receipt.effects.at(-1)?.id;
-        if (expectedEffectId === undefined) {
-            throw new Error(
-                `claim effect receipt ${args.request.receipt.receiptId} has no effects`,
-            );
-        }
-        const response = await this.call({
-            sessionId: args.sessionId,
-            projectRoot: args.projectRoot,
-            method: "claim.effects.apply",
-            body: buildClaimEffectDeliveryWireBody(args.request),
-        });
-        return decodeClaimEffectDeliveryResponse(response, expectedEffectId);
-    }
-
     async claimMirrorReplace(args: {
         sessionId: string;
         projectRoot: string;
@@ -1199,6 +1119,35 @@ export class McHostModuleTransport {
                 this.routeOpenings.delete(routeKey);
             }
         }
+    }
+
+    /** The connection file the transport dials; its absence means no daemon can be reached. */
+    get connectionFilePath(): string {
+        return this.connectionFile;
+    }
+
+    /** Tears down the live connection, its routes, and cached capabilities so an owner evicting this transport does not strand a socket, channel poller, or ring mappings for the process lifetime. A later call on this instance redials. commentlint: allow(JUDGE) */
+    disconnect(): void {
+        this.invalidateConnection();
+    }
+
+    canDemandStart(): boolean {
+        return this.connectionOrigin === "managed-default" && this.demandStart !== undefined;
+    }
+
+    /**
+     * Evicts the cached route for one `(session, root)` so the next call opens
+     * a fresh one. Used after the daemon reports the route unbound: the cached
+     * handle would otherwise be reused until the connection generation turns.
+     */
+    forgetRoute(sessionId: string, rawProjectRoot: string): void {
+        const routeKey = `${sessionId}\0${this.canonicalRoot(rawProjectRoot)}`;
+        this.routes.delete(routeKey);
+        // Fencing the in-flight open keeps a late `route.open` success from
+        // restoring the route this call evicts.
+        const opening = this.routeOpenings.get(routeKey);
+        if (opening) opening.state.closed = true;
+        this.routeOpenings.delete(routeKey);
     }
 
     private dropRoute(routeKey: string, route?: RouteHandle): void {

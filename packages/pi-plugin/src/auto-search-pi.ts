@@ -41,28 +41,29 @@ import {
 	embedTextForProject,
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
-import { recordDeliveredAntiMemoryUsage } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
-import { autoSearchHintFragmentsStillEligible } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
-import type {
-	UnifiedSearchOptions,
-	UnifiedSearchResult,
-} from "@magic-context/core/features/magic-context/search";
+import { resolveProjectRootDirectory } from "@magic-context/core/features/magic-context/memory/project-identity";
+import type { UnifiedSearchOptions } from "@magic-context/core/features/magic-context/search";
 import {
 	type AutoSearchHintDecision,
 	type AutoSearchHintNoHintReason,
 	appendAutoSearchHintDecision,
 	getAutoSearchHintDecisions,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
-import {
-	collectAntiMemoryWarningFragments,
-	packAutoSearchHint,
-} from "@magic-context/core/hooks/magic-context/auto-search-hint";
+import { collectMemoryHintFragments } from "@magic-context/core/hooks/magic-context/auto-search-hint";
 import { extractBoundedAutoSearchQuery } from "@magic-context/core/hooks/magic-context/auto-search-prompt";
+import {
+	type AutoSearchDelivery,
+	autoSearchHintReplayable,
+	executeAutoSearchDelivery,
+} from "@magic-context/core/hooks/magic-context/auto-search-runner";
 import {
 	AUTO_SEARCH_TIMEOUT_MS,
 	hasStackedAugmentation,
-	unifiedSearchWithTimeout,
 } from "@magic-context/core/hooks/magic-context/auto-search-shared";
+import type {
+	KernelClientResolver,
+	KernelMemorySnapshot,
+} from "@magic-context/core/shared/kernel-client";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 
@@ -82,6 +83,12 @@ export interface PiAutoSearchOptions {
 	scoreThreshold: number;
 	minPromptChars: number;
 	projectPath: string;
+	/** The session's working directory; the kernel client binds to its project root. */
+	directory?: string;
+	/** Serves the `memory` source; absent when no daemon transport exists. */
+	kernelClient?: KernelClientResolver;
+	/** The pass's injection memory snapshot; the delivery consumes it instead of re-reading. */
+	memorySnapshot?: KernelMemorySnapshot;
 }
 
 const DEFAULT_SCORE_THRESHOLD = 0.55;
@@ -201,25 +208,35 @@ export async function runAutoSearchHintForPi(args: {
 	if (found === null) return messages;
 
 	const { message: userMsg, messageId: userMsgId } = found;
-	// A persisted hint replays only while every contributing memory remains auto_search-eligible; later policy transitions require a fresh search.
 	const replayHintIfEligible = (decision: AutoSearchHintDecision): void => {
 		if (decision.decision !== "hint") return;
-		if (!autoSearchHintFragmentsStillEligible(db, decision.memoryFragments)) {
-			sessionLog(
-				sessionId,
-				`auto-search: suppressing persisted anti-memory warning for ${decision.messageId} — fresh search required`,
-			);
+		if (autoSearchHintReplayable(decision)) {
+			appendHintToUserMessage(userMsg, decision.text);
 			return;
 		}
-		appendHintToUserMessage(userMsg, decision.text);
+		sessionLog(
+			sessionId,
+			`auto-search: suppressing persisted memory-backed hint for ${decision.messageId} — fresh search required`,
+		);
 	};
 	const existing = getAutoSearchHintDecisions(db, sessionId);
 	const existingForMessage = existing.find(
 		(decision) => decision.messageId === userMsgId,
 	);
-	if (existingForMessage) {
+	// A memory-backed hint decision never replays, and the message it belongs to can be transformed again after a restart or retry reconstructs it; returning here would lose the hint permanently instead of running the promised fresh search. commentlint: allow(JUDGE)
+	const rerunForMessage =
+		existingForMessage !== undefined &&
+		existingForMessage.decision === "hint" &&
+		!autoSearchHintReplayable(existingForMessage);
+	if (existingForMessage && !rerunForMessage) {
 		replayHintIfEligible(existingForMessage);
 		return messages;
+	}
+	if (rerunForMessage) {
+		sessionLog(
+			sessionId,
+			`auto-search: persisted memory-backed hint for ${userMsgId} cannot replay — running a fresh search`,
+		);
 	}
 	if (strictResolutionFailed) {
 		sessionLog(
@@ -264,7 +281,7 @@ export async function runAutoSearchHintForPi(args: {
 		return messages;
 	}
 
-	let results: UnifiedSearchResult[] | null;
+	let delivery: AutoSearchDelivery;
 	try {
 		const snapshot = getProjectEmbeddingSnapshot(options.projectPath);
 		const memoryEnabled = snapshot?.features.memoryEnabled ?? true;
@@ -287,62 +304,82 @@ export async function runAutoSearchHintForPi(args: {
 				return result?.vector ?? null;
 			},
 			isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
-			// Primers v1 are cache-neutral: explicit ctx_search only,
-			// never transform-time auto-search prompt hints.
+			// Primers are cache-neutral: explicit ctx_search only, never
+			// transform-time auto-search prompt hints.
 			sources: ["memory", "message", "git_commit"],
 		};
-		results = await unifiedSearchWithTimeout(
+		delivery = await executeAutoSearchDelivery({
 			db,
 			sessionId,
-			options.projectPath,
-			rawPrompt,
+			projectPath: options.projectPath,
+			prompt: rawPrompt,
 			searchOptions,
-			AUTO_SEARCH_TIMEOUT_MS,
-		);
+			scoreThreshold: options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
+			// The snapshot substitutes for the kernel read, so it forwards without a resolver or directory; tying it to client resolution would drop the pass's injection read and record the project as empty. commentlint: allow(JUDGE)
+			...(memoryEnabled && options.memorySnapshot !== undefined
+				? { memorySnapshot: options.memorySnapshot }
+				: {}),
+			...(memoryEnabled && options.kernelClient && options.directory
+				? {
+						kernelClient: options.kernelClient({
+							sessionId,
+							projectRoot: resolveProjectRootDirectory(options.directory),
+						}),
+					}
+				: {}),
+		});
 	} catch (error) {
+		delivery = { status: "incomplete", kind: "search-failure", error };
+	}
+
+	if (delivery.status === "incomplete") {
 		log(
-			`[auto-search] unified search failed for session ${sessionId} (will retry next pass): ${error instanceof Error ? error.message : String(error)}`,
+			`[auto-search] unified search failed for session ${sessionId} (will retry next pass): ${delivery.error instanceof Error ? delivery.error.message : String(delivery.error)}`,
 		);
 		return messages;
 	}
-
-	if (results === null) {
+	if (delivery.reason === "timeout") {
 		sessionLog(
 			sessionId,
 			`auto-search: timed out after ${AUTO_SEARCH_TIMEOUT_MS}ms, skipping hint for this turn (will retry)`,
 		);
 		return messages;
 	}
-
-	if (results.length === 0) {
+	const results = delivery.prePack;
+	if (delivery.reason === "packer-empty") {
 		writeNoHintAndReconcile("empty");
 		return messages;
 	}
-
-	const scoreThreshold = options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD;
-	if (results[0].score < scoreThreshold) {
+	if (
+		delivery.reason === "memory-abstained" ||
+		delivery.reason === "memory-truncated" ||
+		delivery.reason === "memory-unavailable"
+	) {
+		// A withheld memory lane is transient evidence like a timeout: the pass persists no decision, so a later pass re-evaluates the message once the daemon recovers.
 		sessionLog(
 			sessionId,
-			`auto-search: top score ${results[0].score.toFixed(3)} below threshold ${scoreThreshold}`,
+			`auto-search: memory lane ${delivery.reason}, skipping hint for this turn (will retry)`,
+		);
+		return messages;
+	}
+	if (delivery.reason === "empty") {
+		writeNoHintAndReconcile(delivery.reason);
+		return messages;
+	}
+	if (delivery.reason === "below-threshold") {
+		sessionLog(
+			sessionId,
+			`auto-search: top score ${results[0].score.toFixed(3)} below threshold ${options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD}`,
 		);
 		writeNoHintAndReconcile("below-threshold");
 		return messages;
 	}
 
-	const packed = packAutoSearchHint(results, {
-		warningScoreThreshold: scoreThreshold,
-	});
-	if (!packed.text) {
-		writeNoHintAndReconcile("empty");
-		return messages;
-	}
-
 	// Prefix with double newline so the hint is a separate block, matching
 	// OpenCode's auto-search runner.
-	const payload = `\n\n${packed.text}`;
-	const { warningResults, memoryFragments } = collectAntiMemoryWarningFragments(
-		packed.delivered,
-	);
+	const payload = `\n\n${delivery.hintText}`;
+	// Any memory-backed fragment — an anti-memory warning or a positive kernel hit — marks the persisted decision as non-replayable; hints from non-memory sources persist an empty list and replay. commentlint: allow(JUDGE)
+	const { memoryFragments } = collectMemoryHintFragments(delivery.delivered);
 	const outcome = appendAutoSearchHintDecision(db, sessionId, {
 		messageId: userMsgId,
 		decision: "hint",
@@ -350,10 +387,9 @@ export async function runAutoSearchHintForPi(args: {
 		memoryFragments,
 	});
 	if (!outcome.ok) return messages;
-	// The runner delivers the fresh compare-and-swap winner directly.
-	if (outcome.kind === "appended" && warningResults.length > 0) {
+	if (outcome.kind === "appended" || rerunForMessage) {
+		// A fresh delivery appends directly because a memory-backed decision bypasses replay; a rerun for an existing memory-backed decision appends the freshly searched hint the append answered "already-present" for. commentlint: allow(JUDGE)
 		appendHintToUserMessage(userMsg, payload);
-		recordDeliveredAntiMemoryUsage(db, warningResults);
 	} else {
 		replayHintIfEligible(outcome.decision);
 	}

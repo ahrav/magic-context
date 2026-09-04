@@ -11,6 +11,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
+import { resolveProjectRootDirectory } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { parseCacheTtl } from "@magic-context/core/features/magic-context/scheduler";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
@@ -24,7 +25,6 @@ import {
 	MAX_EXECUTE_THRESHOLD,
 	resolveExecuteThresholdDetail,
 } from "@magic-context/core/hooks/magic-context/event-resolvers";
-import { readProjectClaimLaneSnapshot } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { computeM0BlockTokens } from "@magic-context/core/hooks/magic-context/m0-token-breakdown";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { countCompartmentsNeedingUpgrade } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
@@ -33,6 +33,14 @@ import {
 	formatThresholdClampNote,
 	formatThresholdPercent,
 } from "@magic-context/core/shared/format-threshold";
+import {
+	isServedMemoryDecisionRow,
+	type KernelClientResolver,
+	type KernelMemorySnapshot,
+	kernelMemorySnapshotFrom,
+	type StateKey,
+	stateKey,
+} from "@magic-context/core/shared/kernel-client";
 import type { TailHygieneStatus } from "@magic-context/core/shared/rpc-types";
 import {
 	formatTailHygiene,
@@ -65,13 +73,14 @@ const REFRESH_INTERVAL_MS = 1000;
 
 export interface StatusDialogDeps {
 	db: ContextDatabase;
+	/** Serves the memory count and state the dialog reports. */
+	kernelClient: KernelClientResolver;
 	projectIdentity: string;
 	protectedTags?: number;
 	executeThresholdPercentage?:
 		| number
 		| { default: number; [modelKey: string]: number };
 	historyBudgetPercentage?: number;
-	injectionBudgetTokens?: number;
 	executeThresholdTokens?: {
 		default?: number;
 		[modelKey: string]: number | undefined;
@@ -84,7 +93,12 @@ interface StatusDialogDetail {
 	inputTokens: number;
 	systemPromptTokens: number;
 	compartmentCount: number;
+	/** Rows the kernel serves this project on the `explicit_search` surface. */
 	memoryCount: number;
+	/** True when the read behind `memoryCount` was truncated by the daemon's per-read bounds, making the count a lower bound. */
+	memoryTruncated?: boolean;
+	/** The kernel's state for that read, such as `available` or `unavailable:daemon_absent`. */
+	memoryState: StateKey;
 	memoryBlockCount: number;
 	sessionNoteCount: number;
 	readySmartNoteCount: number;
@@ -142,6 +156,7 @@ export async function showStatusDialog(
 ): Promise<void> {
 	const sessionId = resolveSessionId(ctx);
 	if (!sessionId) throw new Error("No active Pi session is available.");
+	const memory = await readStatusMemory(deps, sessionId, ctx.cwd);
 
 	await ctx.ui.custom<undefined>(
 		(tui, theme, _keybindings, done) =>
@@ -150,6 +165,7 @@ export async function showStatusDialog(
 				ctx,
 				deps,
 				sessionId,
+				memory,
 				theme,
 				tui,
 				done,
@@ -166,9 +182,29 @@ interface StatusDialogProps {
 	ctx: ExtensionCommandContext;
 	deps: StatusDialogDeps;
 	sessionId: string;
+	/** The memory read taken before the dialog opened; refresh ticks re-read. */
+	memory: KernelMemorySnapshot;
 	theme: Theme;
 	tui: TUI;
 	done: (value: undefined) => void;
+}
+
+/**
+ * The status surface reports what an explicit search would see, lag included,
+ * so the dialog shows `stale` when the projector is behind.
+ */
+export async function readStatusMemory(
+	deps: Pick<StatusDialogDeps, "kernelClient">,
+	sessionId: string,
+	directory: string,
+): Promise<KernelMemorySnapshot> {
+	const client = deps.kernelClient({
+		sessionId,
+		projectRoot: resolveProjectRootDirectory(directory),
+	});
+	return kernelMemorySnapshotFrom(
+		await client.read({ surface: "explicit_search", gated: true }),
+	);
 }
 
 /**
@@ -179,6 +215,7 @@ class StatusDialogComponent implements Component {
 	private detail: StatusDialogDetail;
 	private refreshTimer: ReturnType<typeof setInterval> | null = null;
 	private closed = false;
+	private refreshing = false;
 
 	constructor(props: StatusDialogProps) {
 		this.props = props;
@@ -187,21 +224,37 @@ class StatusDialogComponent implements Component {
 			props.ctx,
 			props.deps,
 			props.sessionId,
+			props.memory,
 		);
 		this.refreshTimer = setInterval(() => {
-			if (this.closed) return;
-			try {
-				this.detail = buildPiStatusDetail(
-					this.props.pi,
-					this.props.ctx,
-					this.props.deps,
-					this.props.sessionId,
-				);
-				this.props.tui.requestRender();
-			} catch {
-				// On refresh failure, retain the previous detail.
-			}
+			void this.refresh();
 		}, REFRESH_INTERVAL_MS);
+	}
+
+	/** One read in flight at a time; a slow daemon never stacks refreshes. */
+	private async refresh(): Promise<void> {
+		if (this.closed || this.refreshing) return;
+		this.refreshing = true;
+		try {
+			const memory = await readStatusMemory(
+				this.props.deps,
+				this.props.sessionId,
+				this.props.ctx.cwd,
+			);
+			if (this.closed) return;
+			this.detail = buildPiStatusDetail(
+				this.props.pi,
+				this.props.ctx,
+				this.props.deps,
+				this.props.sessionId,
+				memory,
+			);
+			this.props.tui.requestRender();
+		} catch {
+			// On refresh failure, retain the previous detail.
+		} finally {
+			this.refreshing = false;
+		}
 	}
 
 	handleInput(data: string): void {
@@ -238,6 +291,7 @@ class StatusDialogComponent implements Component {
 	}
 
 	dispose(): void {
+		this.closed = true;
 		if (this.refreshTimer) {
 			clearInterval(this.refreshTimer);
 			this.refreshTimer = null;
@@ -305,7 +359,7 @@ function renderInner(
 	lines.push("");
 
 	lines.push(
-		`Counts: ${s.compartmentCount} compartments · ${s.memoryCount} memories (${s.memoryBlockCount} injected) · ${
+		`Counts: ${s.compartmentCount} compartments · ${s.memoryCount}${s.memoryTruncated ? "+" : ""} memories (${s.memoryBlockCount} injected, ${s.memoryState}) · ${
 			s.sessionNoteCount + s.readySmartNoteCount
 		} notes`,
 	);
@@ -409,6 +463,7 @@ export function buildPiStatusDetail(
 	ctx: ExtensionCommandContext,
 	deps: StatusDialogDeps,
 	sessionId: string,
+	memory: KernelMemorySnapshot,
 ): StatusDialogDetail {
 	const usage = ctx.getContextUsage?.();
 	const meta = getOrCreateSessionMeta(deps.db, sessionId);
@@ -442,10 +497,6 @@ export function buildPiStatusDetail(
 	const compartments = getCompartments(deps.db, sessionId);
 	const metaRow = readSessionMetaRow(deps.db, sessionId);
 	const memoryBlockCount = Number(metaRow?.memory_block_count ?? 0);
-	const claimLane = safeRead(
-		() => readProjectClaimLaneSnapshot(deps.db, deps.projectIdentity),
-		null,
-	);
 
 	const m0Bytes = metaRow?.cached_m0_bytes;
 	const m0Text =
@@ -454,12 +505,7 @@ export function buildPiStatusDetail(
 			: typeof m0Bytes === "string"
 				? m0Bytes
 				: "";
-	const m0Blocks = computeM0BlockTokens(deps.db, sessionId, {
-		m0Text,
-		projectIdentity: deps.projectIdentity,
-		injectionBudgetTokens: deps.injectionBudgetTokens,
-		memoryBlockCount,
-	});
+	const m0Blocks = computeM0BlockTokens(deps.db, sessionId, { m0Text });
 	const compartmentTokens = m0Blocks.compartmentTokens;
 	const factTokens = m0Blocks.factTokens;
 	const memoryTokens = m0Blocks.memoryTokens;
@@ -562,7 +608,12 @@ export function buildPiStatusDetail(
 		inputTokens,
 		systemPromptTokens,
 		compartmentCount: compartments.length,
-		memoryCount: claimLane?.items.length ?? 0,
+		// Expired anti-memories stay out of the count, matching the surface filter list and search apply.
+		memoryCount: memory.rows.filter((row) =>
+			isServedMemoryDecisionRow(row, Date.now()),
+		).length,
+		...(memory.truncated === true ? { memoryTruncated: true } : {}),
+		memoryState: stateKey(memory.state),
 		memoryBlockCount,
 		sessionNoteCount: safeRead(
 			() =>

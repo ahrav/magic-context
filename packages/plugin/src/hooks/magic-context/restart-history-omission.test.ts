@@ -15,6 +15,7 @@ import {
 } from "../../features/magic-context/compartment-storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import { available, type KernelMemorySnapshot } from "../../shared/kernel-client";
 import type { Database } from "../../shared/sqlite";
 import {
     clearInjectionCache,
@@ -24,6 +25,9 @@ import {
     prepareCompartmentInjection,
 } from "./inject-compartments";
 import type { MessageLike } from "./transform-operations";
+
+/** The snapshot of a session whose project has no memories; the block renders only its marker. */
+const EMPTY_MEMORY: KernelMemorySnapshot = { state: available(), rows: [], knownAsOf: 0 };
 
 const SESSION_ID = "ses_restart_omit";
 const PROJECT_PATH = "/tmp/test-restart-omit-project";
@@ -79,16 +83,18 @@ function runProductionFlow(opts: {
     isCacheBustingPass: boolean;
     messages: MessageLike[];
 }): { m0: string; m1: string; tailIds: string[] } {
-    prepareCompartmentInjection(
+    prepareCompartmentInjection({
         db,
-        SESSION_ID,
-        opts.messages,
-        opts.isCacheBustingPass,
-        PROJECT_PATH,
-    );
+        sessionId: SESSION_ID,
+        messages: opts.messages,
+        isCacheBusting: opts.isCacheBustingPass,
+        memory: EMPTY_MEMORY,
+        projectPath: PROJECT_PATH,
+    });
     const state = getOrCreateSessionMeta(db, SESSION_ID) as unknown as M0M1State;
     const result = injectM0M1({
         db,
+        memory: EMPTY_MEMORY,
         sessionId: SESSION_ID,
         messages: opts.messages,
         state,
@@ -220,7 +226,14 @@ describe("restart history omission", () => {
 
         // prepareCompartmentInjection trims to B and caches m1 in memory before injectM0M1 throws.
         const failMsgs = makeMessages(6);
-        prepareCompartmentInjection(db, SESSION_ID, failMsgs, true, PROJECT_PATH);
+        prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: failMsgs,
+            isCacheBusting: true,
+            memory: EMPTY_MEMORY,
+            projectPath: PROJECT_PATH,
+        });
 
         // Without clearInjectionCache(SESSION_ID), a defer pass reuses the cached m1 boundary.
         // The defer pass trims B's raw m1 messages, and stale m[1] (A) does not summarize B.

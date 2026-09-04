@@ -22,23 +22,6 @@ export interface RustNoteToolRequest {
     noteId?: number;
 }
 
-export interface RustMemoryToolRequest {
-    commandId: string;
-    sessionId: string;
-    projectRoot: string;
-    projectPath: string;
-    producer: string;
-    operationKey: string;
-    intentRequest: unknown;
-    commitContext: () => {
-        response: string;
-        producer: string;
-        operationKey: string;
-        requestDigest: string;
-        resultJson: string;
-    };
-}
-
 export function toolCallIdFromContext(context: unknown): string | undefined {
     if (context === null || typeof context !== "object") return undefined;
     const record = context as Record<string, unknown>;
@@ -70,8 +53,6 @@ export interface RustToolBackends {
     }) => Promise<RustAuthorityState | null>;
     /* */
     note?: (args: RustNoteToolRequest) => Promise<unknown>;
-    /* */
-    memory?: (args: RustMemoryToolRequest) => Promise<string>;
     /* */
     noteEvaluationAvailable?: (projectPath: string) => boolean;
 }

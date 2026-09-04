@@ -125,7 +125,7 @@ describe("buildMagicContextSection: memory gating", () => {
         expect(memOn).toBe(legacy);
         expect(memOn).toContain("Use `ctx_memory`");
         expect(memOn).toContain("**Save durable knowledge proactively**");
-        expect(memOn).toContain("opaque `mcm_…` public IDs");
+        expect(memOn).toContain("opaque `mem_…` object ids");
     });
 
     it("memory OFF drops ALL ctx_memory guidance but keeps ctx_search", () => {

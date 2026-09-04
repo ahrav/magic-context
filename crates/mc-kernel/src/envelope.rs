@@ -232,6 +232,19 @@ impl Envelope<'_> {
         self.poison(outcome)
     }
 
+    /// Returns whether a live domain row exists within the transaction.
+    pub fn domain_exists(&self, domain_id: &str) -> Result<bool, KernelError> {
+        self.tx
+            .query_row(
+                "SELECT 1 FROM domains WHERE domain_id=?1 AND invalidated_commit_seq IS NULL",
+                [domain_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|_| KernelError::Io)
+            .map(|row| row.is_some())
+    }
+
     fn insert_domain_inner(&mut self, spec: DomainSpec) -> Result<(), KernelError> {
         let spec = RedactedDomain::new(spec)?;
         insert_domain(self.tx, self.commit_seq, &spec)?;

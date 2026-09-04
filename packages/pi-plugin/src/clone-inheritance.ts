@@ -9,6 +9,7 @@ import {
 	type PendingPiCompactionMarker,
 } from "@magic-context/core/features/magic-context/storage";
 import { log } from "@magic-context/core/shared/logger";
+import { isolatePiSessionKernelTokens } from "./kernel-client-pi";
 import { convertEntriesToRawMessages } from "./read-session-pi";
 
 const CONTENT_ID_SUFFIX = /:(?:p|file)\d+$/;
@@ -208,6 +209,8 @@ export async function handlePiCloneSessionStart(
 			);
 			return result;
 		}
+		// Kernel tokens and `known_as_of` are process state the clone must not share, so an applied copy's first read fetches from tip; a redelivered clone event is a no-op and must not wipe tokens the session already accumulated. commentlint: allow(JUDGE)
+		isolatePiSessionKernelTokens(destinationSessionId);
 
 		stage = "signal-marker";
 		if (result.pendingMarkerMigrated) {

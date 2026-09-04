@@ -513,7 +513,14 @@ function gitRootDirectory(canonical: string): string | null {
  */
 export function resolveProjectRootDirectory(directory: string): string {
     const canonical = path.resolve(directory);
-    return gitRootDirectory(canonical) ?? canonical;
+    const root = gitRootDirectory(canonical);
+    if (root) return root;
+    // Matches the daemon's `ProjectBinding`, which compares roots after `canonical_root` symlink resolution; a raw spelling would derive distinct import identities inside one daemon scope. commentlint: allow(JUDGE)
+    try {
+        return realpathSync.native(canonical);
+    } catch {
+        return canonical;
+    }
 }
 
 export function resolveProjectIdentityForSession(

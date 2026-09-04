@@ -2,10 +2,9 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setProjectMemoryClaimLifecycle } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
 import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
-import { seedProjectMemoryClaim } from "@magic-context/core/features/magic-context/test-claim-database";
+import { FakeKernel } from "@magic-context/core/shared/kernel-client-testing/fake-kernel";
 import {
 	clearModelsDevCache,
 	refreshModelLimitsFromApi,
@@ -41,6 +40,7 @@ function baseState(overrides: Partial<PiM0M1State> = {}): PiM0M1State {
 		sessionId: SESSION_ID,
 		projectIdentity: "git:pi-mural",
 		projectDirectory: "/tmp/pi-mural",
+		memory: new FakeKernel().snapshot(),
 		hardSignals: {
 			systemHash: "sys",
 			modelKey: "anthropic/claude-sonnet-4",
@@ -127,34 +127,37 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 		}
 	});
 
-	it("publishes no mural image and no marker when the claim snapshot went stale", () => {
+	it("publishes no mural image and no marker when the memory snapshot moved", () => {
 		const db = createTestDb();
 		try {
 			getOrCreateSessionMeta(db, SESSION_ID);
+			const kernel = new FakeKernel();
+			const objectId = `mem_${"c".repeat(32)}`;
+			kernel.seedDecision({
+				object_id: objectId,
+				decision_kind: "ARCHITECTURE",
+				summary: "Memory whose cue the mural draws.",
+			});
 			const state = baseState({
+				memory: kernel.snapshot(),
 				mural: muralOption(),
 				injectionBudgetTokens: 8_000,
 				historyBudgetTokens: 60_000,
 			});
-			const claim = seedProjectMemoryClaim(db, {
-				projectIdentity: "git:pi-mural",
-				content: "Claim whose cue the mural draws.",
-				category: "ARCHITECTURE",
-			});
 
-			// The hard pass caches the mural marker and image payload with the claim snapshot.
+			// The hard pass caches the mural marker and image payload with the memory snapshot.
 			const foldMessages = [userMessage("hello")];
 			injectM0M1Pi(state, db, foldMessages as never, undefined, true);
 			expect(textOf(foldMessages[0])).toContain("<memory-mural>");
 			expect(textOf(foldMessages[0])).toContain("<project-memory>");
 			expect(findM0Image(foldMessages)?.data).toBe(FAKE_MURAL_BASE64);
 
-			// Withdrawing the claim after caching the mural forces the next pass to fold.
-			setProjectMemoryClaimLifecycle(
-				db,
-				{ producer: "test", operationKey: "pi-mural-stale-archive" },
-				{ token: claim.token, state: "archived", actor: "user:test" },
-			);
+			// Retiring the memory after caching the mural gives the next pass another snapshot.
+			kernel.touch(objectId);
+			const retired = kernel.objects.get(objectId);
+			if (!retired) throw new Error("missing seeded memory");
+			retired.invalidated_commit_seq = kernel.tip;
+			const moved = { ...state, memory: kernel.snapshot() };
 
 			// A sibling process holding the materialize lock makes `BEGIN IMMEDIATE` fail and forces cached m[0] replay.
 			// Cached m[0] retains the mural marker and image payload.
@@ -179,7 +182,7 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 
 			const staleMessages = [userMessage("stale")];
 			const stale = injectM0M1Pi(
-				state,
+				moved,
 				locked as never,
 				staleMessages as never,
 				undefined,
@@ -187,7 +190,7 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 			);
 			expect(stale.contentionExhausted).toBe(true);
 
-			// The publication fence suppresses all claim-derived representations: the image part, mural marker, and replayable cached payload.
+			// The publication fence suppresses every memory-derived representation: the image part, mural marker, and replayable cached payload.
 			const staleText = textOf(staleMessages[0]);
 			expect(staleText).not.toContain("<project-memory>");
 			expect(staleText).not.toContain("<memory-mural>");

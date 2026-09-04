@@ -16,17 +16,6 @@
  *     historyRefreshSessions signal.
  */
 
-import { renderClaimMemoryBlock } from "@magic-context/core/features/magic-context/memory/claim-memory-render";
-import {
-	canonicalSnapshotVector,
-	type SnapshotVector,
-} from "@magic-context/core/features/magic-context/memory/claim-operation-contract";
-import {
-	type ProjectMemoryClaimSnapshot,
-	readProjectMemorySnapshotVector,
-	snapshotVectorChanges,
-} from "@magic-context/core/features/magic-context/memory/storage-claim-current-state";
-import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
 import type { MuralWireOptions } from "@magic-context/core/features/magic-context/mural/resolve-mural";
 import {
 	type ContextDatabase,
@@ -46,12 +35,6 @@ import {
 	type UserMemory,
 } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
 import {
-	computeWorkspaceEpochFingerprint,
-	expandWorkspaceIdentitySetWithAliases,
-	resolveWorkspaceIdentitySet,
-	resolveWorkspaceShareCategories,
-} from "@magic-context/core/features/magic-context/workspaces";
-import {
 	COMPARTMENT_RENDER_EPOCH,
 	decodeCachedM0UpgradeIdentity,
 	encodeCachedM0UpgradeIdentity,
@@ -63,19 +46,27 @@ import {
 	renderDecayedCompartments,
 } from "@magic-context/core/hooks/magic-context/decay-render";
 import {
-	type ClaimLaneSnapshot,
 	DEFAULT_MEMORY_BUDGET_TOKENS,
 	DEFAULT_USER_PROFILE_BUDGET_TOKENS,
-	readClaimLaneSnapshot,
 	stripMemoryMuralBlock,
 	stripProjectMemoryBlock,
-	trimClaimLane,
 	trimUserMemoriesToBudget,
-	type WorkspaceRenderContext,
 } from "@magic-context/core/hooks/magic-context/inject-compartments";
-
+import {
+	memoryRowLocator,
+	memoryRows,
+	memorySnapshotKey,
+	renderKernelMemoryBlock,
+	trimKernelRowsToBudget,
+	withheldMemoryRowCount,
+} from "@magic-context/core/hooks/magic-context/kernel-memory-render";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
+import {
+	type KernelMemorySnapshot,
+	type ReadRow,
+	sha256Hex,
+} from "@magic-context/core/shared/kernel-client";
 import { sessionLog as logSession } from "@magic-context/core/shared/logger";
 import { resolvePiStableId, SYNTH_USER_ID_PREFIX } from "./read-session-pi";
 
@@ -290,10 +281,9 @@ interface FrozenM0Inputs {
 	docs: PiProjectDocsRender;
 	markers: PiM0SnapshotMarkers;
 	compartments: PiCompartment[];
-	claims: ProjectMemoryClaimSnapshot[];
-	claimLane: ClaimLaneSnapshot;
+	/** Budget-trimmed rows of `state.memory`, in render order. */
+	rows: ReadRow[];
 	userProfile: UserMemory[];
-	workspace: WorkspaceRenderContext;
 }
 
 /**
@@ -323,6 +313,8 @@ export interface PiM0M1State {
 	sessionId: string;
 	projectIdentity: string;
 	projectDirectory: string;
+	/** The memory read taken before the pass's first `await`; rendering never re-reads. */
+	memory: KernelMemorySnapshot;
 	/** When `memory.enabled` is false, project memories are not read or rendered into `m[0]` or `m[1]`.
 	 * When `memoryEnabled=false`, `memoryProjectPath` returns `undefined`, so memory reads return their empty values.
 	 * `injectDocs` unset or true does not disable project-memory injection. */
@@ -341,8 +333,7 @@ export interface PiM0M1State {
 	/** `hardSignals` provides provider-side cache-eviction signals for HARD-bust detection. */
 	hardSignals?: PiM0HardSignals;
 	/**
-	 * When `muralEnabled` is true and the fold's model accepts images, HARD materialization resolves the mural on demand.
-	 * HARD materialization renders the deterministic mural and stores its image in the cached baseline.
+	 * On-demand mural resolution is disabled; an explicit `mural` still folds.
 	 * Defer passes replay the mural bytes stored in the cached baseline. */
 	muralEnabled?: boolean;
 	/** `mural` supplies explicit wire options and skips on-demand mural resolution.
@@ -377,56 +368,29 @@ function memoryProjectPath(state: PiM0M1State): string | undefined {
 	return state.memoryEnabled === false ? undefined : state.projectIdentity;
 }
 
-function resolveWorkspaceRenderContextPi(
-	state: PiM0M1State,
-	db: ContextDatabase,
-): WorkspaceRenderContext {
-	const memPath = memoryProjectPath(state);
-	if (!memPath) {
-		return {
-			identities: [],
-			expandedIdentities: [],
-			ownIdentities: [],
-			shareCategories: null,
-			namesByIdentity: new Map(),
-			canonicalIdentityByStoredPath: new Map(),
-			isWorkspaced: false,
-		};
-	}
-	const identitySet = resolveWorkspaceIdentitySet(db, memPath);
-	const isWorkspaced = identitySet.identities.length > 1;
-	const expanded = expandWorkspaceIdentitySetWithAliases(
-		db,
-		identitySet.identities,
-	);
-	const expandedIdentities = isWorkspaced
-		? expanded.expandedIdentities
-		: identitySet.identities;
-	const canonicalIdentityByStoredPath = isWorkspaced
-		? expanded.canonicalIdentityByStoredPath
-		: new Map(identitySet.identities.map((identity) => [identity, identity]));
-	let ownIdentities = expandedIdentities.filter(
-		(identity) => canonicalIdentityByStoredPath.get(identity) === memPath,
-	);
-	if (ownIdentities.length === 0 && expandedIdentities.includes(memPath)) {
-		ownIdentities = [memPath];
-	}
-	return {
-		identities: identitySet.identities,
-		expandedIdentities,
-		ownIdentities,
-		shareCategories: isWorkspaced
-			? resolveWorkspaceShareCategories(db, memPath)
-			: null,
-		namesByIdentity: identitySet.namesByIdentity,
-		canonicalIdentityByStoredPath,
-		isWorkspaced,
-	};
+/** Rows the injector renders: only a session bound to a project has a kernel scope to read under. */
+function renderedMemoryRows(state: PiM0M1State): ReadRow[] {
+	return memoryProjectPath(state)
+		? trimKernelRowsToBudget(
+				memoryRows(state.memory),
+				state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+			)
+		: [];
+}
+
+/** The digest `memory_block_hashes` tracks per rendered row: the summary bytes. */
+function memoryRowContentDigest(row: ReadRow): string {
+	return sha256Hex(row.decision?.payload.summary ?? "");
 }
 
 export interface PiM0SnapshotMarkers {
 	claimFormatEpoch: number;
-	claimSnapshotVector: SnapshotVector;
+	/**
+	 * `memorySnapshotKey(memory)` of the snapshot the block was rendered from.
+	 * Persisted in `cached_m0_claim_snapshot_vector`, whose column name predates
+	 * the kernel; the value is this key.
+	 */
+	memorySnapshotKey: string;
 	renderedRevisionLocators: string[];
 	maxCompartmentSeq: number;
 	maxMutationId: number;
@@ -553,23 +517,15 @@ function piImageFromDataUrl(dataUrl: string): PiImageContent | null {
 	return { type: "image", mimeType: match[1], data: match[2] };
 }
 
-/**
- */
-function resolveMuralForM0Pi(
-	state: PiM0M1State,
-	db: ContextDatabase,
-	modelKey: string,
-	budgetTokens: number,
-): MuralWireOptions | undefined {
+/** The mural pool, importance scores, and per-revision cues come from the legacy SQLite claim lane, while the Pi m[0] text block renders kernel snapshot rows; the lanes diverge on archived and revised memories, so the injector withholds the image instead of pairing stale claim-lane content with kernel-rendered text. An explicit `state.mural` override still folds. commentlint: allow(JUDGE) */
+function resolveMuralForM0Pi(state: PiM0M1State): MuralWireOptions | undefined {
 	if (state.mural) return state.mural;
 	if (!state.muralEnabled) return undefined;
-	return resolveMuralWire(
-		db,
-		memoryProjectPath(state),
-		modelKey,
-		true,
-		budgetTokens,
+	logSession(
+		state.sessionId,
+		"mural: skipped — the mural pool reads the claim lane while m[0] renders kernel rows",
 	);
+	return undefined;
 }
 
 function cachedInjectionTokenCounts(
@@ -709,40 +665,8 @@ function setCachedBoundary(
 	).run(boundary, sessionId);
 }
 
-function isPiGenerationRecord(value: unknown): value is Record<string, number> {
-	return (
-		value !== null &&
-		typeof value === "object" &&
-		Object.entries(value).every(
-			([key, generation]) =>
-				/^\d+$/.test(key) && Number.isSafeInteger(generation),
-		)
-	);
-}
-
-function parsePiSnapshotVector(raw: string | null): SnapshotVector | null {
-	if (raw === null) return null;
-	try {
-		const value = JSON.parse(raw) as Record<string, unknown>;
-		if (
-			value.vectorVersion !== 1 ||
-			typeof value.databaseIncarnationId !== "string" ||
-			typeof value.workspaceEpoch !== "string" ||
-			!isPiGenerationRecord(value.projectGenerations) ||
-			!isPiGenerationRecord(value.policyGenerations)
-		) {
-			return null;
-		}
-		return {
-			vectorVersion: 1,
-			databaseIncarnationId: value.databaseIncarnationId,
-			workspaceEpoch: value.workspaceEpoch,
-			projectGenerations: value.projectGenerations,
-			policyGenerations: value.policyGenerations,
-		};
-	} catch {
-		return null;
-	}
+function parsePiMemorySnapshotKey(raw: string | null): string | null {
+	return raw !== null && raw.length > 0 ? raw : null;
 }
 
 function parsePiRevisionLocators(raw: string | null): string[] | null {
@@ -765,7 +689,7 @@ function getCachedMarkers(
 ): PiM0SnapshotMarkers | null {
 	const meta = getOrCreateSessionMeta(db, state.sessionId);
 	if (!meta.cachedM0Bytes) return null;
-	const claimSnapshotVector = parsePiSnapshotVector(
+	const snapshotKey = parsePiMemorySnapshotKey(
 		meta.cachedM0ClaimSnapshotVector,
 	);
 	const renderedRevisionLocators = parsePiRevisionLocators(
@@ -773,7 +697,7 @@ function getCachedMarkers(
 	);
 	if (
 		meta.cachedM0ClaimFormatEpoch === null ||
-		claimSnapshotVector === null ||
+		snapshotKey === null ||
 		renderedRevisionLocators === null ||
 		meta.cachedM0MaxCompartmentSeq === null ||
 		meta.cachedM0MaxMutationId === null ||
@@ -810,7 +734,7 @@ function getCachedMarkers(
 	}
 	return {
 		claimFormatEpoch: meta.cachedM0ClaimFormatEpoch,
-		claimSnapshotVector,
+		memorySnapshotKey: snapshotKey,
 		renderedRevisionLocators,
 		maxCompartmentSeq,
 		maxMutationId: meta.cachedM0MaxMutationId,
@@ -844,26 +768,11 @@ function readCurrentMarkersFromCompartments(
 	compartments: readonly PiCompartment[],
 	projectDocsHash?: string,
 ): PiM0SnapshotMarkers {
-	const memPath = memoryProjectPath(state);
-	const workspace = resolveWorkspaceRenderContextPi(state, db);
-	const claimLane = readClaimLaneSnapshot({
-		db,
-		projectPath: memPath,
-		workspace,
-	});
-	if (claimLane === null) {
-		throw new PiMaterializeContentionError("claim snapshot kept moving");
-	}
-	const claims = trimClaimLane(
-		claimLane,
-		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
-		workspace,
-	);
 	const globalState = getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH);
 	return {
 		claimFormatEpoch: DIRECT_FORMAT_EPOCH,
-		claimSnapshotVector: claimLane.snapshotVector,
-		renderedRevisionLocators: claims.map((item) => item.revisionLocator),
+		memorySnapshotKey: memorySnapshotKey(state.memory),
+		renderedRevisionLocators: renderedMemoryRows(state).map(memoryRowLocator),
 		maxCompartmentSeq:
 			compartments.length > 0
 				? compartments.reduce(
@@ -1019,19 +928,16 @@ export function mustMaterializePi(
 	}
 	if (
 		current.claimFormatEpoch !== DIRECT_FORMAT_EPOCH ||
-		current.claimSnapshotVector === undefined ||
-		current.renderedRevisionLocators === undefined ||
 		meta.cachedM0ClaimFormatEpoch !== current.claimFormatEpoch ||
-		meta.cachedM0ClaimSnapshotVector !==
-			canonicalSnapshotVector(current.claimSnapshotVector) ||
+		meta.cachedM0ClaimSnapshotVector !== current.memorySnapshotKey ||
 		meta.cachedM0RenderedRevisionLocators !==
 			JSON.stringify([...current.renderedRevisionLocators].sort())
 	) {
 		return piMaterializeMismatch(
 			"project_memory_change",
-			"claimSnapshotVector",
+			"memorySnapshotKey",
 			meta.cachedM0ClaimSnapshotVector,
-			canonicalSnapshotVector(current.claimSnapshotVector as SnapshotVector),
+			current.memorySnapshotKey,
 		);
 	}
 	// The comparison uses `!==` because a max ID decrease invalidates m[0].
@@ -1071,35 +977,24 @@ export function renderM0Pi(
 	db: ContextDatabase,
 	projectDocs = readProjectDocsForPiM0(state).renderedBlock,
 	decayPressureMultiplier = 1,
-	claimsOverride?: ProjectMemoryClaimSnapshot[],
+	rowsOverride?: readonly ReadRow[],
 	compartmentsOverride?: PiCompartment[],
 	userProfileOverride?: UserMemory[],
-	workspaceOverride?: WorkspaceRenderContext,
 	/** Pi emits mural output only for HARD folds when enabled and vision-capable.
 	 * The string contains the `<memory-mural>` marker block; the PNG is a separate image part. */
 	mural?: { enabled: boolean; supportsVision: boolean; dataUrl?: string },
-	claimLaneOverride?: ClaimLaneSnapshot | null,
 ): string {
-	const memPath = memoryProjectPath(state);
-	const workspace =
-		workspaceOverride ?? resolveWorkspaceRenderContextPi(state, db);
-	const claimLane =
-		claimLaneOverride ??
-		(memPath
-			? readClaimLaneSnapshot({ db, projectPath: memPath, workspace })
-			: null);
-	const claims =
-		claimsOverride ??
-		(claimLane === null
-			? []
-			: trimClaimLane(
-					claimLane,
-					state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
-					workspace,
-				));
-	const memoryBlock = renderClaimMemoryBlock(claims, "project-memory", {
-		sourceNameByClaimId: claimLane?.sourceNameByClaimId,
-	});
+	// The memory block is the rows plus the state marker; a session without a project
+	// renders no memory at all because the kernel scope filter has nothing to bind to.
+	const memoryBlock = memoryProjectPath(state)
+		? renderKernelMemoryBlock(
+				rowsOverride ?? renderedMemoryRows(state),
+				state.memory.state,
+				memoryRows(state.memory).length,
+				state.memory.truncated === true,
+				withheldMemoryRowCount(state.memory),
+			)
+		: "";
 	// Facts render through <project-memory>, not through decayed compartments.
 	// `decayPressureMultiplier` values above `1` reduce `historyBudgetTokens` and increase decay pressure.
 	const baseHistoryBudget =
@@ -1173,29 +1068,14 @@ function readFrozenM0InputsPi(
 	docs = readProjectDocsForPiM0(state),
 	memoryCutoff?: number,
 ): FrozenM0Inputs {
-	const memPath = memoryProjectPath(state);
-	const workspace = resolveWorkspaceRenderContextPi(state, db);
 	const compartments = getRenderableCompartmentsPi(db, state);
-	const claimLane = readClaimLaneSnapshot({
-		db,
-		projectPath: memPath,
-		workspace,
-		nowMs: memoryCutoff,
-	});
-	if (claimLane === null) {
-		throw new PiMaterializeContentionError("claim snapshot kept moving");
-	}
-	const claims = trimClaimLane(
-		claimLane,
-		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
-		workspace,
-	);
+	const rows = renderedMemoryRows(state);
 	const userProfile = safeGetActiveUserMemoriesPi(db);
 	const globalState = getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH);
 	const markers: PiM0SnapshotMarkers = {
 		claimFormatEpoch: DIRECT_FORMAT_EPOCH,
-		claimSnapshotVector: claimLane.snapshotVector,
-		renderedRevisionLocators: claims.map((item) => item.revisionLocator),
+		memorySnapshotKey: memorySnapshotKey(state.memory),
+		renderedRevisionLocators: rows.map(memoryRowLocator),
 		maxCompartmentSeq: compartments.reduce(
 			(max, compartment) =>
 				compartment.sequence > max ? compartment.sequence : max,
@@ -1219,29 +1099,7 @@ function readFrozenM0InputsPi(
 		muralEnabled: state.muralEnabled === true,
 		renderBudgetIdentity: renderBudgetIdentityPi(state),
 	};
-	const freshVector = readProjectMemorySnapshotVector(
-		db,
-		claimLane.projectIds,
-		claimLane.workspaceEpoch,
-	);
-	if (
-		snapshotVectorChanges(claimLane.snapshotVector, freshVector).length > 0 ||
-		canonicalSnapshotVector(markers.claimSnapshotVector) !==
-			canonicalSnapshotVector(claimLane.snapshotVector)
-	) {
-		throw new PiMaterializeContentionError(
-			"claim snapshot changed before render",
-		);
-	}
-	return {
-		docs,
-		markers,
-		compartments,
-		claims,
-		claimLane,
-		userProfile,
-		workspace,
-	};
+	return { docs, markers, compartments, rows, userProfile };
 }
 
 function renderFreshM0PiNonPersisted(
@@ -1259,30 +1117,21 @@ function renderFreshM0PiNonPersisted(
 	frozen.markers.materializedAt = cachedMaterializedAt;
 	const historyBudget =
 		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
-	const memoryBudget =
-		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
-	const mural = resolveMuralForM0Pi(
-		state,
-		db,
-		frozen.markers.modelKey,
-		memoryBudget,
-	);
+	const mural = resolveMuralForM0Pi(state);
 	rememberPiMural(state.sessionId, mural);
-	const render = (claims: ProjectMemoryClaimSnapshot[], dpm: number): string =>
+	const render = (dpm: number): string =>
 		renderM0Pi(
 			state,
 			db,
 			docs.renderedBlock,
 			dpm,
-			claims,
+			frozen.rows,
 			frozen.compartments,
 			frozen.userProfile,
-			frozen.workspace,
 			mural,
-			frozen.claimLane,
 		);
 	let dpm = 1;
-	let m0 = render(frozen.claims, dpm);
+	let m0 = render(dpm);
 	let attempts = 0;
 	while (
 		historyBudget > 0 &&
@@ -1290,26 +1139,13 @@ function renderFreshM0PiNonPersisted(
 		attempts < 3
 	) {
 		dpm *= 1.15;
-		m0 = render(frozen.claims, dpm);
+		m0 = render(dpm);
 		attempts += 1;
-	}
-	const freshVector = readProjectMemorySnapshotVector(
-		db,
-		frozen.claimLane.projectIds,
-		frozen.claimLane.workspaceEpoch,
-	);
-	if (
-		snapshotVectorChanges(frozen.claimLane.snapshotVector, freshVector).length >
-		0
-	) {
-		m0 = render([], dpm);
-		frozen.markers.claimSnapshotVector = freshVector;
-		frozen.markers.renderedRevisionLocators = [];
 	}
 	return {
 		m0,
 		snapshotMarkers: frozen.markers,
-		renderedRevisionLocators: frozen.markers.renderedRevisionLocators ?? [],
+		renderedRevisionLocators: frozen.markers.renderedRevisionLocators,
 	};
 }
 
@@ -1328,23 +1164,13 @@ export function materializeM0Pi(
 	const frozen = readFrozenM0InputsPi(state, db, docs, foldMaterializedAt);
 	const snapshotMarkers = frozen.markers;
 
-	const snapshotClaims = frozen.claims;
+	const snapshotRows = frozen.rows;
 	const snapshotCompartments = frozen.compartments;
 	const snapshotUserProfile = frozen.userProfile;
-	const renderedRevisionLocators = snapshotClaims.map(
-		(item) => item.revisionLocator,
-	);
+	const renderedRevisionLocators = snapshotRows.map(memoryRowLocator);
 	// On-demand murals run only during HARD folds, not deferrals.
-	// When no on-demand mural is supplied, mural resolution uses `muralEnabled` and the HARD fold's model key.
 	// cachedMuralBySession replays on deferral.
-	const memoryBudget =
-		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
-	const mural = resolveMuralForM0Pi(
-		state,
-		db,
-		snapshotMarkers.modelKey,
-		memoryBudget,
-	);
+	const mural = resolveMuralForM0Pi(state);
 	const frozenMuralDataUrl =
 		mural?.enabled && mural.supportsVision ? (mural.dataUrl ?? null) : null;
 	const frozenMuralHash =
@@ -1356,12 +1182,10 @@ export function materializeM0Pi(
 		db,
 		docs.renderedBlock,
 		decayPressureMultiplier,
-		snapshotClaims,
+		snapshotRows,
 		snapshotCompartments,
 		snapshotUserProfile,
-		frozen.workspace,
 		mural,
-		frozen.claimLane,
 	);
 	const historyBudget =
 		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
@@ -1377,12 +1201,10 @@ export function materializeM0Pi(
 			db,
 			docs.renderedBlock,
 			decayPressureMultiplier,
-			snapshotClaims,
+			snapshotRows,
 			snapshotCompartments,
 			snapshotUserProfile,
-			frozen.workspace,
 			mural,
-			frozen.claimLane,
 		);
 		attempts += 1;
 	}
@@ -1400,20 +1222,6 @@ export function materializeM0Pi(
 		throw error;
 	}
 	try {
-		const claimLane = frozen.claimLane;
-		if (claimLane === undefined) {
-			throw new PiMaterializeContentionError("missing frozen claim lane");
-		}
-		const currentWorkspace = resolveWorkspaceRenderContextPi(state, db);
-		const currentWorkspaceEpoch =
-			currentWorkspace.identities.length === 0
-				? "project-memory-disabled"
-				: computeWorkspaceEpochFingerprint(db, currentWorkspace.identities);
-		const freshVector = readProjectMemorySnapshotVector(
-			db,
-			claimLane.projectIds,
-			currentWorkspaceEpoch,
-		);
 		const currentCompartments = getRenderableCompartmentsPi(db, state);
 		const currentMaxCompartmentSeq = currentCompartments.reduce(
 			(max, compartment) =>
@@ -1429,7 +1237,6 @@ export function materializeM0Pi(
 			getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH)
 				?.projectUserProfileVersion ?? 0;
 		const stale =
-			snapshotVectorChanges(claimLane.snapshotVector, freshVector).length > 0 ||
 			currentProfileVersion !== snapshotMarkers.projectUserProfileVersion ||
 			currentMaxCompartmentSeq !== snapshotMarkers.maxCompartmentSeq ||
 			(getMaxM0MutationId(db, state.sessionId) ?? 0) !==
@@ -1453,9 +1260,7 @@ export function materializeM0Pi(
 			muralDataUrl: frozenMuralDataUrl,
 			muralHash: frozenMuralHash,
 			claimFormatEpoch: DIRECT_FORMAT_EPOCH,
-			claimSnapshotVector: canonicalSnapshotVector(
-				frozen.claimLane.snapshotVector,
-			),
+			claimSnapshotVector: snapshotMarkers.memorySnapshotKey,
 			renderedRevisionLocators: JSON.stringify(
 				[...renderedRevisionLocators].sort(),
 			),
@@ -1481,7 +1286,7 @@ export function materializeM0Pi(
 		).run(
 			renderedRevisionLocators.length,
 			JSON.stringify([...renderedRevisionLocators].sort()),
-			JSON.stringify(snapshotClaims.map((item) => item.contentDigest)),
+			JSON.stringify(snapshotRows.map(memoryRowContentDigest)),
 			state.sessionId,
 		);
 
@@ -1552,25 +1357,8 @@ function renderM1PiWithMetadata(
 	_renderedRevisionLocators: readonly string[],
 	compartmentsOverride?: readonly PiCompartment[],
 ): RenderM1PiResult {
-	if (markers.claimSnapshotVector === undefined) {
-		throw new PiMaterializeContentionError("missing claim snapshot vector");
-	}
-	const workspace = resolveWorkspaceRenderContextPi(state, db);
-	const workspaceEpoch =
-		workspace.identities.length === 0
-			? "project-memory-disabled"
-			: computeWorkspaceEpochFingerprint(db, workspace.identities);
-	const freshVector = readProjectMemorySnapshotVector(
-		db,
-		Object.keys(markers.claimSnapshotVector.projectGenerations).map(Number),
-		workspaceEpoch,
-	);
-	if (
-		snapshotVectorChanges(markers.claimSnapshotVector, freshVector).length > 0
-	) {
-		throw new PiMaterializeContentionError(
-			"claim snapshot changed before m1 render",
-		);
+	if (markers.memorySnapshotKey.length === 0) {
+		throw new PiMaterializeContentionError("missing memory snapshot key");
 	}
 
 	const sections: string[] = [];
@@ -1694,15 +1482,14 @@ function markersFromCachedPiRow(
 	const cachedUpgradeIdentity = decodeCachedM0UpgradeIdentity(
 		row.cached_m0_upgrade_state,
 	);
-	const claimSnapshotVector = parsePiSnapshotVector(
+	const snapshotKey = parsePiMemorySnapshotKey(
 		row.cached_m0_claim_snapshot_vector,
 	);
 	const renderedRevisionLocators = parsePiRevisionLocators(
 		row.cached_m0_rendered_revision_locators,
 	);
 	if (row.cached_m0_claim_format_epoch === null) return null;
-	if (claimSnapshotVector === null || renderedRevisionLocators === null)
-		return null;
+	if (snapshotKey === null || renderedRevisionLocators === null) return null;
 	if (row.cached_m0_project_user_profile_version === null) return null;
 	if (row.cached_m0_max_compartment_seq === null) return null;
 	if (row.cached_m0_max_mutation_id === null) return null;
@@ -1711,7 +1498,7 @@ function markersFromCachedPiRow(
 	if (row.cached_m0_upgrade_state === null) return null;
 	return {
 		claimFormatEpoch: row.cached_m0_claim_format_epoch,
-		claimSnapshotVector,
+		memorySnapshotKey: snapshotKey,
 		renderedRevisionLocators,
 		maxCompartmentSeq: normalizeCachedMaxCompartmentSeq(
 			row.cached_m0_max_compartment_seq,
@@ -1751,14 +1538,9 @@ function cachedPiRowMatchesSnapshot(args: {
 	return (
 		bufferEqualsNullable(args.row.cached_m0_bytes, args.m0Bytes) &&
 		rowMarkers.claimFormatEpoch === args.markers.claimFormatEpoch &&
-		rowMarkers.claimSnapshotVector !== undefined &&
-		args.markers.claimSnapshotVector !== undefined &&
-		canonicalSnapshotVector(rowMarkers.claimSnapshotVector) ===
-			canonicalSnapshotVector(args.markers.claimSnapshotVector) &&
-		JSON.stringify([...(rowMarkers.renderedRevisionLocators ?? [])].sort()) ===
-			JSON.stringify(
-				[...(args.markers.renderedRevisionLocators ?? [])].sort(),
-			) &&
+		rowMarkers.memorySnapshotKey === args.markers.memorySnapshotKey &&
+		JSON.stringify([...rowMarkers.renderedRevisionLocators].sort()) ===
+			JSON.stringify([...args.markers.renderedRevisionLocators].sort()) &&
 		rowMarkers.projectUserProfileVersion ===
 			args.markers.projectUserProfileVersion &&
 		rowMarkers.maxCompartmentSeq === args.markers.maxCompartmentSeq &&
@@ -1895,7 +1677,7 @@ function softRefreshCachedM1Pi(args: {
 			args.state,
 			args.db,
 			markers,
-			markers.renderedRevisionLocators ?? [],
+			markers.renderedRevisionLocators,
 			// New compartments use the snapshot that advances the trim boundary, preventing a concurrent publish from placing a compartment in m[1] while its raw messages remain in the tail.
 			args.compartmentsForNormalization,
 		);
@@ -2184,23 +1966,11 @@ export function injectM0M1Pi(
 	const skippedVisibleMessages = boundaryId
 		? trimPiMessagesToBoundary(piMessages, entryIds, boundaryId)
 		: 0;
-	const publishWorkspace = resolveWorkspaceRenderContextPi(state, db);
-	const publishedVector = markers.claimSnapshotVector;
-	const publishWorkspaceEpoch =
-		publishWorkspace.identities.length === 0
-			? "project-memory-disabled"
-			: computeWorkspaceEpochFingerprint(db, publishWorkspace.identities);
-	const claimLaneMoved =
-		publishedVector === undefined ||
-		snapshotVectorChanges(
-			publishedVector,
-			readProjectMemorySnapshotVector(
-				db,
-				Object.keys(publishedVector?.projectGenerations ?? {}).map(Number),
-				publishWorkspaceEpoch,
-			),
-		).length > 0;
-	if (claimLaneMoved) {
+	// A served m[0] whose memory block was rendered from another snapshot than this pass's
+	// read would show rows the daemon no longer serves; the block is stripped and the
+	// locator manifest cleared until a fold re-renders it.
+	const memoryMoved = markers.memorySnapshotKey !== memorySnapshotKey(state.memory);
+	if (memoryMoved) {
 		m0 = stripProjectMemoryBlock(m0);
 		rememberPiMuralPayload(state.sessionId, null, null);
 		db.prepare(
@@ -2216,13 +1986,7 @@ export function injectM0M1Pi(
 		state.sessionId,
 		`injected m[0]/m[1] into Pi messages (${m0.length} + ${m1.length} bytes, materialized=${materialized}${decision.reason ? ` reason=${decision.reason}` : ""})`,
 	);
-	const memPath = memoryProjectPath(state);
-	const claimLane = readClaimLaneSnapshot({
-		db,
-		projectPath: memPath,
-		workspace: publishWorkspace,
-	});
-	const memoryCount = claimLane?.items.length ?? 0;
+	const memoryCount = memoryMoved ? 0 : renderedMemoryRows(state).length;
 	return {
 		injected: true,
 		compartmentCount: currentCompartments.length,

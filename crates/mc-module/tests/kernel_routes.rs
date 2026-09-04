@@ -740,6 +740,25 @@ fn ingest(key: &str, payload: &[u8], sensitivity: Sensitivity) -> ArtifactIngest
 }
 
 #[tokio::test]
+async fn a_commit_on_a_fresh_store_provisions_the_referenced_domain() {
+    let daemon = Daemon::start().await;
+    // No seeded domain: the first commit materializes its referenced domain.
+    let first = daemon
+        .commit("fresh-1", vec![insert_decision(1)], vec![])
+        .await;
+    assert_state(&first, "available", None);
+    let read = daemon.read("explicit_search", None).await;
+    assert_eq!(object_ids(&read), ["decision-object-1"]);
+
+    // The provisioned domain row backs later commits without a second insert.
+    let again = daemon
+        .commit("fresh-2", vec![insert_decision(2)], vec![])
+        .await;
+    assert_state(&again, "available", None);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn replayed_intents_return_one_receipt_and_projects_never_collide() {
     let daemon = Daemon::start().await;
     seed_domain(&daemon.store());
@@ -1002,6 +1021,15 @@ async fn a_plugin_route_cannot_declare_a_class_above_the_derived_one() {
     // Inference-class writes serve labeled on explicit search and never on
     // the automatic surfaces.
     assert_eq!(read["rows"][0]["labeled"], true);
+    // A decision object carries its decision row so the client can render
+    // the text from the read alone.
+    assert_eq!(
+        read["rows"][0]["decision"],
+        json!({
+            "decision_kind": "memory",
+            "payload": {"summary": "decision 1", "rationale": "because 1"},
+        })
+    );
     assert!(object_ids(&daemon.read("auto_inject", None).await).is_empty());
     assert!(object_ids(&daemon.read("auto_search", None).await).is_empty());
     daemon.handler.shutdown().await.unwrap();
@@ -1286,6 +1314,209 @@ async fn reads_at_a_snapshot_return_what_was_visible_then() {
 
     let future = daemon.read("auto_inject", Some(daemon.tip() + 1)).await;
     assert_state(&future, "unavailable", Some("snapshot_diverged"));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+fn insert_decision_with_summary(index: i64, summary: &str) -> Value {
+    let mut operation = insert_decision(index);
+    operation["spec"]["payload"]["summary"] = json!(summary);
+    operation
+}
+
+#[tokio::test]
+async fn a_read_over_the_row_cap_serves_the_newest_rows_and_flags_truncation() {
+    use mc_module::kernel_routes::read::MAX_READ_ROWS;
+
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    // Indices ascend with commit order, so higher indices are newer.
+    let total = MAX_READ_ROWS + 1;
+    let mut index = 0i64;
+    let mut batch = 0usize;
+    while (index as usize) < total {
+        let operations: Vec<Value> = (0..256.min(total - index as usize))
+            .map(|offset| insert_decision(index + offset as i64))
+            .collect();
+        index += operations.len() as i64;
+        let response = daemon
+            .commit(&format!("bulk-{batch}"), operations, vec![])
+            .await;
+        assert_state(&response, "available", None);
+        batch += 1;
+    }
+
+    let read = daemon.read("explicit_search", None).await;
+    assert_state(&read, "available", None);
+    assert_eq!(read["truncated"], true, "{}", read["truncated"]);
+    let rows = read["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), MAX_READ_ROWS);
+    assert_eq!(
+        rows[0]["object"]["object_id"],
+        format!("decision-object-{}", total - 1)
+    );
+    let served: std::collections::HashSet<String> = object_ids(&read).into_iter().collect();
+    let missing: Vec<i64> = (0..total as i64)
+        .filter(|index| !served.contains(&format!("decision-object-{index}")))
+        .collect();
+    // The dropped row comes from the oldest commit, the first batch of 256.
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert!(missing[0] < 256, "{missing:?}");
+    let sequences: Vec<i64> = rows
+        .iter()
+        .map(|row| row["object"]["created_commit_seq"].as_i64().unwrap())
+        .collect();
+    assert!(sequences.windows(2).all(|pair| pair[0] >= pair[1]));
+
+    // The filter returns the dropped row without truncation.
+    let dropped = format!("decision-object-{}", missing[0]);
+    let newest = format!("decision-object-{}", total - 1);
+    let mut filtered = read_request(&daemon.project, "explicit_search", None);
+    filtered["object_ids"] = json!([dropped, newest]);
+    let filtered = daemon.call(daemon.route, filtered).await;
+    assert_state(&filtered, "available", None);
+    assert_eq!(filtered["truncated"], false, "{}", filtered["truncated"]);
+    let mut expected = vec![dropped, newest];
+    expected.sort();
+    assert_eq!(object_ids(&filtered), expected);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_filtered_read_serves_exactly_the_named_visible_objects() {
+    use mc_module::kernel_routes::read::MAX_READ_OBJECT_IDS;
+
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    for index in 1..=3 {
+        let response = daemon
+            .commit(
+                &format!("seed-{index}"),
+                vec![insert_decision(index)],
+                vec![],
+            )
+            .await;
+        assert_state(&response, "available", None);
+    }
+
+    // Named ids scope the read; an id no visible row carries yields nothing.
+    let mut request = read_request(&daemon.project, "explicit_search", None);
+    request["object_ids"] = json!(["decision-object-1", "decision-object-3", "absent-object"]);
+    let read = daemon.call(daemon.route, request).await;
+    assert_state(&read, "available", None);
+    assert_eq!(read["truncated"], false, "{}", read["truncated"]);
+    assert_eq!(
+        object_ids(&read),
+        ["decision-object-1", "decision-object-3"]
+    );
+    // Filtered rows keep the newest-first serving order.
+    assert_eq!(read["rows"][0]["object"]["object_id"], "decision-object-3");
+
+    // More than MAX_READ_OBJECT_IDS ids returns invalid_params.
+    let ids: Vec<String> = (0..=MAX_READ_OBJECT_IDS)
+        .map(|index| format!("decision-object-{index}"))
+        .collect();
+    let mut over = read_request(&daemon.project, "explicit_search", None);
+    over["object_ids"] = json!(ids);
+    assert!(matches!(
+        daemon.handler.dispatch_value_for_test(daemon.route, over).await,
+        PreparedOutcome::Error { code, .. } if code == "invalid_params"
+    ));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+fn synthetic_visible_row(created_commit_seq: i64, object_id: String) -> mc_kernel::VisibleRow {
+    mc_kernel::VisibleRow {
+        object: mc_kernel::ObjectRow {
+            object_id,
+            object_kind: "decision".to_string(),
+            domain_id: DOMAIN.to_string(),
+            source_kind: "fixture".to_string(),
+            source_id: "memory-lineage".to_string(),
+            source_revision: 1,
+            created_commit_seq,
+            invalidated_commit_seq: None,
+            superseded_by: None,
+            sensitivity: Sensitivity::Normal,
+        },
+        visibility: mc_kernel::SurfaceVisibility::Visible,
+        labeled: false,
+        scope_id: None,
+    }
+}
+
+proptest::proptest! {
+    #[test]
+    fn bounded_selection_matches_a_full_sort_and_truncate(
+        keys in proptest::collection::vec((0i64..48, 0u16..256), 0..768),
+        cap in 0usize..40,
+    ) {
+        use mc_module::kernel_routes::read::NewestRows;
+
+        let rows: Vec<mc_kernel::VisibleRow> = keys
+            .into_iter()
+            .map(|(seq, id)| synthetic_visible_row(seq, format!("object-{id}")))
+            .collect();
+        let mut reference = rows.clone();
+        reference.sort_by(|left, right| {
+            right
+                .object
+                .created_commit_seq
+                .cmp(&left.object.created_commit_seq)
+                .then_with(|| left.object.object_id.cmp(&right.object.object_id))
+        });
+        let reference_dropped = reference.len() > cap;
+        reference.truncate(cap);
+
+        let mut newest = NewestRows::new(cap);
+        for row in rows {
+            newest.push(row);
+        }
+        let (selected, dropped) = newest.finish();
+        proptest::prop_assert_eq!(dropped, reference_dropped);
+        proptest::prop_assert_eq!(selected, reference);
+    }
+}
+
+#[tokio::test]
+async fn a_read_over_the_byte_budget_serves_the_newest_rows_that_fit() {
+    use mc_module::kernel_routes::read::MAX_READ_ROW_BYTES;
+
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let small = daemon
+        .commit("small", vec![insert_decision(0)], vec![])
+        .await;
+    assert_state(&small, "available", None);
+    let baseline = daemon.read("explicit_search", None).await;
+    assert_eq!(baseline["truncated"], false, "{}", baseline["truncated"]);
+
+    // Rows of ~480 KiB each, one commit apiece so each is strictly newer than the last; enough of them exceed the byte budget while every summary stays under the 512 KiB redaction limit. commentlint: allow(JUDGE)
+    let row_bytes = 480 * 1024;
+    let total = MAX_READ_ROW_BYTES / row_bytes + 3;
+    let summary = "s".repeat(row_bytes);
+    for index in 1..=total as i64 {
+        let response = daemon
+            .commit(
+                &format!("big-{index}"),
+                vec![insert_decision_with_summary(index, &summary)],
+                vec![],
+            )
+            .await;
+        assert_state(&response, "available", None);
+    }
+
+    let read = daemon.read("explicit_search", None).await;
+    assert_state(&read, "available", None);
+    assert_eq!(read["truncated"], true, "{}", read["truncated"]);
+    let served = object_ids(&read);
+    assert!(!served.is_empty());
+    assert!(served.len() < total + 1, "{}", served.len());
+    // The served set is a contiguous run of the newest commits; the small oldest row is past the stopping point even though it would fit. commentlint: allow(JUDGE)
+    let mut expected: Vec<String> = (0..served.len())
+        .map(|offset| format!("decision-object-{}", total - offset))
+        .collect();
+    expected.sort();
+    assert_eq!(served, expected);
     daemon.handler.shutdown().await.unwrap();
 }
 

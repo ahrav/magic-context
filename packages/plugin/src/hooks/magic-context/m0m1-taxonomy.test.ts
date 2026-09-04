@@ -19,8 +19,12 @@ import {
 } from "../../features/magic-context/compartment-storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import { available, type KernelMemorySnapshot } from "../../shared/kernel-client";
 import type { Database } from "../../shared/sqlite";
 import { clearInjectionCache, injectM0M1, type M0HardSignals } from "./inject-compartments";
+
+/** The snapshot of a session whose project has no memories; the block renders only its marker. */
+const EMPTY_MEMORY: KernelMemorySnapshot = { state: available(), rows: [], knownAsOf: 0 };
 
 const SESSION_ID = "ses_taxonomy";
 const PROJECT_PATH = "/tmp/test-taxonomy-project";
@@ -81,6 +85,7 @@ function pass(opts: {
     const state = getOrCreateSessionMeta(db, SESSION_ID);
     const result = injectM0M1({
         db,
+        memory: EMPTY_MEMORY,
         sessionId: SESSION_ID,
         state,
         projectPath: PROJECT_PATH,
@@ -259,6 +264,7 @@ describe("m[0]/m[1] materialization taxonomy", () => {
         const smallBudget: M0HardSignals = BASE_HARD;
         const baseline = injectM0M1({
             db,
+            memory: EMPTY_MEMORY,
             sessionId: SESSION_ID,
             state: getOrCreateSessionMeta(db, SESSION_ID),
             projectPath: PROJECT_PATH,
@@ -276,6 +282,7 @@ describe("m[0]/m[1] materialization taxonomy", () => {
         ]);
         const folded = injectM0M1({
             db,
+            memory: EMPTY_MEMORY,
             sessionId: SESSION_ID,
             state: getOrCreateSessionMeta(db, SESSION_ID),
             projectPath: PROJECT_PATH,

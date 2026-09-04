@@ -69,6 +69,49 @@
                     }
                 }
             }
+        },
+        {
+            "includes": [
+                "src/tools/ctx-memory/**",
+                "src/tools/ctx-search/**",
+                "src/features/magic-context/search.ts",
+                "src/hooks/magic-context/kernel-transport.ts",
+                "src/hooks/magic-context/kernel-memory-render.ts",
+                "src/hooks/magic-context/kernel-claim-usage.ts",
+                "src/hooks/magic-context/inject-compartments.ts",
+                "src/hooks/magic-context/transform.ts",
+                "src/hooks/magic-context/transform-compartment-phase.ts",
+                "src/hooks/magic-context/transform-postprocess-phase.ts",
+                "src/hooks/magic-context/m0-token-breakdown.ts",
+                "src/hooks/magic-context/auto-search-runner.ts",
+                "src/hooks/magic-context/auto-search-shared.ts",
+                "src/hooks/magic-context/compartment-runner-incremental.ts",
+                "src/plugin/rpc-handlers.ts",
+                "src/plugin/tool-registry.ts",
+                "!**/*.test.ts"
+            ],
+            "linter": {
+                "rules": {
+                    "style": {
+                        "noRestrictedImports": {
+                            "level": "error",
+                            "options": {
+                                "patterns": [
+                                    {
+                                        "group": ["**/storage-claim*"],
+                                        "message": "Memory-path files read and write project memory through the kernel client, never the claim lane."
+                                    },
+                                    {
+                                        "group": ["**"],
+                                        "importNamePattern": "readAuthorizedClaimMemorySnapshot",
+                                        "message": "Memory-path files read and write project memory through the kernel client, never the claim lane."
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
         }
     ]
 }

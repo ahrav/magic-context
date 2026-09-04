@@ -2149,7 +2149,7 @@ impl KernelStore {
         surface: Surface,
         requested: i64,
     ) -> Result<VisibleAsOf, KernelError> {
-        self.visible_as_of_in_scope(surface, requested, None)
+        self.visible_as_of_in_scope(surface, requested, None, None)
     }
 
     /// [`Self::visible_as_of`] restricted to rows whose scope carries a term
@@ -2158,14 +2158,20 @@ impl KernelStore {
     /// The restriction is a superset of the scope algebra's verdict: a term
     /// on the dimension whose operator the query cannot evaluate is kept for
     /// the caller to judge.
+    ///
+    /// `ids` narrows the read to the named objects before any row leaves SQL, so a targeted lookup stays cheap in a large scope. commentlint: allow(JUDGE)
     pub fn visible_as_of_in_scope(
         &self,
         surface: Surface,
         requested: i64,
+        ids: Option<&[String]>,
         scope: Option<ScopeTermFilter<'_>>,
     ) -> Result<VisibleAsOf, KernelError> {
+        let ids = ids
+            .map(|ids| serde_json::to_string(ids).map_err(|_| KernelError::InvalidInput))
+            .transpose()?;
         let (tip, rows) = self.read_snapshot(requested, |tx| {
-            let rows = served_rows(tx, surface, requested, None, scope)?
+            let rows = served_rows(tx, surface, requested, ids.as_deref(), scope)?
                 .into_iter()
                 .filter_map(|(object, visibility, scope_id)| match visibility {
                     SurfaceVisibility::Hidden => None,

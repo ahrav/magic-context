@@ -1,29 +1,18 @@
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { DREAMER_AGENT } from "../../agents/dreamer";
 import { SIDEKICK_AGENT } from "../../agents/sidekick";
-import { WRITABLE_MEMORY_CATEGORIES } from "../../features/magic-context/memory";
+import { ClaimOperationInputError } from "../../features/magic-context/memory/claim-operation-contract";
+import { WRITABLE_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
 import { getProjectEmbeddingSnapshot } from "../../features/magic-context/memory/embedding";
-import {
-    ClaimOperationInputError,
-    ClaimOperationKeyReuseError,
-} from "../../features/magic-context/memory/storage-claim-operations";
-import {
-    isRustAuthorityDrainingError,
-    toolCallIdFromContext,
-} from "../../plugin/rust-tool-backends";
+import { resolveProjectRootDirectory } from "../../features/magic-context/memory/project-identity";
+import { toolCallIdFromContext } from "../../plugin/rust-tool-backends";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
-import {
-    assertCtxMemoryWriteShape,
-    createCtxMemoryProducerIdentity,
-    executeCtxMemoryClaimAction,
-    executeCtxMemoryClaimActionWithCommit,
-} from "./claim-actions";
 import {
     CTX_MEMORY_ANTI_MEMORY_RULE,
     CTX_MEMORY_DESCRIPTION,
-    CTX_MEMORY_MUTATION_TOKEN_RULE,
     CTX_MEMORY_TOOL_NAME,
 } from "./constants";
+import { CTX_MEMORY_ACTOR, CTX_MEMORY_DREAMER_ACTOR, executeCtxMemory } from "./execute";
 import {
     CTX_MEMORY_ACTIONS,
     CTX_MEMORY_DREAMER_ACTIONS,
@@ -31,18 +20,9 @@ import {
     type CtxMemoryArgs,
     type CtxMemoryToolDeps,
 } from "./types";
+import { assertCtxMemoryWriteShape } from "./write-shape";
 
 export { CTX_MEMORY_LIGHT_DESCRIPTION } from "../light-descriptions";
-
-const mutationTokenShape = {
-    tokenVersion: tool.schema.number(),
-    publicClaimId: tool.schema.string(),
-    revision: tool.schema.number(),
-    contentDigest: tool.schema.string(),
-    lifecycleSeq: tool.schema.number(),
-    applicabilityHeadsDigest: tool.schema.string(),
-    policyHeadsDigest: tool.schema.string(),
-};
 
 const antiMemoryShape = {
     trigger: tool.schema.string(),
@@ -55,40 +35,37 @@ const antiMemoryShape = {
     rootCause: tool.schema.string().nullable().optional(),
     recovery: tool.schema.string().nullable().optional(),
     nonApplicableWhen: tool.schema.string().nullable().optional(),
+    expiresAt: tool.schema
+        .number()
+        .nullable()
+        .optional()
+        .describe(
+            "Epoch ms after which the warning stops surfacing; omitted writes default to 90 days out",
+        ),
 };
 
 const ctxMemoryArgsShape = {
     action: tool.schema
         .enum([...CTX_MEMORY_DREAMER_ACTIONS])
         .optional()
-        .describe("create, get, list, revise, archive, restore, or merge"),
-    content: tool.schema.string().optional().describe("Claim content for create/revise/merge"),
+        .describe("create, get, list, revise, archive, or merge"),
+    content: tool.schema.string().optional().describe("Memory content for create/revise/merge"),
     category: tool.schema
         .enum([...WRITABLE_MEMORY_CATEGORIES])
         .optional()
-        .describe("Claim category for create/revise or list filter"),
+        .describe("Memory category for create/revise/merge or list filter"),
     antiMemory: tool.schema
         .object(antiMemoryShape)
         .optional()
         .describe(
             "Rejected-approach payload. Required with category REJECTED_APPROACH, and content must be omitted; invalid with any other category.",
         ),
-    publicClaimId: tool.schema
-        .string()
-        .optional()
-        .describe("Public claim ID for revise/archive/restore"),
-    publicClaimIds: tool.schema
+    objectId: tool.schema.string().optional().describe("Object id for revise/archive"),
+    objectIds: tool.schema
         .array(tool.schema.string())
+        .max(20)
         .optional()
-        .describe("Public claim IDs for get"),
-    mutationToken: tool.schema
-        .object(mutationTokenShape)
-        .optional()
-        .describe("Exact token returned by create/get/list"),
-    mutationTokens: tool.schema
-        .array(tool.schema.object(mutationTokenShape))
-        .optional()
-        .describe("Merge tokens ordered [target, ...sources]"),
+        .describe("Object ids for get, or the objects merge folds into one survivor"),
     limit: tool.schema.number().optional().describe("Maximum list results"),
     reason: tool.schema.string().optional().describe("Lifecycle-change reason"),
 };
@@ -114,14 +91,8 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     content: "string",
                     category: { type: "enum", values: WRITABLE_MEMORY_CATEGORIES },
                     antiMemory: CTX_MEMORY_ANTI_MEMORY_RULE,
-                    publicClaimId: "string",
-                    publicClaimIds: { type: "array", items: "string", maxItems: 20 },
-                    mutationToken: CTX_MEMORY_MUTATION_TOKEN_RULE,
-                    mutationTokens: {
-                        type: "array",
-                        items: CTX_MEMORY_MUTATION_TOKEN_RULE,
-                        maxItems: 20,
-                    },
+                    objectId: "string",
+                    objectIds: { type: "array", items: "string", maxItems: 20 },
                     limit: "number",
                     reason: "string",
                 });
@@ -147,89 +118,41 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 if (!projectIdentity) {
                     return "Error: Could not resolve project identity for memory action.";
                 }
-                await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
+                // The registration await keeps the disabled gate authoritative: without it a call racing the fire-and-forget project registration reads a null snapshot and a per-project `memory.enabled = false` fails open. commentlint: allow(JUDGE)
+                await deps.ensureProjectRegistered?.(toolContext.directory);
                 const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-                if (snapshot ? !snapshot.features.memoryEnabled : deps.memoryEnabled === false) {
+                if ((snapshot?.features.memoryEnabled ?? deps.memoryEnabled) === false) {
                     return "Cross-session memory is disabled for this project.";
                 }
                 const toolCallId = toolCallIdFromContext(toolContext);
-                const mutation = !["get", "list"].includes(args.action);
+                const mutation = !["get", "list"].includes(action);
                 if (!toolCallId && mutation) {
                     return "Error: ctx_memory mutation requires a stable tool-call identity.";
                 }
-                const actor =
-                    toolContext.agent === DREAMER_AGENT
-                        ? "agent:opencode:dreamer"
-                        : "agent:opencode";
-                const identity = {
-                    harness: "opencode" as const,
+                const client = deps.kernelClient({
                     sessionId: toolContext.sessionID,
-                    toolCallId: toolCallId ?? "read",
-                    projectIdentity,
-                };
-                const executeArgs = {
-                    db: deps.db,
+                    projectRoot: resolveProjectRootDirectory(toolContext.directory),
+                });
+                return await executeCtxMemory({
+                    client,
                     args,
-                    projectIdentity,
-                    identity,
-                    actor,
-                };
-                if (mutation && deps.rustToolBackends?.memory) {
-                    const authority = await deps.rustToolBackends.authorityState?.({
-                        projectPath: projectIdentity,
-                        projectRoot: toolContext.directory,
-                        domain: "memories",
-                    });
-                    if (authority === "PREPARING" || authority === "DRAINING") {
-                        return "Error: memory authority is transitioning; retry this tool call.";
-                    }
-                    if (authority === "MODULE") {
-                        const producer = createCtxMemoryProducerIdentity(identity);
-                        const intentRequest = {
-                            action,
-                            actor,
-                            projectIdentity,
-                            ...(args.content !== undefined ? { content: args.content } : {}),
-                            ...(args.category !== undefined ? { category: args.category } : {}),
-                            ...(args.antiMemory !== undefined
-                                ? { antiMemory: args.antiMemory }
-                                : {}),
-                            ...(args.publicClaimId !== undefined
-                                ? { publicClaimId: args.publicClaimId }
-                                : {}),
-                            ...(args.publicClaimIds !== undefined
-                                ? { publicClaimIds: args.publicClaimIds }
-                                : {}),
-                            ...(args.mutationToken !== undefined
-                                ? { mutationToken: args.mutationToken }
-                                : {}),
-                            ...(args.mutationTokens !== undefined
-                                ? { mutationTokens: args.mutationTokens }
-                                : {}),
-                            ...(args.reason !== undefined ? { reason: args.reason } : {}),
-                        };
-                        return await deps.rustToolBackends.memory({
-                            commandId: toolCallId as string,
-                            sessionId: toolContext.sessionID,
-                            projectRoot: toolContext.directory,
-                            projectPath: projectIdentity,
-                            producer: producer.producer,
-                            operationKey: producer.operationKey,
-                            intentRequest,
-                            commitContext: () => executeCtxMemoryClaimActionWithCommit(executeArgs),
-                        });
-                    }
-                }
-                return executeCtxMemoryClaimAction(executeArgs);
+                    action,
+                    identity: {
+                        sessionId: toolContext.sessionID,
+                        toolCallId: toolCallId ?? "read",
+                    },
+                    actor:
+                        toolContext.agent === DREAMER_AGENT
+                            ? CTX_MEMORY_DREAMER_ACTOR
+                            : CTX_MEMORY_ACTOR,
+                    ...(toolContext.agent === DREAMER_AGENT
+                        ? { sourceKind: "dreamer" as const }
+                        : {}),
+                    ...(toolContext.abort ? { signal: toolContext.abort } : {}),
+                });
             } catch (error) {
-                if (error instanceof ClaimOperationKeyReuseError) {
-                    return "Error: this tool call id was already committed with different arguments. Retry as a new call.";
-                }
                 if (error instanceof ClaimOperationInputError) {
                     return `Error: ${error.message}`;
-                }
-                if (isRustAuthorityDrainingError(error)) {
-                    return "Error: memory authority is transitioning; retry this tool call.";
                 }
                 throw error;
             }

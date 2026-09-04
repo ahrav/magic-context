@@ -1,6 +1,5 @@
 {
 	"$schema": "https://biomejs.dev/schemas/2.4.14/schema.json",
-	"root": false,
 	"vcs": {
 		"enabled": true,
 		"clientKind": "git",
@@ -10,10 +9,7 @@
 		"enabled": true
 	},
 	"formatter": {
-		"enabled": true,
-		"indentStyle": "space",
-		"indentWidth": 4,
-		"lineWidth": 100
+		"enabled": false
 	},
 	"linter": {
 		"enabled": true,
@@ -33,13 +29,6 @@
 			}
 		}
 	},
-	"javascript": {
-		"formatter": {
-			"quoteStyle": "double",
-			"trailingCommas": "all",
-			"semicolons": "always"
-		}
-	},
 	"files": {
 		"includes": ["src/**/*.ts", "!dist", "!node_modules"]
 	},
@@ -53,6 +42,44 @@
 					},
 					"style": {
 						"noNonNullAssertion": "off"
+					}
+				}
+			}
+		},
+		{
+			"includes": [
+				"src/tools/ctx-memory.ts",
+				"src/tools/ctx-search.ts",
+				"src/tools/index.ts",
+				"src/kernel-client-pi.ts",
+				"src/inject-compartments-pi.ts",
+				"src/context-handler.ts",
+				"src/auto-search-pi.ts",
+				"src/dialogs/status-dialog.ts",
+				"src/commands/ctx-status.ts",
+				"src/clone-inheritance.ts",
+				"src/pi-historian-runner.ts",
+				"!**/*.test.ts"
+			],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"patterns": [
+									{
+										"group": ["**/storage-claim*"],
+										"message": "Memory-path files read and write project memory through the kernel client, never the claim lane."
+									},
+									{
+										"group": ["**"],
+										"importNamePattern": "readAuthorizedClaimMemorySnapshot",
+										"message": "Memory-path files read and write project memory through the kernel client, never the claim lane."
+									}
+								]
+							}
+						}
 					}
 				}
 			}

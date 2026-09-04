@@ -5,6 +5,7 @@ import {
 import { type ContextDatabase, updateSessionMeta } from "../../features/magic-context/storage";
 import type { ContextUsage } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
+import type { KernelClientResolver, KernelMemorySnapshot } from "../../shared/kernel-client";
 import { sessionLog } from "../../shared/logger";
 import {
     type ActiveCompartmentRun,
@@ -51,6 +52,13 @@ interface RunCompartmentPhaseArgs {
     compartmentDirectory: string;
     messages: MessageLike[];
     pendingCompartmentInjection: PreparedCompartmentInjection | null;
+    /**
+     * The memory read the transform took before this phase; the phase renders
+     * it after its `await` and issues no memory RPC of its own.
+     */
+    memory: KernelMemorySnapshot;
+    /** Handed to the historian it may start; the phase itself issues no memory RPC. */
+    kernelClient?: KernelClientResolver;
     fallbackModelId?: string;
     ensureProjectRegistered?: (directory: string, db: ContextDatabase) => Promise<void>;
     projectPath?: string;
@@ -103,7 +111,8 @@ interface RunCompartmentPhaseArgs {
  * `try/finally` clears the cache when the wrapped function returns its promise.
  * `try/finally` clears the cache when the wrapped function returns its promise, after the function suspends at its first `await`.
  * Only `prepareCompartmentInjection` runs after the first `await`.
- * `prepareCompartmentInjection` reads `context.db`, never raw history.
+ * `prepareCompartmentInjection` reads `context.db` and the `memory` value, never raw history
+ * and never the daemon.
  * `resolvedSessionId` (transform.ts).
  */
 /** Logged when the ≥95% block times out and the prompt proceeds with the historian still running; the paired-delta harness matches this phrase to reject a ledger with a call in flight, so the two sides share one constant. */
@@ -250,6 +259,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             experimentalUserMemories: args.experimentalUserMemories,
             historianTwoPass: args.historianTwoPass,
             memoryEnabled: args.memoryEnabled,
+            kernelClient: args.kernelClient,
             autoPromote: args.autoPromote,
             onCompartmentStatePublished: args.onCompartmentStatePublished,
             preserveInjectionCacheUntilConsumed: true,
@@ -286,15 +296,16 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
         published = published || activeRun.published;
         const historyReprepareShouldBust =
             activeRun.published && args.deferredHistoryRefreshSessions.has(args.sessionId);
-        pendingCompartmentInjection = prepareCompartmentInjection(
-            args.db,
-            args.resolvedSessionId,
-            args.messages,
-            historyReprepareShouldBust,
-            args.projectPath,
-            args.injectionBudgetTokens,
-            args.experimentalTemporalAwareness,
-        );
+        pendingCompartmentInjection = prepareCompartmentInjection({
+            db: args.db,
+            sessionId: args.resolvedSessionId,
+            messages: args.messages,
+            isCacheBusting: historyReprepareShouldBust,
+            memory: args.memory,
+            projectPath: args.projectPath,
+            injectionBudgetTokens: args.injectionBudgetTokens,
+            temporalAwareness: args.experimentalTemporalAwareness,
+        });
         if (historyReprepareShouldBust) {
             rebuiltHistoryThisPass = true;
         }

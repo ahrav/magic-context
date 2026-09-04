@@ -3,29 +3,23 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
-import { formatRevisionLocator } from "@magic-context/core/features/magic-context/memory/claim-operation-contract";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
-import {
-	computeProjectMemoryMutationToken,
-	getProjectMemoryClaimByPublicId,
-	reviseProjectMemoryClaim,
-	setProjectMemoryClaimLifecycle,
-} from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
 import {
 	getCompartments,
 	getOrCreateSessionMeta,
-	setProjectState,
 } from "@magic-context/core/features/magic-context/storage";
-import {
-	type SeededProjectMemoryClaim,
-	seedProjectMemoryClaim,
-} from "@magic-context/core/features/magic-context/test-claim-database";
 import {
 	getActiveUserMemories,
 	insertUserMemory,
 } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
 import { COMPARTMENT_RENDER_EPOCH } from "@magic-context/core/hooks/magic-context/compartment-render-epoch";
-import { readProjectClaimLaneSnapshot } from "@magic-context/core/hooks/magic-context/inject-compartments";
+import { memorySnapshotKey } from "@magic-context/core/hooks/magic-context/kernel-memory-render";
+import {
+	EMPTY_PROJECT_MARKER,
+	type KernelMemorySnapshot,
+	unavailable,
+} from "@magic-context/core/shared/kernel-client";
+import { FakeKernel } from "@magic-context/core/shared/kernel-client-testing/fake-kernel";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	__test,
@@ -33,122 +27,99 @@ import {
 	materializeM0Pi,
 	materializeM0PiWithRetry,
 	mustMaterializePi,
+	type PiM0M1State,
 	renderM0Pi,
 	renderM1Pi,
 } from "./inject-compartments-pi";
 import { createTestDb, textOf, userMessage } from "./test-utils";
 
-const seededClaims = new WeakMap<
-	ReturnType<typeof createTestDb>,
-	Map<number, SeededProjectMemoryClaim>
->();
+type TestDb = ReturnType<typeof createTestDb>;
 
+/** The m[0] of a project with no compartments and an `available` kernel read that returns no rows. */
+const EMPTY_PROJECT_M0 = `<session-history></session-history>\n\n<project-memory>\n${EMPTY_PROJECT_MARKER}\n</project-memory>`;
+
+/**
+ * One fake kernel per database and project stands in for the daemon's
+ * project-scoped read; `memoryFor` is the snapshot the pass would have read.
+ */
+const kernels = new WeakMap<TestDb, Map<string, FakeKernel>>();
 let testMemoryId = 0;
 
+function kernelFor(db: TestDb, projectPath: string): FakeKernel {
+	let byProject = kernels.get(db);
+	if (!byProject) {
+		byProject = new Map();
+		kernels.set(db, byProject);
+	}
+	let kernel = byProject.get(projectPath);
+	if (!kernel) {
+		kernel = new FakeKernel();
+		byProject.set(projectPath, kernel);
+	}
+	return kernel;
+}
+
+function memoryFor(db: TestDb, projectPath: string): KernelMemorySnapshot {
+	return kernelFor(db, projectPath).snapshot();
+}
+
+function memoryObjectId(id: number): string {
+	return `mem_${id.toString(16).padStart(32, "0")}`;
+}
+
+interface SeededMemory {
+	id: string;
+	projectPath: string;
+}
+
 function insertMemory(
-	db: ReturnType<typeof createTestDb>,
+	db: TestDb,
 	input: {
 		projectPath: string;
 		category: string;
 		content: string;
-		importance?: number;
-		expiresAt?: number | null;
-		sourceType?: string;
 	},
-): { id: number } {
+): SeededMemory {
 	testMemoryId += 1;
-	const claim = seedProjectMemoryClaim(db, {
-		projectIdentity: input.projectPath,
-		content: input.content,
-		category: input.category,
-		...(input.importance == null ? {} : { importance: input.importance }),
-		...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+	const id = memoryObjectId(testMemoryId);
+	kernelFor(db, input.projectPath).seedDecision({
+		object_id: id,
+		decision_kind: input.category,
+		summary: input.content,
 	});
-	const byMemoryId =
-		seededClaims.get(db) ?? new Map<number, SeededProjectMemoryClaim>();
-	byMemoryId.set(testMemoryId, claim);
-	seededClaims.set(db, byMemoryId);
-	return { id: testMemoryId };
+	return { id, projectPath: input.projectPath };
 }
 
-function seededClaim(
-	db: ReturnType<typeof createTestDb>,
-	memoryId: number,
-): SeededProjectMemoryClaim {
-	const claim = seededClaims.get(db)?.get(memoryId);
-	if (!claim) throw new Error(`missing seeded claim for memory ${memoryId}`);
-	return claim;
+function archiveSeededMemory(db: TestDb, memory: SeededMemory): void {
+	const kernel = kernelFor(db, memory.projectPath);
+	const object = kernel.objects.get(memory.id);
+	if (!object) throw new Error(`missing seeded memory ${memory.id}`);
+	kernel.touch(memory.id);
+	object.invalidated_commit_seq = kernel.tip;
 }
 
-function refreshSeededClaim(
-	db: ReturnType<typeof createTestDb>,
-	memoryId: number,
-): void {
-	const claim = seededClaim(db, memoryId);
-	const current = getProjectMemoryClaimByPublicId(db, claim.publicClaimId);
-	if (!current) throw new Error(`missing revised claim ${claim.publicClaimId}`);
-	seededClaims.get(db)?.set(memoryId, {
-		...claim,
-		revision: current.revision,
-		contentDigest: current.contentDigest,
-		revisionLocator: formatRevisionLocator({
-			publicClaimId: current.publicClaimId,
-			revision: current.revision,
-			contentDigest: current.contentDigest,
-		}),
-		token: computeProjectMemoryMutationToken(db, claim.publicClaimId),
-	});
-}
-
-function makeSeededClaimShareable(
-	db: ReturnType<typeof createTestDb>,
-	memoryId: number,
-): void {
-	const claim = seededClaim(db, memoryId);
-	reviseProjectMemoryClaim(
-		db,
-		{ producer: "test", operationKey: `share-${claim.publicClaimId}` },
-		{
-			token: computeProjectMemoryMutationToken(db, claim.publicClaimId),
-			sharing: "shareable",
-			provenance: {
-				sourceLocator: `transcript://share/${claim.publicClaimId}`,
-				sourceContent: "share fixture",
-				extractor: "historian",
-				extractorVersion: "1",
-				extractorRunId: `share-${claim.publicClaimId}`,
-				independenceKey: `share-${claim.publicClaimId}`,
-				sourceTrustClass: "explicit_user",
-			},
-			actor: "user:test",
+/**
+ * A state whose `memory` re-reads the fake kernel on each access, so a test
+ * can seed memories after building the state the way a later pass would read
+ * a newer snapshot.
+ */
+function piState(
+	db: TestDb,
+	sessionId: string,
+	cwd: string,
+	overrides: Partial<PiM0M1State> = {},
+): PiM0M1State {
+	const projectIdentity = resolveProjectIdentity(cwd);
+	return {
+		sessionId,
+		projectIdentity,
+		projectDirectory: cwd,
+		injectionBudgetTokens: 10_000,
+		get memory() {
+			return memoryFor(db, projectIdentity);
 		},
-	);
-	refreshSeededClaim(db, memoryId);
-}
-
-function archiveSeededClaim(
-	db: ReturnType<typeof createTestDb>,
-	memoryId: number,
-): void {
-	const claim = seededClaim(db, memoryId);
-	setProjectMemoryClaimLifecycle(
-		db,
-		{ producer: "test", operationKey: `archive-${claim.publicClaimId}` },
-		{ token: claim.token, state: "archived", actor: "user:test" },
-	);
-	refreshSeededClaim(db, memoryId);
-}
-
-function projectMemoryEpochOf(
-	db: ReturnType<typeof createTestDb>,
-	projectPath: string,
-): number {
-	const row = db
-		.prepare(
-			"SELECT project_memory_epoch AS epoch FROM project_state WHERE project_path = ?",
-		)
-		.get(projectPath) as { epoch: number } | null | undefined;
-	return row?.epoch ?? 0;
+		...overrides,
+	};
 }
 
 function user(text: string, timestamp = 1) {
@@ -181,91 +152,6 @@ function result(toolCallId: string) {
 		timestamp: 1,
 	};
 }
-
-describe("workspace memory sharing", () => {
-	it("filters foreign categories consistently in Pi m[0] and status counts", () => {
-		const db = createTestDb();
-		const dir = mkdtempSync(join(tmpdir(), "mc-pi-share-"));
-		try {
-			db.exec(`
-				INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
-				VALUES (1, 'ws', '["CONSTRAINTS"]', 1, 1);
-				INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
-				VALUES (1, 'git:own', 'Own', '/own', 1), (1, 'git:foreign', 'Foreign', '/foreign', 1);
-			`);
-			insertMemory(db, {
-				projectPath: "git:own",
-				category: "NAMING",
-				content: "own naming remains visible",
-			});
-			const shared = insertMemory(db, {
-				projectPath: "git:foreign",
-				category: "CONSTRAINTS",
-				content: "foreign constraint is shared",
-			});
-			makeSeededClaimShareable(db, shared.id);
-			insertMemory(db, {
-				projectPath: "git:foreign",
-				category: "NAMING",
-				content: "foreign naming is hidden",
-			});
-			const state = {
-				sessionId: "pi-share",
-				projectIdentity: "git:own",
-				projectDirectory: dir,
-			};
-
-			const m0 = renderM0Pi(state, db, "");
-			expect(m0).toContain("own naming remains visible");
-			expect(m0).toContain("foreign constraint is shared");
-			expect(m0).not.toContain("foreign naming is hidden");
-
-			const messages = [userMessage("hello")];
-			const result = injectM0M1Pi(state, db, messages);
-			expect(result.memoryCount).toBe(2);
-			expect(textOf(messages[0])).toContain("foreign constraint is shared");
-			expect(textOf(messages[0])).not.toContain("foreign naming is hidden");
-		} finally {
-			rmSync(dir, { recursive: true, force: true });
-			closeQuietly(db);
-		}
-	});
-
-	it("does not render foreign memories when share_categories is malformed", () => {
-		const db = createTestDb();
-		const dir = mkdtempSync(join(tmpdir(), "mc-pi-share-malformed-"));
-		try {
-			db.exec(`
-				INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
-				VALUES (1, 'ws', 'not-json', 1, 1);
-				INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
-				VALUES (1, 'git:own', 'Own', '/own', 1), (1, 'git:foreign', 'Foreign', '/foreign', 1);
-			`);
-			insertMemory(db, {
-				projectPath: "git:own",
-				category: "CONSTRAINTS",
-				content: "own malformed Pi memory remains visible",
-			});
-			insertMemory(db, {
-				projectPath: "git:foreign",
-				category: "CONSTRAINTS",
-				content: "foreign malformed Pi memory is hidden",
-			});
-			const state = {
-				sessionId: "pi-share-malformed",
-				projectIdentity: "git:own",
-				projectDirectory: dir,
-			};
-
-			const m0 = renderM0Pi(state, db, "");
-			expect(m0).toContain("own malformed Pi memory remains visible");
-			expect(m0).not.toContain("foreign malformed Pi memory is hidden");
-		} finally {
-			rmSync(dir, { recursive: true, force: true });
-			closeQuietly(db);
-		}
-	});
-});
 
 describe("trimPiMessagesToBoundary", () => {
 	it("sweeps non-contiguous toolResults whose assistant toolCall was trimmed", () => {
@@ -388,7 +274,7 @@ describe("trimPiMessagesToBoundary", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0-frozen-cp-profile-"));
 		try {
-			const state = piState("ses-pi-frozen-cp-profile", cwd);
+			const state = piState(db, "ses-pi-frozen-cp-profile", cwd);
 			appendCompartments(db, state.sessionId, [
 				{
 					sequence: 1,
@@ -426,11 +312,9 @@ describe("trimPiMessagesToBoundary", () => {
 				frozenCompartments,
 				frozenUserProfile,
 			);
-			const claimLane = readProjectClaimLaneSnapshot(db, state.projectIdentity);
-			if (!claimLane) throw new Error("missing claim lane");
 			const m1 = renderM1Pi(state, db, {
 				claimFormatEpoch: 1,
-				claimSnapshotVector: claimLane.snapshotVector,
+				memorySnapshotKey: memorySnapshotKey(state.memory),
 				renderedRevisionLocators: [],
 				maxCompartmentSeq: 1,
 				maxMutationId: 0,
@@ -455,21 +339,12 @@ describe("trimPiMessagesToBoundary", () => {
 	});
 });
 
-function piState(sessionId: string, cwd: string) {
-	return {
-		sessionId,
-		projectIdentity: resolveProjectIdentity(cwd),
-		projectDirectory: cwd,
-		injectionBudgetTokens: 10_000,
-	};
-}
-
 describe("injectM0M1Pi memory feature gate", () => {
 	it("does NOT render project memories into m[0]/m[1] when memoryEnabled=false", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-memgate-"));
 		try {
-			const base = piState("ses-pi-memgate", cwd);
+			const base = piState(db, "ses-pi-memgate", cwd);
 			appendCompartments(db, base.sessionId, [
 				{
 					sequence: 1,
@@ -485,7 +360,6 @@ describe("injectM0M1Pi memory feature gate", () => {
 				projectPath: base.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "SECRET project memory must not leak when disabled",
-				sourceType: "user",
 			});
 
 			const disabledState = { ...base, memoryEnabled: false };
@@ -496,7 +370,7 @@ describe("injectM0M1Pi memory feature gate", () => {
 			expect(offM0).not.toContain("<project-memory");
 			expect(offM0).toContain("compartment body present");
 
-			const onState = piState("ses-pi-memgate-on", cwd);
+			const onState = piState(db, "ses-pi-memgate-on", cwd);
 			appendCompartments(db, onState.sessionId, [
 				{
 					sequence: 1,
@@ -522,10 +396,9 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-compaction-off-"));
 		try {
-			const offState = {
-				...piState("ses-pi-compaction-off", cwd),
+			const offState = piState(db, "ses-pi-compaction-off", cwd, {
 				compactionOff: true,
-			};
+			});
 			appendCompartments(db, offState.sessionId, [
 				{
 					sequence: 1,
@@ -541,7 +414,6 @@ describe("injectM0M1Pi", () => {
 				projectPath: offState.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "compaction-off memory survives",
-				sourceType: "user",
 			});
 			const messages = [
 				userMessage("raw history stays visible", 10),
@@ -572,11 +444,9 @@ describe("injectM0M1Pi", () => {
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-empty-"));
 		try {
 			const messages = [userMessage("hello", 10)];
-			injectM0M1Pi(piState("ses-pi-empty", cwd), db, messages as never);
+			injectM0M1Pi(piState(db, "ses-pi-empty", cwd), db, messages as never);
 
-			expect(textOf(messages[0] as never)).toBe(
-				"<session-history></session-history>",
-			);
+			expect(textOf(messages[0] as never)).toBe(EMPTY_PROJECT_M0);
 			expect(textOf(messages[1] as never)).toBe(
 				"<session-history-since>(no new content since last materialization)</session-history-since>",
 			);
@@ -597,7 +467,7 @@ describe("injectM0M1Pi", () => {
 				join(cwd, "STRUCTURE.md"),
 				"# PI_FLAG_OFF_STRUCTURE_DOCS\nStructure bytes must stay out.\n",
 			);
-			const state = { ...piState("ses-pi-docs-off", cwd), injectDocs: false };
+			const state = piState(db, "ses-pi-docs-off", cwd, { injectDocs: false });
 
 			const first = [userMessage("hello", 10)];
 			const firstResult = injectM0M1Pi(state, db, first as never);
@@ -629,7 +499,7 @@ describe("injectM0M1Pi", () => {
 			expect(textOf(second[0] as never)).toBe(firstM0);
 			expect(textOf(second[1] as never)).toBe(firstM1);
 
-			const enabledState = piState("ses-pi-docs-on", cwd);
+			const enabledState = piState(db, "ses-pi-docs-on", cwd);
 			const enabled = [userMessage("hello docs", 12)];
 			injectM0M1Pi(enabledState, db, enabled as never);
 			expect(textOf(enabled[0] as never)).toContain("<project-docs>");
@@ -653,7 +523,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-stable-"));
 		try {
-			const state = piState("ses-pi-stable", cwd);
+			const state = piState(db, "ses-pi-stable", cwd);
 			const first = [userMessage("hello", 10)];
 			injectM0M1Pi(state, db, first as never);
 			const firstM0 = textOf(first[0] as never);
@@ -673,7 +543,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-render-epoch-"));
 		try {
-			const state = piState("ses-pi-render-epoch", cwd);
+			const state = piState(db, "ses-pi-render-epoch", cwd);
 			injectM0M1Pi(state, db, [userMessage("first", 10)] as never);
 			db.prepare(
 				"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_upgrade_state = ? WHERE session_id = ?",
@@ -720,7 +590,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-compartment-"));
 		try {
-			const state = piState("ses-pi-compartment", cwd);
+			const state = piState(db, "ses-pi-compartment", cwd);
 			const first = [userMessage("hello", 10)];
 			injectM0M1Pi(state, db, first as never);
 			expect(textOf(first[0] as never)).not.toContain("Compacted setup");
@@ -753,7 +623,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-soft-delta-"));
 		try {
-			const state = piState("ses-pi-soft-delta", cwd);
+			const state = piState(db, "ses-pi-soft-delta", cwd);
 			appendCompartments(db, state.sessionId, [
 				{
 					sequence: 0,
@@ -817,7 +687,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-null-marker-"));
 		try {
-			const state = piState("ses-pi-null-marker", cwd);
+			const state = piState(db, "ses-pi-null-marker", cwd);
 			const first = [userMessage("hello", 10)];
 			injectM0M1Pi(state, db, first as never);
 
@@ -844,7 +714,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-legacy-zero-real-"));
 		try {
-			const state = piState("ses-pi-legacy-zero-real", cwd);
+			const state = piState(db, "ses-pi-legacy-zero-real", cwd);
 			appendCompartments(db, state.sessionId, [
 				{
 					sequence: 0,
@@ -879,7 +749,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-legacy-zero-empty-"));
 		try {
-			const state = piState("ses-pi-legacy-zero-empty", cwd);
+			const state = piState(db, "ses-pi-legacy-zero-empty", cwd);
 			injectM0M1Pi(state, db, [userMessage("hello", 10)] as never);
 			db.prepare(
 				"UPDATE session_meta SET cached_m0_max_compartment_seq = 0 WHERE session_id = ?",
@@ -894,9 +764,7 @@ describe("injectM0M1Pi", () => {
 			const result = injectM0M1Pi(state, db, messages as never);
 
 			expect(result.m0Materialized).toBe(false);
-			expect(textOf(messages[0] as never)).toBe(
-				"<session-history></session-history>",
-			);
+			expect(textOf(messages[0] as never)).toBe(EMPTY_PROJECT_M0);
 			expect(textOf(messages[1] as never)).toContain(
 				"no new content since last materialization",
 			);
@@ -909,7 +777,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-partial-marker-"));
 		try {
-			const state = piState("ses-pi-partial-marker", cwd);
+			const state = piState(db, "ses-pi-partial-marker", cwd);
 			injectM0M1Pi(state, db, [userMessage("hello", 10)] as never);
 
 			db.prepare(
@@ -929,7 +797,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-null-boundary-"));
 		try {
-			const state = piState("ses-pi-null-boundary", cwd);
+			const state = piState(db, "ses-pi-null-boundary", cwd);
 			appendCompartments(db, state.sessionId, [
 				{
 					sequence: 0,
@@ -969,7 +837,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-empty-boundary-"));
 		try {
-			const state = piState("ses-pi-empty-boundary", cwd);
+			const state = piState(db, "ses-pi-empty-boundary", cwd);
 			appendCompartments(db, state.sessionId, [
 				{
 					sequence: 0,
@@ -1007,7 +875,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-seq0-race-"));
 		try {
-			const state = piState("ses-pi-seq0-race", cwd);
+			const state = piState(db, "ses-pi-seq0-race", cwd);
 			const originalExec = db.exec.bind(db);
 			let injectedRace = false;
 			db.exec = ((sql: string) => {
@@ -1042,7 +910,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-frozen-boundary-"));
 		try {
-			const state = piState("ses-pi-frozen-boundary", cwd);
+			const state = piState(db, "ses-pi-frozen-boundary", cwd);
 			appendCompartments(db, state.sessionId, [
 				{
 					sequence: 0,
@@ -1081,7 +949,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-begin-busy-code-"));
 		try {
-			const state = piState("ses-pi-begin-busy-code", cwd);
+			const state = piState(db, "ses-pi-begin-busy-code", cwd);
 			injectM0M1Pi(state, db, [userMessage("hello", 10)] as never);
 			appendCompartments(db, state.sessionId, [
 				{
@@ -1110,9 +978,7 @@ describe("injectM0M1Pi", () => {
 			const result = injectM0M1Pi(state, db, messages as never);
 
 			expect(result.m0Materialized).toBe(false);
-			expect(textOf(messages[0] as never)).toBe(
-				"<session-history></session-history>",
-			);
+			expect(textOf(messages[0] as never)).toBe(EMPTY_PROJECT_M0);
 			expect(textOf(messages[1] as never)).toContain(
 				"no new content since last materialization",
 			);
@@ -1128,7 +994,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-begin-busy-"));
 		try {
-			const state = piState("ses-pi-begin-busy", cwd);
+			const state = piState(db, "ses-pi-begin-busy", cwd);
 			injectM0M1Pi(state, db, [userMessage("hello", 10)] as never);
 			appendCompartments(db, state.sessionId, [
 				{
@@ -1153,9 +1019,7 @@ describe("injectM0M1Pi", () => {
 			const result = injectM0M1Pi(state, db, messages as never);
 
 			expect(result.m0Materialized).toBe(false);
-			expect(textOf(messages[0] as never)).toBe(
-				"<session-history></session-history>",
-			);
+			expect(textOf(messages[0] as never)).toBe(EMPTY_PROJECT_M0);
 			expect(textOf(messages[1] as never)).toContain(
 				"no new content since last materialization",
 			);
@@ -1169,7 +1033,7 @@ describe("injectM0M1Pi", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-claim-additive-fold-"));
 		try {
-			const state = piState("ses-pi-claim-additive-fold", cwd);
+			const state = piState(db, "ses-pi-claim-additive-fold", cwd);
 			insertMemory(db, {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
@@ -1213,23 +1077,23 @@ describe("injectM0M1Pi", () => {
 		}
 	});
 
-	it("folds an archived claim out of m[0] when its snapshot vector changes", () => {
+	it("folds an archived memory out of m[0] when its snapshot key changes", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-claim-archive-fold-"));
+		const cwd = mkdtempSync(join(tmpdir(), "pi-memory-archive-fold-"));
 		try {
-			const state = piState("ses-pi-claim-archive-fold", cwd);
+			const state = piState(db, "ses-pi-memory-archive-fold", cwd);
 			const memory = insertMemory(db, {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
-				content: "Claim removed by lifecycle fold.",
+				content: "Memory removed by lifecycle fold.",
 			});
 			const first = [userMessage("hello", 10)];
 			injectM0M1Pi(state, db, first as never, undefined, true);
 			expect(textOf(first[0] as never)).toContain(
-				"Claim removed by lifecycle fold.",
+				"Memory removed by lifecycle fold.",
 			);
 
-			archiveSeededClaim(db, memory.id);
+			archiveSeededMemory(db, memory);
 			const folded = [userMessage("fold", 11)];
 			const foldResult = injectM0M1Pi(
 				state,
@@ -1240,7 +1104,7 @@ describe("injectM0M1Pi", () => {
 			);
 			expect(foldResult.m0Materialized).toBe(true);
 			expect(textOf(folded[0] as never)).not.toContain(
-				"Claim removed by lifecycle fold.",
+				"Memory removed by lifecycle fold.",
 			);
 			expect(textOf(folded[1] as never)).not.toContain("<memory-updates>");
 
@@ -1259,40 +1123,41 @@ describe("injectM0M1Pi", () => {
 		}
 	});
 
-	it("rejects m[1] publication when the claim snapshot vector changed", () => {
+	it("folds when the memory snapshot key moves, and renders the state marker for a non-available read", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-stale-vector-"));
+		const cwd = mkdtempSync(join(tmpdir(), "pi-m0-snapshot-key-"));
 		try {
-			const state = piState("ses-pi-m1-stale-vector", cwd);
-			insertMemory(db, {
+			const state = piState(db, "ses-pi-snapshot-key", cwd);
+			const seeded = insertMemory(db, {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
-				content: "Frozen vector claim.",
+				content: "Frozen snapshot memory.",
 			});
-			const lane = readProjectClaimLaneSnapshot(db, state.projectIdentity);
-			if (!lane) throw new Error("missing claim lane");
-			insertMemory(db, {
-				projectPath: state.projectIdentity,
-				category: "ARCHITECTURE",
-				content: "Concurrent vector claim.",
+			injectM0M1Pi(state, db, [userMessage("hello", 10)] as never, undefined, true);
+			expect(mustMaterializePi(state, db)).toEqual({ value: false, reason: null });
+
+			const kernel = kernelFor(db, state.projectIdentity);
+			kernel.touch(seeded.id);
+			expect(mustMaterializePi(state, db)).toEqual({ value: false, reason: null });
+			const object = kernel.objects.get(seeded.id);
+			if (object?.decision) object.decision.payload.summary = "Revised snapshot memory.";
+			expect(mustMaterializePi(state, db)).toMatchObject({
+				value: true,
+				reason: "project_memory_change",
+				mismatch: { signal: "memorySnapshotKey" },
 			});
-			expect(() =>
-				renderM1Pi(state, db, {
-					claimFormatEpoch: 1,
-					claimSnapshotVector: lane.snapshotVector,
-					renderedRevisionLocators: lane.items.map(
-						(item) => item.revisionLocator,
-					),
-					maxCompartmentSeq: -1,
-					maxMutationId: 0,
-					projectUserProfileVersion: 0,
-					projectDocsHash: "",
-					sessionFactsVersion: 0,
-					materializedAt: Date.now(),
-					upgradeState: "",
-					lastBaselineEndMessageId: null,
-				}),
-			).toThrow("claim snapshot changed before m1 render");
+
+			const absent = piState(db, state.sessionId, cwd, {
+				memory: { state: unavailable("daemon_absent"), rows: [], knownAsOf: null },
+			});
+			const messages = [userMessage("absent", 11)];
+			const result = injectM0M1Pi(absent, db, messages as never, undefined, true);
+			expect(result.m0Materialized).toBe(true);
+			expect(result.memoryCount).toBe(0);
+			expect(textOf(messages[0] as never)).toContain(
+				"<project-memory>\nmemory: daemon not running\n</project-memory>",
+			);
+			expect(textOf(messages[0] as never)).not.toContain("Frozen snapshot memory.");
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
 			closeQuietly(db);
@@ -1304,7 +1169,7 @@ describe("injectM0M1Pi", () => {
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-soft-cas-"));
 		const originalExec = db.exec.bind(db);
 		try {
-			const state = piState("ses-pi-m1-soft-cas", cwd);
+			const state = piState(db, "ses-pi-m1-soft-cas", cwd);
 			injectM0M1Pi(
 				state,
 				db,
@@ -1348,7 +1213,7 @@ describe("injectM0M1Pi", () => {
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-soft-cas-bytes-"));
 		const originalExec = db.exec.bind(db);
 		try {
-			const state = piState("ses-pi-m1-soft-cas-bytes", cwd);
+			const state = piState(db, "ses-pi-m1-soft-cas-bytes", cwd);
 			injectM0M1Pi(
 				state,
 				db,
@@ -1390,24 +1255,19 @@ describe("injectM0M1Pi", () => {
 		}
 	});
 
-	it("claim snapshot changes force a hard fold despite concurrent docs-marker drift", () => {
+	it("memory snapshot changes force a hard fold despite concurrent docs-marker drift", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-soft-cas-docs-"));
 		const originalExec = db.exec.bind(db);
 		try {
-			const state = piState("ses-pi-m1-soft-cas-docs", cwd);
+			const state = piState(db, "ses-pi-m1-soft-cas-docs", cwd);
 			const first = [userMessage("hello", 10)];
 			injectM0M1Pi(state, db, first as never, undefined, true);
 			const baselineM0 = textOf(first[0] as never);
-			const epochBeforeDelta = projectMemoryEpochOf(db, state.projectIdentity);
 			insertMemory(db, {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "Pi docs-hash-only CAS delta memory",
-				sourceType: "user",
-			});
-			setProjectState(db, state.projectIdentity, {
-				projectMemoryEpoch: epochBeforeDelta,
 			});
 			let changedDocsMarker = false;
 			db.exec = ((sql: string) => {
@@ -1442,7 +1302,7 @@ describe("renderM0Pi sibling-block layout (OpenCode parity)", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0-siblings-"));
 		try {
-			const state = piState("ses-pi-siblings", cwd);
+			const state = piState(db, "ses-pi-siblings", cwd);
 			appendCompartments(db, state.sessionId, [
 				{
 					sequence: 1,
@@ -1458,7 +1318,6 @@ describe("renderM0Pi sibling-block layout (OpenCode parity)", () => {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "The widget service owns rendering.",
-				sourceType: "user",
 			});
 
 			const m0 = renderM0Pi(state, db);
@@ -1468,7 +1327,7 @@ describe("renderM0Pi sibling-block layout (OpenCode parity)", () => {
 			expect(historyClose).toBeGreaterThan(-1);
 			expect(memoryOpen).toBeGreaterThan(-1);
 			expect(memoryOpen).toBeGreaterThan(historyClose);
-			expect(m0).toContain("<ARCHITECTURE>\nmcm_");
+			expect(m0).toContain("<ARCHITECTURE>\nmem_");
 			expect(m0).not.toContain("<memory id=");
 			const historyBlock = m0.slice(
 				m0.indexOf("<session-history>"),
@@ -1481,23 +1340,23 @@ describe("renderM0Pi sibling-block layout (OpenCode parity)", () => {
 		}
 	});
 
-	it("materializeM0Pi binds canonical revision locators and the snapshot vector", () => {
+	it("materializeM0Pi binds object ids as locators and the memory snapshot key", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0-locators-"));
 		try {
-			const state = piState("ses-pi-locators", cwd);
+			const state = piState(db, "ses-pi-locators", cwd);
 			const locators = [
 				"The widget service owns rendering.",
 				"Orders flow through an async queue.",
 				"Sessions use stateless JWT.",
-			].map((content) => {
-				const memory = insertMemory(db, {
-					projectPath: state.projectIdentity,
-					category: "ARCHITECTURE",
-					content,
-				});
-				return seededClaim(db, memory.id).revisionLocator;
-			});
+			].map(
+				(content) =>
+					insertMemory(db, {
+						projectPath: state.projectIdentity,
+						category: "ARCHITECTURE",
+						content,
+					}).id,
+			);
 
 			const { snapshotMarkers, renderedRevisionLocators } = materializeM0Pi(
 				state,
@@ -1508,26 +1367,30 @@ describe("renderM0Pi sibling-block layout (OpenCode parity)", () => {
 			expect(snapshotMarkers.renderedRevisionLocators).toEqual(
 				renderedRevisionLocators,
 			);
+			expect(snapshotMarkers.memorySnapshotKey).toBe(
+				memorySnapshotKey(state.memory),
+			);
 			expect(
-				Object.keys(
-					snapshotMarkers.claimSnapshotVector?.projectGenerations ?? {},
-				),
-			).toHaveLength(1);
+				db
+					.prepare(
+						"SELECT cached_m0_claim_snapshot_vector AS key FROM session_meta WHERE session_id = ?",
+					)
+					.get(state.sessionId),
+			).toEqual({ key: memorySnapshotKey(state.memory) });
 		} finally {
 			closeQuietly(db);
 		}
 	});
 
-	it("HARD fold binds memory expiry cutoff and materializedAt to one timestamp", () => {
+	it("HARD fold binds materializedAt to the fold timestamp and renders one memory block", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-d16c-"));
 		try {
-			const state = piState("ses-pi-d16c", cwd);
+			const state = piState(db, "ses-pi-d16c", cwd);
 			insertMemory(db, {
 				projectPath: state.projectIdentity,
 				category: "KNOWN_ISSUES",
 				content: "Pi D16c expiry-gap memory",
-				expiresAt: 10_500,
 			});
 			insertMemory(db, {
 				projectPath: state.projectIdentity,
@@ -1603,10 +1466,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-newcomp-"));
 		try {
-			const state = {
-				...piState("ses-pi-tax-newcomp", cwd),
+			const state = piState(db, "ses-pi-tax-newcomp", cwd, {
 				hardSignals: baseHard,
-			};
+			});
 			appendCompartments(db, state.sessionId, [compartment(0, "Alpha")]);
 			injectM0M1Pi(state, db, [userMessage("hi", 10)] as never, ["entry-0"]);
 
@@ -1624,10 +1486,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-"));
 		try {
-			const state = {
-				...piState("ses-pi-tax-model", cwd),
+			const state = piState(db, "ses-pi-tax-model", cwd, {
 				hardSignals: baseHard,
-			};
+			});
 			appendCompartments(db, state.sessionId, [compartment(0, "Alpha")]);
 			injectM0M1Pi(state, db, [userMessage("hi", 10)] as never, ["entry-0"]);
 
@@ -1648,10 +1509,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-sys-"));
 		try {
-			const state = {
-				...piState("ses-pi-tax-sys", cwd),
+			const state = piState(db, "ses-pi-tax-sys", cwd, {
 				hardSignals: baseHard,
-			};
+			});
 			appendCompartments(db, state.sessionId, [compartment(0, "Alpha")]);
 			injectM0M1Pi(state, db, [userMessage("hi", 10)] as never, ["entry-0"]);
 
@@ -1673,10 +1533,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-project-null-a-"));
 		const cwdB = mkdtempSync(join(tmpdir(), "pi-tax-project-null-b-"));
 		try {
-			const state = {
-				...piState("ses-pi-tax-project-null", cwd),
+			const state = piState(db, "ses-pi-tax-project-null", cwd, {
 				hardSignals: baseHard,
-			};
+			});
 			appendCompartments(db, state.sessionId, [compartment(0, "Alpha")]);
 			const first = [userMessage("hi", 10)];
 			injectM0M1Pi(state, db, first as never, ["entry-0"]);
@@ -1707,10 +1566,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 					.get(state.sessionId),
 			).toEqual({ cached_m0_project_identity: state.projectIdentity });
 
-			const switched = {
-				...piState(state.sessionId, cwdB),
+			const switched = piState(db, state.sessionId, cwdB, {
 				hardSignals: baseHard,
-			};
+			});
 			expect(mustMaterializePi(switched, db)).toMatchObject({
 				value: true,
 				reason: "project_change",
@@ -1727,10 +1585,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		const cwdA = mkdtempSync(join(tmpdir(), "pi-tax-project-a-"));
 		const cwdB = mkdtempSync(join(tmpdir(), "pi-tax-project-b-"));
 		try {
-			const stateA = {
-				...piState("ses-pi-tax-project-switch", cwdA),
+			const stateA = piState(db, "ses-pi-tax-project-switch", cwdA, {
 				hardSignals: baseHard,
-			};
+			});
 			insertMemory(db, {
 				projectPath: stateA.projectIdentity,
 				category: "ARCHITECTURE",
@@ -1740,10 +1597,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 			injectM0M1Pi(stateA, db, first as never, undefined, true);
 			expect(textOf(first[0] as never)).toContain("Project A memory");
 
-			const stateB = {
-				...piState(stateA.sessionId, cwdB),
+			const stateB = piState(db, stateA.sessionId, cwdB, {
 				hardSignals: baseHard,
-			};
+			});
 			insertMemory(db, {
 				projectPath: stateB.projectIdentity,
 				category: "ARCHITECTURE",
@@ -1786,10 +1642,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		const cwdModel = mkdtempSync(join(tmpdir(), "pi-tax-model-reason-"));
 		const cwdSystem = mkdtempSync(join(tmpdir(), "pi-tax-system-reason-"));
 		try {
-			const modelState = {
-				...piState("ses-pi-tax-model-reason", cwdModel),
+			const modelState = piState(db, "ses-pi-tax-model-reason", cwdModel, {
 				hardSignals: baseHard,
-			};
+			});
 			injectM0M1Pi(modelState, db, [userMessage("hi", 10)] as never);
 			const modelChanged = {
 				...modelState,
@@ -1801,10 +1656,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 			expect(modelResult.m0Reason).toBe("model_change");
 			expect(modelResult.m0Reason).not.toBe("first_render");
 
-			const systemState = {
-				...piState("ses-pi-tax-system-reason", cwdSystem),
+			const systemState = piState(db, "ses-pi-tax-system-reason", cwdSystem, {
 				hardSignals: baseHard,
-			};
+			});
 			injectM0M1Pi(systemState, db, [userMessage("hi", 10)] as never);
 			const systemChanged = {
 				...systemState,
@@ -1826,10 +1680,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-empty-"));
 		try {
-			const state = {
-				...piState("ses-pi-tax-empty", cwd),
+			const state = piState(db, "ses-pi-tax-empty", cwd, {
 				hardSignals: baseHard,
-			};
+			});
 			appendCompartments(db, state.sessionId, [compartment(0, "Alpha")]);
 			injectM0M1Pi(state, db, [userMessage("hi", 10)] as never, ["entry-0"]);
 
@@ -1855,10 +1708,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-docs-soft-"));
 		try {
-			const state = {
-				...piState("ses-pi-tax-docs-soft", cwd),
+			const state = piState(db, "ses-pi-tax-docs-soft", cwd, {
 				hardSignals: baseHard,
-			};
+			});
 			writeFileSync(join(cwd, "ARCHITECTURE.md"), "# Old Pi docs\n");
 			injectM0M1Pi(
 				state,
@@ -1883,10 +1735,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-docs-hard-"));
 		try {
-			const state = {
-				...piState("ses-pi-tax-docs-hard", cwd),
+			const state = piState(db, "ses-pi-tax-docs-hard", cwd, {
 				hardSignals: baseHard,
-			};
+			});
 			writeFileSync(join(cwd, "ARCHITECTURE.md"), "# Old Pi architecture\n");
 			const first = [userMessage("hi", 10)];
 			injectM0M1Pi(state, db, first as never, undefined, true);
@@ -1924,8 +1775,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-live-marker-repro-"));
 		try {
-			const state = {
-				...piState("019de471-4fdc-762d-9286-624dfad0b5fe", cwd),
+			const state = piState(db, "019de471-4fdc-762d-9286-624dfad0b5fe", cwd, {
 				projectIdentity: "git:f78f6db52b23c81d58dae3879c9383f550ec180e",
 				injectionBudgetTokens: 15_000,
 				historyBudgetTokens: 27_540,
@@ -1935,7 +1785,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 					systemHash: "38b2cc92af20c9236054057c7da1a3df",
 					modelKey: "openai-codex/gpt-5.6-sol",
 				},
-			};
+			});
 			appendCompartments(db, state.sessionId, [
 				{
 					sequence: 417,
@@ -2012,10 +1862,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-alias-forward-"));
 		try {
-			const state = {
-				...piState("ses-pi-tax-model-alias-forward", cwd),
+			const state = piState(db, "ses-pi-tax-model-alias-forward", cwd, {
 				hardSignals: { ...baseHard, modelKey: "openai/gpt-5.6-sol" },
-			};
+			});
 			injectM0M1Pi(state, db, [userMessage("hi", 10)] as never, ["entry-0"]);
 
 			const aliasOnly = {
@@ -2036,10 +1885,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-alias-reverse-"));
 		try {
-			const state = {
-				...piState("ses-pi-tax-model-alias-reverse", cwd),
+			const state = piState(db, "ses-pi-tax-model-alias-reverse", cwd, {
 				hardSignals: { ...baseHard, modelKey: "openai-codex/gpt-5.6-sol" },
-			};
+			});
 			injectM0M1Pi(state, db, [userMessage("hi", 10)] as never, ["entry-0"]);
 			expect(getOrCreateSessionMeta(db, state.sessionId).cachedM0ModelKey).toBe(
 				"openai/gpt-5.6-sol",
@@ -2063,10 +1911,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-alias-upgrade-"));
 		try {
-			const state = {
-				...piState("ses-pi-tax-model-alias-upgrade", cwd),
+			const state = piState(db, "ses-pi-tax-model-alias-upgrade", cwd, {
 				hardSignals: { ...baseHard, modelKey: "openai/gpt-5.6-sol" },
-			};
+			});
 			injectM0M1Pi(state, db, [userMessage("hi", 10)] as never, ["entry-0"]);
 			db.prepare(
 				"UPDATE session_meta SET cached_m0_model_key = ? WHERE session_id = ?",
@@ -2086,10 +1933,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-alias-real-switch-"));
 		try {
-			const state = {
-				...piState("ses-pi-tax-model-alias-real-switch", cwd),
+			const state = piState(db, "ses-pi-tax-model-alias-real-switch", cwd, {
 				hardSignals: { ...baseHard, modelKey: "openai-codex/gpt-5.6-sol" },
-			};
+			});
 			injectM0M1Pi(state, db, [userMessage("hi", 10)] as never, ["entry-0"]);
 
 			const realSwitch = {
@@ -2133,7 +1979,7 @@ describe("injectM0M1Pi m[1]-rendered coverage watermark (marker-drain liveness)"
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-coverage-"));
 		try {
-			const state = piState("ses-pi-m1-coverage", cwd);
+			const state = piState(db, "ses-pi-m1-coverage", cwd);
 			appendCompartments(db, state.sessionId, [
 				{
 					sequence: 0,
@@ -2215,7 +2061,7 @@ describe("injectM0M1Pi m[1]-rendered coverage watermark (marker-drain liveness)"
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-coverage-empty-"));
 		try {
-			const state = piState("ses-pi-m1-coverage-empty", cwd);
+			const state = piState(db, "ses-pi-m1-coverage-empty", cwd);
 			// The empty m[0] baseline's snapshot markers carry no compartment boundary.
 			const firstPass = [userMessage("hello", 10)];
 			const r0 = injectM0M1Pi(state, db, firstPass as never);
@@ -2288,7 +2134,7 @@ describe("injectM0M1Pi m[1]-rendered coverage watermark (marker-drain liveness)"
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-coverage-sibling-"));
 		const originalExec = db.exec.bind(db);
 		try {
-			const state = piState("ses-pi-m1-coverage-sibling", cwd);
+			const state = piState(db, "ses-pi-m1-coverage-sibling", cwd);
 			injectM0M1Pi(
 				state,
 				db,

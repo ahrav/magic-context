@@ -8,13 +8,6 @@ import {
     appendCompartments,
     replaceAllCompartmentState,
 } from "../../features/magic-context/compartment-storage";
-import { formatRevisionLocator } from "../../features/magic-context/memory/claim-operation-contract";
-import {
-    computeProjectMemoryMutationToken,
-    getProjectMemoryClaimByPublicId,
-    reviseProjectMemoryClaim,
-    setProjectMemoryClaimLifecycle,
-} from "../../features/magic-context/memory/storage-claim-operations";
 import type { Memory } from "../../features/magic-context/memory/types";
 import {
     bumpSessionFactsVersion,
@@ -22,11 +15,13 @@ import {
     queueM0Mutation,
     setProjectState,
 } from "../../features/magic-context/storage";
-import {
-    type SeededProjectMemoryClaim,
-    seedProjectMemoryClaim,
-} from "../../features/magic-context/test-claim-database";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import {
+    BUDGET_OMITTED_MARKER,
+    type KernelMemorySnapshot,
+    unavailable,
+} from "../../shared/kernel-client";
+import { FakeKernel } from "../../shared/kernel-client-testing/fake-kernel";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -48,6 +43,7 @@ import {
     renderMemoryLineV2,
     trimMemoriesToBudgetV2,
 } from "./inject-compartments";
+import { memorySnapshotKey } from "./kernel-memory-render";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
@@ -59,8 +55,37 @@ let db: Database;
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 const originalXdgCacheHome = process.env.XDG_CACHE_HOME;
-const seededClaims = new WeakMap<Database, Map<number, SeededProjectMemoryClaim>>();
+/**
+ * One fake kernel per database stands in for the daemon; `memoryFor` is the
+ * snapshot the transform would have read before this pass.
+ */
+const kernels = new WeakMap<Database, FakeKernel>();
 let testMemoryId = 0;
+
+function kernelFor(database: Database): FakeKernel {
+    let kernel = kernels.get(database);
+    if (!kernel) {
+        kernel = new FakeKernel();
+        kernels.set(database, kernel);
+    }
+    return kernel;
+}
+
+function memoryFor(database: Database): KernelMemorySnapshot {
+    return kernelFor(database).snapshot();
+}
+
+function memoryObjectId(id: number): string {
+    return `mem_${id.toString(16).padStart(32, "0")}`;
+}
+
+/** A seeded memory row; `id` is the object id the kernel serves it under. */
+interface SeededMemory {
+    id: string;
+    projectPath: string;
+    category: string;
+    content: string;
+}
 
 function insertMemory(
     database: Database,
@@ -74,89 +99,32 @@ function insertMemory(
         sourceType?: string;
         metadataJson?: string;
     },
-): Memory {
+): SeededMemory {
     testMemoryId += 1;
-    const projectIdentity =
-        input.projectPath.startsWith("git:") || input.projectPath.startsWith("dir:")
-            ? input.projectPath
-            : `dir:${input.projectPath}`;
-    const claim = seedProjectMemoryClaim(database, {
-        projectIdentity,
-        content: input.content,
-        category: input.category,
-        ...(input.importance == null ? {} : { importance: input.importance }),
-        ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+    const id = memoryObjectId(testMemoryId);
+    kernelFor(database).seedDecision({
+        object_id: id,
+        decision_kind: input.category,
+        summary: input.content,
     });
-    database
-        .prepare(
-            "INSERT OR IGNORE INTO project_aliases (alias_identity, project_id, created_at) VALUES (?, ?, ?)",
-        )
-        .run(input.projectPath, claim.projectId, Date.now());
-    const byMemoryId = seededClaims.get(database) ?? new Map<number, SeededProjectMemoryClaim>();
-    byMemoryId.set(testMemoryId, claim);
-    seededClaims.set(database, byMemoryId);
-    return {
-        id: testMemoryId,
-        projectPath: input.projectPath,
-        category: input.category,
-        content: input.content,
-        importance: input.importance ?? 50,
-        expiresAt: input.expiresAt ?? null,
-    } as unknown as Memory;
+    return { id, projectPath: input.projectPath, category: input.category, content: input.content };
 }
 
-function seededClaim(database: Database, memoryId: number): SeededProjectMemoryClaim {
-    const claim = seededClaims.get(database)?.get(memoryId);
-    if (!claim) throw new Error(`missing seeded claim for memory ${memoryId}`);
-    return claim;
+/** A change to the object outside this pass's view; the next snapshot key differs. */
+function reviseSeededMemory(database: Database, id: string): void {
+    const kernel = kernelFor(database);
+    const object = kernel.objects.get(id);
+    if (!object?.decision) throw new Error(`missing seeded memory ${id}`);
+    kernel.touch(id);
+    object.decision.payload.summary = `${object.decision.payload.summary} (revised)`;
 }
 
-function seededRevisionLocator(database: Database, memoryId: number): string {
-    return seededClaim(database, memoryId).revisionLocator;
-}
-
-function makeSeededClaimShareable(database: Database, memoryId: number): void {
-    const claim = seededClaim(database, memoryId);
-    reviseProjectMemoryClaim(
-        database,
-        { producer: "test", operationKey: `share-${claim.publicClaimId}` },
-        {
-            token: computeProjectMemoryMutationToken(database, claim.publicClaimId),
-            sharing: "shareable",
-            provenance: {
-                sourceLocator: `transcript://share/${claim.publicClaimId}`,
-                sourceContent: "share fixture",
-                extractor: "historian",
-                extractorVersion: "1",
-                extractorRunId: `share-${claim.publicClaimId}`,
-                independenceKey: `share-${claim.publicClaimId}`,
-                sourceTrustClass: "explicit_user",
-            },
-            actor: "user:test",
-        },
-    );
-    const current = getProjectMemoryClaimByPublicId(database, claim.publicClaimId);
-    if (!current) throw new Error(`missing revised claim ${claim.publicClaimId}`);
-    seededClaims.get(database)?.set(memoryId, {
-        ...claim,
-        revision: current.revision,
-        contentDigest: current.contentDigest,
-        revisionLocator: formatRevisionLocator({
-            publicClaimId: current.publicClaimId,
-            revision: current.revision,
-            contentDigest: current.contentDigest,
-        }),
-        token: computeProjectMemoryMutationToken(database, claim.publicClaimId),
-    });
-}
-
-function archiveSeededClaim(database: Database, memoryId: number): void {
-    const claim = seededClaim(database, memoryId);
-    setProjectMemoryClaimLifecycle(
-        database,
-        { producer: "test", operationKey: `archive-${claim.publicClaimId}` },
-        { token: claim.token, state: "archived", actor: "user:test" },
-    );
+function archiveSeededMemory(database: Database, id: string): void {
+    const kernel = kernelFor(database);
+    const object = kernel.objects.get(id);
+    if (!object) throw new Error(`missing seeded memory ${id}`);
+    kernel.touch(id);
+    object.invalidated_commit_seq = kernel.tip;
 }
 
 function makeDb(): Database {
@@ -317,12 +285,77 @@ describe("compact project-memory wire", () => {
 });
 
 describe("prepareCompartmentInjection — empty compartments fallback", () => {
-    it("returns null when compartments, facts, and memories are all empty", () => {
+    it("renders only the empty-project marker when compartments, facts, and memories are all empty", () => {
         db = makeDb();
         const messages: MessageLike[] = [userMessage("m1", "hi")];
-        const result = prepareCompartmentInjection(db, SESSION_ID, messages, true, PROJECT_PATH);
-        expect(result).toBeNull();
+        const result = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages,
+            isCacheBusting: true,
+            memory: memoryFor(db),
+            projectPath: PROJECT_PATH,
+        });
+        expect(result?.memoryCount).toBe(0);
+        expect(result?.compartmentCount).toBe(0);
+        expect(result?.block).toBe(
+            "<project-memory>\nmemory: no memories recorded for this project yet\n</project-memory>",
+        );
         expect(messages.length).toBe(1);
+    });
+
+    it("renders the budget-omitted marker when the budget trims every memory row", () => {
+        db = makeDb();
+        insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "PROJECT_RULES",
+            content: "always run the focused test suite before handing off",
+        });
+        const result = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: [userMessage("m1", "hi")],
+            isCacheBusting: true,
+            memory: memoryFor(db),
+            projectPath: PROJECT_PATH,
+            injectionBudgetTokens: 0,
+        });
+        expect(result?.memoryCount).toBe(0);
+        expect(result?.block).toBe(`<project-memory>\n${BUDGET_OMITTED_MARKER}\n</project-memory>`);
+    });
+
+    it("returns null when the session has no project to bind memory to", () => {
+        db = makeDb();
+        const messages: MessageLike[] = [userMessage("m1", "hi")];
+        const result = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages,
+            isCacheBusting: true,
+            memory: memoryFor(db),
+        });
+        expect(result).toBeNull();
+    });
+
+    it("renders only the unavailable marker when the daemon cannot be reached", () => {
+        db = makeDb();
+        insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "USER_DIRECTIVES",
+            content: "hidden while the daemon is absent",
+        });
+        const result = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: [userMessage("m1", "hi")],
+            isCacheBusting: true,
+            memory: { state: unavailable("daemon_absent"), rows: [], knownAsOf: null },
+            projectPath: PROJECT_PATH,
+        });
+        expect(result?.memoryCount).toBe(0);
+        expect(result?.block).toContain("<project-memory>");
+        expect(result?.block).not.toContain("hidden while the daemon is absent");
+        expect(result?.block).toContain("memory:");
     });
 
     it("injects memories-only block when no compartments exist", () => {
@@ -334,7 +367,14 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
         });
 
         const messages: MessageLike[] = [userMessage("m1", "original")];
-        const result = prepareCompartmentInjection(db, SESSION_ID, messages, true, PROJECT_PATH);
+        const result = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages,
+            isCacheBusting: true,
+            memory: memoryFor(db),
+            projectPath: PROJECT_PATH,
+        });
 
         expect(result).not.toBeNull();
         expect(result?.compartmentCount).toBe(0);
@@ -360,11 +400,19 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
         );
 
         const messages: MessageLike[] = [userMessage("m1", "go")];
-        const result = prepareCompartmentInjection(db, SESSION_ID, messages, true, PROJECT_PATH);
+        const result = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages,
+            isCacheBusting: true,
+            memory: memoryFor(db),
+            projectPath: PROJECT_PATH,
+        });
 
         // session_facts is not a render source.
         // Facts are rendered only after promotion to memories.
-        expect(result).toBeNull();
+        expect(result?.factCount).toBe(0);
+        expect(result?.block).not.toContain("Use SQLite");
     });
 
     it("injects memories block (facts not rendered) when no compartments", () => {
@@ -382,7 +430,14 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
         );
 
         const messages: MessageLike[] = [userMessage("m1", "hello")];
-        const result = prepareCompartmentInjection(db, SESSION_ID, messages, true, PROJECT_PATH);
+        const result = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages,
+            isCacheBusting: true,
+            memory: memoryFor(db),
+            projectPath: PROJECT_PATH,
+        });
 
         expect(result).not.toBeNull();
         expect(result?.compartmentCount).toBe(0);
@@ -401,7 +456,14 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
         });
 
         const messages: MessageLike[] = [userMessage("m1", "original")];
-        const prepared = prepareCompartmentInjection(db, SESSION_ID, messages, true, PROJECT_PATH);
+        const prepared = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages,
+            isCacheBusting: true,
+            memory: memoryFor(db),
+            projectPath: PROJECT_PATH,
+        });
         expect(prepared).not.toBeNull();
         if (!prepared) return;
 
@@ -428,13 +490,14 @@ describe("prepareCompartmentInjection — cross-database cache isolation", () =>
                 category: "CONSTRAINTS",
                 content: "MEMORY-ONLY-IN-FIRST-DATABASE",
             });
-            const populated = prepareCompartmentInjection(
-                first,
-                SESSION_ID,
-                [userMessage("m1", "hi")],
-                true,
-                PROJECT_PATH,
-            );
+            const populated = prepareCompartmentInjection({
+                db: first,
+                sessionId: SESSION_ID,
+                messages: [userMessage("m1", "hi")],
+                isCacheBusting: true,
+                memory: memoryFor(first),
+                projectPath: PROJECT_PATH,
+            });
             expect(populated?.block).toContain("MEMORY-ONLY-IN-FIRST-DATABASE");
         } finally {
             closeQuietly(first);
@@ -443,105 +506,17 @@ describe("prepareCompartmentInjection — cross-database cache isolation", () =>
         // Stores that share a session ID must not see each other's blocks.
         db = makeDb();
         const messages: MessageLike[] = [userMessage("m1", "hi")];
-        const replayed = prepareCompartmentInjection(db, SESSION_ID, messages, false, PROJECT_PATH);
+        const replayed = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages,
+            isCacheBusting: false,
+            memory: memoryFor(db),
+            projectPath: PROJECT_PATH,
+        });
 
         expect(replayed?.block ?? "").not.toContain("MEMORY-ONLY-IN-FIRST-DATABASE");
-        expect(replayed).toBeNull();
-    });
-});
-
-describe("prepareCompartmentInjection — workspace memory sharing", () => {
-    it("renders only explicitly shared foreign memory categories", () => {
-        db = makeDb();
-        db.prepare(
-            "INSERT INTO workspaces (id, name, share_categories, created_at, updated_at) VALUES (1, 'ws', '[\"CONSTRAINTS\"]', 1, 1)",
-        ).run();
-        db.prepare(
-            "INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at) VALUES (1, ?, 'Own', ?, 1), (1, ?, 'Foreign', ?, 1)",
-        ).run(PROJECT_PATH, PROJECT_PATH, "/tmp/foreign-project", "/tmp/foreign-project");
-        insertMemory(db, {
-            projectPath: PROJECT_PATH,
-            category: "NAMING",
-            content: "own workspace naming remains visible",
-        });
-        const foreignShared = insertMemory(db, {
-            projectPath: "/tmp/foreign-project",
-            category: "CONSTRAINTS",
-            content: "foreign workspace constraint is shared",
-        });
-        makeSeededClaimShareable(db, foreignShared.id);
-        insertMemory(db, {
-            projectPath: "/tmp/foreign-project",
-            category: "NAMING",
-            content: "foreign workspace naming is hidden",
-        });
-        insertMemory(db, {
-            projectPath: "/tmp/foreign-project",
-            category: "CONSTRAINTS",
-            content: "foreign private constraint is hidden",
-        });
-        const archived = insertMemory(db, {
-            projectPath: PROJECT_PATH,
-            category: "ARCHITECTURE",
-            content: "archived high id is hidden",
-        });
-        archiveSeededClaim(db, archived.id);
-        const expired = insertMemory(db, {
-            projectPath: "/tmp/foreign-project",
-            category: "CONSTRAINTS",
-            content: "expired high id is hidden",
-            expiresAt: 1,
-        });
-        makeSeededClaimShareable(db, expired.id);
-
-        const result = materializeM0({
-            db,
-            sessionId: SESSION_ID,
-            state: readStateFromMeta(),
-            projectPath: PROJECT_PATH,
-            projectDirectory: "",
-        });
-
-        expect(result.m0Text).toContain("own workspace naming remains visible");
-        expect(result.m0Text).toContain("foreign workspace constraint is shared");
-        expect(result.m0Text).not.toContain("foreign workspace naming is hidden");
-        expect(result.m0Text).not.toContain("foreign private constraint is hidden");
-        expect(result.m0Text).not.toContain("archived high id is hidden");
-        expect(result.m0Text).not.toContain("expired high id is hidden");
-        expect(result.snapshotMarkers.renderedRevisionLocators).toContain(
-            seededRevisionLocator(db, foreignShared.id),
-        );
-    });
-
-    it("does not render foreign memories when share_categories is malformed", () => {
-        db = makeDb();
-        db.prepare(
-            "INSERT INTO workspaces (id, name, share_categories, created_at, updated_at) VALUES (1, 'ws', 'not-json', 1, 1)",
-        ).run();
-        db.prepare(
-            "INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at) VALUES (1, ?, 'Own', ?, 1), (1, ?, 'Foreign', ?, 1)",
-        ).run(PROJECT_PATH, PROJECT_PATH, "/tmp/foreign-project", "/tmp/foreign-project");
-        insertMemory(db, {
-            projectPath: PROJECT_PATH,
-            category: "CONSTRAINTS",
-            content: "own malformed workspace memory remains visible",
-        });
-        insertMemory(db, {
-            projectPath: "/tmp/foreign-project",
-            category: "CONSTRAINTS",
-            content: "foreign malformed workspace memory is hidden",
-        });
-
-        const result = materializeM0({
-            db,
-            sessionId: SESSION_ID,
-            state: readStateFromMeta(),
-            projectPath: PROJECT_PATH,
-            projectDirectory: "",
-        });
-
-        expect(result.m0Text).toContain("own malformed workspace memory remains visible");
-        expect(result.m0Text).not.toContain("foreign malformed workspace memory is hidden");
+        expect(replayed?.memoryCount).toBe(0);
     });
 });
 
@@ -558,13 +533,14 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
             userMessage("m1", "hello"),
             userMessage("m2", "follow up"),
         ];
-        const pass1 = prepareCompartmentInjection(
+        const pass1 = prepareCompartmentInjection({
             db,
-            SESSION_ID,
-            pass1Messages,
-            true,
-            PROJECT_PATH,
-        );
+            sessionId: SESSION_ID,
+            messages: pass1Messages,
+            isCacheBusting: true,
+            memory: memoryFor(db),
+            projectPath: PROJECT_PATH,
+        });
         expect(pass1?.compartmentCount).toBe(0);
         expect(pass1?.compartmentEndMessageId).toBe("");
         expect(pass1Messages.length).toBe(2);
@@ -592,13 +568,14 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
             userMessage("m1", "hello"),
             userMessage("m2", "follow up"),
         ];
-        const pass2 = prepareCompartmentInjection(
+        const pass2 = prepareCompartmentInjection({
             db,
-            SESSION_ID,
-            pass2Messages,
-            true,
-            PROJECT_PATH,
-        );
+            sessionId: SESSION_ID,
+            messages: pass2Messages,
+            isCacheBusting: true,
+            memory: memoryFor(db),
+            projectPath: PROJECT_PATH,
+        });
         expect(pass2?.compartmentCount).toBe(1);
         expect(pass2?.compartmentEndMessageId).toBe("m1");
         expect(pass2?.skippedVisibleMessages).toBe(1);
@@ -617,24 +594,26 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
         });
 
         const bustMessages: MessageLike[] = [userMessage("m1", "hi")];
-        const busted = prepareCompartmentInjection(
+        const busted = prepareCompartmentInjection({
             db,
-            SESSION_ID,
-            bustMessages,
-            true,
-            PROJECT_PATH,
-        );
+            sessionId: SESSION_ID,
+            messages: bustMessages,
+            isCacheBusting: true,
+            memory: memoryFor(db),
+            projectPath: PROJECT_PATH,
+        });
         expect(busted?.compartmentCount).toBe(0);
 
         // Cached replay leaves messages unchanged.
         const deferMessages: MessageLike[] = [userMessage("m1", "hi"), userMessage("m2", "new")];
-        const cached = prepareCompartmentInjection(
+        const cached = prepareCompartmentInjection({
             db,
-            SESSION_ID,
-            deferMessages,
-            false,
-            PROJECT_PATH,
-        );
+            sessionId: SESSION_ID,
+            messages: deferMessages,
+            isCacheBusting: false,
+            memory: memoryFor(db),
+            projectPath: PROJECT_PATH,
+        });
         // The replayed output matches the busted output except for rebuiltFromDb.
         // rebuiltFromDb is true on a bust and false on replay.
         // rebuiltFromDb signals per-pass provenance to the postprocess drain.
@@ -690,13 +669,14 @@ describe("prepareCompartmentInjection — SQLITE_BUSY handling (issue #23)", () 
 
         const messages: MessageLike[] = [userMessage("m1", "hello")];
         // prepareCompartmentInjection must swallow SQLITE_BUSY from the optional cache write.
-        const result = prepareCompartmentInjection(
-            busyProxy,
-            SESSION_ID,
+        const result = prepareCompartmentInjection({
+            db: busyProxy,
+            sessionId: SESSION_ID,
             messages,
-            true,
-            PROJECT_PATH,
-        );
+            isCacheBusting: true,
+            memory: memoryFor(db),
+            projectPath: PROJECT_PATH,
+        });
 
         expect(result).not.toBeNull();
         expect(result?.memoryCount).toBe(1);
@@ -738,7 +718,14 @@ describe("prepareCompartmentInjection — SQLITE_BUSY handling (issue #23)", () 
 
         const messages: MessageLike[] = [userMessage("m1", "hello")];
         expect(() =>
-            prepareCompartmentInjection(errorProxy, SESSION_ID, messages, true, PROJECT_PATH),
+            prepareCompartmentInjection({
+                db: errorProxy,
+                sessionId: SESSION_ID,
+                messages,
+                isCacheBusting: true,
+                memory: memoryFor(db),
+                projectPath: PROJECT_PATH,
+            }),
         ).toThrow("schema mismatch");
     });
 });
@@ -754,6 +741,7 @@ describe("m[0]/m[1] materialization", () => {
 
         const rendered = materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             temporalAwareness: true,
@@ -772,6 +760,7 @@ describe("m[0]/m[1] materialization", () => {
 
         const rendered = materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             temporalAwareness: false,
@@ -792,6 +781,7 @@ describe("m[0]/m[1] materialization", () => {
 
         const first = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state,
             temporalAwareness: true,
@@ -799,6 +789,7 @@ describe("m[0]/m[1] materialization", () => {
         });
         const second = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state,
             temporalAwareness: true,
@@ -806,6 +797,7 @@ describe("m[0]/m[1] materialization", () => {
         });
         const third = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state,
             temporalAwareness: true,
@@ -844,6 +836,7 @@ describe("m[0]/m[1] materialization", () => {
 
         const first = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: firstMessages,
             state,
@@ -853,6 +846,7 @@ describe("m[0]/m[1] materialization", () => {
         });
         const second = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: secondMessages,
             state,
@@ -872,6 +866,7 @@ describe("m[0]/m[1] materialization", () => {
         db = makeDb();
         const decision = mustMaterialize({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
@@ -885,6 +880,7 @@ describe("m[0]/m[1] materialization", () => {
         const projectDirectory = makeProjectDir();
         materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
@@ -894,6 +890,7 @@ describe("m[0]/m[1] materialization", () => {
 
         const decision = mustMaterialize({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state,
             projectPath: PROJECT_PATH,
@@ -903,59 +900,47 @@ describe("m[0]/m[1] materialization", () => {
         expect(decision).toEqual({ value: false, reason: null });
     });
 
-    it("invalidates claim snapshot vectors after background claim and workspace writes", () => {
-        const directory = makeProjectDir();
-        const path = join(directory, "claim-vector.db");
-        const reader = createDirectTestDatabase({ path }).db;
-        getOrCreateSessionMeta(reader, SESSION_ID);
-        const writer = new Database(path);
-        try {
-            const before = readCurrentM0SnapshotMarkers({
-                db: reader,
+    it("changes the memory snapshot key when the kernel serves a different snapshot", () => {
+        db = makeDb();
+        const read = () =>
+            readCurrentM0SnapshotMarkers({
+                db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 projectPath: PROJECT_PATH,
                 projectDirectory: "",
             });
-            insertMemory(writer, {
-                projectPath: PROJECT_PATH,
-                category: "PROJECT_RULES",
-                content: "Background claim write must invalidate the vector.",
-            });
-            const afterClaim = readCurrentM0SnapshotMarkers({
-                db: reader,
-                sessionId: SESSION_ID,
-                projectPath: PROJECT_PATH,
-                projectDirectory: "",
-            });
-            expect(afterClaim.claimSnapshotVector).not.toEqual(before.claimSnapshotVector);
+        const before = read();
+        const seeded = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "PROJECT_RULES",
+            content: "A background write must change the key.",
+        });
+        const afterWrite = read();
+        expect(afterWrite.memorySnapshotKey).not.toBe(before.memorySnapshotKey);
 
-            writer
-                .prepare("INSERT INTO workspaces (name, created_at, updated_at) VALUES (?, ?, ?)")
-                .run("background-workspace", 1, 1);
-            writer
-                .prepare(
-                    "INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at) VALUES (1, ?, ?, ?, ?)",
-                )
-                .run(PROJECT_PATH, "primary", PROJECT_PATH, 1);
-            const afterWorkspace = readCurrentM0SnapshotMarkers({
-                db: reader,
-                sessionId: SESSION_ID,
-                projectPath: PROJECT_PATH,
-                projectDirectory: "",
-            });
-            expect(afterWorkspace.claimSnapshotVector?.workspaceEpoch).not.toBe(
-                afterClaim.claimSnapshotVector?.workspaceEpoch,
-            );
-        } finally {
-            closeQuietly(writer);
-            closeQuietly(reader);
-        }
+        kernelFor(db).touch(seeded.id);
+        expect(read().memorySnapshotKey).toBe(afterWrite.memorySnapshotKey);
+
+        reviseSeededMemory(db, seeded.id);
+        const afterRevision = read();
+        expect(afterRevision.memorySnapshotKey).not.toBe(afterWrite.memorySnapshotKey);
+
+        const unavailableRead = readCurrentM0SnapshotMarkers({
+            db,
+            memory: { state: unavailable("daemon_absent"), rows: [], knownAsOf: null },
+            sessionId: SESSION_ID,
+            projectPath: PROJECT_PATH,
+            projectDirectory: "",
+        });
+        expect(unavailableRead.memorySnapshotKey).not.toBe(afterRevision.memorySnapshotKey);
     });
 
-    it("returns the same claim snapshot vector for unchanged state", () => {
+    it("returns the same memory snapshot key for an unchanged snapshot", () => {
         db = makeDb();
         const args = {
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             projectPath: PROJECT_PATH,
             projectDirectory: "",
@@ -964,7 +949,7 @@ describe("m[0]/m[1] materialization", () => {
         const before = readCurrentM0SnapshotMarkers(args);
         const after = readCurrentM0SnapshotMarkers(args);
 
-        expect(after.claimSnapshotVector).toEqual(before.claimSnapshotVector);
+        expect(after.memorySnapshotKey).toEqual(before.memorySnapshotKey);
         expect(after.renderedRevisionLocators).toEqual(before.renderedRevisionLocators);
     });
 
@@ -973,6 +958,7 @@ describe("m[0]/m[1] materialization", () => {
         const projectDirectory = makeProjectDir();
         materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
@@ -990,6 +976,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(
             mustMaterialize({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 state,
                 projectPath: PROJECT_PATH,
@@ -999,6 +986,7 @@ describe("m[0]/m[1] materialization", () => {
 
         const folded = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state,
             projectPath: PROJECT_PATH,
@@ -1006,6 +994,7 @@ describe("m[0]/m[1] materialization", () => {
         });
         const replay1 = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state,
             projectPath: PROJECT_PATH,
@@ -1013,6 +1002,7 @@ describe("m[0]/m[1] materialization", () => {
         });
         const replay2 = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state,
             projectPath: PROJECT_PATH,
@@ -1031,6 +1021,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(
             mustMaterialize({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 state,
                 projectPath: PROJECT_PATH,
@@ -1050,6 +1041,7 @@ describe("m[0]/m[1] materialization", () => {
                 });
                 const rendered = materializeM0({
                     db: localDb,
+                    memory: memoryFor(localDb),
                     sessionId: SESSION_ID,
                     state: getOrCreateSessionMeta(localDb, SESSION_ID),
                     projectPath: PROJECT_PATH,
@@ -1065,69 +1057,33 @@ describe("m[0]/m[1] materialization", () => {
         };
 
         const normalizeLocator = (value: string) =>
-            value.replace(/mcm_[a-f0-9]{32}/g, "mcm_PUBLIC_ID");
+            value.replace(/mem_[a-f0-9]{32}/g, "mem_OBJECT_ID");
         expect(normalizeLocator(render(true))).toBe(normalizeLocator(render(false)));
     });
 
-    it("mustMaterialize rejects a cached claim generation ahead of current state", () => {
+    it("mustMaterialize folds when the cached memory snapshot key is not the current one", () => {
         db = makeDb();
         insertMemory(db, {
             projectPath: PROJECT_PATH,
             category: "ARCHITECTURE",
-            content: "Generation mismatch fixture",
+            content: "Snapshot key mismatch fixture",
         });
         const projectDirectory = makeProjectDir();
         materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
             projectDirectory,
         });
         const state = readStateFromMeta();
-        const vector = JSON.parse(state.cachedM0ClaimSnapshotVector ?? "null") as {
-            projectGenerations: Record<string, number>;
-        };
-        const projectId = Object.keys(vector.projectGenerations)[0];
-        if (!projectId) throw new Error("missing project generation");
-        vector.projectGenerations[projectId] += 1;
-        state.cachedM0ClaimSnapshotVector = JSON.stringify(vector);
+        expect(state.cachedM0ClaimSnapshotVector).toBe(memorySnapshotKey(memoryFor(db)));
+        state.cachedM0ClaimSnapshotVector = "available@99#1";
 
         const decision = mustMaterialize({
             db,
-            sessionId: SESSION_ID,
-            state,
-            projectPath: PROJECT_PATH,
-            projectDirectory,
-        });
-        expect(decision.value).toBe(true);
-        expect(decision.reason).toBe("project_memory_change");
-    });
-
-    it("mustMaterialize rejects a stale cached workspace epoch", () => {
-        db = makeDb();
-        insertMemory(db, {
-            projectPath: PROJECT_PATH,
-            category: "ARCHITECTURE",
-            content: "Workspace epoch fixture",
-        });
-        const projectDirectory = makeProjectDir();
-        materializeM0({
-            db,
-            sessionId: SESSION_ID,
-            state: readStateFromMeta(),
-            projectPath: PROJECT_PATH,
-            projectDirectory,
-        });
-        const state = readStateFromMeta();
-        const vector = JSON.parse(state.cachedM0ClaimSnapshotVector ?? "null") as {
-            workspaceEpoch: string;
-        };
-        vector.workspaceEpoch = "stale-workspace-epoch";
-        state.cachedM0ClaimSnapshotVector = JSON.stringify(vector);
-
-        const decision = mustMaterialize({
-            db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state,
             projectPath: PROJECT_PATH,
@@ -1146,6 +1102,7 @@ describe("m[0]/m[1] materialization", () => {
         const projectDirectory = makeProjectDir();
         materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
@@ -1169,6 +1126,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(
             mustMaterialize({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 state,
                 projectPath: PROJECT_PATH,
@@ -1177,6 +1135,7 @@ describe("m[0]/m[1] materialization", () => {
         ).toBe(false);
         const refreshed = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state,
             projectPath: PROJECT_PATH,
@@ -1193,6 +1152,7 @@ describe("m[0]/m[1] materialization", () => {
         const projectDirectory = makeProjectDir();
         materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
@@ -1213,6 +1173,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(
             mustMaterialize({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 state,
                 projectPath: PROJECT_PATH,
@@ -1228,6 +1189,7 @@ describe("m[0]/m[1] materialization", () => {
         const projectDirectory = makeProjectDir();
         materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
@@ -1255,6 +1217,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(
             mustMaterialize({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 state,
                 projectPath: PROJECT_PATH,
@@ -1268,6 +1231,7 @@ describe("m[0]/m[1] materialization", () => {
         const projectDirectory = makeProjectDir();
         materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
@@ -1283,6 +1247,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(
             mustMaterialize({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 state,
                 projectPath: PROJECT_PATH,
@@ -1297,6 +1262,7 @@ describe("m[0]/m[1] materialization", () => {
         const projectDirectory = makeProjectDir();
         materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
@@ -1308,6 +1274,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(
             mustMaterialize({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 state,
                 projectPath: PROJECT_PATH,
@@ -1338,6 +1305,7 @@ describe("m[0]/m[1] materialization", () => {
         const first = [userMessage("m1", "hello")];
         const firstResult = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: first,
             state,
@@ -1357,6 +1325,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(
             mustMaterialize({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 state,
                 projectPath: PROJECT_PATH,
@@ -1369,6 +1338,7 @@ describe("m[0]/m[1] materialization", () => {
         const second = [userMessage("m2", "hello again")];
         const secondResult = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: second,
             state,
@@ -1393,6 +1363,7 @@ describe("m[0]/m[1] materialization", () => {
         const first = [userMessage("m1", "hello")];
         injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: first,
             state,
@@ -1409,6 +1380,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(
             mustMaterialize({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 state,
                 projectPath: PROJECT_PATH,
@@ -1430,6 +1402,7 @@ describe("m[0]/m[1] materialization", () => {
         const second = [userMessage("m2", "hello again")];
         const result = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: second,
             state,
@@ -1458,6 +1431,7 @@ describe("m[0]/m[1] materialization", () => {
         const projectDirectory = makeProjectDir();
         materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
@@ -1471,6 +1445,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(
             mustMaterialize({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 state,
                 projectPath: PROJECT_PATH,
@@ -1484,6 +1459,7 @@ describe("m[0]/m[1] materialization", () => {
         const projectDirectory = makeProjectDir();
         const result = materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
@@ -1506,9 +1482,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(Buffer.from(row.cached_m0_bytes as Buffer).toString("utf8")).toBe(result.m0Text);
         expect(Buffer.from(row.cached_m1_bytes as Buffer).toString("utf8")).toBe(result.m1Text);
         expect(typeof row.cached_m0_claim_format_epoch).toBe("number");
-        expect(JSON.parse(String(row.cached_m0_claim_snapshot_vector))).toEqual(
-            result.snapshotMarkers.claimSnapshotVector,
-        );
+        expect(row.cached_m0_claim_snapshot_vector).toBe(result.snapshotMarkers.memorySnapshotKey);
         expect(JSON.parse(String(row.cached_m0_rendered_revision_locators))).toEqual([]);
         expect(row.cached_m0_project_user_profile_version).toBe(0);
         expect(row.cached_m0_max_compartment_seq).toBe(-1);
@@ -1536,6 +1510,7 @@ describe("m[0]/m[1] materialization", () => {
         }).id;
         materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
@@ -1548,9 +1523,7 @@ describe("m[0]/m[1] materialization", () => {
             .get(SESSION_ID) as { memory_block_count: number; memory_block_ids: string };
         expect(row.memory_block_count).toBe(2);
         const locators = JSON.parse(row.memory_block_ids) as string[];
-        expect(new Set(locators)).toEqual(
-            new Set([seededRevisionLocator(db, id1), seededRevisionLocator(db, id2)]),
-        );
+        expect(new Set(locators)).toEqual(new Set([id1, id2]));
     });
 
     it("publishes new claim locators only after the snapshot-vector fold", () => {
@@ -1563,28 +1536,26 @@ describe("m[0]/m[1] materialization", () => {
         }).id;
         materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
             projectDirectory,
         });
         const state = readStateFromMeta();
-        expect(getVisibleRevisionLocators(db, SESSION_ID)).toEqual(
-            new Set([seededRevisionLocator(db, initialId)]),
-        );
+        expect(getVisibleRevisionLocators(db, SESSION_ID)).toEqual(new Set([initialId]));
 
         const newId = insertMemory(db, {
             projectPath: PROJECT_PATH,
             category: "ARCHITECTURE",
             content: "New claim appears after vector fold",
         }).id;
-        expect(
-            getVisibleRevisionLocators(db, SESSION_ID)?.has(seededRevisionLocator(db, newId)),
-        ).toBe(false);
+        expect(getVisibleRevisionLocators(db, SESSION_ID)?.has(newId)).toBe(false);
 
         const messages = [userMessage("m2", "fold")];
         const result = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages,
             state,
@@ -1595,9 +1566,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(result.m0RematerializedThisPass).toBe(true);
         expect(result.decision.reason).toBe("project_memory_change");
         expect(renderedText(messages[0])).toContain("New claim appears after vector fold");
-        expect(getVisibleRevisionLocators(db, SESSION_ID)).toEqual(
-            new Set([seededRevisionLocator(db, initialId), seededRevisionLocator(db, newId)]),
-        );
+        expect(getVisibleRevisionLocators(db, SESSION_ID)).toEqual(new Set([initialId, newId]));
     });
 
     it("materializeM0 sizes session-history to the HISTORY budget, not budget minus project-docs", () => {
@@ -1628,6 +1597,7 @@ describe("m[0]/m[1] materialization", () => {
         replaceAllCompartmentState(db, SESSION_ID, mkCompartments(), []);
         const small = materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
@@ -1648,6 +1618,7 @@ describe("m[0]/m[1] materialization", () => {
         replaceAllCompartmentState(db, SESSION_ID, mkCompartments(), []);
         const big = materializeM0({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             state: readStateFromMeta(),
             projectPath: PROJECT_PATH,
@@ -1662,22 +1633,35 @@ describe("m[0]/m[1] materialization", () => {
         expect(bigHist.length).toBe(smallHist.length);
     });
 
-    it("materializeM0 throws MaterializeContentionError when epoch changes between snapshot and swap", () => {
+    it("materializeM0 renders the snapshot it was handed even when the kernel moves before Phase 3", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
+        insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "ARCHITECTURE",
+            content: "Frozen for this pass.",
+        });
+        const memory = memoryFor(db);
 
-        expect(() =>
-            materializeM0({
-                db,
-                sessionId: SESSION_ID,
-                state: readStateFromMeta(),
-                projectPath: PROJECT_PATH,
-                projectDirectory,
-                beforePhase3ForTest: () => {
-                    setProjectState(db, PROJECT_PATH, { projectMemoryEpoch: 1 });
-                },
-            }),
-        ).toThrow(MaterializeContentionError);
+        const result = materializeM0({
+            db,
+            memory,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            beforePhase3ForTest: () => {
+                setProjectState(db, PROJECT_PATH, { projectMemoryEpoch: 1 });
+                insertMemory(db, {
+                    projectPath: PROJECT_PATH,
+                    category: "ARCHITECTURE",
+                    content: "Landed after the read.",
+                });
+            },
+        });
+        expect(result.m0Text).toContain("Frozen for this pass.");
+        expect(result.m0Text).not.toContain("Landed after the read.");
+        expect(result.snapshotMarkers.memorySnapshotKey).toBe(memorySnapshotKey(memory));
     });
 
     it("materializeWithRetry retries three times then throws", () => {
@@ -1689,6 +1673,7 @@ describe("m[0]/m[1] materialization", () => {
             materializeWithRetry(
                 {
                     db,
+                    memory: memoryFor(db),
                     sessionId: SESSION_ID,
                     state: readStateFromMeta(),
                     projectPath: PROJECT_PATH,
@@ -1715,6 +1700,7 @@ describe("m[0]/m[1] materialization", () => {
 
         const result = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages,
             state,
@@ -1738,10 +1724,11 @@ describe("m[0]/m[1] materialization", () => {
             encodeCachedM0UpgradeIdentity("ready", COMPARTMENT_RENDER_EPOCH, false, "m8000-h60000"),
         );
         expect(state.snapshotMarkers?.renderedRevisionLocators).toEqual([]);
-        expect(state.snapshotMarkers?.claimSnapshotVector).toBeDefined();
+        expect(state.snapshotMarkers?.memorySnapshotKey).toBeDefined();
         expect(
             mustMaterialize({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 state,
                 projectPath: PROJECT_PATH,
@@ -1764,6 +1751,7 @@ describe("m[0]/m[1] materialization", () => {
 
         const result = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages,
             state,
@@ -1787,6 +1775,7 @@ describe("m[0]/m[1] materialization", () => {
 
         const result = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages,
             state,
@@ -1817,6 +1806,7 @@ describe("m[0]/m[1] materialization", () => {
 
         const result = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages,
             state,
@@ -1850,6 +1840,7 @@ describe("m[0]/m[1] materialization", () => {
         };
         injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages,
             state,
@@ -1867,6 +1858,7 @@ describe("m[0]/m[1] materialization", () => {
         const firstMessages = [userMessage("m1", "hello")];
         injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: firstMessages,
             state,
@@ -1878,6 +1870,7 @@ describe("m[0]/m[1] materialization", () => {
         const secondMessages = [userMessage("m2", "hello again")];
         const second = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: secondMessages,
             state,
@@ -1896,6 +1889,7 @@ describe("m[0]/m[1] materialization", () => {
         const firstMessages = [userMessage("m1", "hello")];
         injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: firstMessages,
             state,
@@ -1909,6 +1903,7 @@ describe("m[0]/m[1] materialization", () => {
         ).run(SESSION_ID);
         const legacyNullDecision = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: [userMessage("m2", "legacy")],
             state,
@@ -1920,6 +1915,7 @@ describe("m[0]/m[1] materialization", () => {
 
         const changedDecision = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: [userMessage("m3", "changed")],
             state,
@@ -1943,6 +1939,7 @@ describe("m[0]/m[1] materialization", () => {
         const baselineMessages = [userMessage("m1", "hello")];
         injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: baselineMessages,
             state,
@@ -1960,6 +1957,7 @@ describe("m[0]/m[1] materialization", () => {
         const flushMessages = [userMessage("m2", "after flush")];
         const flushPass = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: flushMessages,
             state,
@@ -1977,6 +1975,7 @@ describe("m[0]/m[1] materialization", () => {
         const deferMessages = [userMessage("m3", "defer")];
         const deferPass = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: deferMessages,
             state,
@@ -2020,6 +2019,7 @@ describe("m[0]/m[1] materialization", () => {
             };
             const first = materializeM0({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 state,
                 projectPath: PROJECT_PATH,
@@ -2033,6 +2033,7 @@ describe("m[0]/m[1] materialization", () => {
             const state2 = readStateFromMeta();
             const second = materializeM0({
                 db,
+                memory: memoryFor(db),
                 sessionId: SESSION_ID,
                 state: state2,
                 projectPath: PROJECT_PATH,
@@ -2057,6 +2058,7 @@ describe("m[0]/m[1] materialization", () => {
         const first = [userMessage("m1", "hi")];
         injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: first,
             state,
@@ -2069,6 +2071,7 @@ describe("m[0]/m[1] materialization", () => {
         const second = [userMessage("m2", "hi again")];
         const result = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: second,
             state,
@@ -2093,6 +2096,7 @@ describe("m[0]/m[1] materialization", () => {
         const first = [userMessage("m1", "hello")];
         injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: first,
             state,
@@ -2110,6 +2114,7 @@ describe("m[0]/m[1] materialization", () => {
         const folded = [userMessage("m2", "fold")];
         const foldResult = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: folded,
             state,
@@ -2125,6 +2130,7 @@ describe("m[0]/m[1] materialization", () => {
         const replay = [userMessage("m3", "replay")];
         const replayResult = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: replay,
             state,
@@ -2148,6 +2154,7 @@ describe("m[0]/m[1] materialization", () => {
         const first = [userMessage("m1", "hello")];
         injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: first,
             state,
@@ -2155,14 +2162,13 @@ describe("m[0]/m[1] materialization", () => {
             projectDirectory,
         });
         expect(renderedText(first[0])).toContain("OpenCode claim removed by lifecycle fold.");
-        expect(getVisibleRevisionLocators(db, SESSION_ID)).toEqual(
-            new Set([seededRevisionLocator(db, memory.id)]),
-        );
+        expect(getVisibleRevisionLocators(db, SESSION_ID)).toEqual(new Set([memory.id]));
 
-        archiveSeededClaim(db, memory.id);
+        archiveSeededMemory(db, memory.id);
         const folded = [userMessage("m2", "fold")];
         const result = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: folded,
             state,
@@ -2175,7 +2181,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(getVisibleRevisionLocators(db, SESSION_ID)).toBeNull();
     });
 
-    it("discards a frozen claim snapshot when a revision publishes before Phase 3", () => {
+    it("an archive that lands before Phase 3 folds out on the next pass, not this one", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
         const memory = insertMemory(db, {
@@ -2183,16 +2189,27 @@ describe("m[0]/m[1] materialization", () => {
             category: "ARCHITECTURE",
             content: "Frozen OpenCode claim.",
         });
-        expect(() =>
-            materializeM0({
-                db,
-                sessionId: SESSION_ID,
-                state: readStateFromMeta(),
-                projectPath: PROJECT_PATH,
-                projectDirectory,
-                beforePhase3ForTest: () => archiveSeededClaim(db, memory.id),
-            }),
-        ).toThrow(MaterializeContentionError);
+        const state = readStateFromMeta();
+        const first = materializeM0({
+            db,
+            memory: memoryFor(db),
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            beforePhase3ForTest: () => archiveSeededMemory(db, memory.id),
+        });
+        expect(first.m0Text).toContain("Frozen OpenCode claim.");
+
+        const next = mustMaterialize({
+            db,
+            memory: memoryFor(db),
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+        });
+        expect(next).toEqual({ value: true, reason: "project_memory_change" });
     });
 
     it("soft m1 refresh CAS rolls back and replays a sibling cached m1 on marker mismatch", () => {
@@ -2201,6 +2218,7 @@ describe("m[0]/m[1] materialization", () => {
         const state = readStateFromMeta();
         injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: [userMessage("m1", "hello")],
             state,
@@ -2215,6 +2233,7 @@ describe("m[0]/m[1] materialization", () => {
         const bust = [userMessage("m2", "bust")];
         const result = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: bust,
             state,
@@ -2235,6 +2254,7 @@ describe("m[0]/m[1] materialization", () => {
         const state = readStateFromMeta();
         injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: [userMessage("m1", "hello")],
             state,
@@ -2253,6 +2273,7 @@ describe("m[0]/m[1] materialization", () => {
         const bust = [userMessage("m2", "bust")];
         const result = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: bust,
             state,
@@ -2274,6 +2295,7 @@ describe("m[0]/m[1] materialization", () => {
         const first = [userMessage("m1", "hello")];
         injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: first,
             state,
@@ -2294,6 +2316,7 @@ describe("m[0]/m[1] materialization", () => {
         const bust = [userMessage("m2", "bust")];
         const result = injectM0M1({
             db,
+            memory: memoryFor(db),
             sessionId: SESSION_ID,
             messages: bust,
             state,

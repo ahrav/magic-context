@@ -10,8 +10,10 @@ import {
 	LIGHT_TOOL_DESCRIPTIONS,
 } from "@magic-context/core/shared/prompt-surface-runtime";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
-import { createTestDb } from "../test-utils";
+import { createTestDb, fakeKernelResolver } from "../test-utils";
 import { registerMagicContextTools } from "./index";
+
+const kernelClient = fakeKernelResolver().kernelClient;
 
 describe("registerMagicContextTools", () => {
 	it("can omit ctx_memory for retrieval-only sidekick subagents", () => {
@@ -30,6 +32,7 @@ describe("registerMagicContextTools", () => {
 
 			registerMagicContextTools(pi, {
 				db,
+				kernelClient,
 				memoryToolEnabled: false,
 				sessionScopedToolsDisabled: true,
 				todowriteCommandEnabled: false,
@@ -54,7 +57,7 @@ describe("registerMagicContextTools", () => {
 				registerTool: (tool: { name: string }) => registered.push(tool.name),
 				registerCommand: () => undefined,
 			} as never;
-			registerMagicContextTools(pi, { db, compactionOff: true });
+			registerMagicContextTools(pi, { db, kernelClient, compactionOff: true });
 
 			expect(registered).not.toContain("ctx_reduce");
 			expect(registered).toEqual(
@@ -95,7 +98,7 @@ describe("registerMagicContextTools", () => {
 				registerCommand: () => undefined,
 			} as never;
 
-			registerMagicContextTools(pi, { db });
+			registerMagicContextTools(pi, { db, kernelClient });
 
 			const expectedFields: Record<string, string[]> = {
 				ctx_search: ["query", "limit", "sources"],
@@ -104,10 +107,8 @@ describe("registerMagicContextTools", () => {
 					"content",
 					"category",
 					"antiMemory",
-					"publicClaimId",
-					"publicClaimIds",
-					"mutationToken",
-					"mutationTokens",
+					"objectId",
+					"objectIds",
 					"limit",
 					"reason",
 				],
@@ -157,6 +158,7 @@ describe("registerMagicContextTools", () => {
 
 			registerMagicContextTools(pi, {
 				db,
+				kernelClient,
 				dreamerEnabled: false,
 				resolveDreamerEnabled: (ctx) => ctx.cwd === "/tmp/project-b",
 			});
@@ -196,7 +198,7 @@ describe("registerMagicContextTools", () => {
 				registerCommand: (name: string) => commands.push(name),
 			} as never;
 
-			registerMagicContextTools(pi, { db });
+			registerMagicContextTools(pi, { db, kernelClient });
 
 			expect(registered).toContain("todowrite");
 			expect(commands).toContain("todos");
@@ -215,7 +217,7 @@ describe("registerMagicContextTools", () => {
 				registerCommand: (name: string) => commands.push(name),
 			} as never;
 
-			registerMagicContextTools(pi, { db, todowriteEnabled: false });
+			registerMagicContextTools(pi, { db, kernelClient, todowriteEnabled: false });
 
 			expect(registered).toContain("ctx_search");
 			expect(registered).not.toContain("todowrite");
@@ -235,7 +237,7 @@ describe("registerMagicContextTools", () => {
 				registerCommand: (name: string) => commands.push(name),
 			} as never;
 
-			registerMagicContextTools(pi, { db, todowriteCommandEnabled: false });
+			registerMagicContextTools(pi, { db, kernelClient, todowriteCommandEnabled: false });
 
 			expect(registered).toContain("todowrite");
 			expect(commands).not.toContain("todos");
@@ -305,9 +307,10 @@ describe("registerMagicContextTools — prompt-surface registration", () => {
 		const implicitDb = createTestDb();
 		const explicitDb = createTestDb();
 		try {
-			const implicit = captureRegisteredTools({ db: implicitDb });
+			const implicit = captureRegisteredTools({ db: implicitDb, kernelClient });
 			const explicit = captureRegisteredTools({
 				db: explicitDb,
+				kernelClient,
 				promptSurface: { default: "full" },
 			});
 			const implicitIds = [...implicit.keys()].filter((id) =>
@@ -339,9 +342,10 @@ describe("registerMagicContextTools — prompt-surface registration", () => {
 		const fullDb = createTestDb();
 		const lightDb = createTestDb();
 		try {
-			const full = captureRegisteredTools({ db: fullDb });
+			const full = captureRegisteredTools({ db: fullDb, kernelClient });
 			const light = captureRegisteredTools({
 				db: lightDb,
+				kernelClient,
 				promptSurface: { default: "light" },
 			});
 			for (const toolId of Object.keys(LIGHT_TOOL_DESCRIPTIONS)) {
@@ -365,13 +369,14 @@ describe("registerMagicContextTools — prompt-surface registration", () => {
 		const overrideDb = createTestDb();
 		const warnings: string[] = [];
 		try {
-			const baseline = captureRegisteredTools({ db: baselineDb });
+			const baseline = captureRegisteredTools({ db: baselineDb, kernelClient });
 			const runtime = createPromptSurfaceRuntime({
 				userConfigDirectory: process.cwd(),
 				warn: (warning) => warnings.push(warning),
 			});
 			const overridden = captureRegisteredTools({
 				db: overrideDb,
+				kernelClient,
 				promptSurface: {
 					default: "full",
 					models: { "provider/model": "light" },

@@ -28,6 +28,7 @@ export interface PromotedMemoryRef {
     revisionLocator: string;
     contentDigest: string;
     content: string;
+    category: string;
 }
 
 function isPromotableCategory(category: string): category is MemoryCategory {
@@ -70,6 +71,7 @@ function refsFromPayload(payload: CanonicalJsonValue): PromotedMemoryRef[] {
             revisionLocator: row.revisionLocator,
             contentDigest: row.contentDigest,
             content: "",
+            category: "",
         });
     }
     return refs;
@@ -141,6 +143,7 @@ export function promoteSessionFactsDurable(
         const refs = refsFromPayload(operation.operation.result.payload);
         for (let index = 0; index < refs.length; index += 1) {
             refs[index].content = promotable[index]?.content ?? "";
+            refs[index].category = promotable[index]?.category ?? "";
         }
         return refs;
     };
