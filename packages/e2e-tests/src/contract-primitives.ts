@@ -32,6 +32,8 @@ export interface ContractPrimitives {
     text(value: unknown, label: string): string;
     /** `text`, or null where the producer writes null for "not recorded". */
     nullableText(value: unknown, label: string): string | null;
+    /** `parse(value)`, or null where the producer writes null for "absent". */
+    nullable<T>(value: unknown, parse: (raw: unknown) => T): T | null;
     boolean(value: unknown, label: string): boolean;
     staticId(value: unknown, label: string, pattern: RegExp): string;
     hex64(value: unknown, label: string): string;
@@ -162,6 +164,10 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
         return values;
     }
 
+    function nullable<T>(value: unknown, parse: (raw: unknown) => T): T | null {
+        return value === null ? null : parse(value);
+    }
+
     function nullableText(value: unknown, label: string): string | null {
         return value === null ? null : textValue(value, label);
     }
@@ -174,5 +180,5 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
         return array(value, label).map((entry, index) => stringValue(entry, `${label}[${index}]`));
     }
 
-    return { fail, record, exact, string: stringValue, text: textValue, nullableText, boolean: booleanValue, staticId, hex64, enumeration, array, number: numberValue, integer, boundedInteger, countRecord, unique, sorted, idArray, textArray, stringArray };
+    return { fail, record, exact, string: stringValue, text: textValue, nullableText, nullable, boolean: booleanValue, staticId, hex64, enumeration, array, number: numberValue, integer, boundedInteger, countRecord, unique, sorted, idArray, textArray, stringArray };
 }

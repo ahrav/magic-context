@@ -125,8 +125,10 @@ describe("loadEvidenceBundle", () => {
         const declared = (report: BenchmarkReport): BenchmarkReport => ({ ...report, status: "complete" });
         const noScenarios = declared(retrievalReportFixture({ scenarios: [] }));
         expect(statuses(tree({ lanes: { retrieval: noScenarios } })).retrieval).toBe("incomplete");
+        // Duplicate query ids are a report the retrieval contract itself calls invalid, not a run that stopped early.
         const duplicated = declared(retrievalReportFixture({ scenarios: [retrievalScenarioFixture("case-1:q-1"), retrievalScenarioFixture("case-1:q-1")] }));
-        expect(statuses(tree({ lanes: { retrieval: duplicated } })).retrieval).toBe("incomplete");
+        expect(laneEvidence(loadEvidenceBundle(tree({ lanes: { retrieval: duplicated } })), "retrieval"))
+            .toMatchObject({ status: "schema-mismatch", diagnostics: ["report-parse-failed"] });
         const complete = retrievalReportFixture();
         const interrupted = declared({
             ...complete,

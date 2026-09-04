@@ -148,6 +148,13 @@ function runIncompleteReasons(parsed: ParsedLane): string[] {
     }
 }
 
+/** A report whose own rows the lane's contract would refuse is a schema mismatch, however its declared status reads. */
+function contradictionReasons(parsed: ParsedLane): string[] {
+    if (parsed.lane !== "retrieval") return [];
+    const { scenarios, attempts } = parsed.report.evidence;
+    return computeRetrievalReportStatus({ expectedQueryIds: [], scenarios, attempts }) === "invalid" ? ["report-parse-failed"] : [];
+}
+
 /** The report's binding fields must name the paired-delta policy the scorecard policy pinned, and that policy's pool. */
 function pairedDeltaBindingReasons(report: PairedDeltaReport, policy: ScorecardPolicy, pairedDeltaPolicy: PairedDeltaPolicyView): string[] {
     const bound = report.body.policyFingerprint === policy.pairedDeltaPolicyFingerprint
@@ -259,8 +266,11 @@ function loadLane(required: RequiredLane, policy: ScorecardPolicy, pairedDeltaPo
         return rejected("schema-mismatch", ["report-parse-failed"], reportFingerprint);
     }
     const identity = observedIdentity(parsed);
-    const bindingReasons = parsed.lane === "paired-delta" ? pairedDeltaBindingReasons(parsed.report, policy, pairedDeltaPolicy) : [];
-    if (bindingReasons.length > 0) return rejected("schema-mismatch", bindingReasons, reportFingerprint, identity);
+    const rejectedReasons = [
+        ...contradictionReasons(parsed),
+        ...(parsed.lane === "paired-delta" ? pairedDeltaBindingReasons(parsed.report, policy, pairedDeltaPolicy) : []),
+    ];
+    if (rejectedReasons.length > 0) return rejected("schema-mismatch", rejectedReasons, reportFingerprint, identity);
     const diagnostics = [
         ...runIncompleteReasons(parsed),
         ...(parsed.lane === "paired-delta" ? pairedDeltaConformanceReasons(parsed.report, policy, pairedDeltaPolicy) : []),
@@ -278,8 +288,8 @@ function loadBaseline(policy: ScorecardPolicy, path: string | null): BaselineEvi
     if (artifact.kind === "missing") return mismatch("baseline-unreadable");
     if (artifact.kind === "unparseable") return mismatch("baseline-invalid-json");
     let report: ScorecardReport;
+    if (scanForSensitiveContent(artifact.raw).length > 0) return mismatch("baseline-privacy-rejected");
     try {
-        if (scannedFingerprint(artifact.raw) === null) return mismatch("baseline-privacy-rejected");
         report = parseScorecardReport(artifact.raw);
     } catch {
         return mismatch("baseline-parse-failed");

@@ -19,6 +19,7 @@ import {
     hex64,
     idArray,
     integer,
+    nullable,
     number,
     parseLaneIdentity,
     record,
@@ -235,10 +236,6 @@ const ESTIMATE_FAMILY_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
 /** Every paired-delta estimate is a difference of two binary outcomes or two fractions, so it lies in [-1, 1]. */
 const deltaNumber = (value: unknown, label: string): number => number(value, label, { minimum: -1, maximum: 1 });
-
-function nullable<T>(value: unknown, parse: (raw: unknown) => T): T | null {
-    return value === null ? null : parse(value);
-}
 
 function parseInterval(raw: unknown, label: string, bound: (value: unknown, label: string) => number = number): Interval {
     const value = record(raw, label);

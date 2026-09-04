@@ -36,6 +36,7 @@ export const {
     enumeration,
     array,
     boolean,
+    nullable,
     number,
     integer,
     unique,
@@ -237,10 +238,6 @@ function positiveNumber(value: unknown, label: string): number {
     return value as number;
 }
 
-function nullableHex64(value: unknown, label: string): string | null {
-    return value === null ? null : hex64(value, label);
-}
-
 function exactIdSequence<T extends string>(raw: unknown, expected: readonly T[], label: string, code: string): T[] {
     const values = array(raw, label).map((entry, index) => string(entry, `${label}[${index}]`));
     if (values.length !== expected.length || values.some((value, index) => value !== expected[index])) fail(`${label}: ${code}`);
@@ -356,7 +353,7 @@ export function parseScorecardPolicy(raw: unknown): ScorecardPolicy {
         requiredLanes: parseRequiredLanes(root.requiredLanes, "policy.requiredLanes"),
         requiredMetricSlots,
         pairedDeltaPolicyFingerprint: hex64(root.pairedDeltaPolicyFingerprint, "policy.pairedDeltaPolicyFingerprint"),
-        baselineScorecardReportFingerprint: nullableHex64(root.baselineScorecardReportFingerprint, "policy.baselineScorecardReportFingerprint"),
+        baselineScorecardReportFingerprint: nullable(root.baselineScorecardReportFingerprint, (fingerprint) => hex64(fingerprint, "policy.baselineScorecardReportFingerprint")),
     };
 }
 
