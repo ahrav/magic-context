@@ -70,6 +70,11 @@ pub const MAX_STAGED_BYTES: u64 = UPLOAD_ALLOWANCE_BYTES * MAX_PENDING_UPLOADS a
 /// artifact. Every finish occupies a pending slot, so at most
 /// [`MAX_PENDING_UPLOADS`] run at once, each at the allowance.
 pub const FINISH_WORKING_BYTES_MAX: u64 = 2 * MAX_STAGED_BYTES;
+/// Decoded page bytes in flight across every route: a page is decoded and
+/// hashed before it is staged, and until then its bytes are charged to
+/// neither the staging budget nor any upload, so concurrent page requests
+/// are bounded here. Enough for one page per pending upload at once.
+pub const PAGE_DECODE_BYTES_MAX: u64 = PAGE_BYTES_MAX * MAX_PENDING_UPLOADS as u64;
 /// Uploads are evicted after this idle interval.
 pub const UPLOAD_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 const MAX_UPLOAD_ID_BYTES: usize = 128;
@@ -253,6 +258,9 @@ pub(crate) struct UploadCoordinator {
     latest_generation: HashMap<RouteHandle, u64>,
     stale_after: Duration,
     next_generation: u64,
+    /// Decoded page bytes currently in flight, bounded by `decode_max`.
+    decoding_bytes: u64,
+    decode_max: u64,
 }
 
 impl Default for UploadCoordinator {
@@ -263,6 +271,8 @@ impl Default for UploadCoordinator {
             latest_generation: HashMap::new(),
             stale_after: UPLOAD_STALE_AFTER,
             next_generation: 1,
+            decoding_bytes: 0,
+            decode_max: PAGE_DECODE_BYTES_MAX,
         }
     }
 }
@@ -369,6 +379,22 @@ impl UploadCoordinator {
         self.budget.release(bytes);
     }
 
+    /// Admits `bytes` of page decoding when the in-flight total stays under
+    /// the cap.
+    fn reserve_decode(&mut self, bytes: u64) -> bool {
+        match self.decoding_bytes.checked_add(bytes) {
+            Some(total) if total <= self.decode_max => {
+                self.decoding_bytes = total;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn release_decode(&mut self, bytes: u64) {
+        self.decoding_bytes = self.decoding_bytes.saturating_sub(bytes);
+    }
+
     /// An upload already handed out by `take_complete` is no longer in the
     /// map, so its reservation outlives this call until the finish handler
     /// releases it.
@@ -377,6 +403,9 @@ impl UploadCoordinator {
         for route in routes {
             self.take(route);
         }
+        // A finish still running for a cleared route must not restore its
+        // upload either: the transition drops every upload, held or not.
+        self.latest_generation.clear();
     }
 
     /// Stages `page` under `index`. A page already held under that index with
@@ -476,6 +505,19 @@ impl Drop for StagingReservation {
         if let Some(bytes) = self.bytes {
             self.kernel.uploads().release(bytes);
         }
+    }
+}
+
+/// Holds a share of [`PAGE_DECODE_BYTES_MAX`] from before a page is decoded
+/// until it is staged or refused.
+struct DecodeReservation {
+    kernel: Arc<KernelOpenCoordinator>,
+    bytes: u64,
+}
+
+impl Drop for DecodeReservation {
+    fn drop(&mut self) {
+        self.kernel.uploads().release_decode(self.bytes);
     }
 }
 
@@ -621,15 +663,23 @@ impl McHandler {
         if parsed.bytes_base64.len() > PAGE_BASE64_BYTES_MAX {
             return state_only(KernelOutcome::invalid(InvalidReason::PageTooLarge));
         }
-        let generation =
-            match self
-                .kernel
-                .uploads()
-                .accepts_page(channel, &parsed.upload_id, parsed.index)
-            {
+        // Padded base64 decodes to at most three bytes per four characters.
+        let decode_bytes = (parsed.bytes_base64.len() as u64).div_ceil(4) * 3;
+        let generation = {
+            let mut uploads = self.kernel.uploads();
+            let generation = match uploads.accepts_page(channel, &parsed.upload_id, parsed.index) {
                 Ok(generation) => generation,
                 Err(reason) => return state_only(KernelOutcome::invalid(reason)),
             };
+            if !uploads.reserve_decode(decode_bytes) {
+                return state_only(KernelOutcome::unavailable(UnavailableReason::QueueFull));
+            }
+            generation
+        };
+        let _decoding = DecodeReservation {
+            kernel: Arc::clone(&self.kernel),
+            bytes: decode_bytes,
+        };
         // Decoding and hashing a page is CPU work proportional to the frame,
         // so it runs off the async workers and before the coordinator lock.
         let decoded = blocking(move || {
@@ -655,14 +705,17 @@ impl McHandler {
             Ok(_) => return state_only(KernelOutcome::invalid(InvalidReason::PageDigest)),
             Err(outcome) => return state_only(outcome),
         };
-        match self.kernel.uploads().stage(
+        // Bound to a local so the coordinator guard is released before the
+        // decode reservation's drop takes the same lock.
+        let staged = self.kernel.uploads().stage(
             channel,
             &upload_id,
             generation,
             index,
             page,
             Instant::now(),
-        ) {
+        );
+        match staged {
             Ok(progress) => kernel_response(&KernelOutcome::Available, progress),
             Err(reason) => state_only(KernelOutcome::invalid(reason)),
         }
@@ -1231,6 +1284,45 @@ mod tests {
             uploads.accepts_page(route(1), "u", 1),
             Err(InvalidReason::UploadNotFound)
         );
+    }
+
+    #[test]
+    fn page_decoding_is_bounded_and_released_exactly() {
+        let mut uploads = UploadCoordinator {
+            decode_max: 10,
+            ..UploadCoordinator::default()
+        };
+        assert!(uploads.reserve_decode(6));
+        assert!(!uploads.reserve_decode(5));
+        assert!(uploads.reserve_decode(4));
+        assert!(!uploads.reserve_decode(1));
+        uploads.release_decode(6);
+        assert!(uploads.reserve_decode(6));
+        assert!(!uploads.reserve_decode(1));
+        uploads.release_decode(10);
+        assert!(uploads.reserve_decode(10));
+    }
+
+    #[test]
+    fn a_cleared_coordinator_refuses_to_restore_a_finish_it_no_longer_knows() {
+        let mut uploads = UploadCoordinator::default();
+        let now = Instant::now();
+        started(uploads.begin(route(1), upload("u", 2, 1, b"ab"), now));
+        uploads
+            .stage(
+                route(1),
+                "u",
+                generation(&uploads, route(1), "u"),
+                0,
+                page(b"ab"),
+                now,
+            )
+            .unwrap();
+        let complete = uploads.take_complete(route(1), "u").unwrap();
+        uploads.clear();
+        let returned = uploads.restore(route(1), complete, now).unwrap();
+        uploads.release(returned.total_bytes);
+        assert_eq!(uploads.budget(), StagingBudget::default());
     }
 
     #[test]
