@@ -72,6 +72,11 @@ required-features = ["bench-internals"]
 name = "kernels"
 harness = false
 
+[[bench]]
+name = "kernel_routes"
+harness = false
+required-features = ["test-support"]
+
 [dev-dependencies]
 criterion = "=0.8.2"
 proptest = "1"
