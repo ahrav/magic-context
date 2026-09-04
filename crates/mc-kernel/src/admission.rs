@@ -12,13 +12,14 @@ use super::scope::Dimension;
 use super::slice::{DecisionSpec, DecisionWriteOutcome};
 use super::{map_sqlite, KernelError, KernelStore, Sensitivity};
 use crate::current_time_ms;
+use crate::CachedSql;
 use rusqlite::{params, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "ad521020d5ceac2fcc76ed2e8db10318598290e5f9f67a135b437f26531a8871";
+    "ea6a55eb504fd2f30dcb0ed14623ba64b4c19f9ee6e55eea726c02bc5c250abd";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -777,7 +778,7 @@ impl Envelope<'_> {
         let source_kind = identity(source_kind)?;
         let source_id = identity(source_id)?;
         self.tx
-            .execute(
+            .execute_cached(
                 "INSERT INTO object_registry(
                      object_id,object_kind,domain_id,source_kind,source_id,source_revision,
                      created_commit_seq,sensitivity_class
@@ -793,7 +794,7 @@ impl Envelope<'_> {
             )
             .map_err(map_sqlite)?;
         self.tx
-            .execute(
+            .execute_cached(
                 "INSERT INTO observations(
                      observation_id,object_id,observation_kind,observation_payload,observed_at,
                      created_commit_seq,sensitivity_class
@@ -870,7 +871,7 @@ impl Envelope<'_> {
         let facts = load_candidate_facts(self, candidate_id)?;
         let mut statement = self
             .tx
-            .prepare(&format!(
+            .prepare_cached(&format!(
                 "SELECT o.object_id
                  FROM object_registry o
                  JOIN decisions d ON d.object_id=o.object_id
@@ -1143,7 +1144,7 @@ impl Envelope<'_> {
         let approval_object_id = identity(approval_object_id)?;
         let approval = self
             .tx
-            .query_row(
+            .query_row_cached(
                 &format!(
                     "SELECT {OBJECT_ROW_COLUMNS}
                      FROM object_registry o
@@ -1468,7 +1469,7 @@ impl Envelope<'_> {
             .as_deref()
             .map(|payload| format!("{:x}", Sha256::digest(payload)));
         self.tx
-            .execute(
+            .execute_cached(
                 "INSERT INTO admission_decisions(
                      admission_decision_id,candidate_id,candidate_ref,candidate_kind,
                      candidate_payload_digest,subject_object_id,source_kind,source_id,
@@ -1603,7 +1604,7 @@ fn candidate_is_materialized(
 ) -> Result<bool, KernelError> {
     envelope
         .tx
-        .query_row(
+        .query_row_cached(
             "SELECT EXISTS(
                  SELECT 1 FROM admission_decisions
                  WHERE candidate_ref=?1 AND subject_object_id IS NOT NULL
@@ -1625,7 +1626,7 @@ fn load_candidate_facts(
     let (source_kind, source_id, source_revision, sensitivity, provenance, candidate_kind, payload) =
         envelope
             .tx
-            .query_row(
+            .query_row_cached(
                 "SELECT r.source_kind,r.source_id,r.source_revision,c.sensitivity_class,
                     c.provenance_witness,c.candidate_kind,c.payload
              FROM candidates c
@@ -1677,7 +1678,7 @@ fn load_subject_facts(
     let subject_object_id = identity(subject_object_id)?;
     envelope
         .tx
-        .query_row(
+        .query_row_cached(
             "SELECT domain_id,source_kind,source_id,source_revision,sensitivity_class
              FROM object_registry
              WHERE object_id=?1 AND invalidated_commit_seq IS NULL",
@@ -1718,7 +1719,7 @@ fn load_prior_decision(
     };
     let row = envelope
         .tx
-        .query_row(
+        .query_row_cached(
             &format!(
                 "SELECT maturity,effective_maturity,disposition,outcome,source_class,
                         taint_class,sensitivity_class,policy_revision,approval_object_id
@@ -1797,7 +1798,7 @@ fn enforce_approval_dependent_cap(
 ) -> Result<(), KernelError> {
     let dependents: i64 = envelope
         .tx
-        .query_row(
+        .query_row_cached(
             &format!(
                 "SELECT COUNT(DISTINCT a.subject_object_id) FROM admission_decisions a
                  JOIN object_registry o ON o.object_id=a.subject_object_id
@@ -1830,7 +1831,7 @@ fn subject_is_accepted_decision(
     };
     envelope
         .tx
-        .query_row(
+        .query_row_cached(
             &format!(
                 "SELECT EXISTS(
                      SELECT 1
@@ -1855,7 +1856,7 @@ fn load_approval_dependents(
 ) -> Result<Vec<(String, String, String, i64)>, KernelError> {
     let mut statement = envelope
         .tx
-        .prepare(&format!(
+        .prepare_cached(&format!(
             "SELECT a.subject_object_id,a.source_class,a.taint_class,a.policy_revision
              FROM admission_decisions a
              JOIN object_registry o ON o.object_id=a.subject_object_id
@@ -1936,7 +1937,7 @@ fn validate_approval(
     let member_qualifies = approval_qualifies_predicate("member.object_id");
     envelope
         .tx
-        .query_row(
+        .query_row_cached(
             &format!(
                 "WITH RECURSIVE chain(object_id,depth) AS (
                      SELECT ?1,0
@@ -1990,7 +1991,7 @@ fn validate_trigger(
             };
             let sensitivity: Option<String> = envelope
                 .tx
-                .query_row(
+                .query_row_cached(
                     "SELECT observed.sensitivity_class
                      FROM object_registry o
                      JOIN observations observed ON observed.object_id=o.object_id

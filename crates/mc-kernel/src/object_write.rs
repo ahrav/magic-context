@@ -8,6 +8,7 @@ use rusqlite::{params, Transaction};
 use super::envelope::ObjectRow;
 use super::redaction::{record, RedactedField};
 use super::KernelError;
+use crate::CachedSql;
 
 pub(crate) fn map_write_error(error: rusqlite::Error) -> KernelError {
     super::map_sqlite(error)
@@ -21,7 +22,7 @@ pub(super) fn insert_registry(
     commit_seq: i64,
     object: &ObjectRow,
 ) -> Result<(), KernelError> {
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO object_registry(
              object_id,object_kind,domain_id,source_kind,source_id,source_revision,
              created_commit_seq,sensitivity_class
@@ -95,7 +96,7 @@ pub(super) fn invalidate(
     object_id: &str,
 ) -> Result<(), KernelError> {
     let changed = tx
-        .execute(
+        .execute_cached(
             "UPDATE object_registry SET invalidated_commit_seq=?1
              WHERE object_id=?2 AND invalidated_commit_seq IS NULL",
             params![commit_seq, object_id],
@@ -109,7 +110,7 @@ pub(super) fn invalidate(
          WHERE {column}=?2 AND invalidated_commit_seq IS NULL"
     );
     if tx
-        .execute(&sql, params![commit_seq, object_id])
+        .execute_cached(&sql, params![commit_seq, object_id])
         .map_err(map_write_error)?
         != 1
     {
@@ -129,13 +130,13 @@ pub(super) fn set_successor(
     old_object_id: &str,
     new_object_id: &str,
 ) -> Result<(), KernelError> {
-    tx.execute(
+    tx.execute_cached(
         "UPDATE object_registry SET superseded_by=?1 WHERE object_id=?2",
         params![new_object_id, old_object_id],
     )
     .map_err(map_write_error)?;
     let sql = format!("UPDATE {table} SET superseded_by=?1 WHERE object_id=?2");
-    tx.execute(&sql, params![new_object_id, old_object_id])
+    tx.execute_cached(&sql, params![new_object_id, old_object_id])
         .map_err(map_write_error)?;
     Ok(())
 }

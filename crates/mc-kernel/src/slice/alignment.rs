@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use super::read::snapshot_tip;
 use crate::envelope::{check_fence, replace_alignment_projection_tx, AlignmentProjectionSpec};
-use crate::{KernelError, KernelStore};
+use crate::{CachedSql, KernelError, KernelStore};
 
 /// One active decision and classified observation pair emitted by derivation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,7 +128,7 @@ pub(crate) fn rebuild_alignment_with_writer(
 /// Derives and replaces alignment at `tx`'s current commit tip.
 pub(crate) fn rebuild_alignment_tx(tx: &Transaction<'_>) -> Result<AlignmentRebuild, KernelError> {
     let tip = tx
-        .query_row(
+        .query_row_cached(
             "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
             [],
             |row| row.get::<_, i64>(0),
@@ -167,7 +167,7 @@ fn load_alignment_input(
     let tip = snapshot_tip(tx, requested)?;
     let decisions = {
         let mut statement = tx
-            .prepare(
+            .prepare_cached(
                 "SELECT decision_id,object_id,
                         CASE WHEN invalidated_commit_seq<=?1 THEN invalidated_commit_seq END,
                         CASE WHEN invalidated_commit_seq<=?1 THEN superseded_by END,
@@ -200,7 +200,7 @@ fn load_alignment_input(
     };
     let observations = {
         let mut statement = tx
-            .prepare(
+            .prepare_cached(
                 "SELECT observation_id,observation_payload
                  FROM observations o
                  WHERE created_commit_seq<=?1
@@ -232,7 +232,7 @@ fn load_alignment_input(
     };
     let dependencies = {
         let mut statement = tx
-            .prepare(
+            .prepare_cached(
                 "SELECT observation_id,dependency_object_id
                  FROM observation_dependencies
                  WHERE dependency_kind=?1",

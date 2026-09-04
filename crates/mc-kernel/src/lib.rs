@@ -84,6 +84,32 @@ pub use slice::{
     ObservationWriteOutcome, RetirementOutcome, SliceSnapshot, ALIGNMENT_DEPENDENCY_KIND,
 };
 
+/// `Connection::execute` and `Connection::query_row` prepare their statement
+/// on every call; these run the same statement through the connection's
+/// prepared-statement cache instead.
+pub(crate) trait CachedSql {
+    fn execute_cached<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize>;
+
+    fn query_row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>;
+}
+
+impl CachedSql for rusqlite::Connection {
+    fn execute_cached<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize> {
+        self.prepare_cached(sql)?.execute(params)
+    }
+
+    fn query_row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.prepare_cached(sql)?.query_row(params, f)
+    }
+}
+
 /// A constraint violation is permanent and a lock wait is retryable, so collapsing both into `Io` would make either untreatable.
 pub(crate) fn map_sqlite(error: rusqlite::Error) -> KernelError {
     let rusqlite::Error::SqliteFailure(failure, _) = &error else {

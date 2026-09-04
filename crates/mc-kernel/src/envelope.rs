@@ -17,6 +17,7 @@ use super::open::AcquireLimit;
 use super::redaction::{clear_owner, clear_owner_kind, identity, record, redact, RedactedField};
 use super::{map_sqlite, KernelError, KernelStore};
 use crate::current_time_ms;
+use crate::CachedSql;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -345,7 +346,7 @@ impl Envelope<'_> {
                 // `name<>?1` skips already-redacted domains; repeat remediation appends only an audit record.
                 let rewritten = self
                     .tx
-                    .execute(
+                    .execute_cached(
                         "UPDATE domains SET name=?1 WHERE object_id=?2 AND name<>?1",
                         params![OPERATOR_REDACTION_PLACEHOLDER, object_id],
                     )
@@ -406,7 +407,7 @@ impl Envelope<'_> {
         }
         let registry = self
             .tx
-            .execute(
+            .execute_cached(
                 "UPDATE object_registry SET invalidated_commit_seq=?1
                  WHERE object_id=?2 AND object_kind=?3 AND invalidated_commit_seq IS NULL",
                 params![self.commit_seq, object_id, DOMAIN_OBJECT_KIND],
@@ -414,7 +415,7 @@ impl Envelope<'_> {
             .map_err(map_sqlite)?;
         let domains = self
             .tx
-            .execute(
+            .execute_cached(
                 "UPDATE domains SET invalidated_commit_seq=?1
                  WHERE object_id=?2 AND invalidated_commit_seq IS NULL",
                 params![self.commit_seq, object_id],
@@ -433,7 +434,7 @@ impl Envelope<'_> {
     ) -> Result<(), KernelError> {
         let registry = self
             .tx
-            .execute(
+            .execute_cached(
                 "UPDATE object_registry SET superseded_by=?1
                  WHERE object_id=?2 AND object_kind=?3",
                 params![successor_object_id, replaced_object_id, DOMAIN_OBJECT_KIND],
@@ -441,7 +442,7 @@ impl Envelope<'_> {
             .map_err(map_sqlite)?;
         let domains = self
             .tx
-            .execute(
+            .execute_cached(
                 "UPDATE domains SET superseded_by=?1 WHERE object_id=?2",
                 params![successor_object_id, replaced_object_id],
             )
@@ -621,7 +622,7 @@ impl KernelStore {
         check_fence(&tx, self.lease_epoch())?;
         let provenance = spec.provenance_json()?;
         let existing = tx
-            .query_row(
+            .query_row_cached(
                 "SELECT extractor,source_kind,source_id,source_revision,sensitivity_class,
                         provenance_witness,terminal_state,lease_expires_at,heartbeat_at
                  FROM extraction_runs WHERE extraction_run_id=?1",
@@ -665,7 +666,7 @@ impl KernelStore {
             {
                 return Err(KernelError::Conflict);
             }
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE extraction_runs
                  SET heartbeat_at=MAX(heartbeat_at,?1),lease_expires_at=MAX(lease_expires_at,?2)
                  WHERE extraction_run_id=?3",
@@ -677,7 +678,7 @@ impl KernelStore {
             )
             .map_err(map_sqlite)?;
         } else {
-            tx.execute(
+            tx.execute_cached(
                 "INSERT INTO extraction_runs(
                      extraction_run_id,extractor,source_kind,source_id,source_revision,
                      sensitivity_class,provenance_witness,redaction_metadata,started_at,
@@ -699,7 +700,7 @@ impl KernelStore {
             .map_err(map_sqlite)?;
         }
         let existing_candidate = tx
-            .query_row(
+            .query_row_cached(
                 "SELECT extraction_run_id,sensitivity_class,candidate_kind,payload,
                         redaction_metadata,terminal_state
                  FROM candidates WHERE candidate_id=?1",
@@ -737,7 +738,7 @@ impl KernelStore {
             {
                 return Err(KernelError::Conflict);
             }
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE candidates
                  SET heartbeat_at=MAX(heartbeat_at,?1),lease_expires_at=MAX(lease_expires_at,?2)
                  WHERE candidate_id=?3",
@@ -752,7 +753,7 @@ impl KernelStore {
             });
         }
         let candidate_metadata = spec.candidate_detection_json()?;
-        tx.execute(
+        tx.execute_cached(
             "INSERT INTO candidates(
                  candidate_id,extraction_run_id,candidate_kind,payload,sensitivity_class,
                  provenance_witness,redaction_metadata,created_at,heartbeat_at,lease_expires_at
@@ -885,7 +886,7 @@ fn commit_prepared_with_writer(
     check_fence(&tx, lease_epoch)?;
 
     if let Some((digest, commit_seq, result)) = tx
-        .query_row(
+        .query_row_cached(
             "SELECT request_digest,commit_seq,result_payload FROM operation_receipts
              WHERE producer=?1 AND operation_key=?2",
             params![intent.producer, intent.operation_key],
@@ -917,7 +918,7 @@ fn commit_prepared_with_writer(
     }
 
     let recorded_at = current_time_ms();
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO commit_log(
              transaction_id,writer_epoch,producer,operation_key,request_digest,
              recorded_at,actor,cause
@@ -976,7 +977,7 @@ fn commit_prepared_with_writer(
     for (index, change) in envelope.changes.iter().enumerate() {
         let ordinal = i64::try_from(index).map_err(|_| KernelError::InvalidInput)?;
         let event_id = format!("{commit_seq}:{ordinal}");
-        tx.execute(
+        tx.execute_cached(
             "INSERT INTO change_event(
                  commit_seq,ordinal,object_id,change_kind,idempotency_key,payload
              ) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -1004,7 +1005,7 @@ fn commit_prepared_with_writer(
     after_events()?;
     for (index, change) in envelope.changes.iter().enumerate() {
         let ordinal = i64::try_from(index).map_err(|_| KernelError::InvalidInput)?;
-        tx.execute(
+        tx.execute_cached(
             "INSERT INTO outbox(
                  commit_seq,ordinal,object_id,object_kind,source_kind,source_id,
                  source_revision,sensitivity_class,payload,created_at
@@ -1035,7 +1036,7 @@ fn commit_prepared_with_writer(
             )?;
         }
     }
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO operation_receipts(
              receipt_id,producer,operation_key,request_digest,commit_seq,result_payload,created_at
          ) VALUES (?1,?2,?3,?4,?5,?6,?7)",
@@ -1099,7 +1100,7 @@ const OBSERVATION_INSERT_KIND: &str = "observation_insert";
 /// same answer for one commit sequence.
 fn commit_affects_alignment(tx: &Transaction<'_>, commit_seq: i64) -> Result<bool, KernelError> {
     let kinds = serde_json::to_string(ALIGNMENT_CHANGE_KINDS).map_err(|_| KernelError::Io)?;
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT EXISTS(
              SELECT 1 FROM change_event e
              WHERE e.commit_seq=?1
@@ -1149,7 +1150,7 @@ pub(super) fn commit_with_writer(
 /// The watermark is stored apart from the rows, so an empty rebuild still orders later replacements.
 fn guard_projection_generation(tx: &Transaction<'_>, generation: i64) -> Result<(), KernelError> {
     let stored: Option<i64> = tx
-        .query_row(
+        .query_row_cached(
             "SELECT built_through_commit_seq FROM alignment_projection_state WHERE singleton=1",
             [],
             |row| row.get(0),
@@ -1163,7 +1164,7 @@ fn guard_projection_generation(tx: &Transaction<'_>, generation: i64) -> Result<
 }
 
 fn record_projection_generation(tx: &Transaction<'_>, generation: i64) -> Result<(), KernelError> {
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO alignment_projection_state(singleton,built_through_commit_seq)
          VALUES (1,?1)
          ON CONFLICT(singleton) DO UPDATE SET built_through_commit_seq=excluded.built_through_commit_seq",
@@ -1175,7 +1176,7 @@ fn record_projection_generation(tx: &Transaction<'_>, generation: i64) -> Result
 
 fn truncate_alignment_projection(tx: &Transaction<'_>) -> Result<usize, KernelError> {
     let removed = tx
-        .execute("DELETE FROM alignment_projection", [])
+        .execute_cached("DELETE FROM alignment_projection", [])
         .map_err(map_sqlite)?;
     clear_owner_kind(tx, "alignment_projection")?;
     Ok(removed)
@@ -1281,7 +1282,7 @@ fn insert_domain(
     commit_seq: i64,
     spec: &RedactedDomain,
 ) -> Result<(), KernelError> {
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO domains(
              domain_id,object_id,name,created_commit_seq,sensitivity_class
          ) VALUES (?1,?2,?3,?4,?5)",
@@ -1294,7 +1295,7 @@ fn insert_domain(
         ],
     )
     .map_err(map_sqlite)?;
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO object_registry(
              object_id,object_kind,domain_id,source_kind,source_id,source_revision,
              created_commit_seq,sensitivity_class
@@ -1389,7 +1390,7 @@ pub(super) fn load_object_state(
 }
 
 fn load_object(tx: &Transaction<'_>, object_id: &str) -> Result<Option<ObjectRow>, KernelError> {
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT object_id,object_kind,domain_id,source_kind,source_id,source_revision,
                 created_commit_seq,NULL,NULL,sensitivity_class
          FROM object_registry WHERE object_id=?1 AND invalidated_commit_seq IS NULL",
@@ -1404,7 +1405,7 @@ fn load_object_any_generation(
     tx: &Transaction<'_>,
     object_id: &str,
 ) -> Result<Option<ObjectRow>, KernelError> {
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT object_id,object_kind,domain_id,source_kind,source_id,source_revision,
                 created_commit_seq,sensitivity_class,invalidated_commit_seq,superseded_by
          FROM object_registry WHERE object_id=?1",
@@ -1430,7 +1431,7 @@ fn load_object_any_generation(
 }
 
 fn domain_name_is_redacted(tx: &Transaction<'_>, object_id: &str) -> Result<bool, KernelError> {
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT name FROM domains WHERE object_id=?1",
         [object_id],
         |row| row.get::<_, String>(0),
@@ -1720,7 +1721,7 @@ pub(super) fn strip_legacy_candidate_verifiers(
         for (candidate_id, metadata) in &batch {
             let detections = legacy_detections(metadata).unwrap_or_default();
             let replacement = serde_json::to_vec(&detections).map_err(|_| KernelError::Io)?;
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE candidates SET redaction_metadata=?1 WHERE candidate_id=?2",
                 params![replacement, candidate_id],
             )
@@ -1748,7 +1749,7 @@ pub(super) fn strip_legacy_candidate_verifiers(
 
 pub(super) fn check_fence(tx: &Transaction<'_>, expected: u64) -> Result<(), KernelError> {
     let durable: i64 = tx
-        .query_row(
+        .query_row_cached(
             "SELECT writer_epoch FROM writer_fence WHERE id=0",
             [],
             |row| row.get(0),
