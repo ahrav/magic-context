@@ -279,7 +279,12 @@ jobs:
           cargo nextest run -p mc-module \
             --test caveman_differential \
             --test historian_truncate_differential \
-            --test selection_differential
+            --test selection_differential \
+            --test base64_differential
+
+      # The self dev-dependency enables `test-support`, which this suite needs.
+      - name: Kernel route contracts
+        run: cargo nextest run -p mc-module --test kernel_routes
 
       - name: Native module adapter and CLI lifecycle
         run: |
