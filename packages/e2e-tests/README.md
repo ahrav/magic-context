@@ -335,7 +335,7 @@ fail-closed default, not a bug.
 
    ```sh
    gh run download <run-id> --name <artifact> --dir downloads/<artifact>/
-   mv downloads/historian-eval-report/historian-eval-report.json artifacts/historian-report.json
+   mv -f downloads/historian-eval-report/historian-eval-report.json artifacts/historian-report.json
    # ... one rename per lane; pick one retrieval candidate report.
    # dreamer expects one JSON array of run reports, excluding the variance files:
    find downloads/dreamer-eval-report -name '*.json' ! -name variance.json -print0 \

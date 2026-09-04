@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { HEX64_RE } from "../src/contract-primitives";
 import { loadEvidenceBundle, type EvidenceSources } from "../src/scorecard/evidence";
@@ -60,6 +61,8 @@ export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): Par
 }
 
 export function runScorecard(args: ScorecardCliArgs, log: (line: string) => void = console.log): ScorecardExitCode {
+    // A refused run must not leave an earlier report, possibly promotion-allowed, at the documented output path.
+    rmSync(args.out, { force: true });
     try {
         const bundle = loadEvidenceBundle(args.sources);
         const report = buildScorecardReport(bundle);

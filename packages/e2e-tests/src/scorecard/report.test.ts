@@ -8,8 +8,8 @@ import { createFamilyEstimatorAdapter } from "../paired-delta/estimator";
 import { buildProspectiveReport, validateProspectiveReportEvidence } from "../prospective-holdout/report";
 import { H3 } from "../prospective-holdout/test-fixtures";
 import type { ScorecardEvidenceBundle } from "./evidence";
-import { SCORECARD_GATE_IDS, ScorecardContractError, LANE_IDS } from "./policy";
-import { REPORT_BODY_KEYS, baselineComparable, parseScorecardReport, type ScorecardReport } from "./report-contract";
+import { SCORECARD_GATE_IDS, SCORE_FAMILY_IDS, ScorecardContractError, LANE_IDS } from "./policy";
+import { REPORT_BODY_KEYS, baselineComparable, deriveOutcome, parseScorecardReport, type ScorecardReport } from "./report-contract";
 import { buildScorecardReport, createScorecardAdapter, publishScorecardReport, scorecardExitCode } from "./report";
 import {
     H1,
@@ -33,11 +33,16 @@ function allGatesPassed(bundle: ScorecardEvidenceBundle): ScorecardReport {
     body.safetyGates = body.safetyGates.map((row) => row.status === "passed"
         ? row
         : { ...row, status: "passed", observedCount: 0, evidenceFingerprint: H1, sourceLane: "incident", diagnostic: null });
-    body.outcome.hardGateFailures = [];
     body.limitations = body.limitations.filter((code) => code !== "hard-gates-unobserved");
-    body.outcome.promotionAllowed = body.outcome.mandatoryEvidenceComplete
-        && baselineComparable(body.target, body.evidence.baseline)
-        && body.outcome.blockingRegressionCount <= bundle.policy.maxToleratedRegressions;
+    body.outcome = deriveOutcome({
+        gates: body.safetyGates,
+        lanes: body.evidence.lanes,
+        families: SCORE_FAMILY_IDS.map((family) => body[family]),
+        requiredMetricSlots: bundle.policy.requiredMetricSlots,
+        adverseDeltas: body.adverseDeltas,
+        maxToleratedRegressions: bundle.policy.maxToleratedRegressions,
+        baselineComparable: baselineComparable(body.target, body.evidence.baseline),
+    });
     return parseScorecardReport({ schema: report.schema, body, reportFingerprint: canonicalFingerprint(body) });
 }
 
@@ -122,14 +127,29 @@ describe("buildScorecardReport", () => {
 
     it("denies promotion and exits 1 when the policy pins a baseline the bundle cannot compare against", () => {
         const policy = policyFixture({ baselineScorecardReportFingerprint: H3 });
-        const report = allGatesPassed(bundleFixture({ policy, baseline: null }));
+        const bundle = bundleFixture({ policy, baseline: null });
+        expect(bundle.baseline.status).toBe("schema-mismatch");
+        const report = allGatesPassed(bundle);
         expect(report.body.adverseDeltas).toEqual([]);
         expect(report.body.outcome).toMatchObject({ promotionAllowed: false, mandatoryEvidenceComplete: true, blockingRegressionCount: 0 });
-        expect(report.body.limitations).toContain("baseline-not-comparable");
+        expect(report.body.limitations.filter((code) => code === "baseline-not-comparable")).toHaveLength(1);
+        expect(report.body.limitations).toContain("baseline-path-missing");
         expect(scorecardExitCode(report)).toBe(1);
         const forged = structuredClone(report.body);
         forged.outcome.promotionAllowed = true;
         expect(() => parseScorecardReport({ schema: report.schema, body: forged, reportFingerprint: canonicalFingerprint(forged) }))
+            .toThrow(/outcome\.promotionAllowed: cross-field-invalid/);
+    });
+
+    it("treats a present baseline bound to another fingerprint as not comparable", () => {
+        const policy = policyFixture({ baselineScorecardReportFingerprint: H3 });
+        const foreign = allGatesPassed(bundleFixture({ policy, baseline: baselineReport() }));
+        expect(foreign.body.evidence.baseline.status).toBe("present");
+        expect(foreign.body.outcome.promotionAllowed).toBe(false);
+        expect(foreign.body.limitations).toContain("baseline-not-comparable");
+        const forged = structuredClone(foreign.body);
+        forged.outcome.promotionAllowed = true;
+        expect(() => parseScorecardReport({ schema: foreign.schema, body: forged, reportFingerprint: canonicalFingerprint(forged) }))
             .toThrow(/outcome\.promotionAllowed: cross-field-invalid/);
     });
 
@@ -170,6 +190,20 @@ describe("createScorecardAdapter", () => {
         });
     }
 
+    function analysisPolicy(bundle: ScorecardEvidenceBundle): string {
+        const pairedDelta = bundle.lanes.find((lane) => lane.lane === "paired-delta")!;
+        if (pairedDelta.lane !== "paired-delta" || pairedDelta.report === null) throw new Error("fixture lane absent");
+        return pairedDelta.report.body.policyFingerprint;
+    }
+
+    function holdout(bundle: ScorecardEvidenceBundle, pairs = PAIRED_FACTS) {
+        return {
+            pairs,
+            estimator: estimator(bundle).analyze(PAIRED_FACTS, analysisPolicy(bundle)),
+            freezeManifestFingerprint: bundle.freezeManifestFingerprint,
+        };
+    }
+
     it("rejects a report that was not derived from the supplied bundle", () => {
         const bundle = bundleFixture();
         const foreign = buildScorecardReport(bundleFixture({ freezeManifestFingerprint: H3 }));
@@ -178,25 +212,60 @@ describe("createScorecardAdapter", () => {
         expect(() => createScorecardAdapter({ bundle, report: buildScorecardReport(bundle) })).not.toThrow();
     });
 
-    it("rejects a foreign policy fingerprint and paired facts the paired-delta report did not analyze", () => {
+    it("attests the recomputed outcome, not a forged body or an input mutated after construction", () => {
+        const bundle = bundleFixture();
+        const genuine = buildScorecardReport(bundle);
+        const forged = structuredClone(genuine);
+        forged.body.outcome = { promotionAllowed: true, mandatoryEvidenceComplete: true, hardGateFailures: [], blockingRegressionCount: 0 };
+        const fromForged = createScorecardAdapter({ bundle, report: forged });
+        expect(fromForged.evaluate(holdout(bundle), bundle.policyFingerprint)).toMatchObject({
+            promotionAllowed: false,
+            hardGateFailures: genuine.body.outcome.hardGateFailures,
+        });
+        const mutableBundle = bundleFixture();
+        const adapter = createScorecardAdapter({ bundle: mutableBundle, report: genuine });
+        const before = adapter.evaluate(holdout(mutableBundle), mutableBundle.policyFingerprint);
+        genuine.body.outcome.promotionAllowed = true;
+        mutableBundle.policyFingerprint = H3;
+        mutableBundle.lanes[0]!.reportFingerprint = H3;
+        expect(adapter.evaluate(holdout(bundle), bundle.policyFingerprint)).toEqual(before);
+        expect(before.promotionAllowed).toBe(false);
+    });
+
+    it("rejects a foreign policy or freeze fingerprint, foreign paired facts, and an estimator result from another analysis", () => {
         const bundle = bundleFixture();
         const adapter = createScorecardAdapter({ bundle, report: buildScorecardReport(bundle) });
-        const outcome = { direction: "no-change" as const, evidenceSufficient: true, completeFamilyCount: 1, resultFingerprint: H1 };
-        expect(() => adapter.evaluate({ pairs: PAIRED_FACTS, estimator: outcome }, H3)).toThrow(/adapter: policy-fingerprint-mismatch/);
-        expect(() => adapter.evaluate({ pairs: PAIRED_FACTS.slice(1), estimator: outcome }, bundle.policyFingerprint)).toThrow(/adapter: evidence-pairs-mismatch/);
-        expect(() => adapter.evaluate({ pairs: PAIRED_FACTS, estimator: outcome }, H3)).toThrow(ScorecardContractError);
+        expect(() => adapter.evaluate(holdout(bundle), H3)).toThrow(/adapter: policy-fingerprint-mismatch/);
+        expect(() => adapter.evaluate({ ...holdout(bundle), freezeManifestFingerprint: H3 }, bundle.policyFingerprint))
+            .toThrow(/adapter: freeze-fingerprint-mismatch/);
+        expect(() => adapter.evaluate(holdout(bundle, PAIRED_FACTS.slice(1)), bundle.policyFingerprint)).toThrow(/adapter: evidence-pairs-mismatch/);
+        const otherAnalysis = bundleFixture({ lanes: { "paired-delta": pairedDeltaReportFixture({ familyDeltas: { "fam-a": 0.9, "fam-b": 0.9 } }) } });
+        expect(() => adapter.evaluate({ ...holdout(bundle), estimator: holdout(otherAnalysis).estimator }, bundle.policyFingerprint))
+            .toThrow(/adapter: estimator-result-mismatch/);
+        expect(() => adapter.evaluate(holdout(bundle), H3)).toThrow(ScorecardContractError);
+    });
+
+    it("attests the report's own denial when the paired-delta lane is absent instead of throwing", () => {
+        const bundle = bundleFixture({ statuses: { "paired-delta": "missing" } });
+        const report = buildScorecardReport(bundle);
+        const adapter = createScorecardAdapter({ bundle, report });
+        const outcome = adapter.evaluate(
+            { pairs: PAIRED_FACTS, estimator: holdout(bundleFixture()).estimator, freezeManifestFingerprint: bundle.freezeManifestFingerprint },
+            bundle.policyFingerprint,
+        );
+        expect(outcome).toMatchObject({ promotionAllowed: false, mandatoryEvidenceComplete: false });
+        expect(report.body.outcome.mandatoryEvidenceComplete).toBe(false);
     });
 
     it("drives the prospective report to hard-gate-failed and recomputes to the same result fingerprint", () => {
         const bundle = bundleFixture();
         const report = buildScorecardReport(bundle);
         const scorecard = createScorecardAdapter({ bundle, report });
-        const pairedDelta = bundle.lanes.find((lane) => lane.lane === "paired-delta")!;
         const prospective = buildProspectiveReport({
             epochId: "epoch-test-release",
             freezeManifestFingerprint: bundle.freezeManifestFingerprint,
             closeManifestFingerprint: H3,
-            analysisPolicyFingerprint: pairedDelta.report!.body.policyFingerprint,
+            analysisPolicyFingerprint: analysisPolicy(bundle),
             scorecardPolicyFingerprint: bundle.policyFingerprint,
             pairs: PAIRED_FACTS,
             estimator: estimator(bundle),
@@ -211,5 +280,9 @@ describe("createScorecardAdapter", () => {
         const swapped = createScorecardAdapter({ bundle: swappedLane, report: buildScorecardReport(swappedLane) });
         expect(() => validateProspectiveReportEvidence(prospective, PAIRED_FACTS, { estimator: estimator(bundle), scorecard: swapped })).toThrow(/sibling-recomputation-mismatch/);
         expect(() => validateProspectiveReportEvidence(prospective, PAIRED_FACTS.slice(1), { estimator: estimator(bundle), scorecard })).toThrow(/deterministic-recomputation-mismatch/);
+        const otherFreeze = bundleFixture({ freezeManifestFingerprint: H3 });
+        const otherFreezeAdapter = createScorecardAdapter({ bundle: otherFreeze, report: buildScorecardReport(otherFreeze) });
+        expect(() => validateProspectiveReportEvidence(prospective, PAIRED_FACTS, { estimator: estimator(bundle), scorecard: otherFreezeAdapter }))
+            .toThrow(/adapter: freeze-fingerprint-mismatch/);
     });
 });

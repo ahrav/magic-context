@@ -325,9 +325,10 @@ function parseEvidenceRow(raw: unknown, index: number): EvidenceRow {
  */
 export function baselineComparable(
     target: Pick<ScorecardReportBody["target"], "baselineScorecardReportFingerprint">,
-    baseline: Pick<ScorecardReportBody["evidence"]["baseline"], "status">,
+    baseline: ScorecardReportBody["evidence"]["baseline"],
 ): boolean {
-    return target.baselineScorecardReportFingerprint === null || baseline.status === "present";
+    return target.baselineScorecardReportFingerprint === null
+        || (baseline.status === "present" && baseline.reportFingerprint === target.baselineScorecardReportFingerprint);
 }
 
 /** Whether every row and slot the policy requires supports promotion. Recomputed by the parser so a report cannot claim what its own rows deny. */

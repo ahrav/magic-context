@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readCanonicalJsonFile } from "../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -44,6 +44,17 @@ describe("run-scorecard", () => {
         expect(existsSync(join(args.out, ".."))).toBe(false);
     });
 
+    it("removes a stale report at the output path before a run that is then refused", () => {
+        const { args, lines } = release();
+        mkdirSync(join(args.out, ".."), { recursive: true });
+        writeFileSync(args.out, "{\"stale\":true}\n");
+        const other = release({ policy: policyFixture({ maxToleratedRegressions: 2 }) });
+        const swapped: ScorecardCliArgs = { ...args, sources: { ...args.sources, policies: other.args.sources.policies } };
+        expect(runScorecard(swapped, (line) => lines.push(line))).toBe(2);
+        expect(lines.join("")).toContain("policy-not-frozen");
+        expect(existsSync(args.out)).toBe(false);
+    });
+
     it("still publishes a report when a lane artifact is absent and records the lane as missing", () => {
         const { args } = release({ omitLanes: ["retrieval"] });
         expect(runScorecard(args, () => {})).toBe(2);
@@ -67,10 +78,24 @@ describe("run-scorecard parseArgs", () => {
     it("resolves paths, defaults the policy locations to the e2e root, and accepts an optional baseline", () => {
         const args = cli(base);
         expect(args.sources.freeze).toEqual({ artifactDir: join(process.cwd(), "freeze"), expectedManifestFingerprint: hex });
-        expect(args.sources.policies.scorecardPath).toBe("/root/prospective-holdout/policies/scorecard-policy.json");
+        expect(args.sources.artifactsDir).toBe(join(process.cwd(), "artifacts"));
+        expect(args.out).toBe(join(process.cwd(), "out.json"));
+        expect(args.sources.policies).toEqual({
+            analysisPath: "/root/prospective-holdout/policies/analysis-policy.json",
+            scorecardPath: "/root/prospective-holdout/policies/scorecard-policy.json",
+        });
         expect(args.sources.pairedDeltaPolicyPath).toBe("/root/pools/paired-delta-policy.json");
         expect(args.sources.baselinePath).toBeNull();
         expect(cli([...base, "--baseline", "b.json"]).sources.baselinePath).toBe(join(process.cwd(), "b.json"));
+    });
+
+    it("resolves explicit policy overrides relative to the working directory", () => {
+        const args = cli([...base, "--policies", "pol", "--paired-delta-policy", "pd.json"]);
+        expect(args.sources.policies).toEqual({
+            analysisPath: join(process.cwd(), "pol", "analysis-policy.json"),
+            scorecardPath: join(process.cwd(), "pol", "scorecard-policy.json"),
+        });
+        expect(args.sources.pairedDeltaPolicyPath).toBe(join(process.cwd(), "pd.json"));
     });
 
     it("reports a help request as a value instead of exiting, wherever the flag appears", () => {
@@ -81,6 +106,8 @@ describe("run-scorecard parseArgs", () => {
 
     it("rejects missing, repeated, unknown, and malformed flags", () => {
         expect(() => cli(base.slice(2))).toThrow(/--freeze is required/);
+        expect(() => cli([...base.slice(0, 4), ...base.slice(6)])).toThrow(/--artifacts is required/);
+        expect(() => cli(base.slice(0, 6))).toThrow(/--out is required/);
         expect(() => cli([...base, "--out", "twice"])).toThrow(/given twice/);
         expect(() => cli([...base, "--verbose", "1"])).toThrow(/unknown argument/);
         expect(() => cli([...base, "--baseline"])).toThrow(/requires a value/);
