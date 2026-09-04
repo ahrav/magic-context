@@ -28,3 +28,7 @@ proptest = "1.7"
 [[bench]]
 name = "redaction"
 harness = false
+
+[[bench]]
+name = "windowed"
+harness = false
