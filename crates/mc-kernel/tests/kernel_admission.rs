@@ -5544,6 +5544,103 @@ fn a_later_row_cannot_declassify_what_an_earlier_decision_restricted() {
 }
 
 #[test]
+fn an_own_restriction_in_history_outranks_a_permissive_lineage_row() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let seq = insert_subject(
+        &store,
+        "own-strict",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    drop(store);
+    // The lineage branch is non-null, so the history fold must rank the own
+    // branch higher rather than fall through to it.
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,
+                 visibility,outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'own-strict-lineage-normal',NULL,'fixture','source-own-strict',1,
+                 'trusted_local_code','current_code','other','verified','verified','active',
+                 'automatic','admit','normal',1,'fixture',1,1
+             )",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+    assert!(
+        store
+            .visible_as_of(Surface::AutoInject, seq)
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.object.object_id == "object-own-strict"),
+        "with only normal rows on both branches the object serves automatically"
+    );
+    drop(store);
+
+    // Insert an earlier `secret` own row, id-sorted below the real row, so the
+    // latest own decision remains `normal` while history retains the restriction.
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,
+                 visibility,outcome,sensitivity_class,policy_revision,reason,elevated_support,
+                 commit_seq,decided_at
+             )
+             SELECT '0-earlier-secret-row',subject_object_id,source_kind,source_id,
+                    source_revision,source_class,taint_class,event_kind,maturity,
+                    effective_maturity,disposition,visibility,outcome,'secret',policy_revision,
+                    reason,elevated_support,commit_seq,decided_at
+             FROM admission_decisions WHERE subject_object_id='object-own-strict'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT sensitivity_class FROM admission_decisions
+             WHERE subject_object_id='object-own-strict'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "normal"
+    );
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT sensitivity_class FROM admission_decisions
+             WHERE subject_object_id IS NULL AND source_id='source-own-strict'"
+        ),
+        "normal"
+    );
+    for surface in [
+        Surface::AutoInject,
+        Surface::AutoSearch,
+        Surface::ExplicitSearch,
+    ] {
+        assert!(
+            store
+                .visible_as_of(surface, seq)
+                .unwrap()
+                .rows
+                .iter()
+                .all(|row| row.object.object_id != "object-own-strict"),
+            "a permissive lineage row must not outrank a stricter own-object history"
+        );
+    }
+}
+
+#[test]
 fn a_lineage_row_with_an_impossible_maturity_shape_carries_no_authority() {
     let directory = tempfile::tempdir().unwrap();
     seed_approval(directory.path());
