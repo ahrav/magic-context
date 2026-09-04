@@ -840,7 +840,7 @@ pub(super) fn replace_alignment_projection_tx(
     let removed = truncate_alignment_projection(tx)?;
     {
         let mut statement = tx
-            .prepare(
+            .prepare_cached(
                 "INSERT INTO alignment_projection(
                      decision_id,observation_id,alignment_kind,alignment_payload,
                      built_through_commit_seq
