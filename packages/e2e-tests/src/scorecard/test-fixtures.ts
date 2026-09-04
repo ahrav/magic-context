@@ -146,6 +146,7 @@ export const PAIRED_FACTS: PairedCaseFact[] = [pairedFact(9), pairedFact(7)];
 
 export interface PairedDeltaFixtureOptions {
     policyDocument?: PolicyOwnerDocument;
+    poolManifestFingerprint?: string;
     /** Per-family valid-success deltas applied at both primary endpoints. */
     familyDeltas?: Readonly<Record<string, number>>;
     noiseFloors?: readonly FamilyNoiseFloor[];
@@ -156,6 +157,7 @@ export interface PairedDeltaFixtureOptions {
 
 export function pairedDeltaReportFixture(options: PairedDeltaFixtureOptions = {}): PairedDeltaReport {
     const policyDocument = options.policyDocument ?? pairedDeltaPolicyDocumentFixture();
+    const poolManifestFingerprint = options.poolManifestFingerprint ?? H1;
     const familyDeltas = options.familyDeltas ?? { "fam-a": 0.3, "fam-b": 0.1 };
     const analysis = estimateFamilyDeltas({
         observations: Object.entries(familyDeltas).flatMap(([familyId, delta]) => [
@@ -169,7 +171,7 @@ export function pairedDeltaReportFixture(options: PairedDeltaFixtureOptions = {}
         bootstrapSeed: 17,
         bootstrapResamples: options.bootstrapResamples ?? 2000,
         lane: {
-            poolManifestFingerprint: H1,
+            poolManifestFingerprint,
             pinnedSnapshotId: "fixture-model",
             policyFingerprint: policyDocument.policyFingerprint!,
             pairedFactsFingerprint: pairedFactsFingerprint(PAIRED_FACTS),
@@ -177,7 +179,7 @@ export function pairedDeltaReportFixture(options: PairedDeltaFixtureOptions = {}
         ...(options.noiseFloors === undefined ? {} : { noiseFloors: options.noiseFloors }),
     });
     return buildPairedDeltaReport({
-        poolManifestFingerprint: H1,
+        poolManifestFingerprint,
         pinnedSnapshotId: "fixture-model",
         policyDocument,
         implementationDigest: "impl-digest-fixture",
@@ -491,7 +493,9 @@ export function scorecardReportFixture(policy: ScorecardPolicy = policyFixture()
             freezeManifestFingerprint: H1,
             policyFingerprint: canonicalFingerprint(policy),
             pairedDeltaPolicyFingerprint: policy.pairedDeltaPolicyFingerprint,
-            baselineScorecardReportFingerprint: null,
+            baselineScorecardReportFingerprint: policy.baselineScorecardReportFingerprint,
+            requiredMetricSlots: policy.requiredMetricSlots,
+            maxToleratedRegressions: policy.maxToleratedRegressions,
         },
         utility: { ...unmeasuredFamily("utility"), family: "utility", familyEstimates: [], deltas: [] },
         formation: unmeasuredFamily("formation"),
@@ -506,7 +510,9 @@ export function scorecardReportFixture(policy: ScorecardPolicy = policyFixture()
         limitations: [],
         evidence: {
             lanes: LANE_IDS.map((lane) => ({ lane, status: "missing", reportFingerprint: null, identity: null, diagnostics: ["artifact-missing"] })),
-            baseline: { status: "absent", reportFingerprint: null },
+            baseline: policy.baselineScorecardReportFingerprint === null
+                ? { status: "absent", reportFingerprint: null }
+                : { status: "present", reportFingerprint: policy.baselineScorecardReportFingerprint },
         },
         ...overrides,
     };
@@ -515,10 +521,11 @@ export function scorecardReportFixture(policy: ScorecardPolicy = policyFixture()
         outcome: overrides.outcome ?? deriveOutcome({
             gates: rows.safetyGates,
             lanes: rows.evidence.lanes,
+            baseline: rows.evidence.baseline.status,
             families: SCORE_FAMILY_IDS.map((family) => rows[family]),
             adverseDeltas: rows.adverseDeltas,
-            requiredMetricSlots: policy.requiredMetricSlots,
-            maxToleratedRegressions: policy.maxToleratedRegressions,
+            requiredMetricSlots: rows.target.requiredMetricSlots,
+            maxToleratedRegressions: rows.target.maxToleratedRegressions,
         }),
     };
     return { schema: SCORECARD_REPORT_SCHEMA, body, reportFingerprint: canonicalFingerprint(body) };

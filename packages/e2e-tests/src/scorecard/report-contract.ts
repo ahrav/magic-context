@@ -5,6 +5,7 @@ import type { RawRegretLadder } from "../paired-delta/report";
 import {
     GATE_ID_RE,
     LANE_IDS,
+    METRIC_SLOT_IDS,
     REASON_CODE_RE,
     SCORECARD_GATE_IDS,
     SCORE_FAMILY_IDS,
@@ -16,9 +17,12 @@ import {
     hex64,
     idArray,
     integer,
+    number,
     parseLaneIdentity,
     record,
+    sorted,
     staticId,
+    unique,
     type GateId,
     type LaneId,
     type LaneIdentity,
@@ -43,6 +47,64 @@ export interface GateRow {
 
 export const METRIC_UNITS = ["ratio", "count", "tokens", "milliseconds", "delta"] as const;
 export type MetricUnit = (typeof METRIC_UNITS)[number];
+
+/**
+ * The one unit each slot is measured in. A `ratio` lies in [0, 1], a `delta` (a difference of two ratios) in
+ * [-1, 1], `count` and `tokens` are non-negative integers, and `milliseconds` is non-negative.
+ */
+export const SLOT_UNITS: Readonly<Record<MetricSlotId, MetricUnit>> = {
+    "valid-success-delta-mc-on-vs-mc-off": "delta",
+    "valid-success-delta-mc-on-vs-compaction": "delta",
+    "valid-failure-rate": "ratio",
+    "invalid-failure-rate": "ratio",
+    "invalid-success-rate-mc-on": "ratio",
+    "invalid-success-rate-mc-off": "ratio",
+    "invalid-success-rate-compaction": "ratio",
+    "final-attempt-tokens-mc-on": "tokens",
+    "final-attempt-tokens-mc-off": "tokens",
+    "final-attempt-tokens-compaction": "tokens",
+    "final-attempt-wall-clock-ms-mc-on": "milliseconds",
+    "final-attempt-wall-clock-ms-mc-off": "milliseconds",
+    "final-attempt-wall-clock-ms-compaction": "milliseconds",
+    "final-attempt-turns-mc-on": "count",
+    "final-attempt-turns-mc-off": "count",
+    "final-attempt-turns-compaction": "count",
+    "active-claim-precision": "ratio",
+    "active-claim-recall": "ratio",
+    "false-authoritative-scenario-rate": "ratio",
+    "false-authoritative-memory-rate": "ratio",
+    "supersession-latency": "milliseconds",
+    "pollution-duplication": "ratio",
+    "recall-at-10-explicit": "ratio",
+    "recall-at-50-explicit": "ratio",
+    "reciprocal-rank-explicit": "ratio",
+    "ndcg-at-10-explicit": "ratio",
+    "duplicate-rate-at-50-explicit": "ratio",
+    "recall-at-10-automatic": "ratio",
+    "recall-at-50-automatic": "ratio",
+    "reciprocal-rank-automatic": "ratio",
+    "ndcg-at-10-automatic": "ratio",
+    "duplicate-rate-at-50-automatic": "ratio",
+    currentness: "ratio",
+    "rejection-recall": "ratio",
+    "literal-recall": "ratio",
+    "abstention-accuracy": "ratio",
+    "post-compaction-probe-accuracy": "ratio",
+    "ctx-expand-recovery": "ratio",
+    "input-token-reduction": "ratio",
+    "cache-write-preservation": "ratio",
+    "paired-delta-planned-coordinates": "count",
+    "paired-delta-healthy-coordinates": "count",
+    "paired-delta-excluded-cells": "count",
+    "incident-results-total": "count",
+    "incident-results-unhealthy": "count",
+    "incident-baseline-mismatches": "count",
+    "cross-harness-parity-pass-rate": "ratio",
+    "dreamer-runs-total": "count",
+    "dreamer-runs-not-passed": "count",
+    "restart-scenarios": "count",
+    "contention-failures": "count",
+};
 
 export type MetricSlot =
     | { id: MetricSlotId; status: "measured"; value: number; unit: MetricUnit; sourceLane: LaneId; sourceFingerprint: string }
@@ -104,11 +166,14 @@ export interface EvidenceRow {
 }
 
 export interface ScorecardReportBody {
+    /** The policy terms the outcome depends on are restated here so a reader can recompute it from the report alone. */
     target: {
         freezeManifestFingerprint: string;
         policyFingerprint: string;
         pairedDeltaPolicyFingerprint: string;
         baselineScorecardReportFingerprint: string | null;
+        requiredMetricSlots: MetricSlotId[];
+        maxToleratedRegressions: number;
     };
     utility: UtilitySection;
     formation: ScoreFamilySection;
@@ -190,6 +255,20 @@ function parseGateRow(raw: unknown, index: number): GateRow {
     return row;
 }
 
+function measuredValue(raw: unknown, unit: MetricUnit, label: string): number {
+    switch (unit) {
+        case "ratio":
+            return number(raw, label, { minimum: 0, maximum: 1 });
+        case "delta":
+            return number(raw, label, { minimum: -1, maximum: 1 });
+        case "milliseconds":
+            return number(raw, label, { minimum: 0 });
+        case "count":
+        case "tokens":
+            return integer(raw, label, 0);
+    }
+}
+
 function parseSlot(raw: unknown, family: ScoreFamilyId, index: number): MetricSlot {
     const label = `report.body.${family}.slots[${index}]`;
     const value = record(raw, label);
@@ -199,11 +278,13 @@ function parseSlot(raw: unknown, family: ScoreFamilyId, index: number): MetricSl
     const id = expectedId as MetricSlotId;
     if (status === "measured") {
         exact(value, ["id", "status", "value", "unit", "sourceLane", "sourceFingerprint"], label);
+        const unit = SLOT_UNITS[id];
+        if (value.unit !== unit) fail(`${label}.unit: slot-unit-invalid`);
         return {
             id,
             status,
-            value: finiteNumber(value.value, `${label}.value`),
-            unit: enumeration(value.unit, METRIC_UNITS, `${label}.unit`),
+            value: measuredValue(value.value, unit, `${label}.value`),
+            unit,
             sourceLane: enumeration(value.sourceLane, LANE_IDS, `${label}.sourceLane`),
             sourceFingerprint: hex64(value.sourceFingerprint, `${label}.sourceFingerprint`),
         };
@@ -311,34 +392,39 @@ function parseEvidenceRow(raw: unknown, index: number): EvidenceRow {
     exact(value, ["lane", "status", "reportFingerprint", "identity", "diagnostics"], label);
     const lane = enumeration(value.lane, LANE_IDS, `${label}.lane`);
     if (lane !== LANE_IDS[index]) fail(`${label}.lane: order-invalid`);
-    return {
+    const row: EvidenceRow = {
         lane,
         status: enumeration(value.status, LANE_STATUSES, `${label}.status`),
         reportFingerprint: nullable(value.reportFingerprint, (fingerprint) => hex64(fingerprint, `${label}.reportFingerprint`)),
         identity: nullable(value.identity, (identity) => parseLaneIdentity(identity, lane, `${label}.identity`)),
         diagnostics: idArray(value.diagnostics, `${label}.diagnostics`, REASON_CODE_RE),
     };
+    if ((row.status === "present") !== (row.diagnostics.length === 0)) fail(`${label}.diagnostics: cross-field-invalid`);
+    if ((row.status === "present" || row.status === "incomplete") && row.reportFingerprint === null) fail(`${label}.reportFingerprint: required`);
+    if (row.status === "missing" && (row.reportFingerprint !== null || row.identity !== null)) fail(`${label}: shape-invalid`);
+    return row;
 }
 
-export interface OutcomePolicyTerms {
-    requiredMetricSlots: readonly MetricSlotId[];
-    maxToleratedRegressions: number;
+export function estimateKey(row: { endpoint: PrimaryEndpoint; familyId: string }): string {
+    return JSON.stringify([row.endpoint, row.familyId]);
 }
-
-/** `UNBOUNDED_POLICY_TERMS` omits required slots and permits every regression, so derived flags only bound claims. */
-const UNBOUNDED_POLICY_TERMS: OutcomePolicyTerms = { requiredMetricSlots: [], maxToleratedRegressions: Number.POSITIVE_INFINITY };
 
 /** Whether every row and slot the policy requires supports promotion. Recomputed by the parser so a report cannot claim what its own rows deny. */
-export function deriveOutcome(input: OutcomePolicyTerms & {
+export function deriveOutcome(input: {
     gates: readonly GateRow[];
     lanes: readonly EvidenceRow[];
+    baseline: BaselineStatus;
     families: readonly ScoreFamilySection[];
+    requiredMetricSlots: readonly MetricSlotId[];
     adverseDeltas: readonly AdverseRow[];
+    maxToleratedRegressions: number;
 }): ScorecardReportBody["outcome"] {
     const hardGateFailures = input.gates.filter((row) => row.status !== "passed").map((row) => row.gateId).sort();
     const measured = new Set(input.families.flatMap((family) => family.slots)
         .filter((slot) => slot.status === "measured").map((slot) => slot.id));
+    // A pinned baseline that did not load leaves the release-over-release comparison unmade.
     const mandatoryEvidenceComplete = input.lanes.every((row) => row.status === "present")
+        && input.baseline !== "schema-mismatch"
         && input.requiredMetricSlots.every((slot) => measured.has(slot));
     const blockingRegressionCount = input.adverseDeltas.filter((row) => row.blocking).length;
     return {
@@ -351,26 +437,71 @@ export function deriveOutcome(input: OutcomePolicyTerms & {
     };
 }
 
-/** With `policyTerms`, the claimed outcome must equal the derived one. Without them, the counts must match and each claimed flag may not exceed its unbounded derivation. */
-function verifyOutcome(body: ScorecardReportBody, policyTerms: OutcomePolicyTerms | undefined): void {
-    const derived = deriveOutcome({
-        ...(policyTerms ?? UNBOUNDED_POLICY_TERMS),
-        gates: body.safetyGates,
-        lanes: body.evidence.lanes,
-        families: familySections(body),
-        adverseDeltas: body.adverseDeltas,
-    });
-    const claimed = body.outcome;
-    if (JSON.stringify(claimed.hardGateFailures) !== JSON.stringify(derived.hardGateFailures)) fail("report.body.outcome.hardGateFailures: cross-field-invalid");
-    if (claimed.blockingRegressionCount !== derived.blockingRegressionCount) fail("report.body.outcome.blockingRegressionCount: cross-field-invalid");
-    const flagInvalid = (flag: boolean, bound: boolean): boolean => (policyTerms === undefined ? flag && !bound : flag !== bound);
-    if (flagInvalid(claimed.mandatoryEvidenceComplete, derived.mandatoryEvidenceComplete)) fail("report.body.outcome.mandatoryEvidenceComplete: cross-field-invalid");
-    if (flagInvalid(claimed.promotionAllowed, derived.promotionAllowed) || (claimed.promotionAllowed && !claimed.mandatoryEvidenceComplete)) {
-        fail("report.body.outcome.promotionAllowed: cross-field-invalid");
+/** Every gate observation and measurement must name a lane row that carries the same fingerprint. */
+function verifyEvidenceBindings(body: ScorecardReportBody): void {
+    const lanes = new Map(body.evidence.lanes.map((row) => [row.lane, row]));
+    for (const [index, gate] of body.safetyGates.entries()) {
+        if (gate.sourceLane === null) continue;
+        const lane = lanes.get(gate.sourceLane);
+        if (lane?.status !== "present" || lane.reportFingerprint !== gate.evidenceFingerprint) {
+            fail(`report.body.safetyGates[${index}]: evidence-binding-invalid`);
+        }
+    }
+    for (const family of familySections(body)) {
+        for (const [index, slot] of family.slots.entries()) {
+            if (slot.status !== "measured") continue;
+            // Reliability slots read run-health counts from a lane that did not finish, so `incomplete` also sources a measurement.
+            const lane = lanes.get(slot.sourceLane);
+            const parsed = lane?.status === "present" || lane?.status === "incomplete";
+            if (!parsed || lane.reportFingerprint !== slot.sourceFingerprint) {
+                fail(`report.body.${family.family}.slots[${index}]: evidence-binding-invalid`);
+            }
+        }
     }
 }
 
-export function parseScorecardReport(raw: unknown, policyTerms?: OutcomePolicyTerms): ScorecardReport {
+/** Recomputes the adverse rows from the deltas; a `family-missing` row cannot name a key the current release estimated. */
+function verifyComparison(body: ScorecardReportBody): void {
+    const { familyEstimates, deltas } = body.utility;
+    const baselinePresent = body.evidence.baseline.status === "present";
+    unique(familyEstimates.map(estimateKey), "report.body.utility.familyEstimates");
+    if (deltas.length !== familyEstimates.length) fail("report.body.utility.deltas: estimate-mirror-invalid");
+    for (const [index, delta] of deltas.entries()) {
+        const estimate = familyEstimates[index]!;
+        const label = `report.body.utility.deltas[${index}]`;
+        if (estimateKey(delta) !== estimateKey(estimate)) fail(`${label}: estimate-mirror-invalid`);
+        if (delta.status === "no-baseline") {
+            if (delta.value !== estimate.pointEstimate) fail(`${label}.value: cross-field-invalid`);
+        } else {
+            if (!baselinePresent) fail(`${label}.status: baseline-required`);
+            if (delta.noiseLabel !== estimate.noiseLabel) fail(`${label}.noiseLabel: cross-field-invalid`);
+        }
+    }
+    const adverse = body.adverseDeltas;
+    const adverseKey = (row: AdverseRow): string => estimateKey({ endpoint: row.endpoint!, familyId: row.familyId });
+    unique(adverse.map((row) => `${row.kind}:${adverseKey(row)}`), "report.body.adverseDeltas");
+    sorted(adverse, (row) => [row.familyId, row.endpoint ?? "", row.kind], "report.body.adverseDeltas");
+    if (adverse.length > 0 && !baselinePresent) fail("report.body.adverseDeltas: baseline-required");
+    const expected = deltas.filter((row): row is Extract<DeltaRow, { status: "compared" }> => row.status === "compared" && row.interval.upper < 0);
+    const claimedByKey = new Map(adverse.filter((row) => row.kind === "adverse-interval").map((row) => [adverseKey(row), row]));
+    if (claimedByKey.size !== expected.length) fail("report.body.adverseDeltas: derived-mismatch");
+    for (const row of expected) {
+        const claimed = claimedByKey.get(estimateKey(row));
+        if (claimed === undefined
+            || claimed.delta !== row.delta
+            || claimed.noiseLabel !== row.noiseLabel
+            || claimed.interval!.lower !== row.interval.lower
+            || claimed.interval!.upper !== row.interval.upper) {
+            fail("report.body.adverseDeltas: derived-mismatch");
+        }
+    }
+    const currentKeys = new Set(familyEstimates.map(estimateKey));
+    for (const [index, row] of adverse.entries()) {
+        if (row.kind === "family-missing" && currentKeys.has(adverseKey(row))) fail(`report.body.adverseDeltas[${index}]: family-present`);
+    }
+}
+
+export function parseScorecardReport(raw: unknown): ScorecardReport {
     const root = record(raw, "report");
     exact(root, ["schema", "body", "reportFingerprint"], "report");
     if (root.schema !== SCORECARD_REPORT_SCHEMA) fail("report.schema: version-invalid");
@@ -378,7 +509,10 @@ export function parseScorecardReport(raw: unknown, policyTerms?: OutcomePolicyTe
     exact(value, REPORT_BODY_KEYS, "report.body");
     if (Object.keys(value).some((key, index) => key !== REPORT_BODY_KEYS[index])) fail("report.body: section-order-invalid");
     const target = record(value.target, "report.body.target");
-    exact(target, ["freezeManifestFingerprint", "policyFingerprint", "pairedDeltaPolicyFingerprint", "baselineScorecardReportFingerprint"], "report.body.target");
+    exact(target, [
+        "freezeManifestFingerprint", "policyFingerprint", "pairedDeltaPolicyFingerprint", "baselineScorecardReportFingerprint",
+        "requiredMetricSlots", "maxToleratedRegressions",
+    ], "report.body.target");
     const evidence = record(value.evidence, "report.body.evidence");
     exact(evidence, ["lanes", "baseline"], "report.body.evidence");
     const baseline = record(evidence.baseline, "report.body.evidence.baseline");
@@ -389,6 +523,9 @@ export function parseScorecardReport(raw: unknown, policyTerms?: OutcomePolicyTe
     if (gates.length !== SCORECARD_GATE_IDS.length) fail("report.body.safetyGates: exact-gate-set-required");
     const lanes = array(evidence.lanes, "report.body.evidence.lanes");
     if (lanes.length !== LANE_IDS.length) fail("report.body.evidence.lanes: exact-lane-set-required");
+    const requiredMetricSlots = idArray(target.requiredMetricSlots, "report.body.target.requiredMetricSlots", REASON_CODE_RE)
+        .map((slot, index) => enumeration(slot, METRIC_SLOT_IDS, `report.body.target.requiredMetricSlots[${index}]`));
+    unique(requiredMetricSlots, "report.body.target.requiredMetricSlots");
     const body: ScorecardReportBody = {
         target: {
             freezeManifestFingerprint: hex64(target.freezeManifestFingerprint, "report.body.target.freezeManifestFingerprint"),
@@ -396,6 +533,8 @@ export function parseScorecardReport(raw: unknown, policyTerms?: OutcomePolicyTe
             pairedDeltaPolicyFingerprint: hex64(target.pairedDeltaPolicyFingerprint, "report.body.target.pairedDeltaPolicyFingerprint"),
             baselineScorecardReportFingerprint: nullable(target.baselineScorecardReportFingerprint, (fingerprint) =>
                 hex64(fingerprint, "report.body.target.baselineScorecardReportFingerprint")),
+            requiredMetricSlots,
+            maxToleratedRegressions: integer(target.maxToleratedRegressions, "report.body.target.maxToleratedRegressions", 0),
         },
         utility: parseUtilitySection(value.utility),
         formation: parseFamilySection(value.formation, "formation"),
@@ -423,10 +562,23 @@ export function parseScorecardReport(raw: unknown, policyTerms?: OutcomePolicyTe
     };
     const reportFingerprint = hex64(root.reportFingerprint, "report.reportFingerprint");
     if (canonicalFingerprint(body) !== reportFingerprint) fail("report.reportFingerprint: mismatch");
-    verifyOutcome(body, policyTerms);
-    if ((body.evidence.baseline.status === "present") !== (body.evidence.baseline.reportFingerprint !== null)) {
-        fail("report.body.evidence.baseline: shape-invalid");
-    }
+    const pinned = body.target.baselineScorecardReportFingerprint;
+    const loaded = body.evidence.baseline;
+    if ((loaded.status === "absent") !== (pinned === null)) fail("report.body.evidence.baseline.status: cross-field-invalid");
+    if ((loaded.status === "present") !== (loaded.reportFingerprint !== null)) fail("report.body.evidence.baseline: shape-invalid");
+    if (loaded.status === "present" && loaded.reportFingerprint !== pinned) fail("report.body.evidence.baseline.reportFingerprint: cross-field-invalid");
+    verifyEvidenceBindings(body);
+    verifyComparison(body);
+    const derived = deriveOutcome({
+        gates: body.safetyGates,
+        lanes: body.evidence.lanes,
+        baseline: loaded.status,
+        families: familySections(body),
+        requiredMetricSlots: body.target.requiredMetricSlots,
+        adverseDeltas: body.adverseDeltas,
+        maxToleratedRegressions: body.target.maxToleratedRegressions,
+    });
+    if (canonicalFingerprint(body.outcome) !== canonicalFingerprint(derived)) fail("report.body.outcome: cross-field-invalid");
     return { schema: SCORECARD_REPORT_SCHEMA, body, reportFingerprint };
 }
 

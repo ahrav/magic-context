@@ -3,10 +3,12 @@ import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import type { BenchmarkReport } from "../../../plugin/scripts/retrieval-benchmark/report";
 import type { PolicyOwnerDocument } from "../prospective-holdout/contract";
 import { laneEvidence, loadEvidenceBundle, type EvidenceSources } from "./evidence";
 import { LANE_IDS, ScorecardContractError } from "./policy";
 import {
+    H2,
     HISTORIAN_SYSTEM,
     PAIRED_DELTA_POLICY,
     dreamerReportFixture,
@@ -20,6 +22,7 @@ import {
     policyFixture,
     requiredLanesWith,
     retrievalReportFixture,
+    retrievalScenarioFixture,
     scannableDreamerReportFixture,
     scenarioScoreFixture,
     scorecardReportFixture,
@@ -108,10 +111,36 @@ describe("loadEvidenceBundle", () => {
         expect(laneEvidence(bundle, "paired-delta").report).not.toBeNull();
     });
 
+    it("lowers paired-delta to incomplete when the estimator found too few analyzable families", () => {
+        // One family is below the pre-registered minimum of two, and without a calibration the run summary can still say complete.
+        const insufficient = pairedDeltaReportFixture({ familyDeltas: { "fam-a": 0.3 } });
+        expect(insufficient.body.analysis.evidenceSufficient).toBe(false);
+        expect(insufficient.body.runSummary.evidenceComplete).toBe(true);
+        const bundle = loadEvidenceBundle(tree({ lanes: { "paired-delta": insufficient } }));
+        expect(laneEvidence(bundle, "paired-delta")).toMatchObject({ status: "incomplete", diagnostics: ["run-incomplete"] });
+    });
+
+    it("recomputes retrieval completeness from the archived scenarios and attempts", () => {
+        const declared = (report: BenchmarkReport): BenchmarkReport => ({ ...report, status: "complete" });
+        const noScenarios = declared(retrievalReportFixture({ scenarios: [] }));
+        expect(statuses(tree({ lanes: { retrieval: noScenarios } })).retrieval).toBe("incomplete");
+        const duplicated = declared(retrievalReportFixture({ scenarios: [retrievalScenarioFixture("case-1:q-1"), retrievalScenarioFixture("case-1:q-1")] }));
+        expect(statuses(tree({ lanes: { retrieval: duplicated } })).retrieval).toBe("incomplete");
+        const complete = retrievalReportFixture();
+        const interrupted = declared({
+            ...complete,
+            evidence: { ...complete.evidence, attempts: complete.evidence.attempts.map((attempt) => ({ ...attempt, status: "interrupted" as const })) },
+        });
+        expect(statuses(tree({ lanes: { retrieval: interrupted } })).retrieval).toBe("incomplete");
+    });
+
     it("rejects a paired-delta report bound to another paired-delta policy as schema-mismatch", () => {
         const foreign = pairedDeltaPolicyDocumentFixture({ ...PAIRED_DELTA_POLICY, replicateCount: 2 });
         const bundle = loadEvidenceBundle(tree({ lanes: { "paired-delta": pairedDeltaReportFixture({ policyDocument: foreign }) } }));
         expect(laneEvidence(bundle, "paired-delta")).toMatchObject({ status: "schema-mismatch", diagnostics: ["policy-binding-mismatch"] });
+        // The report names the pinned policy but a pool the loaded paired-delta policy does not name.
+        const otherPool = loadEvidenceBundle(tree({ lanes: { "paired-delta": pairedDeltaReportFixture({ poolManifestFingerprint: H2 }) } }));
+        expect(laneEvidence(otherPool, "paired-delta")).toMatchObject({ status: "schema-mismatch", diagnostics: ["policy-binding-mismatch"] });
     });
 
     it("lowers paired-delta to incomplete when a pre-registered run setting differs", () => {

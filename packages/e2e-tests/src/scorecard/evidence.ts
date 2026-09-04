@@ -5,7 +5,11 @@ import {
     readCanonicalJsonFile,
 } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { scanForSensitiveContent } from "../../../plugin/scripts/retrieval-benchmark/privacy";
-import { parseReport as parseRetrievalReport, type BenchmarkReport } from "../../../plugin/scripts/retrieval-benchmark/report";
+import {
+    computeReportStatus as computeRetrievalReportStatus,
+    parseReport as parseRetrievalReport,
+    type BenchmarkReport,
+} from "../../../plugin/scripts/retrieval-benchmark/report";
 import { parseRunReport as parseDreamerRunReport, type DreamerEvalRunReport } from "../dreamer-eval/contract";
 import { parseLaneReport as parseHistorianReport, type LaneReport as HistorianReport } from "../historian-eval/scorer";
 import { parseIncidentReport, type IncidentPoolReport } from "../incident-pool/report";
@@ -122,8 +126,10 @@ function observedIdentity(parsed: ParsedLane): LaneIdentity | null {
 function runIncompleteReasons(parsed: ParsedLane): string[] {
     switch (parsed.lane) {
         case "paired-delta": {
-            const summary = parsed.report.body.runSummary;
-            return summary.status === "completed" && summary.evidenceComplete ? [] : ["run-incomplete"];
+            // Without a calibration, `evidenceComplete` records pool-sizing validity and says nothing about whether
+            // enough families were analyzable, so the estimator's own sufficiency verdict is required alongside it.
+            const { runSummary, analysis } = parsed.report.body;
+            return runSummary.status === "completed" && runSummary.evidenceComplete && analysis.evidenceSufficient ? [] : ["run-incomplete"];
         }
         case "historian":
             return parsed.report.aggregate.errors > 0 ? ["run-incomplete"] : [];
@@ -133,13 +139,21 @@ function runIncompleteReasons(parsed: ParsedLane): string[] {
             return parsed.report.length > 0 && parsed.report.every((run) => run.status !== "ERROR") ? [] : ["run-incomplete"];
         case "incident":
             return parsed.report.evaluation_complete ? [] : ["run-incomplete"];
-        case "retrieval":
-            return parsed.report.status === "complete" ? [] : ["run-incomplete"];
+        case "retrieval": {
+            // The declared status is recomputed from the archived rows. The manifest's expected query ids are not
+            // archived with the report, so a missing expected query is the one `incomplete` cause not recoverable here.
+            const { scenarios, attempts } = parsed.report.evidence;
+            const recomputed = computeRetrievalReportStatus({ expectedQueryIds: [], scenarios, attempts });
+            return parsed.report.status === "complete" && recomputed === "complete" && scenarios.length > 0 ? [] : ["run-incomplete"];
+        }
     }
 }
 
-function pairedDeltaBindingReasons(report: PairedDeltaReport, policy: ScorecardPolicy): string[] {
-    return report.body.policyFingerprint === policy.pairedDeltaPolicyFingerprint ? [] : ["policy-binding-mismatch"];
+/** The report's binding fields must name the paired-delta policy the scorecard policy pinned, and that policy's pool. */
+function pairedDeltaBindingReasons(report: PairedDeltaReport, policy: ScorecardPolicy, pairedDeltaPolicy: PairedDeltaPolicyView): string[] {
+    const bound = report.body.policyFingerprint === policy.pairedDeltaPolicyFingerprint
+        && report.body.poolManifestFingerprint === pairedDeltaPolicy.poolManifestFingerprint;
+    return bound ? [] : ["policy-binding-mismatch"];
 }
 
 /** A difference in a pre-registered run setting is a pre-registration mismatch, not a schema problem. */
@@ -161,6 +175,7 @@ function identityReasons(identity: LaneIdentity | null, required: RequiredLane):
 }
 
 interface PairedDeltaPolicyView {
+    poolManifestFingerprint: string;
     modelMatrix: ScorecardPolicy["modelMatrix"];
     replicateCount: number;
     releaseCostBudgetUsd: number;
@@ -174,7 +189,12 @@ function loadPairedDeltaPolicy(path: string, expectedFingerprint: string): Paire
         throw new ScorecardContractError(["scorecard: paired-delta-policy-binding-mismatch"]);
     }
     const policy = parsePairedDeltaPolicy(document.policy);
-    return { modelMatrix: policy.modelMatrix, replicateCount: policy.replicateCount, releaseCostBudgetUsd: policy.costBudgetUsd.release };
+    return {
+        poolManifestFingerprint: policy.poolManifestFingerprint,
+        modelMatrix: policy.modelMatrix,
+        replicateCount: policy.replicateCount,
+        releaseCostBudgetUsd: policy.costBudgetUsd.release,
+    };
 }
 
 type JsonArtifact = { kind: "missing" } | { kind: "unparseable" } | { kind: "json"; raw: unknown };
@@ -216,7 +236,7 @@ function loadLane(required: RequiredLane, policy: ScorecardPolicy, pairedDeltaPo
         return rejected("schema-mismatch", "report-parse-failed", reportFingerprint);
     }
     const identity = observedIdentity(parsed);
-    const bindingReasons = parsed.lane === "paired-delta" ? pairedDeltaBindingReasons(parsed.report, policy) : [];
+    const bindingReasons = parsed.lane === "paired-delta" ? pairedDeltaBindingReasons(parsed.report, policy, pairedDeltaPolicy) : [];
     if (bindingReasons.length > 0) {
         return { lane, status: "schema-mismatch", reportFingerprint, identity, diagnostics: bindingReasons, report: null };
     }

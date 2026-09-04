@@ -35,8 +35,10 @@ export const {
     hex64,
     enumeration,
     array,
+    number,
     integer,
     unique,
+    sorted,
     idArray,
 } = p;
 
