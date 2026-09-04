@@ -1040,6 +1040,51 @@ async fn a_request_naming_another_project_root_is_refused_before_any_work() {
 }
 
 #[tokio::test]
+async fn a_project_path_shaped_like_a_secret_still_serves_its_own_rows() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    let root = daemon._data.path().join(SECRET);
+    fs::create_dir_all(&root).unwrap();
+    let route = RouteHandle {
+        channel: 13,
+        epoch: 1,
+    };
+    assert!(matches!(
+        daemon
+            .handler
+            .bind(route, identity(&root, "session-s"))
+            .await,
+        BindOutcome::Accept
+    ));
+    let mut write = commit_request(&root, "secret-root", vec![insert_decision(1)], vec![]);
+    write["session_id"] = json!("session-s");
+    let written = daemon.call(route, write).await;
+    assert_state(&written, "available", None);
+    let known_as_of = written["known_as_of"].as_i64().unwrap();
+
+    // The scope term carries the digest, so the redactor left it alone and
+    // the route matches its own rows.
+    let mut read = read_request(&root, "explicit_search", None);
+    read["session_id"] = json!("session-s");
+    let read = daemon.call(route, read).await;
+    assert_eq!(object_ids(&read), ["decision-object-1"]);
+    let terms = store
+        .scope_terms(read["rows"][0]["scope_id"].as_str().unwrap())
+        .unwrap();
+    assert!(!terms[0].exact_value.as_deref().unwrap().contains(SECRET));
+    let mut retire = commit_request(
+        &root,
+        "retire-secret-root",
+        vec![json!({"op": "retire_decision", "object_id": "decision-object-1"})],
+        vec![token("decision-object-1", known_as_of)],
+    );
+    retire["session_id"] = json!("session-s");
+    assert_state(&daemon.call(route, retire).await, "available", None);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_route_bound_through_a_symlink_stays_on_the_project_it_was_bound_to() {
     let daemon = Daemon::start().await;
     seed_domain(&daemon.store());
@@ -1307,6 +1352,20 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
     let mut write_b = commit_request(&project_b, "b", vec![insert_decision(7)], vec![]);
     write_b["session_id"] = json!("session-b");
     daemon.call(route_b, write_b).await;
+    // Written `normal`, but admitted under a `personal` taint whose floor the
+    // serving view folds onto the object as `sensitive`.
+    let mut personal = commit_request(
+        &daemon.project,
+        "personal",
+        vec![insert_decision(10)],
+        vec![],
+    );
+    personal["asserted_taint_class"] = json!("personal");
+    assert_state(
+        &daemon.call(daemon.route, personal).await,
+        "available",
+        None,
+    );
     let sensitive = store
         .ingest_artifact(ingest(
             "sensitive",
@@ -1326,6 +1385,7 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
         // Eligibility checks an object's class even when the object cites no artifact.
         json!({"object_id": "decision-object-8", "source_revision": 8}),
         json!({"object_id": "decision-object-9", "source_revision": 9}),
+        json!({"object_id": "decision-object-10", "source_revision": 10}),
     ];
     let request = eligibility_request(&daemon.project, "remote", candidates.clone());
     let first = daemon.call(daemon.route, request.clone()).await;
@@ -1344,14 +1404,15 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
             ("never-written", "retracted"),
             ("decision-object-8", "provider_sensitive"),
             ("decision-object-9", "provider_sensitive"),
+            ("decision-object-10", "provider_sensitive"),
         ]
         .map(|(id, verdict)| (id.to_string(), verdict.to_string()))
     );
-    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 9);
+    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 10);
 
     // Same tip, same candidates: every verdict comes from the cache.
     let second = daemon.call(daemon.route, request.clone()).await;
-    assert_eq!(second["cache_hits"], 9);
+    assert_eq!(second["cache_hits"], 10);
     assert_eq!(verdicts(&second), verdicts(&first));
     // An oversized id or a malformed digest never reaches the cache.
     for candidate in [
@@ -1370,7 +1431,7 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
             PreparedOutcome::Error { code, .. } if code == "invalid_params"
         ));
     }
-    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 9);
+    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 10);
     // A different declared revision is a different key and a different verdict.
     let revised = daemon
         .call(
@@ -1396,6 +1457,7 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
     // A secret object is refused locally too; a sensitive one is eligible.
     assert_eq!(verdicts(&local)[7].1, "provider_sensitive");
     assert_eq!(verdicts(&local)[8].1, "ok");
+    assert_eq!(verdicts(&local)[9].1, "ok");
 
     // Retiring the `ok` candidate moves the tip, so the old entries stop matching.
     daemon
@@ -2168,10 +2230,24 @@ async fn another_projects_objects_are_not_found_through_commit_targets_or_tokens
         )
         .await;
     assert_state(&own, "available", None);
+    // Only `implements` feeds the alignment projection; any other dependency
+    // kind may cite a live object that carries no scope, such as the domain.
+    let cites_domain = daemon
+        .commit(
+            "cite-domain",
+            vec![observation_depending(3, "domain-object", "about")],
+            vec![],
+        )
+        .await;
+    assert_state(&cites_domain, "available", None);
     daemon.handler.shutdown().await.unwrap();
 }
 
 fn observation_implementing(index: i64, decision_object_id: &str) -> Value {
+    observation_depending(index, decision_object_id, "implements")
+}
+
+fn observation_depending(index: i64, dependency_object_id: &str, kind: &str) -> Value {
     json!({
         "op": "insert_observation",
         "spec": {
@@ -2182,7 +2258,7 @@ fn observation_implementing(index: i64, decision_object_id: &str) -> Value {
             "payload": {"summary": "code present", "classification": "code_present"},
             "observed_at": index,
             "dependencies": [
-                {"dependency_object_id": decision_object_id, "dependency_kind": "implements"}
+                {"dependency_object_id": dependency_object_id, "dependency_kind": kind}
             ],
             "source_id": "memory-lineage",
             "source_revision": index,
@@ -2202,7 +2278,8 @@ async fn a_row_under_any_scope_naming_the_project_is_readable_and_mutable() {
         "available",
         None,
     );
-    // Another producer's scope, under its own id, names this route's root.
+    // Another producer's scope, under its own id, names this route's root by
+    // the digest of its canonical path.
     let root = daemon.project.canonicalize().unwrap();
     store
         .commit(intent("alias-scope"), |envelope| {
@@ -2217,7 +2294,7 @@ async fn a_row_under_any_scope_naming_the_project_is_readable_and_mutable() {
                 terms: vec![ScopeTermSpec {
                     dimension: "project".to_string(),
                     operator: "exact".to_string(),
-                    exact_value: Some(root.to_string_lossy().into_owned()),
+                    exact_value: Some(digest(&root.to_string_lossy())),
                     ..ScopeTermSpec::default()
                 }],
             })?;
@@ -2277,6 +2354,28 @@ async fn a_write_naming_an_existing_id_is_already_exists_not_a_retryable_conflic
         .await;
     assert_state(&retried, "invalid", Some("already_exists"));
     assert_eq!(daemon.tip(), tip);
+
+    // A successor whose revision does not advance is not a storage constraint:
+    // every id is fresh, and a higher revision lands.
+    let mut stalled = decision_spec(2);
+    stalled["source_revision"] = json!(1);
+    let stalled = daemon
+        .commit(
+            "stalled",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": stalled})],
+            vec![],
+        )
+        .await;
+    assert_state(&stalled, "invalid", Some("revision_not_advanced"));
+    assert_eq!(daemon.tip(), tip);
+    let advanced = daemon
+        .commit(
+            "advanced",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": decision_spec(2)})],
+            vec![],
+        )
+        .await;
+    assert_state(&advanced, "available", None);
     daemon.handler.shutdown().await.unwrap();
 }
 

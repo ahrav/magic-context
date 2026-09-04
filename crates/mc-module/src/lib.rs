@@ -14055,11 +14055,14 @@ struct RequestMethodProbe {
 impl RequestMethodProbe {
     fn is_transform_class(&self) -> bool {
         let named = |value: &Option<String>, name: &str| value.as_deref() == Some(name);
+        // Dispatch reads `method` and falls back to `kind`, so the class is
+        // read the same way.
+        let route = self.method.as_deref().or(self.kind.as_deref());
         named(&self.kind, "transform")
             // The state-sync path uses the transform-class ceiling because one row can exceed the facade cap.
-            || named(&self.method, "state_sync")
+            || route == Some("state_sync")
             // One base64 artifact page carries up to 16 MiB decoded.
-            || named(&self.method, kernel_routes::ingest::PAGE)
+            || route == Some(kernel_routes::ingest::PAGE)
     }
 }
 

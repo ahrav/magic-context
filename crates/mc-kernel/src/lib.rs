@@ -29,8 +29,8 @@ mod slice;
 pub use admission::{
     evaluate_admission, served_visibility_row, surface_visibility, AdmissionDecision,
     AdmissionDomainSpec, AdmissionEvent, AdmissionRequest, Disposition, EffectiveMaturity,
-    Evaluation, EvaluationInputs, EventKind, Maturity, Outcome, PriorDecision, SourceClass,
-    Surface, SurfaceVisibility, TaintClass, VisibilityRow, VisibleAsOf, VisibleRow,
+    EgressCandidate, Evaluation, EvaluationInputs, EventKind, Maturity, Outcome, PriorDecision,
+    SourceClass, Surface, SurfaceVisibility, TaintClass, VisibilityRow, VisibleAsOf, VisibleRow,
     POLICY_REVISION,
 };
 pub use anchor::{
@@ -81,7 +81,7 @@ pub use slice::{
     AlignmentRebuild, AlignmentRow, AlignmentSnapshot, DecisionEventOutcome, DecisionEventPayload,
     DecisionEventSpec, DecisionPayload, DecisionRow, DecisionSpec, DecisionWriteOutcome,
     ObservationDependencySpec, ObservationPayload, ObservationRow, ObservationSpec,
-    ObservationWriteOutcome, RetirementOutcome, SliceSnapshot,
+    ObservationWriteOutcome, RetirementOutcome, SliceSnapshot, ALIGNMENT_DEPENDENCY_KIND,
 };
 
 /// A constraint violation is permanent and a lock wait is retryable, so collapsing both into `Io` would make either untreatable.

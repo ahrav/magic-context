@@ -1,8 +1,8 @@
 //! The project a route is bound to, and how kernel rows are filtered by it.
 //!
 //! One kernel root serves every project on the host; a project is a scope
-//! term on the `project` dimension whose exact value is the bound root. A
-//! row serves to a route only when its scope names that root.
+//! term on the `project` dimension whose exact value is the digest of the
+//! bound root. A row serves to a route only when its scope names that digest.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,10 +20,12 @@ const PROJECT_SCOPE_SOURCE_KIND: &str = "kernel_route";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectBinding {
-    /// The bound root after canonicalization; the scope term's exact value.
+    /// The bound root after canonicalization.
     root: String,
-    /// `sha256(root)`, the collision-free handle both the scope id and the
-    /// per-project operation-key prefix are built from.
+    /// `sha256(root)`: the scope term's exact value, and the handle the scope
+    /// id and the per-project operation-key prefix are built from. A path can
+    /// match a secret detector and be stored as a placeholder, which would
+    /// leave the route unable to match its own rows; the digest cannot.
     digest: String,
 }
 
@@ -70,14 +72,14 @@ impl ProjectBinding {
             terms: vec![ScopeTermSpec {
                 dimension: Dimension::Project.as_str().to_string(),
                 operator: "exact".to_string(),
-                exact_value: Some(self.root.clone()),
+                exact_value: Some(self.digest.clone()),
                 ..ScopeTermSpec::default()
             }],
         }
     }
 
     fn match_context(&self) -> ScopeMatchContext {
-        ScopeMatchContext::new().with_value(Dimension::Project, self.root.clone())
+        ScopeMatchContext::new().with_value(Dimension::Project, self.digest.clone())
     }
 }
 

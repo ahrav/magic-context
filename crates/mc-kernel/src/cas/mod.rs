@@ -368,6 +368,7 @@ pub use deletion::{
 #[cfg(feature = "test-support")]
 pub use gc::ArtifactGcFault;
 pub use gc::ArtifactGcResult;
+pub(crate) use read::egress_facts_tx;
 
 impl fmt::Debug for ArtifactError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

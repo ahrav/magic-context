@@ -7,8 +7,8 @@ use std::collections::{HashMap, VecDeque};
 use mc_core::claim_operation::is_lower_hex;
 use mc_host::RouteHandle;
 use mc_kernel::{
-    ArtifactDestination, ArtifactEligibility, ArtifactHandle, KernelError, KernelStore,
-    ObjectState, Sensitivity,
+    ArtifactDestination, ArtifactEligibility, EgressCandidate, KernelError, KernelStore,
+    Sensitivity,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -117,16 +117,20 @@ fn parse_destination(value: &str) -> Option<ArtifactDestination> {
 /// Verdict order is fixed: an object that is gone or replaced is reported as
 /// such before its revision, scope, or sensitivity is considered.
 ///
-/// A secret object is refused for every destination and a non-normal object
-/// for a remote one, whether or not the candidate cites an artifact.
+/// The sensitivity judged is the one the serving view folds onto the object
+/// from its admission history, since that is the class a read handed the
+/// caller; an object no admission decision serves has an unknown class and is
+/// refused for a remote destination. A secret object is refused for every
+/// destination and a non-normal object for a remote one, whether or not the
+/// candidate cites an artifact.
 fn judge(
     store: &KernelStore,
     filter: &mut ScopeFilter,
     candidate: &Candidate,
-    state: Option<&ObjectState>,
+    facts: &EgressCandidate,
     destination: ArtifactDestination,
 ) -> Result<Verdict, KernelError> {
-    let Some(state) = state else {
+    let Some(state) = &facts.state else {
         return Ok(Verdict::Retracted);
     };
     if state.object.superseded_by.is_some() {
@@ -141,41 +145,22 @@ fn judge(
     if !filter.matches(state.scope_id.as_deref(), &mut stored_terms(store))? {
         return Ok(Verdict::WrongScope);
     }
-    if state.object.sensitivity == Sensitivity::Secret
-        || (destination == ArtifactDestination::Remote
-            && state.object.sensitivity != Sensitivity::Normal)
-    {
+    let sensitive = match facts.served_sensitivity {
+        Some(Sensitivity::Secret) => true,
+        Some(sensitivity) => {
+            destination == ArtifactDestination::Remote && sensitivity != Sensitivity::Normal
+        }
+        None => destination == ArtifactDestination::Remote,
+    };
+    if sensitive {
         return Ok(Verdict::ProviderSensitive);
     }
-    if let Some(digest) = &candidate.artifact_digest {
-        let handle = ArtifactHandle {
-            digest: digest.clone(),
-            evidence_id: String::new(),
-        };
-        match store.artifact_eligibility(&handle, destination) {
-            Ok(ArtifactEligibility::Allowed) => {}
-            Ok(ArtifactEligibility::Denied(_)) => return Ok(Verdict::ProviderSensitive),
-            Err(error) => return Err(artifact_error(error)),
+    if let Some(artifact) = &facts.artifact {
+        if artifact.eligibility != ArtifactEligibility::Allowed {
+            return Ok(Verdict::ProviderSensitive);
         }
     }
     Ok(Verdict::Ok)
-}
-
-/// Artifact errors reach the route through their kind; the outcome mapping
-/// classifies the kind, so the kernel error chosen here only has to preserve
-/// the busy-versus-invalid distinction that mapping needs.
-fn artifact_error(error: mc_kernel::ArtifactError) -> KernelError {
-    match KernelOutcome::from(error.kind()) {
-        KernelOutcome::Unavailable {
-            reason: super::UnavailableReason::StoreBusy,
-        } => KernelError::Busy,
-        KernelOutcome::Invalid { .. } => KernelError::InvalidInput,
-        KernelOutcome::Available
-        | KernelOutcome::Stale { .. }
-        | KernelOutcome::Abstained { .. }
-        | KernelOutcome::Unavailable { .. }
-        | KernelOutcome::Conflict { .. } => KernelError::Io,
-    }
 }
 
 struct BatchResponse {
@@ -191,11 +176,16 @@ fn evaluate(
     destination: ArtifactDestination,
     candidates: &[Candidate],
 ) -> Result<BatchResponse, KernelError> {
-    let object_ids: Vec<String> = candidates
+    let named: Vec<(String, Option<String>)> = candidates
         .iter()
-        .map(|candidate| candidate.object_id.clone())
+        .map(|candidate| {
+            (
+                candidate.object_id.clone(),
+                candidate.artifact_digest.clone(),
+            )
+        })
         .collect();
-    let (tip, states) = store.object_states(&object_ids)?;
+    let (tip, facts) = store.egress_candidates(&named, destination)?;
     let lease_epoch = store.lease_epoch();
     let project_scope_id = project.scope_id();
     let keys: Vec<CacheKey> = candidates
@@ -220,15 +210,15 @@ fn evaluate(
     let mut filter = ScopeFilter::new(project);
     let mut verdicts = Vec::with_capacity(candidates.len());
     let mut fresh: Vec<(CacheKey, Verdict)> = Vec::new();
-    for ((candidate, state), (key, cached)) in candidates
+    for ((candidate, facts), (key, cached)) in candidates
         .iter()
-        .zip(&states)
+        .zip(&facts)
         .zip(keys.into_iter().zip(cached))
     {
         let verdict = match cached {
             Some(verdict) => verdict,
             None => {
-                let verdict = judge(store, &mut filter, candidate, state.as_ref(), destination)?;
+                let verdict = judge(store, &mut filter, candidate, facts, destination)?;
                 fresh.push((key, verdict));
                 verdict
             }

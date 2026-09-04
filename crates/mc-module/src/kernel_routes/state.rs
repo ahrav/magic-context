@@ -83,6 +83,9 @@ pub enum InvalidReason {
     /// A write named an id the registry already holds or otherwise violated a
     /// storage constraint; retrying with fresh tokens cannot succeed.
     AlreadyExists,
+    /// A successor's `source_revision` does not exceed its predecessor's.
+    /// Retrying with a higher revision can succeed.
+    RevisionNotAdvanced,
     PayloadTooLarge,
     /// A staged page's bytes do not match its declared digest, or a page index
     /// was resent with different bytes.

@@ -16,7 +16,7 @@ use mc_kernel::{
     AdmissionEvent, AdmissionRequest, CommitIntent, CommitReceipt, DecisionPayload, DecisionSpec,
     Envelope, EventKind, KernelError, KernelStore, ObjectState, ObservationDependencySpec,
     ObservationPayload, ObservationSpec, Sensitivity, SourceClass, TaintClass, TokenCheck,
-    TokenConflict,
+    TokenConflict, ALIGNMENT_DEPENDENCY_KIND,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -275,6 +275,8 @@ enum CommitFailure {
     /// A storage constraint (a duplicate `object_id` or `decision_id`, a
     /// broken reference) rejected a write inside the envelope.
     StorageConstraint,
+    /// A successor's revision did not advance past its predecessor's.
+    RevisionNotAdvanced,
 }
 
 impl From<CommitFailure> for KernelOutcome {
@@ -292,6 +294,7 @@ impl From<CommitFailure> for KernelOutcome {
             }
             CommitFailure::OperationKeyReused => Self::invalid(InvalidReason::OperationKeyReused),
             CommitFailure::StorageConstraint => Self::invalid(InvalidReason::AlreadyExists),
+            CommitFailure::RevisionNotAdvanced => Self::invalid(InvalidReason::RevisionNotAdvanced),
         }
     }
 }
@@ -381,6 +384,7 @@ fn apply(
     envelope: &mut Envelope<'_>,
     filter: &mut ScopeFilter,
     plan: &CommitPlan,
+    revision_stalled: &mut bool,
 ) -> Result<String, KernelError> {
     let scope_id = plan.project.scope_id();
     let mut scope_ready = false;
@@ -399,15 +403,23 @@ fn apply(
                 spec,
             } => {
                 ensure_scope(envelope, &plan.project, &spec.domain_id, &mut scope_ready)?;
-                scoped_object_state(envelope, filter, replaced_object_id)?;
-                // A live replacement must belong to the bound project too.
-                let replacement_live = match envelope.object_state(&spec.object_id)? {
-                    Some(state) if state.object.invalidated_commit_seq.is_none() => {
-                        scoped_object_state(envelope, filter, &spec.object_id)?;
-                        true
-                    }
-                    _ => false,
-                };
+                let predecessor = scoped_object_state(envelope, filter, replaced_object_id)?;
+                // A live replacement must belong to the bound project too. Its
+                // stored revision, not the spec's, is what the kernel compares.
+                let (replacement_live, successor_revision) =
+                    match envelope.object_state(&spec.object_id)? {
+                        Some(state) if state.object.invalidated_commit_seq.is_none() => {
+                            scoped_object_state(envelope, filter, &spec.object_id)?;
+                            (true, state.object.source_revision)
+                        }
+                        _ => (false, spec.source_revision),
+                    };
+                // The kernel refuses this as `Conflict`, the same error a storage
+                // constraint raises, so the route names the reason first.
+                if successor_revision <= predecessor.object.source_revision {
+                    *revision_stalled = true;
+                    return Err(KernelError::Conflict);
+                }
                 let spec = spec.clone().into_spec(&plan.source_kind, &scope_id);
                 let outcome = envelope.supersede_decision(replaced_object_id, spec)?;
                 if replacement_live {
@@ -425,12 +437,15 @@ fn apply(
             }
             Operation::InsertObservation { spec } => {
                 ensure_scope(envelope, &plan.project, &spec.domain_id, &mut scope_ready)?;
-                // A dependency is a claim about its target; the alignment
-                // projection pairs observations with the decisions they cite
-                // without comparing scopes, so a foreign target would let this
-                // project alter another project's derived results.
+                // The alignment projection pairs an observation with the
+                // decision its `implements` dependency names without comparing
+                // scopes, so a foreign target would let this project alter
+                // another project's derived results. Other dependency kinds
+                // may cite any live registry object, as the kernel allows.
                 for dependency in &spec.dependencies {
-                    scoped_object_state(envelope, filter, &dependency.dependency_object_id)?;
+                    if dependency.dependency_kind == ALIGNMENT_DEPENDENCY_KIND {
+                        scoped_object_state(envelope, filter, &dependency.dependency_object_id)?;
+                    }
                 }
                 let spec = spec.clone().into_spec(&plan.source_kind, &scope_id);
                 let outcome = envelope.insert_observation(spec)?;
@@ -446,6 +461,7 @@ fn apply(
 fn run(store: &KernelStore, plan: CommitPlan) -> Result<CommitReceipt, CommitFailure> {
     let mut entered = false;
     let mut token_conflict = None;
+    let mut revision_stalled = false;
     let mut filter = ScopeFilter::new(&plan.project);
     let result = store.commit_before(
         Instant::now() + plan.deadline,
@@ -461,7 +477,7 @@ fn run(store: &KernelStore, plan: CommitPlan) -> Result<CommitReceipt, CommitFai
                     return Err(KernelError::Conflict);
                 }
             }
-            apply(envelope, &mut filter, &plan)
+            apply(envelope, &mut filter, &plan, &mut revision_stalled)
         },
     );
     match result {
@@ -471,6 +487,7 @@ fn run(store: &KernelStore, plan: CommitPlan) -> Result<CommitReceipt, CommitFai
             // The receipt lookup runs before the operation, so a conflict
             // raised without entering it is a reused `operation_key`.
             None if !entered => Err(CommitFailure::OperationKeyReused),
+            None if revision_stalled => Err(CommitFailure::RevisionNotAdvanced),
             None => Err(CommitFailure::StorageConstraint),
         },
         Err(error) => Err(CommitFailure::Kernel(error)),

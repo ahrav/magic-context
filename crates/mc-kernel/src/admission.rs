@@ -1,12 +1,16 @@
+use std::collections::HashMap;
+
+use super::cas::{ArtifactDestination, ArtifactEgressFacts};
 use super::envelope::{
-    object_row_from, DomainSpec, Envelope, ObjectRow, PendingChange, OBJECT_ROW_COLUMNS,
+    load_object_state, object_row_from, DomainSpec, Envelope, ObjectRow, ObjectState,
+    PendingChange, OBJECT_ROW_COLUMNS,
 };
 use super::object_write;
 use super::redaction::{identity, record, redact};
 use super::slice::{DecisionSpec, DecisionWriteOutcome};
 use super::{map_sqlite, KernelError, KernelStore, Sensitivity};
 use crate::current_time_ms;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 
 pub const POLICY_REVISION: i64 = 1;
@@ -2143,106 +2147,19 @@ impl KernelStore {
         surface: Surface,
         requested: i64,
     ) -> Result<VisibleAsOf, KernelError> {
-        let own = latest_own_decision_sql("a", "AND a.commit_seq<=:governing_as_of");
-        let lineage = latest_lineage_decision_sql("a", "AND a.commit_seq<=:governing_as_of");
-        let history = strictest_sensitivity_sql("AND h.commit_seq<=:governing_as_of");
-        let own_history_inconsistent =
-            own_history_inconsistent_sql("d", "AND p.commit_seq<=:governing_as_of");
         let (tip, rows) = self.read_snapshot(requested, |tx| {
-            let mut statement = tx
-                .prepare(&format!(
-                    "SELECT o.object_id,o.object_kind,o.domain_id,o.source_kind,o.source_id,
-                            o.source_revision,o.created_commit_seq,NULL,NULL,o.sensitivity_class,
-                            d.maturity AS d_maturity,
-                            d.effective_maturity AS d_effective_maturity,
-                            d.disposition AS d_disposition,d.visibility AS d_visibility,
-                            d.taint_class AS d_taint_class,d.source_class AS d_source_class,
-                            d.policy_revision AS d_policy_revision,
-                            d.sensitivity_class AS d_sensitivity_class,
-                            d.approval_object_id AS d_approval_object_id,
-                            s.maturity AS s_maturity,
-                            s.effective_maturity AS s_effective_maturity,
-                            s.disposition AS s_disposition,s.visibility AS s_visibility,
-                            s.taint_class AS s_taint_class,s.source_class AS s_source_class,
-                            s.policy_revision AS s_policy_revision,
-                            s.sensitivity_class AS s_sensitivity_class,
-                            s.approval_object_id AS s_approval_object_id,
-                            EXISTS(
-                                SELECT 1 FROM decisions ad
-                                WHERE ad.object_id=o.object_id
-                                  AND o.object_kind='decision'
-                                  AND ad.decision_kind='adr_accepted'
-                                  AND ad.created_commit_seq<=:governing_as_of
-                                  AND (ad.invalidated_commit_seq IS NULL
-                                       OR :governing_as_of<ad.invalidated_commit_seq)
-                            ) AS accepted_decision,
-                            {history} AS history_sensitivity_class,
-                            {own_history_inconsistent} AS own_history_inconsistent,
-                            COALESCE(dec.scope_id,obs.scope_id) AS scope_id
-                     FROM object_registry o
-                     JOIN admission_decisions d
-                       ON d.admission_decision_id={own}
-                     LEFT JOIN admission_decisions s
-                       ON s.admission_decision_id={lineage}
-                     LEFT JOIN decisions dec ON dec.object_id=o.object_id
-                     LEFT JOIN observations obs ON obs.object_id=o.object_id
-                     WHERE o.created_commit_seq<=:governing_as_of
-                       AND (o.invalidated_commit_seq IS NULL
-                            OR :governing_as_of<o.invalidated_commit_seq)
-                     ORDER BY o.object_id"
-                ))
-                .map_err(map_sqlite)?;
-            let rows = statement
-                .query_map(
-                    rusqlite::named_params! { ":governing_as_of": requested },
-                    |row| {
-                        let mut object = object_row_from(row)?;
-                        let (mut visibility_row_value, mut sensitivity, interpretable) =
-                            decided_row(row, &OWN_DECISION_COLUMNS)?.unwrap_or((
-                                VisibilityRow::AuditOnly,
-                                Sensitivity::Secret,
-                                false,
-                            ));
-                        if !interpretable || row.get::<_, bool>("own_history_inconsistent")? {
-                            visibility_row_value = VisibilityRow::AuditOnly;
-                            sensitivity = Sensitivity::Secret;
-                        }
-                        // Neither scope may relax the other: a restriction on one
-                        // outlives a later permissive decision on the other, so the
-                        // served surface is the stricter of the two.
-                        if let Some((lineage_row, lineage_sensitivity, _)) =
-                            decided_row(row, &LINEAGE_DECISION_COLUMNS)?
-                        {
-                            visibility_row_value = served_visibility_row(
-                                Some(visibility_row_value),
-                                Some(lineage_row),
-                            );
-                            sensitivity = sensitivity.restrictive(lineage_sensitivity);
-                        }
-                        sensitivity = sensitivity.restrictive(Sensitivity::from_stored(
-                            &row.get::<_, Option<String>>("history_sensitivity_class")?
-                                .unwrap_or_default(),
-                        ));
-                        object.sensitivity = object.sensitivity.restrictive(sensitivity);
-                        let visibility =
-                            surface_visibility(visibility_row_value, surface, object.sensitivity);
-                        let scope_id = row.get::<_, Option<String>>("scope_id")?;
-                        Ok((object, visibility, scope_id))
-                    },
-                )
-                .map_err(map_sqlite)?
-                .filter_map(|row| match row {
-                    Ok((_object, SurfaceVisibility::Hidden, _)) => None,
-                    Ok((object, visibility, scope_id)) => Some(Ok(VisibleRow {
+            let rows = served_rows(tx, surface, requested, None)?
+                .into_iter()
+                .filter_map(|(object, visibility, scope_id)| match visibility {
+                    SurfaceVisibility::Hidden => None,
+                    visibility => Some(VisibleRow {
                         object,
                         visibility,
                         labeled: visibility == SurfaceVisibility::Labeled,
                         scope_id,
-                    })),
-                    Err(error) => Some(Err(error)),
+                    }),
                 })
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(map_sqlite)?;
+                .collect();
             Ok(rows)
         })?;
         Ok(VisibleAsOf {
@@ -2251,6 +2168,167 @@ impl KernelStore {
             rows,
         })
     }
+
+    /// Everything a dispatch decision for `candidates` needs, read in one
+    /// snapshot at the tip: each object's state, the sensitivity the serving
+    /// view folds onto it from its admission history, and the egress facts of
+    /// the artifact the candidate names. The tip is returned so the caller can
+    /// key its answer to the snapshot every part of it came from.
+    pub fn egress_candidates(
+        &self,
+        candidates: &[(String, Option<String>)],
+        destination: ArtifactDestination,
+    ) -> Result<(i64, Vec<EgressCandidate>), KernelError> {
+        let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
+        let ids = serde_json::to_string(&ids).map_err(|_| KernelError::InvalidInput)?;
+        self.read_snapshot(0, |tx| {
+            let tip = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(map_sqlite)?;
+            let served: HashMap<String, Sensitivity> =
+                served_rows(tx, Surface::ExplicitSearch, tip, Some(&ids))?
+                    .into_iter()
+                    .map(|(object, _, _)| (object.object_id, object.sensitivity))
+                    .collect();
+            candidates
+                .iter()
+                .map(|(object_id, digest)| {
+                    let state = load_object_state(tx, object_id)?;
+                    let served_sensitivity = served.get(object_id).copied();
+                    let artifact = match digest {
+                        Some(digest) => Some(
+                            crate::cas::egress_facts_tx(tx, digest, destination)
+                                .map_err(map_sqlite)?,
+                        ),
+                        None => None,
+                    };
+                    Ok(EgressCandidate {
+                        state,
+                        served_sensitivity,
+                        artifact,
+                    })
+                })
+                .collect()
+        })
+    }
+}
+
+/// One candidate of [`KernelStore::egress_candidates`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressCandidate {
+    /// `None` when the registry has never seen the object.
+    pub state: Option<ObjectState>,
+    /// The object's sensitivity as the serving view folds it from its
+    /// admission history; `None` when no admission decision serves the object,
+    /// so its class is unknown.
+    pub served_sensitivity: Option<Sensitivity>,
+    /// Facts for the artifact the candidate named, when it named one.
+    pub artifact: Option<ArtifactEgressFacts>,
+}
+
+/// Every object admitted at `requested` with its served sensitivity and the
+/// visibility `surface` gives it, restricted to `ids` (a JSON string array)
+/// when given. Hidden rows are included so a caller can see the class of an
+/// object no surface serves.
+fn served_rows(
+    tx: &Transaction<'_>,
+    surface: Surface,
+    requested: i64,
+    ids: Option<&str>,
+) -> Result<Vec<(ObjectRow, SurfaceVisibility, Option<String>)>, KernelError> {
+    let own = latest_own_decision_sql("a", "AND a.commit_seq<=:governing_as_of");
+    let lineage = latest_lineage_decision_sql("a", "AND a.commit_seq<=:governing_as_of");
+    let history = strictest_sensitivity_sql("AND h.commit_seq<=:governing_as_of");
+    let own_history_inconsistent =
+        own_history_inconsistent_sql("d", "AND p.commit_seq<=:governing_as_of");
+    let mut statement = tx
+        .prepare(&format!(
+            "SELECT o.object_id,o.object_kind,o.domain_id,o.source_kind,o.source_id,
+                    o.source_revision,o.created_commit_seq,NULL,NULL,o.sensitivity_class,
+                    d.maturity AS d_maturity,
+                    d.effective_maturity AS d_effective_maturity,
+                    d.disposition AS d_disposition,d.visibility AS d_visibility,
+                    d.taint_class AS d_taint_class,d.source_class AS d_source_class,
+                    d.policy_revision AS d_policy_revision,
+                    d.sensitivity_class AS d_sensitivity_class,
+                    d.approval_object_id AS d_approval_object_id,
+                    s.maturity AS s_maturity,
+                    s.effective_maturity AS s_effective_maturity,
+                    s.disposition AS s_disposition,s.visibility AS s_visibility,
+                    s.taint_class AS s_taint_class,s.source_class AS s_source_class,
+                    s.policy_revision AS s_policy_revision,
+                    s.sensitivity_class AS s_sensitivity_class,
+                    s.approval_object_id AS s_approval_object_id,
+                    EXISTS(
+                        SELECT 1 FROM decisions ad
+                        WHERE ad.object_id=o.object_id
+                          AND o.object_kind='decision'
+                          AND ad.decision_kind='adr_accepted'
+                          AND ad.created_commit_seq<=:governing_as_of
+                          AND (ad.invalidated_commit_seq IS NULL
+                               OR :governing_as_of<ad.invalidated_commit_seq)
+                    ) AS accepted_decision,
+                    {history} AS history_sensitivity_class,
+                    {own_history_inconsistent} AS own_history_inconsistent,
+                    COALESCE(dec.scope_id,obs.scope_id) AS scope_id
+             FROM object_registry o
+             JOIN admission_decisions d
+               ON d.admission_decision_id={own}
+             LEFT JOIN admission_decisions s
+               ON s.admission_decision_id={lineage}
+             LEFT JOIN decisions dec ON dec.object_id=o.object_id
+             LEFT JOIN observations obs ON obs.object_id=o.object_id
+             WHERE o.created_commit_seq<=:governing_as_of
+               AND (o.invalidated_commit_seq IS NULL
+                    OR :governing_as_of<o.invalidated_commit_seq)
+               AND (:ids IS NULL
+                    OR o.object_id IN (SELECT value FROM json_each(:ids)))
+             ORDER BY o.object_id"
+        ))
+        .map_err(map_sqlite)?;
+    let rows = statement
+        .query_map(
+            rusqlite::named_params! { ":governing_as_of": requested, ":ids": ids },
+            |row| {
+                let mut object = object_row_from(row)?;
+                let (mut visibility_row_value, mut sensitivity, interpretable) = decided_row(
+                    row,
+                    &OWN_DECISION_COLUMNS,
+                )?
+                .unwrap_or((VisibilityRow::AuditOnly, Sensitivity::Secret, false));
+                if !interpretable || row.get::<_, bool>("own_history_inconsistent")? {
+                    visibility_row_value = VisibilityRow::AuditOnly;
+                    sensitivity = Sensitivity::Secret;
+                }
+                // Neither scope may relax the other: a restriction on one
+                // outlives a later permissive decision on the other, so the
+                // served surface is the stricter of the two.
+                if let Some((lineage_row, lineage_sensitivity, _)) =
+                    decided_row(row, &LINEAGE_DECISION_COLUMNS)?
+                {
+                    visibility_row_value =
+                        served_visibility_row(Some(visibility_row_value), Some(lineage_row));
+                    sensitivity = sensitivity.restrictive(lineage_sensitivity);
+                }
+                sensitivity = sensitivity.restrictive(Sensitivity::from_stored(
+                    &row.get::<_, Option<String>>("history_sensitivity_class")?
+                        .unwrap_or_default(),
+                ));
+                object.sensitivity = object.sensitivity.restrictive(sensitivity);
+                let visibility =
+                    surface_visibility(visibility_row_value, surface, object.sensitivity);
+                let scope_id = row.get::<_, Option<String>>("scope_id")?;
+                Ok((object, visibility, scope_id))
+            },
+        )
+        .map_err(map_sqlite)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(map_sqlite)?;
+    Ok(rows)
 }
 
 impl SourceClass {
