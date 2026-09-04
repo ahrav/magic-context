@@ -2407,6 +2407,7 @@ fn served_rows(
              ORDER BY o.object_id"
         ))
         .map_err(map_sqlite)?;
+    debug_assert_served_columns(&statement);
     let rows = statement
         .query_map(
             rusqlite::named_params! {
@@ -2450,6 +2451,29 @@ fn served_rows(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(map_sqlite)?;
     Ok(rows)
+}
+
+fn debug_assert_served_columns(statement: &rusqlite::Statement<'_>) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let expected = [
+        (OWN_DECISION_COLUMNS.maturity, "d_maturity"),
+        (OWN_DECISION_COLUMNS.approval_object_id, "d_approval_object_id"),
+        (LINEAGE_DECISION_COLUMNS.maturity, "s_maturity"),
+        (LINEAGE_DECISION_COLUMNS.approval_object_id, "s_approval_object_id"),
+        (ACCEPTED_DECISION_COLUMN, "accepted_decision"),
+        (HISTORY_SENSITIVITY_COLUMN, "history_sensitivity_class"),
+        (OWN_HISTORY_INCONSISTENT_COLUMN, "own_history_inconsistent"),
+        (SCOPE_ID_COLUMN, "scope_id"),
+    ];
+    for (index, alias) in expected {
+        debug_assert_eq!(
+            statement.column_name(index).ok(),
+            Some(alias),
+            "served_rows column {index} must be {alias}"
+        );
+    }
 }
 
 impl SourceClass {
