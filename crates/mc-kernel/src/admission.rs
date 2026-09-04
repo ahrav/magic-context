@@ -2344,7 +2344,7 @@ fn served_rows(
     let own_history_inconsistent =
         own_history_inconsistent_sql("d", "AND p.commit_seq<=:governing_as_of");
     let mut statement = tx
-        .prepare(&format!(
+        .prepare_cached(&format!(
             "SELECT o.object_id,o.object_kind,o.domain_id,o.source_kind,o.source_id,
                     o.source_revision,o.created_commit_seq,NULL,NULL,o.sensitivity_class,
                     d.maturity AS d_maturity,

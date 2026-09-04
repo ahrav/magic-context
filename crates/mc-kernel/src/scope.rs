@@ -325,17 +325,15 @@ fn load_scope_terms(
     scope_id: &str,
 ) -> Result<Option<Vec<ScopeTermSpec>>, KernelError> {
     let exists = tx
-        .query_row("SELECT 1 FROM scopes WHERE scope_id=?1", [scope_id], |_| {
-            Ok(())
-        })
-        .optional()
+        .prepare_cached("SELECT 1 FROM scopes WHERE scope_id=?1")
+        .and_then(|mut statement| statement.query_row([scope_id], |_| Ok(())).optional())
         .map_err(super::map_sqlite)?
         .is_some();
     if !exists {
         return Ok(None);
     }
     let mut statement = tx
-        .prepare(
+        .prepare_cached(
             "SELECT dimension,operator,exact_value,set_values,range_start,range_end,
                     version_range,git_oid,git_start_oid,git_end_oid,payload
              FROM scope_term WHERE scope_id=?1 ORDER BY ordinal",

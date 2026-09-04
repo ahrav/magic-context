@@ -22,6 +22,7 @@ use crate::sqlite_runtime::{
 };
 
 const BUSY_TIMEOUT_MS: i64 = 5_000;
+const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 128;
 const READ_POOL_SIZE: usize = 2;
 const WRITER_ACQUIRE_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 const RESET_MARKER_PROTOCOL: &str = "mc-kernel-reset-marker-v1";
@@ -703,6 +704,7 @@ fn bootstrap(path: &Path) -> Result<Connection, KernelError> {
 }
 
 pub(super) fn apply_preclassification_profile(conn: &Connection) -> rusqlite::Result<()> {
+    conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
     conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
