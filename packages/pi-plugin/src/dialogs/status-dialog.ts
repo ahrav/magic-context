@@ -289,6 +289,7 @@ class StatusDialogComponent implements Component {
 	}
 
 	dispose(): void {
+		this.closed = true;
 		if (this.refreshTimer) {
 			clearInterval(this.refreshTimer);
 			this.refreshTimer = null;

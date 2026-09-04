@@ -57,6 +57,26 @@ export async function commitPromotedFactsToKernel(args: {
     refs: readonly PromotedMemoryRef[];
     identity: HistorianPromotionIdentity;
 }): Promise<void> {
+    // Promotion runs after the caller's claim-lane transaction commits, and the facts are already durable there, so a thrown marker reset or transport failure logs instead of failing the committed run. commentlint: allow(JUDGE)
+    try {
+        await commitPromotedFacts(args);
+    } catch (error) {
+        sessionLog(
+            args.sessionId,
+            `historian kernel promotion failed post-commit; facts stay in the claim lane: ${String(error)}`,
+        );
+    }
+}
+
+async function commitPromotedFacts(args: {
+    client: KernelClient | undefined;
+    db: Database;
+    projectPath: string;
+    projectRoot: string;
+    sessionId: string;
+    refs: readonly PromotedMemoryRef[];
+    identity: HistorianPromotionIdentity;
+}): Promise<void> {
     if (!args.client) return;
     const specs = promotedFactSpecs(args.refs, args.projectRoot);
     if (specs.length === 0) return;

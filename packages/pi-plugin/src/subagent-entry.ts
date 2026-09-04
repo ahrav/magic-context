@@ -93,7 +93,10 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 
 			registerMagicContextTools(pi, {
 				db,
-				kernelClient: createPiKernelClientResolver(() => cfg),
+				kernelClient: createPiKernelClientResolver(
+					// The resolver loads configuration from `projectRoot`; a `/cd` into another project dials with that project's `memory.enabled` and connection file, not the startup ones. commentlint: allow(JUDGE)
+					(projectRoot) => loadPiConfig({ cwd: projectRoot }).config,
+				),
 				ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 				resolveProjectIdentity: (ctx) =>
 					resolveProjectIdentityForSession(ctx.cwd, cfg.allow_home_project),

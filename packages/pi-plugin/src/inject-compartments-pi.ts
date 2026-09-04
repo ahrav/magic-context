@@ -2008,9 +2008,7 @@ export function injectM0M1Pi(
 		state.sessionId,
 		`injected m[0]/m[1] into Pi messages (${m0.length} + ${m1.length} bytes, materialized=${materialized}${decision.reason ? ` reason=${decision.reason}` : ""})`,
 	);
-	const memoryCount = memoryProjectPath(state)
-		? memoryRows(state.memory).length
-		: 0;
+	const memoryCount = memoryMoved ? 0 : renderedMemoryRows(state).length;
 	return {
 		injected: true,
 		compartmentCount: currentCompartments.length,

@@ -50,6 +50,8 @@ export class FakeKernel {
     readonly surfaceStates = new Map<Surface, MemoryState>();
     /** Forces the next commit to answer with this state. */
     nextCommitState: MemoryState | null = null;
+    /** Every read reply carries this `truncated` flag, standing in for a daemon that dropped rows to fit its per-read bounds. commentlint: allow(JUDGE) */
+    readTruncated = false;
     /** Runs after the client's read and before the commit's token check, standing in for a concurrent writer. */
     beforeCommit: (() => void) | null = null;
 
@@ -163,6 +165,7 @@ export class FakeKernel {
             known_as_of: asOf,
             tip: this.tip,
             gated: body.gated === true,
+            truncated: this.readTruncated,
             rows,
         };
     }
@@ -220,6 +223,49 @@ export class FakeKernel {
             }
         }
         const seq = this.nextSeq();
+        // The daemon applies one envelope atomically: every operation is validated against pre-envelope state before any mutation, and `invalidating` rejects a second supersede or retire of a target an earlier operation in the envelope already invalidates. commentlint: allow(JUDGE)
+        const invalidating = new Set<string>();
+        for (const operation of operations) {
+            if (operation.op === "insert_decision") continue;
+            if (operation.op === "supersede_decision") {
+                const targetId = operation.replaced_object_id as string;
+                const replaced = this.objects.get(targetId);
+                // The daemon looks the target up among live objects only; a
+                // missing or invalidated one is `NotFound`, which maps to `internal`.
+                if (
+                    !replaced ||
+                    replaced.invalidated_commit_seq !== null ||
+                    invalidating.has(targetId)
+                ) {
+                    return { state: { kind: "invalid", reason: "internal" } };
+                }
+                const spec = operation.spec as Record<string, unknown>;
+                if (
+                    replaced.domain_id !== spec.domain_id ||
+                    replaced.source_id !== spec.source_id ||
+                    replaced.source_kind !== sourceKind
+                ) {
+                    return { state: { kind: "invalid", reason: "invalid_input" } };
+                }
+                if ((spec.source_revision as number) <= replaced.source_revision) {
+                    return { state: { kind: "conflict", reason: "known_as_of_advanced" } };
+                }
+                invalidating.add(targetId);
+            } else if (operation.op === "retire_decision") {
+                const targetId = operation.object_id as string;
+                const retired = this.objects.get(targetId);
+                if (
+                    !retired ||
+                    retired.invalidated_commit_seq !== null ||
+                    invalidating.has(targetId)
+                ) {
+                    return { state: { kind: "invalid", reason: "internal" } };
+                }
+                invalidating.add(targetId);
+            } else {
+                return { state: { kind: "invalid", reason: "invalid_input" } };
+            }
+        }
         const insert = (spec: Record<string, unknown>): void => {
             const objectId = spec.object_id as string;
             if (!this.objects.has(objectId)) {
@@ -248,22 +294,8 @@ export class FakeKernel {
                 insert(operation.spec as Record<string, unknown>);
             } else if (operation.op === "supersede_decision") {
                 const replaced = this.objects.get(operation.replaced_object_id as string);
-                // The daemon looks the target up among live objects only; a
-                // missing or invalidated one is `NotFound`, which maps to `internal`.
-                if (!replaced || replaced.invalidated_commit_seq !== null) {
-                    return { state: { kind: "invalid", reason: "internal" } };
-                }
                 const spec = operation.spec as Record<string, unknown>;
-                if (
-                    replaced.domain_id !== spec.domain_id ||
-                    replaced.source_id !== spec.source_id ||
-                    replaced.source_kind !== sourceKind
-                ) {
-                    return { state: { kind: "invalid", reason: "invalid_input" } };
-                }
-                if ((spec.source_revision as number) <= replaced.source_revision) {
-                    return { state: { kind: "conflict", reason: "known_as_of_advanced" } };
-                }
+                if (!replaced) continue;
                 insert(spec);
                 replaced.invalidated_commit_seq = seq;
                 replaced.superseded_by = spec.object_id as string;
@@ -271,14 +303,10 @@ export class FakeKernel {
                 touched.add(replaced.object_id);
             } else if (operation.op === "retire_decision") {
                 const retired = this.objects.get(operation.object_id as string);
-                if (!retired || retired.invalidated_commit_seq !== null) {
-                    return { state: { kind: "invalid", reason: "internal" } };
-                }
+                if (!retired) continue;
                 retired.invalidated_commit_seq = seq;
                 this.lastChange.set(retired.object_id, seq);
                 touched.add(retired.object_id);
-            } else {
-                return { state: { kind: "invalid", reason: "invalid_input" } };
             }
         }
         const receipt: Receipt = {

@@ -1218,6 +1218,10 @@ export class McHostModuleTransport {
     forgetRoute(sessionId: string, rawProjectRoot: string): void {
         const routeKey = `${sessionId}\0${this.canonicalRoot(rawProjectRoot)}`;
         this.routes.delete(routeKey);
+        // Fencing the in-flight open keeps a late `route.open` success from
+        // restoring the route this call evicts.
+        const opening = this.routeOpenings.get(routeKey);
+        if (opening) opening.state.closed = true;
         this.routeOpenings.delete(routeKey);
     }
 

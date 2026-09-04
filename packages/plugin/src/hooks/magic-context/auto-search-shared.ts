@@ -60,6 +60,8 @@ export async function unifiedSearchWithTimeout(
         return await Promise.race([search(), timeoutPromise]);
     } finally {
         if (timer !== undefined) clearTimeout(timer);
+        // Every exit aborts so a rejected memory read cannot leave the sibling embedding fetch in flight. commentlint: allow(JUDGE)
+        controller.abort();
     }
 }
 
