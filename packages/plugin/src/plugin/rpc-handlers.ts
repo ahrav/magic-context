@@ -61,7 +61,7 @@ import {
 } from "../shared/announcement";
 import {
     disabled,
-    isMemoryDecisionRow,
+    isServedMemoryDecisionRow,
     type KernelMemorySnapshot,
     kernelMemorySnapshotFrom,
     stateKey,
@@ -314,7 +314,11 @@ export function buildSidebarSnapshot(
                 ? moduleStatus.compartment_count
                 : archivedCompartmentCount;
 
-        const memoryCount = memory ? memory.rows.filter(isMemoryDecisionRow).length : 0;
+        // Expired anti-memories stay out of the count, matching the surface filter list and search apply.
+        const memoryNowMs = Date.now();
+        const memoryCount = memory
+            ? memory.rows.filter((row) => isServedMemoryDecisionRow(row, memoryNowMs)).length
+            : 0;
         const memoryTruncated = memory?.truncated === true;
         const memoryState = memory ? stateKey(memory.state) : null;
 

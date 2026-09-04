@@ -1,6 +1,6 @@
 {
   "artifactId": "prompt-surface-budget",
-  "revision": "s2-r5",
+  "revision": "s2-r6",
   "status": "PENDING-RATIFICATION",
   "policy": {
     "expression": "floor(0.50 * mutableProseBaseline)",
@@ -88,7 +88,7 @@
         "tokens": 391
       },
       "ctx_memory": {
-        "chars": 781,
+        "chars": 770,
         "tokens": 179
       },
       "ctx_search": {

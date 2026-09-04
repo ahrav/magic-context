@@ -209,6 +209,39 @@ describe("auto-search-runner", () => {
         }
     });
 
+    test("a provided memory snapshot serves the memory source when no kernel client resolves", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: OBJECT_A,
+            decision_kind: "PROJECT_RULES",
+            summary: "the historian decides to run when context passes the execute threshold",
+        });
+        try {
+            const messages = [
+                makeUserMsg(
+                    "u-snap-no-client",
+                    "please explain how the historian decides when to run",
+                ),
+            ];
+            expect(
+                await runAutoSearchHint({
+                    sessionId: "s-snap-no-client",
+                    db,
+                    messages,
+                    options: {
+                        ...baseOptions,
+                        memorySnapshot: kernel.snapshot("explicit_search"),
+                    },
+                }),
+            ).toEqual({ ok: true });
+            expect(findUserPromptText(messages[0])).toContain("<ctx-search-hint>");
+            expect(getAutoSearchHintDecisions(db, "s-snap-no-client")[0]?.decision).toBe("hint");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
     test.each([
         [
             "stale",

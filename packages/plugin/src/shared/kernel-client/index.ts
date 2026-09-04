@@ -30,6 +30,7 @@ export {
 export {
     BUDGET_OMITTED_MARKER,
     EMPTY_PROJECT_MARKER,
+    isServedMemoryDecisionRow,
     renderMemoryStateMarker,
     renderToolStateText,
 } from "./render";

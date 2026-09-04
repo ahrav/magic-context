@@ -1,0 +1,1 @@
+{"version":3,"file":"types.d.ts","sourceRoot":"","sources":["../../../src/tools/ctx-expand/types.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,mBAAmB,EAAE,MAAM,iCAAiC,CAAC;AAE3E,MAAM,WAAW,aAAc,SAAQ,mBAAmB;IACtD,KAAK,CAAC,EAAE,MAAM,CAAC;IACf,GAAG,CAAC,EAAE,MAAM,CAAC;IACb,oFAAoF;IACpF,OAAO,CAAC,EAAE,OAAO,CAAC;IAClB,0EAA0E;IAC1E,OAAO,CAAC,EAAE,MAAM,CAAC;CACpB"}

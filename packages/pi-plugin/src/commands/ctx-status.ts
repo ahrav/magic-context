@@ -12,7 +12,7 @@ import { getTagsBySession } from "@magic-context/core/features/magic-context/sto
 import { executeStatus } from "@magic-context/core/hooks/magic-context/execute-status";
 import { describeError } from "@magic-context/core/shared/error-message";
 import {
-	isMemoryDecisionRow,
+	isServedMemoryDecisionRow,
 	type KernelClientResolver,
 	type KernelMemorySnapshot,
 	type StateKey,
@@ -201,7 +201,10 @@ export function buildStatusDetails(
 		lastCompartmentRange: lastCompartment
 			? `${lastCompartment.startMessage}-${lastCompartment.endMessage}`
 			: null,
-		memoryCount: memory.rows.filter(isMemoryDecisionRow).length,
+		// Expired anti-memories stay out of the count, matching the surface filter list and search apply.
+		memoryCount: memory.rows.filter((row) =>
+			isServedMemoryDecisionRow(row, Date.now()),
+		).length,
 		...(memory.truncated === true ? { memoryTruncated: true } : {}),
 		memoryState: stateKey(memory.state),
 		noteCount:

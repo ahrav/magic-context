@@ -34,7 +34,7 @@ import {
 	formatThresholdPercent,
 } from "@magic-context/core/shared/format-threshold";
 import {
-	isMemoryDecisionRow,
+	isServedMemoryDecisionRow,
 	type KernelClientResolver,
 	type KernelMemorySnapshot,
 	kernelMemorySnapshotFrom,
@@ -608,7 +608,10 @@ export function buildPiStatusDetail(
 		inputTokens,
 		systemPromptTokens,
 		compartmentCount: compartments.length,
-		memoryCount: memory.rows.filter(isMemoryDecisionRow).length,
+		// Expired anti-memories stay out of the count, matching the surface filter list and search apply.
+		memoryCount: memory.rows.filter((row) =>
+			isServedMemoryDecisionRow(row, Date.now()),
+		).length,
 		...(memory.truncated === true ? { memoryTruncated: true } : {}),
 		memoryState: stateKey(memory.state),
 		memoryBlockCount,

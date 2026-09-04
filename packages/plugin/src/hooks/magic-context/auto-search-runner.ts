@@ -391,15 +391,16 @@ export async function runAutoSearchHint(args: {
             prompt: rawPrompt,
             searchOptions,
             scoreThreshold: options.scoreThreshold,
+            // The snapshot substitutes for the kernel read, so it forwards without a resolver or directory; tying it to client resolution would drop the pass's injection read and record the project as empty. commentlint: allow(JUDGE)
+            ...(memoryEnabled !== false && options.memorySnapshot !== undefined
+                ? { memorySnapshot: options.memorySnapshot }
+                : {}),
             ...(memoryEnabled !== false && options.kernelClient && options.directory
                 ? {
                       kernelClient: options.kernelClient({
                           sessionId,
                           projectRoot: resolveProjectRootDirectory(options.directory),
                       }),
-                      ...(options.memorySnapshot === undefined
-                          ? {}
-                          : { memorySnapshot: options.memorySnapshot }),
                   }
                 : {}),
         });

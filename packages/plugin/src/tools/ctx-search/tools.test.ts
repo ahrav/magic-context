@@ -447,6 +447,7 @@ describe("createCtxSearchTools", () => {
             expect(result).toContain("[1] [memory]");
             expect(result).toContain(`id=${OBJECT_A}`);
             expect(result).toContain("Direct id hit.");
+            expect(searchSpy).not.toHaveBeenCalled();
             const read = harness.transport.calls[0]?.body as { surface: string; gated: boolean };
             expect(read).toMatchObject({ surface: "explicit_search", gated: true });
         } finally {
@@ -482,8 +483,75 @@ describe("createCtxSearchTools", () => {
             const result = await tools.ctx_search.execute({ query: OBJECT_A }, toolContext());
             expect(result).toContain(`id=${OBJECT_A}`);
             expect(result).toContain("Oldest row, beyond the cap.");
+            expect(searchSpy).not.toHaveBeenCalled();
             const read = harness.transport.calls[0]?.body as { object_ids?: string[] };
             expect(read.object_ids).toEqual([OBJECT_A]);
+        } finally {
+            searchSpy.mockRestore();
+        }
+    });
+
+    it("resolves an object-id query whose filtered read is byte-truncated through chunked reads", async () => {
+        const harness = kernelHarness();
+        harness.kernel.seedDecision({
+            object_id: OBJECT_A,
+            decision_kind: "ARCHITECTURE",
+            summary: "Oldest row, dropped by the byte budget.",
+        });
+        harness.kernel.seedDecision({
+            object_id: OBJECT_B,
+            decision_kind: "ARCHITECTURE",
+            summary: "Newest row.",
+        });
+        harness.kernel.filteredReadRowCap = 1;
+        const searchSpy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => {
+            throw new Error("unifiedSearch must not run for object-id queries");
+        });
+        try {
+            const tools = createCtxSearchTools({
+                db,
+                kernelClient: harness.kernelClient,
+                resolveProjectPath: () => "git:repo-project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+            const result = await tools.ctx_search.execute(
+                { query: `${OBJECT_A} ${OBJECT_B}` },
+                toolContext(),
+            );
+            expect(result).toContain(`id=${OBJECT_A}`);
+            expect(result).toContain("Oldest row, dropped by the byte budget.");
+            expect(result).toContain(`id=${OBJECT_B}`);
+            expect(result).not.toContain("unresolved");
+            expect(searchSpy).not.toHaveBeenCalled();
+            const idReads = harness.transport.calls.map(
+                (call) => (call.body as { object_ids?: string[] }).object_ids,
+            );
+            expect(idReads[0]).toEqual([OBJECT_A, OBJECT_B]);
+            expect(idReads.slice(1).sort()).toEqual([[OBJECT_A], [OBJECT_B]]);
+        } finally {
+            searchSpy.mockRestore();
+        }
+    });
+
+    it("names an object id whose single-row read stays truncated instead of dropping it silently", async () => {
+        const harness = kernelHarness();
+        harness.kernel.readTruncated = true;
+        const searchSpy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
+        try {
+            const tools = createCtxSearchTools({
+                db,
+                kernelClient: harness.kernelClient,
+                resolveProjectPath: () => "git:repo-project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+            const result = await tools.ctx_search.execute({ query: OBJECT_A }, toolContext());
+            expect(result).toStartWith(
+                `Memory: unresolved object id (the daemon read stayed truncated): ${OBJECT_A}`,
+            );
         } finally {
             searchSpy.mockRestore();
         }

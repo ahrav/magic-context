@@ -1,0 +1,1 @@
+{"version":3,"file":"escalation-bands.d.ts","sourceRoot":"","sources":["../../src/shared/escalation-bands.ts"],"names":[],"mappings":"AAAA,eAAO,MAAM,qBAAqB,KAAK,CAAC;AACxC,eAAO,MAAM,6BAA6B,KAAK,CAAC;AAEhD,MAAM,WAAW,eAAe;IAC5B,8BAA8B,EAAE,MAAM,CAAC;IACvC,mBAAmB,EAAE,MAAM,CAAC;CAC/B;AAED,wFAAwF;AACxF,wBAAgB,eAAe,CAAC,4BAA4B,EAAE,MAAM,GAAG,eAAe,CAQrF"}

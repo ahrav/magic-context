@@ -35,6 +35,7 @@ import {
     type Sensitivity,
     type SourceKind,
 } from "../../shared/kernel-client";
+import { readObjectRowsChunked } from "../ctx-search/kernel-memory-search";
 import {
     CTX_MEMORY_RESPONSE_BUDGET_BYTES,
     DEFAULT_SEARCH_LIMIT,
@@ -348,6 +349,31 @@ async function readMemoryRows(
     };
 }
 
+/** The revise and merge preflight reads its targets through chunked filtered reads: the id filter bypasses the daemon's row cap but not its byte budget, and a byte-truncated preflight would misclassify the dropped live targets as missing. After chunking, `truncated` is true only for an id whose single-row read stayed truncated, so `requireVisible` rejects only targets the daemon provably does not serve. commentlint: allow(JUDGE) */
+async function readMemoryRowsChunked(
+    client: KernelClient,
+    objectIds: readonly string[],
+    signal?: AbortSignal,
+): Promise<
+    | { ok: true; rows: ReadRow[]; knownAsOf: number; truncated: boolean }
+    | { ok: false; state: MemoryState }
+> {
+    const read = await readObjectRowsChunked({
+        client,
+        surface: "explicit_search",
+        gated: false,
+        objectIds,
+        ...(signal ? { signal } : {}),
+    });
+    if (!read.ok) return read;
+    return {
+        ok: true,
+        rows: read.rows.filter(isMemoryDecisionRow),
+        knownAsOf: read.knownAsOf,
+        truncated: read.unresolvedObjectIds.length > 0,
+    };
+}
+
 /** An anti-memory predecessor's summary is parsed back into an `antiMemory` payload — never inherited as `content` — because `assertCtxMemoryWriteShape` requires the payload arm for the anti-memory category. commentlint: allow(JUDGE) */
 function revisionArgs(args: CtxMemoryArgs, predecessors: readonly ReadRow[]): CtxMemoryArgs {
     const decision = predecessors[0]?.decision;
@@ -416,8 +442,12 @@ function replayMatchesRow(args: CtxMemoryArgs, row: ReadRow): boolean {
     return decision.payload.summary === args.content.trim();
 }
 
-/** The revise and merge replay probe requires every payload field explicitly: an omitted category, content, or reason inherits from the retired predecessors, which no read serves, so the reconstructed spec is unverifiable — the probe answers no match and the ordinary path surfaces the mismatch instead of a false "already applied". commentlint: allow(JUDGE) */
-function replayMatchesSuccessor(args: CtxMemoryArgs, row: ReadRow): boolean {
+/** The revise and merge replay probe requires every payload field explicitly: an omitted category, content, or reason inherits from the retired predecessors, which no read serves, so the reconstructed spec is unverifiable — the probe answers no match and the ordinary path surfaces the mismatch instead of a false "already applied". A generated anti-memory expiry is the one field a redelivery legitimately drifts on — it is day-aligned at delivery time — so the comparison re-renders under the stored expiry, mirroring the create probe. commentlint: allow(JUDGE) */
+function replayMatchesSuccessor(
+    args: CtxMemoryArgs,
+    row: ReadRow,
+    generatedExpiry: boolean,
+): boolean {
     const decision = row.decision;
     if (!decision) return false;
     const category = args.category?.trim();
@@ -426,7 +456,19 @@ function replayMatchesSuccessor(args: CtxMemoryArgs, row: ReadRow): boolean {
         return false;
     }
     if (args.antiMemory) {
-        return renderAntiMemoryContent(args.antiMemory) === decision.payload.summary;
+        if (!generatedExpiry) {
+            return renderAntiMemoryContent(args.antiMemory) === decision.payload.summary;
+        }
+        try {
+            const stored = parseAntiMemoryContent(decision.payload.summary);
+            const rendered = renderAntiMemoryContent({
+                ...args.antiMemory,
+                expiresAt: stored.expiresAt ?? null,
+            });
+            return rendered === decision.payload.summary;
+        } catch {
+            return false;
+        }
     }
     if (args.content === undefined) return false;
     return decision.payload.summary === args.content.trim();
@@ -438,11 +480,12 @@ function redeliveredSuccessor(
     identity: CtxMemoryWriteIdentity,
     rows: readonly ReadRow[],
     targets: readonly string[],
+    generatedExpiry: boolean,
 ): ReadRow | null {
     const present = new Set(rows.map((row) => row.object.object_id));
     if (targets.some((id) => present.has(id))) return null;
     const successor = rows.find((row) => row.object.object_id === derivedId("mem", identity, 0));
-    if (!successor || !replayMatchesSuccessor(args, successor)) return null;
+    if (!successor || !replayMatchesSuccessor(args, successor, generatedExpiry)) return null;
     return successor;
 }
 
@@ -460,6 +503,9 @@ function renderReplayedOutcome(action: CtxMemoryAction, row: ReadRow, knownAsOf:
 export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<string> {
     const { client, action, identity, actor, sourceKind, signal } = input;
     const args = withAntiMemoryExpiry(input.args);
+    // A generated expiry drifts across UTC day boundaries, so a redelivered call renders a different expiry line under the same operation key; the replay probes compare such requests under the stored expiry instead. commentlint: allow(JUDGE)
+    const generatedExpiry =
+        args.antiMemory !== undefined && input.args.antiMemory?.expiresAt == null;
     const operationId = operationIdOf(identity);
     const mutation: MutationArgs = {
         actor,
@@ -534,9 +580,7 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         });
         const createMutation = sourceKind === undefined ? mutation : { ...mutation, sourceKind };
         const result = await client.create(spec, createMutation);
-        // A generated expiry drifts across UTC day boundaries, so a call redelivered later produces a different request digest under the same operation key and the daemon answers `operation_key_reused` instead of replaying. The object id derives from the same identity, so a visible object under it proves the first delivery committed; answer the replay the daemon would have given. commentlint: allow(JUDGE)
-        const generatedExpiry =
-            args.antiMemory !== undefined && input.args.antiMemory?.expiresAt == null;
+        // A redelivery of a generated-expiry create answers `operation_key_reused` because its digest drifted. The object id derives from the same identity, so a visible object under it proves the first delivery committed; answer the replay the daemon would have given. commentlint: allow(JUDGE)
         if (
             generatedExpiry &&
             !isAvailable(result) &&
@@ -574,14 +618,16 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
     if (action === "revise") {
         const target = requireTarget(args);
         // The successor id rides in the filter so redelivery recovery sees the row this identity already wrote. commentlint: allow(JUDGE)
-        const read = await readMemoryRows(client, signal, [
-            ...new Set([target, derivedId("mem", identity, 0)]),
-        ]);
+        const read = await readMemoryRowsChunked(
+            client,
+            [...new Set([target, derivedId("mem", identity, 0)])],
+            signal,
+        );
         if (!read.ok) return renderCtxMemoryStateText(read.state, [target]);
         // A truncated read cannot prove the target retired, so recovery only runs on a complete snapshot. commentlint: allow(JUDGE)
         const replayed = read.truncated
             ? null
-            : redeliveredSuccessor(args, identity, read.rows, [target]);
+            : redeliveredSuccessor(args, identity, read.rows, [target], generatedExpiry);
         if (replayed) return renderReplayedOutcome(action, replayed, read.knownAsOf);
         const predecessors = requireVisible(read.rows, [target]);
         const merged = revisionArgs(args, predecessors);
@@ -632,13 +678,15 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         throw new ClaimOperationInputError("merge requires at least two objectIds");
     }
     // The successor id rides in the filter so redelivery recovery sees the row this identity already wrote. commentlint: allow(JUDGE)
-    const read = await readMemoryRows(client, signal, [
-        ...new Set([...targets, derivedId("mem", identity, 0)]),
-    ]);
+    const read = await readMemoryRowsChunked(
+        client,
+        [...new Set([...targets, derivedId("mem", identity, 0)])],
+        signal,
+    );
     if (!read.ok) return renderCtxMemoryStateText(read.state, targets);
     const replayed = read.truncated
         ? null
-        : redeliveredSuccessor(args, identity, read.rows, targets);
+        : redeliveredSuccessor(args, identity, read.rows, targets, generatedExpiry);
     if (replayed) return renderReplayedOutcome(action, replayed, read.knownAsOf);
     const predecessors = requireVisible(read.rows, targets);
     const predecessorCategory = requireMergeableCategory(predecessors);

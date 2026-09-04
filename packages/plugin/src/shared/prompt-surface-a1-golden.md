@@ -342,7 +342,7 @@ Actions:
 - archive: objectId.
 - merge: objectIds into one survivor + content/category or antiMemory.
 
-Memories created here start at candidate maturity and are surfaced through explicit search until promoted. Agent calls to approve/enforce are rejected.
+Memories created here surface in the project's automatic memory context and in explicit search. Agent calls to approve/enforce are rejected.
 ```
 
 **Parameters (JSON Schema per parameter, as serialized to the provider):**

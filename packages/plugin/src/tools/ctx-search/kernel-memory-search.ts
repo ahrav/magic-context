@@ -17,12 +17,73 @@ import type {
     AntiMemorySearchResult,
     MemorySearchResult,
 } from "../../features/magic-context/search";
-import { isMemoryDecisionRow, type ReadRow } from "../../shared/kernel-client";
+import {
+    isAvailable,
+    isMemoryDecisionRow,
+    type KernelClient,
+    type MemoryState,
+    type ReadRow,
+    type Surface,
+} from "../../shared/kernel-client";
 
 export type KernelMemorySearchResult = MemorySearchResult | AntiMemorySearchResult;
 
 /** How a result matched: `exact` for an object-id lookup, `lexical` for term-overlap ranking. */
 export type KernelMemoryMatchType = "exact" | "lexical";
+
+export type ChunkedObjectRead =
+    | { ok: true; rows: ReadRow[]; knownAsOf: number; unresolvedObjectIds: string[] }
+    | { ok: false; state: MemoryState };
+
+/**
+ * Reads the named objects through the daemon's id filter, halving any chunk
+ * whose reply is truncated: the filter bypasses the daemon's row cap but not
+ * its serialization byte budget, and the budget keeps a newest-first prefix,
+ * so a truncated filtered read has silently dropped the oldest named rows.
+ * The daemon's budget holds at least eight worst-case rows (each decision
+ * text field is redaction-capped well under an eighth of the budget), so
+ * halving reaches complete chunks before the single-id floor; a single id
+ * whose read still reports truncated without serving its row lands in
+ * `unresolvedObjectIds` instead of passing as proven-missing. commentlint: allow(JUDGE)
+ */
+export async function readObjectRowsChunked(args: {
+    client: KernelClient;
+    surface: Surface;
+    gated: boolean;
+    /** At most `MAX_READ_OBJECT_IDS` ids; the client rejects longer filters. */
+    objectIds: readonly string[];
+    signal?: AbortSignal;
+}): Promise<ChunkedObjectRead> {
+    const rows: ReadRow[] = [];
+    const unresolvedObjectIds: string[] = [];
+    let knownAsOf = 0;
+    const pending: (readonly string[])[] = [args.objectIds];
+    while (pending.length > 0) {
+        const chunk = pending.pop() as readonly string[];
+        const read = await args.client.read({
+            surface: args.surface,
+            gated: args.gated,
+            objectIds: chunk,
+            ...(args.signal ? { signal: args.signal } : {}),
+        });
+        if (!isAvailable(read)) return { ok: false, state: read.state };
+        knownAsOf = Math.max(knownAsOf, read.known_as_of);
+        if (read.truncated && chunk.length > 1) {
+            const mid = Math.ceil(chunk.length / 2);
+            pending.push(chunk.slice(0, mid), chunk.slice(mid));
+            continue;
+        }
+        rows.push(...read.rows);
+        if (
+            read.truncated &&
+            chunk.length === 1 &&
+            !read.rows.some((row) => row.object.object_id === chunk[0])
+        ) {
+            unresolvedObjectIds.push(chunk[0] as string);
+        }
+    }
+    return { ok: true, rows, knownAsOf, unresolvedObjectIds };
+}
 
 const OBJECT_ID = /^mem_[0-9a-f]{32}$/;
 /** The `revisionLocator` shape search results emit: `<object id>@<created commit seq>`. */

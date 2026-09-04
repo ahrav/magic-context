@@ -94,6 +94,11 @@ async function commitPromotedFacts(args: {
         deferred(stateKey(existing.state), specs.length);
         return;
     }
+    // A truncated snapshot can hide a live row whose (kind, summary) matches a pending fact, so the content dedupe below cannot prove novelty; the batch defers and a later importer replay retries against a complete read. commentlint: allow(JUDGE)
+    if (existing.truncated) {
+        deferred("truncated", specs.length);
+        return;
+    }
     // Facts already live under the same (kind, summary) — rows the claim-lane importer holds under its own derived ids — are excluded by content. The snapshot serves only this content check; id presence resolves through the targeted reads below because the snapshot is capped. commentlint: allow(JUDGE)
     const presentContent = liveMemoryContentKeys(existing.rows);
     // A targeted read reaches a claim-stable id past the daemon's row cap.
@@ -107,6 +112,11 @@ async function commitPromotedFacts(args: {
         });
         if (!isAvailable(read)) {
             deferred(stateKey(read.state), specs.length);
+            return;
+        }
+        // The id filter bypasses the daemon's row cap but not its byte budget; a truncated targeted read cannot prove which derived ids are absent, so the batch defers instead of treating the retained prefix as complete. commentlint: allow(JUDGE)
+        if (read.truncated) {
+            deferred("truncated", specs.length);
             return;
         }
         for (const row of read.rows) present.add(row.object.object_id);

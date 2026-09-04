@@ -21,9 +21,15 @@ import {
     disabled,
     isAvailable,
     MAX_READ_OBJECT_IDS,
+    type MemoryState,
+    type ReadRow,
     renderToolStateText,
 } from "../../shared/kernel-client";
-import { parseObjectIdQuery, searchKernelMemoryRows } from "./kernel-memory-search";
+import {
+    parseObjectIdQuery,
+    readObjectRowsChunked,
+    searchKernelMemoryRows,
+} from "./kernel-memory-search";
 import { normalizeCtxSearchArgs, prepareQueryFromNormalizedArgs } from "./query-input";
 import { type ExplicitDeliveryReason, packSearchResults } from "./render";
 import type { CtxSearchArgs, CtxSearchSource, CtxSearchToolDeps } from "./types";
@@ -194,27 +200,51 @@ export async function executeCtxSearch(
             sessionId: toolContext.sessionID,
             projectRoot,
         });
-        // An id query filters the read so a named object beyond the daemon's row cap still resolves; a pasted list over the filter bound falls back to the unfiltered snapshot instead of failing the search. commentlint: allow(JUDGE)
-        const read = await client.read({
-            surface: "explicit_search",
-            gated: true,
-            ...(idQuery && idQuery.length <= MAX_READ_OBJECT_IDS ? { objectIds: idQuery } : {}),
-            ...(toolContext.abort ? { signal: toolContext.abort } : {}),
-        });
-        if (isAvailable(read)) {
+        // An id query filters the read so a named object beyond the daemon's row cap still resolves; the chunked read splits on byte-budget truncation so every named id resolves or is reported unresolved by name. A pasted list over the filter bound falls back to the unfiltered snapshot instead of failing the search. commentlint: allow(JUDGE)
+        const filteredIds = idQuery && idQuery.length <= MAX_READ_OBJECT_IDS ? idQuery : null;
+        let memoryRows: ReadRow[] | null = null;
+        let memoryState: MemoryState | null = null;
+        let unresolvedObjectIds: string[] = [];
+        if (filteredIds) {
+            const read = await readObjectRowsChunked({
+                client,
+                surface: "explicit_search",
+                gated: true,
+                objectIds: filteredIds,
+                ...(toolContext.abort ? { signal: toolContext.abort } : {}),
+            });
+            if (read.ok) {
+                memoryRows = read.rows;
+                unresolvedObjectIds = read.unresolvedObjectIds;
+            } else {
+                memoryState = read.state;
+            }
+        } else {
+            const read = await client.read({
+                surface: "explicit_search",
+                gated: true,
+                ...(toolContext.abort ? { signal: toolContext.abort } : {}),
+            });
+            if (isAvailable(read)) memoryRows = read.rows;
+            else memoryState = read.state;
+        }
+        if (memoryRows) {
+            if (unresolvedObjectIds.length > 0) {
+                memoryNote = `Memory: unresolved object id${unresolvedObjectIds.length === 1 ? "" : "s"} (the daemon read stayed truncated): ${unresolvedObjectIds.join(", ")}`;
+            }
             const hits = searchKernelMemoryRows({
-                rows: read.rows,
+                rows: memoryRows,
                 query,
                 limit: normalizeSearchResultLimit(args.limit),
                 excludeObjectIds: visibleObjectIds,
             });
             if (hits) {
                 // An object-id query is answered by the daemon alone.
-                if (idQuery) return completeFrom(hits);
+                if (idQuery) return completeFrom(hits, memoryNote);
                 memoryResults = hits;
             }
-        } else {
-            const text = renderToolStateText(read.state);
+        } else if (memoryState) {
+            const text = renderToolStateText(memoryState);
             if (memoryOnly) return { status: "invalid", text: `Error: ${text}` };
             memoryNote = `Memory: ${text}`;
         }

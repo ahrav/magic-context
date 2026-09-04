@@ -1,7 +1,10 @@
 import { describe, expect, it } from "bun:test";
+import { renderAntiMemoryContent } from "@magic-context/core/features/magic-context/memory/anti-memory-content";
+import { ANTI_MEMORY_CATEGORY } from "@magic-context/core/features/magic-context/memory/constants";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { setSessionWorkMetrics } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { buildStatusDetails } from "../commands/ctx-status";
 import {
 	clearPiChannel1State,
 	setPiChannel1Baseline,
@@ -347,6 +350,68 @@ describe("Pi status dialog", () => {
 			expect(rendered.flat().join("\n")).toContain(
 				"1+ memories (0 injected, available)",
 			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+	it("an expired anti-memory stays out of the memory count on both Pi surfaces", () => {
+		const db = createTestDb();
+		try {
+			const sessionId = "ses-status-expired-anti";
+			const fake = fakeKernelResolver();
+			fake.kernel.seedDecision({
+				object_id: `mem_${"a".repeat(32)}`,
+				decision_kind: "PROJECT_RULES",
+				summary: "Always use Bun for builds",
+			});
+			fake.kernel.seedDecision({
+				object_id: `mem_${"b".repeat(32)}`,
+				decision_kind: ANTI_MEMORY_CATEGORY,
+				summary: renderAntiMemoryContent({
+					trigger: "asked to bypass the daemon",
+					rejectedStrategy: "write straight to the store",
+					rejectionReason: "the daemon owns commit ordering",
+					expiresAt: 1,
+				}),
+			});
+			fake.kernel.seedDecision({
+				object_id: `mem_${"c".repeat(32)}`,
+				decision_kind: ANTI_MEMORY_CATEGORY,
+				summary: renderAntiMemoryContent({
+					trigger: "asked to fork the schema",
+					rejectedStrategy: "fork the schema",
+					rejectionReason: "one schema serves both hosts",
+					expiresAt: Date.now() + 60_000,
+				}),
+			});
+			const memory = fake.kernel.snapshot("explicit_search");
+
+			const dialogDetail = buildPiStatusDetail(
+				{ getAllTools: () => [] } as never,
+				{
+					...fakeContext(sessionId),
+					getSystemPrompt: () => "system prompt",
+				} as never,
+				{
+					db,
+					kernelClient: fake.kernelClient,
+					projectIdentity: resolveProjectIdentity(process.cwd()),
+				},
+				sessionId,
+				memory,
+			);
+			expect(dialogDetail.memoryCount).toBe(2);
+
+			const commandDetails = buildStatusDetails(
+				{
+					db,
+					kernelClient: fake.kernelClient,
+					projectIdentity: resolveProjectIdentity(process.cwd()),
+				},
+				sessionId,
+				memory,
+			);
+			expect(commandDetails.memoryCount).toBe(2);
 		} finally {
 			closeQuietly(db);
 		}

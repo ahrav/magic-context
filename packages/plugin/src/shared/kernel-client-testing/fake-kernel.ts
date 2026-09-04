@@ -54,6 +54,8 @@ export class FakeKernel {
     readTruncated = false;
     /** Rows served per read when set, standing in for the daemon's newest-rows cap: the `object_ids` filter applies before the cap, so a filtered read reaches a row a capped unfiltered read drops. commentlint: allow(JUDGE) */
     readRowCap: number | null = null;
+    /** Rows served per filtered read when set, standing in for the daemon's serialization byte budget: the `object_ids` filter bypasses the row cap but not the budget, and the budget keeps a newest-first prefix of the filtered rows. commentlint: allow(JUDGE) */
+    filteredReadRowCap: number | null = null;
     /** Runs after the client's read and before the commit's token check, standing in for a concurrent writer. */
     beforeCommit: (() => void) | null = null;
 
@@ -155,12 +157,16 @@ export class FakeKernel {
         if (objectIds !== null) {
             visible = visible.filter((object) => objectIds.has(object.object_id));
         }
-        // The daemon scopes rows to the id filter before its newest-rows cap, so the cap applies after the filter here too. commentlint: allow(JUDGE)
+        // The daemon scopes rows to the id filter before its newest-rows cap, so the cap applies after the filter here too; the filtered cap stands in for the byte budget, which binds even when the id filter bypasses the row cap. commentlint: allow(JUDGE)
         let truncated = this.readTruncated;
-        if (this.readRowCap !== null && visible.length > this.readRowCap) {
+        const caps = [this.readRowCap, objectIds === null ? null : this.filteredReadRowCap].filter(
+            (cap): cap is number => cap !== null,
+        );
+        const cap = caps.length > 0 ? Math.min(...caps) : null;
+        if (cap !== null && visible.length > cap) {
             visible = [...visible]
                 .sort((left, right) => right.created_commit_seq - left.created_commit_seq)
-                .slice(0, this.readRowCap);
+                .slice(0, cap);
             truncated = true;
         }
         const rows = visible

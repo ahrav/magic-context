@@ -421,6 +421,42 @@ describe("ctx_memory reads beyond the daemon row cap", () => {
         expect(revised.outcome).toBe("applied");
         expect(kernel.objects.get("mem_a")?.superseded_by).toBe(revised.objectId ?? "");
     });
+
+    test("a merge whose targeted preflight is byte-truncated resolves every target through chunked reads", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        kernel.seedDecision({ object_id: "mem_b", decision_kind: "ARCHITECTURE", summary: "B." });
+        kernel.seedDecision({ object_id: "mem_c", decision_kind: "ARCHITECTURE", summary: "C." });
+        // The id filter bypasses the daemon's row cap but not its byte budget; the cap stands in for a budget that holds two rows per filtered read. commentlint: allow(JUDGE)
+        kernel.filteredReadRowCap = 2;
+        const tool = harness(kernel);
+        const merged = parseJson<CommitJson>(
+            await tool.execute(
+                {
+                    action: "merge",
+                    objectIds: ["mem_a", "mem_b", "mem_c"],
+                    content: "A, B, and C.",
+                },
+                "call-merge-byte-truncated",
+            ),
+        );
+        expect(merged.outcome).toBe("applied");
+        expect(merged.objects).toContain("mem_a");
+        expect(merged.objects).toContain("mem_b");
+        expect(merged.objects).toContain("mem_c");
+        expect(kernel.liveRows().map((row) => row.decision?.payload.summary)).toEqual([
+            "A, B, and C.",
+        ]);
+        // Every follow-up read after the truncated preflight names a strict subset of the ids.
+        const idReads = tool.transport.calls
+            .filter((call) => call.method === "kernel.read")
+            .map((call) => (call.body as { object_ids?: string[] }).object_ids)
+            .filter((ids): ids is string[] => Array.isArray(ids));
+        expect(idReads[0]).toHaveLength(4);
+        for (const ids of idReads.slice(1)) {
+            expect(ids.length).toBeLessThanOrEqual(2);
+        }
+    });
 });
 
 describe("ctx_memory lifecycle and merge", () => {
@@ -962,6 +998,42 @@ describe("ctx_memory anti-memory", () => {
             category: "REJECTED_APPROACH",
             antiMemory: expect.objectContaining(payload),
         });
+    });
+
+    test("a redelivered anti-memory revise without an expiry replays across a day boundary", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: "mem_anti_predecessor",
+            decision_kind: "REJECTED_APPROACH",
+            summary: "Trigger: caching\nRejected strategy: Redis\nWhy rejected: offline builds",
+        });
+        const tool = harness(kernel);
+        const args = {
+            action: "revise",
+            objectId: "mem_anti_predecessor",
+            category: "REJECTED_APPROACH",
+            reason: "sharpened",
+            antiMemory: {
+                trigger: "Choosing a cache backend",
+                rejectedStrategy: "Use Redis",
+                rejectionReason: "The project must work offline",
+            },
+        };
+        try {
+            setSystemTime(new Date("2026-01-01T12:00:00Z"));
+            const first = parseJson<CommitJson>(await tool.execute(args, "call-anti-revise-day"));
+            expect(first.outcome).toBe("applied");
+            // The generated expiry re-renders day-aligned two days later, so only the stored-expiry comparison recognizes the committed successor. commentlint: allow(JUDGE)
+            setSystemTime(new Date("2026-01-03T12:00:00Z"));
+            const second = parseJson<CommitJson>(await tool.execute(args, "call-anti-revise-day"));
+            expect(second).toMatchObject({
+                outcome: "already applied",
+                objectId: first.objectId,
+            });
+            expect(kernel.liveRows()).toHaveLength(1);
+        } finally {
+            setSystemTime();
+        }
     });
 
     test("revise of an anti-memory whose summary does not parse names the input error", async () => {

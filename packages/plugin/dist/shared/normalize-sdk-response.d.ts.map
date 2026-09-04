@@ -1,0 +1,1 @@
+{"version":3,"file":"normalize-sdk-response.d.ts","sourceRoot":"","sources":["../../src/shared/normalize-sdk-response.ts"],"names":[],"mappings":"AAAA,MAAM,WAAW,2BAA2B;IACxC,2BAA2B,CAAC,EAAE,OAAO,CAAC;CACzC;AAMD,wBAAgB,oBAAoB,CAAC,KAAK,EACtC,QAAQ,EAAE,OAAO,EACjB,QAAQ,EAAE,KAAK,EACf,OAAO,CAAC,EAAE,2BAA2B,GACtC,KAAK,CA2BP"}

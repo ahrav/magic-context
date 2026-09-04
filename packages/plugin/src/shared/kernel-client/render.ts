@@ -1,4 +1,21 @@
+import {
+    antiMemoryExpired,
+    parseAntiMemoryContent,
+} from "../../features/magic-context/memory/anti-memory-content";
+import { ANTI_MEMORY_CATEGORY } from "../../features/magic-context/memory/constants";
 import { guidanceFor, type MemoryState } from "./state";
+import { isMemoryDecisionRow, type ReadRow } from "./wire";
+
+/** The rows list, search, and status counters serve: memory-domain decisions minus anti-memories past their rendered expiry. An unparseable summary never counts as expired. commentlint: allow(JUDGE) */
+export function isServedMemoryDecisionRow(row: ReadRow, nowMs: number): boolean {
+    if (!isMemoryDecisionRow(row)) return false;
+    if (row.decision?.decision_kind !== ANTI_MEMORY_CATEGORY) return true;
+    try {
+        return !antiMemoryExpired(parseAntiMemoryContent(row.decision.payload.summary), nowMs);
+    } catch {
+        return true;
+    }
+}
 
 /** An `available` read with no rows for the project. */
 export const EMPTY_PROJECT_MARKER = "memory: no memories recorded for this project yet";

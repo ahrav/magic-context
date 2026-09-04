@@ -2,6 +2,8 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
+import { renderAntiMemoryContent } from "../features/magic-context/memory/anti-memory-content";
+import { ANTI_MEMORY_CATEGORY } from "../features/magic-context/memory/constants";
 import { FORK_MIGRATION_VERSION_FLOOR } from "../features/magic-context/migrations";
 import {
     getPersistedSchemaVersion,
@@ -232,6 +234,49 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
             });
             expect(absent.memoryCount).toBe(0);
             expect(absent.memoryState).toBe("unavailable:daemon_absent");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("an expired anti-memory stays out of the memory count", () => {
+        const db = createTestDb();
+        try {
+            const kernel = new FakeKernel();
+            kernel.seedDecision({
+                object_id: `mem_${"a".repeat(32)}`,
+                decision_kind: "PROJECT_RULES",
+                summary: "Always use Bun for builds",
+            });
+            kernel.seedDecision({
+                object_id: `mem_${"b".repeat(32)}`,
+                decision_kind: ANTI_MEMORY_CATEGORY,
+                summary: renderAntiMemoryContent({
+                    trigger: "asked to bypass the daemon",
+                    rejectedStrategy: "write straight to the store",
+                    rejectionReason: "the daemon owns commit ordering",
+                    expiresAt: 1,
+                }),
+            });
+            kernel.seedDecision({
+                object_id: `mem_${"c".repeat(32)}`,
+                decision_kind: ANTI_MEMORY_CATEGORY,
+                summary: renderAntiMemoryContent({
+                    trigger: "asked to fork the schema",
+                    rejectedStrategy: "fork the schema",
+                    rejectionReason: "one schema serves both hosts",
+                    expiresAt: Date.now() + 60_000,
+                }),
+            });
+
+            const snapshot = buildSidebarSnapshot(
+                db,
+                "ses-expired-anti",
+                process.cwd(),
+                undefined,
+                kernel.snapshot("explicit_search"),
+            );
+            expect(snapshot.memoryCount).toBe(2);
         } finally {
             closeQuietly(db);
         }

@@ -195,6 +195,40 @@ describe("runAutoSearchHintForPi", () => {
 		}
 	});
 
+	it("a provided memory snapshot serves the memory source when no kernel client resolves", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
+		const fake = fakeKernelResolver();
+		fake.kernel.seedDecision({
+			object_id: `mem_${"d".repeat(32)}`,
+			decision_kind: "PROJECT_RULES",
+			summary:
+				"the historian decides to run when context passes the execute threshold",
+		});
+		try {
+			const messages = [
+				userMessage("please explain how the historian decides when to run", 1),
+			];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				options: {
+					...baseOptions,
+					memorySnapshot: fake.kernel.snapshot("explicit_search"),
+				},
+			});
+			expect(textOf(messages[0])).toContain("<ctx-search-hint>");
+			expect(fake.transport.calls).toEqual([]);
+			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]).toMatchObject({
+				decision: "hint",
+			});
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
 	it.each([
 		[
 			"stale",

@@ -148,6 +148,79 @@ describe("historian kernel promotion", () => {
         expect(kernel.liveRows()).toHaveLength(1);
     });
 
+    test("a truncated snapshot defers instead of committing a semantic duplicate", async () => {
+        const { db, kernel, transport, client } = harness();
+        expect(
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
+        ).toBe("done");
+        // The matching (kind, summary) row is the oldest, so the capped snapshot retains only the unrelated newest row and the content dedupe cannot see the match. commentlint: allow(JUDGE)
+        kernel.seedDecision({
+            object_id: "mem_claim_lane_row",
+            decision_kind: "PROJECT_RULES",
+            summary: "the build runs in CI only",
+        });
+        kernel.seedDecision({
+            object_id: "mem_newer_unrelated",
+            decision_kind: "NAMING",
+            summary: "unrelated newest row",
+        });
+        kernel.readRowCap = 1;
+        await commitPromotedFactsToKernel({
+            client,
+            db,
+            projectPath: PROJECT,
+            projectRoot: ROOT,
+            sessionId: "s1",
+            refs: [ref("PROJECT_RULES", "the build runs in CI only")],
+            identity,
+        });
+        expect(transport.methods()).not.toContain("kernel.commit");
+        expect(kernel.liveRows()).toHaveLength(2);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(false);
+    });
+
+    test("a truncated targeted read defers instead of trusting the retained prefix", async () => {
+        const { db, kernel, transport, client } = harness();
+        expect(
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
+        ).toBe("done");
+        const refs = [ref("PROJECT_RULES", "fact one"), ref("PROJECT_RULES", "fact two")];
+        // Both derived ids are live with revised summaries, so only the id-presence check can exclude them; the truncated targeted read serves just one. commentlint: allow(JUDGE)
+        for (const factRef of refs) {
+            kernel.seedDecision({
+                object_id: promotedObjectId(factRef.publicClaimId, ROOT),
+                decision_kind: "PROJECT_RULES",
+                summary: `${factRef.content}, revised in place`,
+                source_id: "historian",
+                source_kind: "model",
+            });
+        }
+        kernel.filteredReadRowCap = 1;
+        await commitPromotedFactsToKernel({
+            client,
+            db,
+            projectPath: PROJECT,
+            projectRoot: ROOT,
+            sessionId: "s1",
+            refs,
+            identity,
+        });
+        expect(transport.methods()).not.toContain("kernel.commit");
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(false);
+    });
+
     test("a fact already live under another object id is not promoted again", async () => {
         const { db, kernel, transport, client } = harness();
         kernel.seedDecision({
