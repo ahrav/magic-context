@@ -236,8 +236,8 @@ impl Redactor {
 
     /// Detects findings in bytes that need not be UTF-8.
     ///
-    /// Scans text produced by `String::from_utf8_lossy`, one window at a time,
-    /// because invalid bytes expand to three-byte replacement characters.
+    /// Scans valid UTF-8 in place; otherwise, scans lossy UTF-8 one window at a
+    /// time because invalid bytes expand to three-byte replacement characters.
     pub fn detect_windowed_bytes(&self, bytes: &[u8]) -> Result<bool, RedactionError> {
         // Valid UTF-8 decodes to itself, so the windows are slices of the input
         // rather than copies; the slide arithmetic below is the copying loop's.
@@ -283,13 +283,10 @@ impl Redactor {
         loop {
             let filled = char_floor(text, start.saturating_add(MAX_REDACTABLE_BYTES));
             if filled == end && end < text.len() {
-                if !scan
-                    .findings(window(text, start, end)?, start, false)?
-                    .is_empty()
-                {
+                let window = window(text, start, end)?;
+                if !scan.findings(window, start, false)?.is_empty() {
                     return Ok(true);
                 }
-                let window = window(text, start, end)?;
                 start += char_floor(window, window.len().saturating_sub(WINDOW_OVERLAP_BYTES));
                 continue;
             }
