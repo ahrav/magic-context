@@ -3,7 +3,8 @@
 //! checks. Decision objects also carry their decision row, so a client can
 //! render the decision text without a second route.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
 use mc_host::RouteHandle;
 use mc_kernel::{DecisionRow, KernelError, KernelStore, Surface, SurfaceVisibility, VisibleRow};
@@ -24,12 +25,18 @@ pub const MAX_READ_ROWS: usize = 8192;
 /// Byte budget for the serialized `rows` array: one eighth of the 64 MiB wire cap. Redaction caps each decision text field at 512 KiB, so a worst-case row is ~1 MiB and at least eight always fit; typical memory rows run ~1 KiB, so thousands fit before [`MAX_READ_ROWS`] binds first. The response is the rows plus a fixed envelope of under 200 bytes, so a rows array within this budget cannot reach the cap that would fail the whole response. commentlint: allow(JUDGE)
 pub const MAX_READ_ROW_BYTES: usize = crate::dispatch::MAX_WIRE_BODY_BYTES / 8;
 
+/// Ids per `object_ids` filter. A filtered read preflights one mutation batch, so the bound stays far under [`MAX_READ_ROWS`] and a filtered read never hits the row cap. commentlint: allow(JUDGE)
+pub const MAX_READ_OBJECT_IDS: usize = 64;
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReadRequest {
     surface: String,
     /// `None` reads the tip.
     #[serde(default)]
     as_of: Option<i64>,
+    /// Filters the read to these objects before the row cap applies, so a targeted lookup addresses a row the bounded unfiltered read drops; `None` reads the whole surface. commentlint: allow(JUDGE)
+    #[serde(default)]
+    object_ids: Option<Vec<String>>,
     /// Whether the serving policy judges freshness before rows are returned.
     #[serde(default)]
     gated: bool,
@@ -64,11 +71,76 @@ pub(crate) struct ReadResponse {
     decisions: HashMap<String, DecisionRow>,
 }
 
+/// Orders rows for a max-heap whose maximum is the serving-order-last row: an older `created_commit_seq` ranks greater, and among rows of one commit the greater `object_id` ranks greater, so the heap's peek is exactly the row a full newest-first sort then truncate drops first. commentlint: allow(JUDGE)
+struct ServingOrderLast(VisibleRow);
+
+impl Ord for ServingOrderLast {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .0
+            .object
+            .created_commit_seq
+            .cmp(&self.0.object.created_commit_seq)
+            .then_with(|| self.0.object.object_id.cmp(&other.0.object.object_id))
+    }
+}
+
+impl PartialOrd for ServingOrderLast {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ServingOrderLast {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for ServingOrderLast {}
+
+/// Bounded newest-first selection: keeps at most `cap` rows of the serving order (`created_commit_seq` descending, `object_id` breaking ties) while candidates stream in, so selection costs `O(n log cap)` comparisons and `cap` retained rows instead of a full sort. Each overflow evicts the serving-order-last kept row, so the kept set and its order match a full sort followed by a truncate. commentlint: allow(JUDGE)
+pub struct NewestRows {
+    cap: usize,
+    heap: BinaryHeap<ServingOrderLast>,
+    dropped: bool,
+}
+
+impl NewestRows {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            heap: BinaryHeap::with_capacity(cap.saturating_add(1)),
+            dropped: false,
+        }
+    }
+
+    pub fn push(&mut self, row: VisibleRow) {
+        self.heap.push(ServingOrderLast(row));
+        if self.heap.len() > self.cap {
+            self.heap.pop();
+            self.dropped = true;
+        }
+    }
+
+    /// Returns the kept rows in serving order and whether any candidate was dropped.
+    pub fn finish(self) -> (Vec<VisibleRow>, bool) {
+        let rows = self
+            .heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|entry| entry.0)
+            .collect();
+        (rows, self.dropped)
+    }
+}
+
 pub(crate) fn read_visible(
     store: &KernelStore,
     project: &ProjectBinding,
     surface: Surface,
     as_of: Option<i64>,
+    object_ids: Option<&[String]>,
 ) -> Result<ReadResponse, KernelError> {
     let requested = match as_of {
         Some(as_of) => as_of,
@@ -76,25 +148,18 @@ pub(crate) fn read_visible(
     };
     // The kernel keeps rows whose scope names another project out of the
     // snapshot, so the read costs the project's rows and not the store's.
-    let visible = store.visible_as_of_in_scope(surface, requested, Some(project.scope_term()))?;
+    let visible =
+        store.visible_as_of_in_scope(surface, requested, object_ids, Some(project.scope_term()))?;
     let mut filter = ScopeFilter::new(project);
     let mut terms = stored_terms(store);
-    let mut rows = Vec::with_capacity(visible.rows.len());
+    // `ScopeFilter` judges scope-term operators the kernel query keeps for the caller, so the row bound cannot be a SQL `LIMIT`; it applies here, after the filter. commentlint: allow(JUDGE)
+    let mut newest = NewestRows::new(MAX_READ_ROWS);
     for row in visible.rows {
         if filter.matches(row.scope_id.as_deref(), &mut terms)? {
-            rows.push(row);
+            newest.push(row);
         }
     }
-    // Newest first, so bounded reads return recent rows deterministically. Rows from one commit share a sequence; `object_id` breaks ties. commentlint: allow(JUDGE)
-    rows.sort_by(|left, right| {
-        right
-            .object
-            .created_commit_seq
-            .cmp(&left.object.created_commit_seq)
-            .then_with(|| left.object.object_id.cmp(&right.object.object_id))
-    });
-    let truncated = rows.len() > MAX_READ_ROWS;
-    rows.truncate(MAX_READ_ROWS);
+    let (rows, truncated) = newest.finish();
     let decision_ids: Vec<String> = rows
         .iter()
         .filter(|row| row.object.object_kind == "decision")
@@ -155,6 +220,15 @@ impl McHandler {
                 return crate::invalid_params_error(format!("invalid {OPERATION}: {error}"))
             }
         };
+        if parsed
+            .object_ids
+            .as_ref()
+            .is_some_and(|ids| ids.len() > MAX_READ_OBJECT_IDS)
+        {
+            return crate::invalid_params_error(format!(
+                "{OPERATION} object_ids must name at most {MAX_READ_OBJECT_IDS} objects"
+            ));
+        }
         let Ok(surface) = Surface::try_from(parsed.surface.as_str()) else {
             return crate::invalid_params_error(format!(
                 "{OPERATION} surface must be one of auto_inject, auto_search, explicit_search"
@@ -183,7 +257,10 @@ impl McHandler {
         }
         let store = scope.store.clone();
         let project = scope.project.clone();
-        let result = blocking(move || read_visible(&store, &project, surface, as_of)).await;
+        let object_ids = parsed.object_ids.clone();
+        let result =
+            blocking(move || read_visible(&store, &project, surface, as_of, object_ids.as_deref()))
+                .await;
         let response = match result {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => return state_only(KernelOutcome::from(error)),

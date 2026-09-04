@@ -1366,7 +1366,115 @@ async fn a_read_over_the_row_cap_serves_the_newest_rows_and_flags_truncation() {
         .map(|row| row["object"]["created_commit_seq"].as_i64().unwrap())
         .collect();
     assert!(sequences.windows(2).all(|pair| pair[0] >= pair[1]));
+
+    // The filter returns the dropped row without truncation.
+    let dropped = format!("decision-object-{}", missing[0]);
+    let newest = format!("decision-object-{}", total - 1);
+    let mut filtered = read_request(&daemon.project, "explicit_search", None);
+    filtered["object_ids"] = json!([dropped, newest]);
+    let filtered = daemon.call(daemon.route, filtered).await;
+    assert_state(&filtered, "available", None);
+    assert_eq!(filtered["truncated"], false, "{}", filtered["truncated"]);
+    let mut expected = vec![dropped, newest];
+    expected.sort();
+    assert_eq!(object_ids(&filtered), expected);
     daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_filtered_read_serves_exactly_the_named_visible_objects() {
+    use mc_module::kernel_routes::read::MAX_READ_OBJECT_IDS;
+
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    for index in 1..=3 {
+        let response = daemon
+            .commit(
+                &format!("seed-{index}"),
+                vec![insert_decision(index)],
+                vec![],
+            )
+            .await;
+        assert_state(&response, "available", None);
+    }
+
+    // Named ids scope the read; an id no visible row carries yields nothing.
+    let mut request = read_request(&daemon.project, "explicit_search", None);
+    request["object_ids"] = json!(["decision-object-1", "decision-object-3", "absent-object"]);
+    let read = daemon.call(daemon.route, request).await;
+    assert_state(&read, "available", None);
+    assert_eq!(read["truncated"], false, "{}", read["truncated"]);
+    assert_eq!(
+        object_ids(&read),
+        ["decision-object-1", "decision-object-3"]
+    );
+    // Filtered rows keep the newest-first serving order.
+    assert_eq!(read["rows"][0]["object"]["object_id"], "decision-object-3");
+
+    // More than MAX_READ_OBJECT_IDS ids returns invalid_params.
+    let ids: Vec<String> = (0..=MAX_READ_OBJECT_IDS)
+        .map(|index| format!("decision-object-{index}"))
+        .collect();
+    let mut over = read_request(&daemon.project, "explicit_search", None);
+    over["object_ids"] = json!(ids);
+    assert!(matches!(
+        daemon.handler.dispatch_value_for_test(daemon.route, over).await,
+        PreparedOutcome::Error { code, .. } if code == "invalid_params"
+    ));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+fn synthetic_visible_row(created_commit_seq: i64, object_id: String) -> mc_kernel::VisibleRow {
+    mc_kernel::VisibleRow {
+        object: mc_kernel::ObjectRow {
+            object_id,
+            object_kind: "decision".to_string(),
+            domain_id: DOMAIN.to_string(),
+            source_kind: "fixture".to_string(),
+            source_id: "memory-lineage".to_string(),
+            source_revision: 1,
+            created_commit_seq,
+            invalidated_commit_seq: None,
+            superseded_by: None,
+            sensitivity: Sensitivity::Normal,
+        },
+        visibility: mc_kernel::SurfaceVisibility::Visible,
+        labeled: false,
+        scope_id: None,
+    }
+}
+
+proptest::proptest! {
+    #[test]
+    fn bounded_selection_matches_a_full_sort_and_truncate(
+        keys in proptest::collection::vec((0i64..48, 0u16..256), 0..768),
+        cap in 0usize..40,
+    ) {
+        use mc_module::kernel_routes::read::NewestRows;
+
+        let rows: Vec<mc_kernel::VisibleRow> = keys
+            .into_iter()
+            .map(|(seq, id)| synthetic_visible_row(seq, format!("object-{id}")))
+            .collect();
+        let mut reference = rows.clone();
+        reference.sort_by(|left, right| {
+            right
+                .object
+                .created_commit_seq
+                .cmp(&left.object.created_commit_seq)
+                .then_with(|| left.object.object_id.cmp(&right.object.object_id))
+        });
+        let reference_dropped = reference.len() > cap;
+        reference.truncate(cap);
+
+        let mut newest = NewestRows::new(cap);
+        for row in rows {
+            newest.push(row);
+        }
+        let (selected, dropped) = newest.finish();
+        proptest::prop_assert_eq!(dropped, reference_dropped);
+        proptest::prop_assert_eq!(selected, reference);
+    }
 }
 
 #[tokio::test]

@@ -62,6 +62,12 @@ export interface ReadRow {
 
 export const MEMORY_DOMAIN_ID = "memory";
 
+/**
+ * `kernel.read` rejects a longer `object_ids` filter with `invalid_params`.
+ * A filtered read scopes visible rows to named objects before the daemon applies its row cap, so a targeted lookup reaches rows a capped unfiltered read drops. commentlint: allow(JUDGE)
+ */
+export const MAX_READ_OBJECT_IDS = 64;
+
 export function isMemoryDecisionRow(row: ReadRow): boolean {
     return row.decision !== undefined && row.object.domain_id === MEMORY_DOMAIN_ID;
 }
