@@ -215,6 +215,7 @@ function parseReadRow(raw: unknown): ReadRow | null {
     // A decision object always carries its decision row; a daemon that omits it
     // predates the field, and the row would otherwise vanish silently.
     if (decision === undefined && object.object_kind === "decision") return null;
+    if (decision !== undefined && object.object_kind !== "decision") return null;
     return {
         object,
         visibility: raw.visibility,
@@ -234,7 +235,12 @@ function failed<P>(): Parsed<P> {
 export function parseReadResponse(raw: unknown): Parsed<ReadPayload> {
     const { state, payload } = parseKernelResponse(raw);
     if (state.kind !== "available") return { state, payload: null };
-    if (!isNonNegativeInteger(payload.known_as_of) || !isNonNegativeInteger(payload.tip)) {
+    // A snapshot must not be newer than the store tip.
+    if (
+        !isNonNegativeInteger(payload.known_as_of) ||
+        !isNonNegativeInteger(payload.tip) ||
+        payload.known_as_of > payload.tip
+    ) {
         return failed();
     }
     if (typeof payload.gated !== "boolean" || !Array.isArray(payload.rows)) return failed();
