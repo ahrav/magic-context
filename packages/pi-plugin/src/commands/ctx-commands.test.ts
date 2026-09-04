@@ -370,6 +370,13 @@ describe("Pi Magic Context commands", () => {
 			decision_kind: "NAMING",
 			summary: "One memory.",
 		});
+		// The count excludes decisions outside the memory domain.
+		fake.kernel.seedDecision({
+			object_id: `mem_${"3".repeat(32)}`,
+			decision_kind: "NAMING",
+			summary: "A foreign-domain decision.",
+			domain_id: "notes",
+		});
 		registerCtxStatusCommand(pi as never, {
 			db,
 			kernelClient: fake.kernelClient,

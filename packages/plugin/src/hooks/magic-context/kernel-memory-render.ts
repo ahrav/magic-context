@@ -11,6 +11,7 @@ import {
     abstained,
     disabled,
     isAvailable,
+    isMemoryDecisionRow,
     type KernelClient,
     type KernelClientResolver,
     type KernelMemorySnapshot,
@@ -53,12 +54,14 @@ export async function readInjectionMemorySnapshot(args: {
     if (!args.kernelClient) return daemonAbsentSnapshot();
     const client = args.kernelClient({ sessionId: args.sessionId, projectRoot: args.projectRoot });
     return withoutSensitiveRows(
-        kernelMemorySnapshotFrom(
-            await client.read({
-                surface: MEMORY_READ_SURFACE,
-                gated: false,
-                deadlineMs: INJECTION_READ_DEADLINE_MS,
-            }),
+        withholdLaggingMemory(
+            kernelMemorySnapshotFrom(
+                await client.read({
+                    surface: MEMORY_READ_SURFACE,
+                    gated: true,
+                    deadlineMs: INJECTION_READ_DEADLINE_MS,
+                }),
+            ),
         ),
     );
 }
@@ -82,7 +85,10 @@ export function withholdLaggingMemory(snapshot: KernelMemorySnapshot): KernelMem
     };
 }
 
-/** The historian deduplicates against the block the model saw; a non-`available` read yields no baseline. */
+/**
+ * The historian deduplicates against the block the model saw; a non-`available`
+ * read — including a gated read's `stale` answer — yields no baseline.
+ */
 export async function readHistorianMemoryBlock(args: {
     client: KernelClient | undefined;
     sessionId: string;
@@ -90,7 +96,7 @@ export async function readHistorianMemoryBlock(args: {
     if (!args.client) return "";
     const read = await args.client.read({
         surface: MEMORY_READ_SURFACE,
-        gated: false,
+        gated: true,
         deadlineMs: INJECTION_READ_DEADLINE_MS,
     });
     if (!isAvailable(read)) {
@@ -115,9 +121,8 @@ export function memorySnapshotKey(snapshot: KernelMemorySnapshot): string {
     return `${stateKey(snapshot.state)}#${rows.length}@${sha256Hex(rows.join("\u001e")).slice(0, 16)}`;
 }
 
-/** Rows with a decision payload are the only ones that render as memory text. */
 export function memoryRows(snapshot: KernelMemorySnapshot): ReadRow[] {
-    return snapshot.rows.filter((row) => row.decision !== undefined);
+    return snapshot.rows.filter(isMemoryDecisionRow);
 }
 
 /** The identity a rendered row is tracked by in cache manifests and search exclusion. */

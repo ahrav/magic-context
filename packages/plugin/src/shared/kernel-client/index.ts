@@ -60,6 +60,8 @@ export { TokenCache } from "./token";
 export {
     type CommitPayload,
     type DecisionPayload,
+    isMemoryDecisionRow,
+    MEMORY_DOMAIN_ID,
     type MutationToken,
     type ObjectRow,
     type Parsed,

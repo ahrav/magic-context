@@ -60,6 +60,12 @@ export interface ReadRow {
     decision?: ReadDecision;
 }
 
+export const MEMORY_DOMAIN_ID = "memory";
+
+export function isMemoryDecisionRow(row: ReadRow): boolean {
+    return row.decision !== undefined && row.object.domain_id === MEMORY_DOMAIN_ID;
+}
+
 export interface ReadPayload {
     known_as_of: number;
     tip: number;

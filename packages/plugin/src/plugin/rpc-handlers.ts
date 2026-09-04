@@ -61,6 +61,7 @@ import {
 } from "../shared/announcement";
 import {
     disabled,
+    isMemoryDecisionRow,
     type KernelMemorySnapshot,
     kernelMemorySnapshotFrom,
     stateKey,
@@ -265,7 +266,7 @@ export function buildSidebarSnapshot(
                 ? moduleStatus.compartment_count
                 : archivedCompartmentCount;
 
-        const memoryCount = memory?.rows.length ?? 0;
+        const memoryCount = memory ? memory.rows.filter(isMemoryDecisionRow).length : 0;
         const memoryState = memory ? stateKey(memory.state) : null;
 
         let pendingOpsCount = 0;

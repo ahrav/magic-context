@@ -207,6 +207,27 @@ describe("ctx_memory reads", () => {
         expect(listed.memories.map((memory) => memory.objectId)).toEqual(["mem_b"]);
     });
 
+    test("get with more than 20 unique ids is rejected naming the limit", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        const tool = harness(kernel);
+        const objectIds = Array.from({ length: 21 }, (_, index) => `mem_over_${index}`);
+        expect(await tool.execute({ action: "get", objectIds }, "call-get-over")).toBe(
+            "Error: get accepts at most 20 objectIds; 21 were given. Split the request.",
+        );
+        // Duplicates collapse before the limit check, so 21 entries with 20 unique ids pass.
+        const got = parseJson<ReadJson>(
+            await tool.execute(
+                {
+                    action: "get",
+                    objectIds: [...objectIds.slice(0, 20), "mem_over_0"],
+                },
+                "call-get-dedup",
+            ),
+        );
+        expect(got.missingObjectIds).toHaveLength(20);
+    });
+
     test("a stale read renders the state text", async () => {
         const kernel = new FakeKernel();
         kernel.surfaceStates.set("explicit_search", {
@@ -250,6 +271,25 @@ describe("ctx_memory lifecycle and merge", () => {
         expect(await tool.execute({ action: "merge", objectIds: ["only"] }, "call-merge-one")).toBe(
             "Error: merge requires at least two objectIds",
         );
+    });
+
+    test("archive persists the supplied reason in the commit cause", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        kernel.seedDecision({ object_id: "mem_b", decision_kind: "ARCHITECTURE", summary: "B." });
+        const tool = harness(kernel);
+        await tool.execute(
+            { action: "archive", objectId: "mem_a", reason: "superseded by ADR-7" },
+            "call-archive-reason",
+        );
+        const withReason = tool.transport.calls.find((call) => call.method === "kernel.commit")
+            ?.body as { intent: { cause: string } };
+        expect(withReason.intent.cause).toBe("call-archive-reason reason: superseded by ADR-7");
+
+        await tool.execute({ action: "archive", objectId: "mem_b" }, "call-archive-bare");
+        const bare = tool.transport.calls.filter((call) => call.method === "kernel.commit")[1]
+            ?.body as { intent: { cause: string } };
+        expect(bare.intent.cause).toBe("call-archive-bare");
     });
 
     test("a target the project cannot read is refused before any commit", async () => {

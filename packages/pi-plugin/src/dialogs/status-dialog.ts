@@ -34,6 +34,7 @@ import {
 	formatThresholdPercent,
 } from "@magic-context/core/shared/format-threshold";
 import {
+	isMemoryDecisionRow,
 	type KernelClientResolver,
 	type KernelMemorySnapshot,
 	kernelMemorySnapshotFrom,
@@ -604,7 +605,7 @@ export function buildPiStatusDetail(
 		inputTokens,
 		systemPromptTokens,
 		compartmentCount: compartments.length,
-		memoryCount: memory.rows.length,
+		memoryCount: memory.rows.filter(isMemoryDecisionRow).length,
 		memoryState: stateKey(memory.state),
 		memoryBlockCount,
 		sessionNoteCount: safeRead(

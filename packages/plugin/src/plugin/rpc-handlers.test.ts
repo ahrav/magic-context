@@ -195,6 +195,13 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
                 decision_kind: "ARCHITECTURE",
                 summary: "OpenCode source lives at ~/Work/OSS/opencode.",
             });
+            // The sidebar count excludes decisions outside the memory domain.
+            kernel.seedDecision({
+                object_id: `mem_${"c".repeat(32)}`,
+                decision_kind: "ARCHITECTURE",
+                summary: "A foreign-domain decision.",
+                domain_id: "notes",
+            });
 
             db.prepare(
                 `INSERT INTO session_meta (

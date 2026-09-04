@@ -16,9 +16,12 @@ import {
     type CommitResult,
     type DecisionSpecInput,
     isAvailable,
+    isMemoryDecisionRow,
     type KernelClient,
+    MEMORY_DOMAIN_ID,
     type MemoryState,
     type MutationArgs,
+    OPERATION_KEY_SEPARATOR,
     type ReadRow,
     renderToolStateText,
     type SourceKind,
@@ -29,7 +32,7 @@ import type { CtxMemoryAction, CtxMemoryArgs } from "./types";
 import { assertCtxMemoryWriteShape } from "./write-shape";
 
 /** Every memory the tool writes lives in this kernel domain. */
-export const CTX_MEMORY_DOMAIN_ID = "memory";
+export const CTX_MEMORY_DOMAIN_ID = MEMORY_DOMAIN_ID;
 /** The lineage every tool-written decision names; revisions advance `source_revision`. */
 export const CTX_MEMORY_SOURCE_ID = "ctx_memory";
 export const CTX_MEMORY_ACTOR = "agent:opencode";
@@ -42,10 +45,6 @@ function normalizeLimit(limit: number | undefined): number {
 
 function uniqueIds(ids: readonly string[] | undefined): string[] {
     return [...new Set((ids ?? []).map((id) => id.trim()).filter((id) => id.length > 0))];
-}
-
-function isMemoryRow(row: ReadRow): boolean {
-    return row.decision !== undefined && row.object.domain_id === CTX_MEMORY_DOMAIN_ID;
 }
 
 function memoryView(row: ReadRow): Record<string, unknown> {
@@ -199,7 +198,7 @@ async function readMemoryRows(
 ): Promise<{ ok: true; rows: ReadRow[]; knownAsOf: number } | { ok: false; state: MemoryState }> {
     const read = await client.read({ surface: "explicit_search", gated: false });
     if (!isAvailable(read)) return { ok: false, state: read.state };
-    return { ok: true, rows: read.rows.filter(isMemoryRow), knownAsOf: read.known_as_of };
+    return { ok: true, rows: read.rows.filter(isMemoryDecisionRow), knownAsOf: read.known_as_of };
 }
 
 /** The category a revision keeps unless the call names another; `rationale` follows the same rule. */
@@ -223,6 +222,12 @@ function nextSourceRevision(predecessors: readonly ReadRow[]): number {
     return predecessors.reduce((max, row) => Math.max(max, row.object.source_revision), 0) + 1;
 }
 
+/** A `retire_decision` operation carries no payload, so the caller's reason rides in the commit intent's `cause` after the tool-call id; `deriveOperationKey` joins fields with `OPERATION_KEY_SEPARATOR`, and the reason drops that separator to keep operation keys unambiguous. commentlint: allow(JUDGE) */
+function archiveCause(identity: CtxMemoryWriteIdentity, reason: string | undefined): string {
+    const trimmed = reason?.trim().replaceAll(OPERATION_KEY_SEPARATOR, " ");
+    return trimmed ? `${identity.toolCallId} reason: ${trimmed}` : identity.toolCallId;
+}
+
 export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<string> {
     const { client, args, action, identity, actor, sourceKind } = input;
     const mutation: MutationArgs = { actor, cause: identity.toolCallId };
@@ -231,9 +236,14 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         const read = await readMemoryRows(client);
         if (!read.ok) return renderCtxMemoryStateText(read.state, []);
         if (action === "get") {
-            const wanted = uniqueIds(args.objectIds).slice(0, GET_MAX_CLAIMS);
+            const wanted = uniqueIds(args.objectIds);
             if (wanted.length === 0) {
                 return "Error: 'objectIds' is required when action is 'get'.";
+            }
+            if (wanted.length > GET_MAX_CLAIMS) {
+                throw new ClaimOperationInputError(
+                    `get accepts at most ${GET_MAX_CLAIMS} objectIds; ${wanted.length} were given. Split the request.`,
+                );
             }
             const found = read.rows.filter((row) => wanted.includes(row.object.object_id));
             const foundIds = new Set(found.map((row) => row.object.object_id));
@@ -271,7 +281,11 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         const read = await readMemoryRows(client);
         if (!read.ok) return renderCtxMemoryStateText(read.state, [target]);
         requireVisible(read.rows, [target]);
-        return renderCommit(action, await client.archive(target, mutation), [target]);
+        return renderCommit(
+            action,
+            await client.archive(target, { actor, cause: archiveCause(identity, args.reason) }),
+            [target],
+        );
     }
 
     if (action === "revise") {

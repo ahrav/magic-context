@@ -16,9 +16,12 @@ import type {
     AntiMemorySearchResult,
     MemorySearchResult,
 } from "../../features/magic-context/search";
-import type { ReadRow } from "../../shared/kernel-client";
+import { isMemoryDecisionRow, type ReadRow } from "../../shared/kernel-client";
 
 export type KernelMemorySearchResult = MemorySearchResult | AntiMemorySearchResult;
+
+/** How a result matched: `exact` for an object-id lookup, `lexical` for term-overlap ranking. */
+export type KernelMemoryMatchType = "exact" | "lexical";
 
 const OBJECT_ID = /^mem_[0-9a-f]{32}$/;
 
@@ -62,7 +65,11 @@ function antiMemoryPayloadFromSummary(summary: string): AntiMemoryPayload | null
  * variant; anything else — including an unparseable summary — falls back to
  * the generic memory shape so the row still surfaces.
  */
-export function memoryResultFromRow(row: ReadRow, score: number): KernelMemorySearchResult {
+export function memoryResultFromRow(
+    row: ReadRow,
+    score: number,
+    matchType: KernelMemoryMatchType,
+): KernelMemorySearchResult {
     const decision = row.decision;
     const revisionLocator = `${row.object.object_id}@${row.object.created_commit_seq}`;
     const payload =
@@ -86,7 +93,7 @@ export function memoryResultFromRow(row: ReadRow, score: number): KernelMemorySe
             rejectedStrategy: payload.rejectedStrategy,
             rejectionReason: payload.rejectionReason,
             saferAlternative: payload.saferAlternative ?? null,
-            matchType: "exact",
+            matchType,
             ...(row.labeled ? { policyLabel: "labeled" } : {}),
         };
     }
@@ -97,7 +104,7 @@ export function memoryResultFromRow(row: ReadRow, score: number): KernelMemorySe
         publicClaimId: row.object.object_id,
         revisionLocator,
         category: decision?.decision_kind ?? row.object.object_kind,
-        matchType: "exact",
+        matchType,
         ...(row.labeled ? { policyLabel: "labeled" } : {}),
     };
 }
@@ -120,7 +127,7 @@ export function searchKernelMemoryRows(
     args: KernelMemorySearchArgs,
 ): KernelMemorySearchResult[] | null {
     const candidates = args.rows.filter(
-        (row) => row.decision !== undefined && !args.excludeObjectIds?.has(row.object.object_id),
+        (row) => isMemoryDecisionRow(row) && !args.excludeObjectIds?.has(row.object.object_id),
     );
     const ids = parseObjectIdQuery(args.query);
     if (ids) {
@@ -129,7 +136,7 @@ export function searchKernelMemoryRows(
             .map((id) => byId.get(id))
             .filter((row): row is ReadRow => row !== undefined)
             .slice(0, args.limit)
-            .map((row) => memoryResultFromRow(row, 1));
+            .map((row) => memoryResultFromRow(row, 1, "exact"));
         return hits.length > 0 ? hits : null;
     }
     const terms = queryTerms(args.query);
@@ -148,6 +155,6 @@ export function searchKernelMemoryRows(
                 left.row.object.object_id.localeCompare(right.row.object.object_id),
         )
         .slice(0, args.limit)
-        .map((entry) => memoryResultFromRow(entry.row, entry.score));
+        .map((entry) => memoryResultFromRow(entry.row, entry.score, "lexical"));
     return scored.length > 0 ? scored : null;
 }

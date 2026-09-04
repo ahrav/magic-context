@@ -23,6 +23,7 @@ function kernelHarness(kernel = new FakeKernel()): {
     kernel: FakeKernel;
     client: KernelClient;
     kernelClient: KernelClientResolver;
+    transport: FakeKernelTransport;
 } {
     const transport = new FakeKernelTransport(kernel);
     const kernelClient: KernelClientResolver = ({ sessionId, projectRoot }) =>
@@ -31,6 +32,7 @@ function kernelHarness(kernel = new FakeKernel()): {
         kernel,
         client: kernelClient({ sessionId: SESSION, projectRoot: PROJECT }),
         kernelClient,
+        transport,
     };
 }
 
@@ -104,5 +106,61 @@ describe("sensitivity filtering on automatic surfaces", () => {
         const block = await readHistorianMemoryBlock({ client, sessionId: SESSION });
         expect(block).toContain("a normal memory");
         expect(block).not.toContain("a sensitive memory");
+    });
+});
+
+describe("domain fence on rendered rows", () => {
+    test("memoryRows keeps only memory-domain decision rows", () => {
+        const kernel = seededKernel([{ id: "a", summary: "a memory-domain row" }]);
+        kernel.seedDecision({
+            object_id: `mem_${"c".repeat(32)}`,
+            decision_kind: "PROJECT_RULES",
+            summary: "a foreign-domain decision",
+            domain_id: "notes",
+        });
+        const snapshot = kernel.snapshot();
+        expect(snapshot.rows).toHaveLength(2);
+        const rows = memoryRows(snapshot);
+        expect(rows.map((row) => row.decision?.payload.summary)).toEqual(["a memory-domain row"]);
+    });
+});
+
+describe("serving-policy gating on automatic reads", () => {
+    test("the injection read is gated and a stale answer becomes abstained with no rows", async () => {
+        const { kernel, kernelClient, transport } = kernelHarness(
+            seededKernel([{ id: "a", summary: "a memory" }]),
+        );
+        kernel.surfaceStates.set("explicit_search", {
+            kind: "stale",
+            lag_positions: 12,
+            oldest_unconsumed_age_ms: 90_000,
+        });
+        const snapshot = await readInjectionMemorySnapshot({
+            kernelClient,
+            memoryEnabled: true,
+            projectIdentity: PROJECT,
+            sessionId: SESSION,
+            projectRoot: PROJECT,
+        });
+        expect(transport.calls[0]?.body).toMatchObject({ gated: true });
+        expect(snapshot.state).toEqual({
+            kind: "abstained",
+            lag_positions: 12,
+            oldest_unconsumed_age_ms: 90_000,
+        });
+        expect(snapshot.rows).toEqual([]);
+    });
+
+    test("the historian read is gated and a stale answer yields no baseline", async () => {
+        const kernel = seededKernel([{ id: "a", summary: "a memory" }]);
+        kernel.surfaceStates.set("explicit_search", {
+            kind: "stale",
+            lag_positions: 1,
+            oldest_unconsumed_age_ms: 60_000,
+        });
+        const { client, transport } = kernelHarness(kernel);
+        const block = await readHistorianMemoryBlock({ client, sessionId: SESSION });
+        expect(transport.calls[0]?.body).toMatchObject({ gated: true });
+        expect(block).toBe("");
     });
 });

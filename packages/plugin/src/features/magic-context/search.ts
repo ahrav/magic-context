@@ -209,7 +209,8 @@ export interface MemorySearchResult {
     /** Canonical current revision locator the content was read from. */
     revisionLocator: string;
     category: string;
-    matchType: "exact";
+    /** `exact` for an object-id lookup, `lexical` for term-overlap ranking. */
+    matchType: "exact" | "lexical";
     sourceName?: string;
     policyLabel?: string;
     /** Exact SHA-256 digest of the served revision's content bytes. */

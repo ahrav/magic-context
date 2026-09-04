@@ -12,6 +12,7 @@ import { getTagsBySession } from "@magic-context/core/features/magic-context/sto
 import { executeStatus } from "@magic-context/core/hooks/magic-context/execute-status";
 import { describeError } from "@magic-context/core/shared/error-message";
 import {
+	isMemoryDecisionRow,
 	type KernelClientResolver,
 	type KernelMemorySnapshot,
 	type StateKey,
@@ -198,7 +199,7 @@ export function buildStatusDetails(
 		lastCompartmentRange: lastCompartment
 			? `${lastCompartment.startMessage}-${lastCompartment.endMessage}`
 			: null,
-		memoryCount: memory.rows.length,
+		memoryCount: memory.rows.filter(isMemoryDecisionRow).length,
 		memoryState: stateKey(memory.state),
 		noteCount:
 			getNotes(deps.db, { sessionId, type: "session", status: "active" })

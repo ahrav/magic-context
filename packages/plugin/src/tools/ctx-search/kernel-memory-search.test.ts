@@ -54,7 +54,7 @@ describe("memoryResultFromRow", () => {
             summary,
             seq: 7,
         });
-        const result = memoryResultFromRow(row, 0.9);
+        const result = memoryResultFromRow(row, 0.9, "exact");
         expect(result.source).toBe("anti_memory");
         if (result.source !== "anti_memory") return;
         expect(result.trigger).toBe("session caching");
@@ -77,11 +77,12 @@ describe("memoryResultFromRow", () => {
             decisionKind: ANTI_MEMORY_CATEGORY,
             summary: "free-form text without labeled anti-memory fields",
         });
-        const result = memoryResultFromRow(row, 0.5);
+        const result = memoryResultFromRow(row, 0.5, "lexical");
         expect(result.source).toBe("memory");
         if (result.source !== "memory") return;
         expect(result.content).toBe("free-form text without labeled anti-memory fields");
         expect(result.category).toBe(ANTI_MEMORY_CATEGORY);
+        expect(result.matchType).toBe("lexical");
     });
 
     test("an ordinary decision row keeps the memory shape", () => {
@@ -90,8 +91,55 @@ describe("memoryResultFromRow", () => {
             decisionKind: "PROJECT_RULES",
             summary: "the historian runs on a lease",
         });
-        const result = memoryResultFromRow(row, 1);
+        const result = memoryResultFromRow(row, 1, "exact");
         expect(result.source).toBe("memory");
+    });
+});
+
+describe("searchKernelMemoryRows match labeling and domain fence", () => {
+    test("an object-id query labels hits exact; a text query labels hits lexical", () => {
+        const rows = [
+            readRow({
+                objectId: OBJECT_A,
+                decisionKind: "PROJECT_RULES",
+                summary: "the historian runs on a lease",
+            }),
+        ];
+        const byId = searchKernelMemoryRows({ rows, query: OBJECT_A, limit: 5 });
+        expect(byId?.map((hit) => hit.matchType)).toEqual(["exact"]);
+        const byText = searchKernelMemoryRows({ rows, query: "historian lease", limit: 5 });
+        expect(byText?.map((hit) => hit.matchType)).toEqual(["lexical"]);
+    });
+
+    test("a text-ranked anti-memory hit is labeled lexical", () => {
+        const rows = [
+            readRow({
+                objectId: OBJECT_A,
+                decisionKind: ANTI_MEMORY_CATEGORY,
+                summary: renderAntiMemoryContent({
+                    trigger: "session caching",
+                    rejectedStrategy: "Redis",
+                    rejectionReason: "it creates split ownership",
+                }),
+            }),
+        ];
+        const hits = searchKernelMemoryRows({ rows, query: "session caching", limit: 5 });
+        expect(hits?.map((hit) => [hit.source, hit.matchType])).toEqual([
+            ["anti_memory", "lexical"],
+        ]);
+    });
+
+    test("a decision row outside the memory domain never matches", () => {
+        const foreign = readRow({
+            objectId: OBJECT_A,
+            decisionKind: "PROJECT_RULES",
+            summary: "alpha beta",
+        });
+        foreign.object.domain_id = "notes";
+        expect(searchKernelMemoryRows({ rows: [foreign], query: "alpha beta", limit: 5 })).toBe(
+            null,
+        );
+        expect(searchKernelMemoryRows({ rows: [foreign], query: OBJECT_A, limit: 5 })).toBe(null);
     });
 });
 
