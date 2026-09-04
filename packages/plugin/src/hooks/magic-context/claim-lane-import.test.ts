@@ -135,6 +135,26 @@ describe("claim-lane import", () => {
         expect(listed?.map((claim) => claim.content)).toEqual(["Own claim A."]);
     });
 
+    test("a claim the lane withholds from automatic surfaces imports as sensitive", async () => {
+        const { db, kernel, client } = harness();
+        seedClaim(db, PROJECT, "a", "Explicit-search-only claim.");
+        db.prepare(
+            "UPDATE claim_effective_policy SET auto_eligible = 0, explicit_eligible = 1",
+        ).run();
+        expect(
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
+        ).toBe("done");
+        const rows = kernel.liveRows();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.sensitivity).toBe("sensitive");
+    });
+
     test("a stale claim-lane snapshot lists as null, defers, and leaves the marker unset", async () => {
         const { db, kernel, transport, client } = harness();
         seedClaim(db, PROJECT, "a", "Own claim A.");

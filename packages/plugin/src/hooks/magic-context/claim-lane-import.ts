@@ -14,6 +14,7 @@ import {
     readProjectMemoryCurrentState,
     resolveProjectIdsForIdentities,
 } from "../../features/magic-context/memory/storage-claim-current-state";
+import { CLAIM_POLICY_VERSION } from "../../features/magic-context/storage-claim-policy-schema";
 import {
     type DecisionSpecInput,
     isAvailable,
@@ -173,6 +174,17 @@ function claimLaneImportSummary(claim: ProjectMemoryClaimSnapshot): string {
     }
 }
 
+/** Mirrors the claim lane's `auto_inject` eligibility: a supported policy version, an auto-eligible policy row, and no stale, disputed, or superseded disposition. commentlint: allow(JUDGE) */
+function claimAutoEligible(claim: ProjectMemoryClaimSnapshot): boolean {
+    const softHidden =
+        claim.dispositions.stale || claim.dispositions.disputed || claim.dispositions.superseded;
+    return (
+        claim.policy.policyVersion <= CLAIM_POLICY_VERSION &&
+        claim.policy.autoEligible &&
+        !softHidden
+    );
+}
+
 export function claimLaneImportSpec(
     claim: ProjectMemoryClaimSnapshot,
     projectRoot: string,
@@ -185,6 +197,10 @@ export function claimLaneImportSpec(
         payload: { summary: claimLaneImportSummary(claim), rationale: "" },
         source_id: CLAIM_LANE_IMPORT_SOURCE_ID,
         source_revision: Math.max(1, claim.revision),
+        // A positive claim the lane withheld from automatic surfaces imports as `sensitive`: the kernel hides sensitive rows from automatic surfaces while explicit search still serves them, preserving the lane's eligibility split. Anti-memories keep their own category fence — marking them sensitive would also drop their auto-search warnings. commentlint: allow(JUDGE)
+        ...(claim.category !== ANTI_MEMORY_CATEGORY && !claimAutoEligible(claim)
+            ? { sensitivity: "sensitive" as const }
+            : {}),
     };
 }
 
