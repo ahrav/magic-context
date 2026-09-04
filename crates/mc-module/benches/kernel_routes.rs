@@ -56,8 +56,9 @@
 //! - `ingest/page/{bytes}`: one `page` call carrying `bytes` of base64 text,
 //!   staged against an upload begun in the batch setup.
 //! - `ingest/finish/{bytes}`: `begin` + pages run in setup; the timed call is
-//!   `finish`: assemble, digest, redact, `ingest_artifact`. The store's CAS
-//!   fills by `bytes` per iteration, so the group runs few samples.
+//!   `finish`: assemble, digest, redact, `ingest_artifact`. Each finish adds
+//!   `bytes` to the CAS and one evidence row, so the daemon is rebuilt on a
+//!   fixed cycle as the fresh commits are.
 //! - `redaction/{clean,dense}/{bytes}`: the kernel's windowed redactor over
 //!   `bytes` of UTF-8 with zero or one keyed secret per 4 KiB, timed directly
 //!   through `mc_core::redaction::redact_windowed_durable_text` since the
@@ -71,7 +72,9 @@
 //! subsample and is not the keep/discard evidence.
 //!
 //! `MC_KERNEL_ROUTES_PROFILE=<case-prefix>` bypasses Criterion and repeats the
-//! named case for ten seconds so `perf record` has a stable window.
+//! named case for ten seconds so `perf record` has a stable window. Groups and
+//! cases the prefix cannot match skip their fixture setup, so the recorded
+//! process contains only the target's work.
 
 use std::cell::RefCell;
 use std::fs;
@@ -501,10 +504,17 @@ fn text_payload(total: usize, secret_every: usize) -> Vec<u8> {
 /// `MC_KERNEL_ROUTES_GROUPS=read,commit` limits the run to the named groups
 /// so a filtered run does not pay every other group's fixture setup.
 fn group_enabled(group: &str) -> bool {
-    match std::env::var("MC_KERNEL_ROUTES_GROUPS") {
+    let listed = match std::env::var("MC_KERNEL_ROUTES_GROUPS") {
         Ok(list) if !list.is_empty() => list.split(',').any(|g| g.trim() == group),
         _ => true,
-    }
+    };
+    // A group cannot contain the profiled case unless either name prefixes
+    // the other.
+    let profiled = match profile_target() {
+        Some(target) => target.starts_with(group) || group.starts_with(target.as_str()),
+        None => true,
+    };
+    listed && profiled
 }
 
 fn profile_target() -> Option<String> {
@@ -513,13 +523,19 @@ fn profile_target() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Callers check this before building a case's fixture so `perf record` sees
+/// only the target case's work.
+fn profile_skips(case: &str) -> bool {
+    profile_target().is_some_and(|target| !case.starts_with(target.as_str()))
+}
+
 /// When a profile target is set, runs `body` for ten seconds if `case` matches
 /// it and returns `true` either way so the caller skips Criterion.
 fn profile_or_bench(case: &str, mut body: impl FnMut()) -> bool {
-    let Some(target) = profile_target() else {
+    if profile_target().is_none() {
         return false;
-    };
-    if !case.starts_with(target.as_str()) {
+    }
+    if profile_skips(case) {
         return true;
     }
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -543,6 +559,10 @@ fn bench_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("read");
     for rows in [10usize, 1_000, 50_000] {
         for (shape, scope_count) in [("narrow-scope", 1usize), ("wide-scope", 64)] {
+            let case = format!("read/{rows}-rows/{shape}");
+            if profile_skips(&case) {
+                continue;
+            }
             let daemon = Daemon::start();
             let own_scope = daemon.project_scope_id();
             let mut scopes = vec![own_scope];
@@ -555,7 +575,6 @@ fn bench_read(c: &mut Criterion) {
             let served = response["rows"].as_array().unwrap().len();
             // One seed row plus every row on the project's own scope.
             assert_eq!(served, 1 + rows.div_ceil(scope_count), "{shape} {rows}");
-            let case = format!("read/{rows}-rows/{shape}");
             if profile_or_bench(&case, || {
                 black_box(daemon.call(request.clone()));
             }) {
@@ -567,7 +586,13 @@ fn bench_read(c: &mut Criterion) {
             group.bench_with_input(
                 BenchmarkId::new(format!("{rows}-rows"), shape),
                 &request,
-                |b, request| b.iter(|| black_box(daemon.call(request.clone()))),
+                |b, request| {
+                    b.iter_batched(
+                        || request.clone(),
+                        |request| black_box(daemon.call(request)),
+                        BatchSize::PerIteration,
+                    )
+                },
             );
             daemon.shutdown();
         }
@@ -597,76 +622,72 @@ fn commit_envelope(daemon: &Daemon, key: &str, ops: usize, token_ids: &[(String,
     commit_request(daemon, key, operations, tokens)
 }
 
-struct CommitFixture {
-    daemon: Daemon,
-    token_ids: Vec<(String, i64)>,
-    committed: usize,
-}
-
-impl CommitFixture {
-    fn start() -> Self {
-        let daemon = Daemon::start();
-        let own_scope = daemon.project_scope_id();
-        // Token targets: rows the route may mutate, with the tip they were read at.
-        let targets = seed_decisions(&daemon.store(), 0, 16, std::slice::from_ref(&own_scope));
-        let tip = daemon.store().tip().unwrap();
-        let token_ids = targets.into_iter().map(|id| (id, tip)).collect();
-        Self {
-            daemon,
-            token_ids,
-            committed: 0,
-        }
-    }
-
-    fn next_envelope(&mut self, ops: usize) -> Value {
-        self.committed += 1;
-        commit_envelope(
-            &self.daemon,
-            &format!("k{}", self.committed),
-            ops,
-            &self.token_ids,
-        )
-    }
-}
-
-/// `FreshCommits` rebuilds its fixture every `reset_every` commits, so timed
-/// commits operate on stores at most `reset_every * ops` rows past the seed.
-struct FreshCommits {
-    ops: usize,
+struct Cycled<S, B: FnMut() -> (Daemon, S)> {
+    build: B,
     reset_every: usize,
-    fixture: Option<CommitFixture>,
+    fixture: Option<(Daemon, S)>,
+    used: usize,
 }
 
-impl FreshCommits {
-    fn new(ops: usize, reset_every: usize) -> Self {
+/// `Cycled` rebuilds its daemon and fixture state every `reset_every` uses.
+impl<S, B: FnMut() -> (Daemon, S)> Cycled<S, B> {
+    fn new(reset_every: usize, build: B) -> Self {
+        assert!(reset_every > 0, "a cycle must allow at least one use");
         Self {
-            ops,
+            build,
             reset_every,
             fixture: None,
+            used: 0,
         }
     }
 
     fn reset(&mut self) {
-        if let Some(fixture) = self.fixture.take() {
-            fixture.daemon.shutdown();
+        if let Some((daemon, _)) = self.fixture.take() {
+            daemon.shutdown();
         }
+        self.used = 0;
     }
 
-    /// `stage` prepares setup outside the timed region; the caller times only
-    /// `daemon.call(request)`.
-    fn stage(&mut self) -> (&Daemon, Value) {
-        let cycle_done = match &self.fixture {
-            Some(fixture) => fixture.committed >= self.reset_every,
-            None => true,
-        };
-        if cycle_done {
+    /// `stage` runs outside the timed region and returns the fixture for the
+    /// next use with that use's 1-based index within the current cycle.
+    fn stage(&mut self) -> (&Daemon, &S, usize) {
+        if self.fixture.is_none() || self.used >= self.reset_every {
             self.reset();
-            self.fixture = Some(CommitFixture::start());
+            self.fixture = Some((self.build)());
         }
-        let fixture = self.fixture.as_mut().expect("fixture started");
-        let request = fixture.next_envelope(self.ops);
-        (&fixture.daemon, request)
+        self.used += 1;
+        let (daemon, state) = self.fixture.as_ref().expect("fixture built");
+        (daemon, state, self.used)
     }
+}
+
+/// Times `call` over `iters` staged uses of `cycle`, restarting the cycle
+/// first so every Criterion sample starts at use 1.
+fn time_cycled<S, B: FnMut() -> (Daemon, S)>(
+    cycle: &mut Cycled<S, B>,
+    iters: u64,
+    mut call: impl FnMut(&Daemon, &S, usize) -> Value,
+) -> Duration {
+    cycle.reset();
+    let mut elapsed = Duration::ZERO;
+    for _ in 0..iters {
+        let (daemon, state, n) = cycle.stage();
+        let request = call(daemon, state, n);
+        let started = Instant::now();
+        black_box(daemon.call(request));
+        elapsed += started.elapsed();
+    }
+    elapsed
+}
+
+fn commit_fixture() -> (Daemon, Vec<(String, i64)>) {
+    let daemon = Daemon::start();
+    let own_scope = daemon.project_scope_id();
+    // Token targets: rows the route may mutate, with the tip they were read at.
+    let targets = seed_decisions(&daemon.store(), 0, 16, std::slice::from_ref(&own_scope));
+    let tip = daemon.store().tip().unwrap();
+    let token_ids = targets.into_iter().map(|id| (id, tip)).collect();
+    (daemon, token_ids)
 }
 
 fn bench_commit(c: &mut Criterion) {
@@ -675,41 +696,37 @@ fn bench_commit(c: &mut Criterion) {
     }
     let mut group = c.benchmark_group("commit");
     for (ops, reset_every) in [(1usize, 64usize), (16, 16), (128, 4)] {
-        let mut fresh = FreshCommits::new(ops, reset_every);
         let case = format!("commit/{ops}-ops");
+        if profile_skips(&case) {
+            continue;
+        }
+        let mut cycle = Cycled::new(reset_every, commit_fixture);
+        let envelope = |daemon: &Daemon, token_ids: &Vec<(String, i64)>, n: usize| {
+            commit_envelope(daemon, &format!("k{n}"), ops, token_ids)
+        };
         if profile_or_bench(&case, || {
-            let (daemon, request) = fresh.stage();
-            black_box(daemon.call(request));
+            let (daemon, token_ids, n) = cycle.stage();
+            black_box(daemon.call(envelope(daemon, token_ids, n)));
         }) {
-            fresh.reset();
+            cycle.reset();
             continue;
         }
         group.sample_size(if ops >= 128 { 10 } else { 20 });
         group.sampling_mode(SamplingMode::Flat);
         group.throughput(Throughput::Elements(ops as u64));
         group.bench_function(BenchmarkId::new(format!("{ops}-ops"), "fresh"), |b| {
-            b.iter_custom(|iters| {
-                fresh.reset();
-                let mut elapsed = Duration::ZERO;
-                for _ in 0..iters {
-                    let (daemon, request) = fresh.stage();
-                    let started = Instant::now();
-                    black_box(daemon.call(request));
-                    elapsed += started.elapsed();
-                }
-                elapsed
-            })
+            b.iter_custom(|iters| time_cycled(&mut cycle, iters, envelope))
         });
-        fresh.reset();
+        cycle.reset();
     }
     group.sampling_mode(SamplingMode::Auto);
 
     // Replay: the receipt answers without entering the operation.
-    let daemon = Daemon::start();
-    let own_scope = daemon.project_scope_id();
-    let targets = seed_decisions(&daemon.store(), 0, 16, std::slice::from_ref(&own_scope));
-    let tip = daemon.store().tip().unwrap();
-    let token_ids: Vec<(String, i64)> = targets.into_iter().map(|id| (id, tip)).collect();
+    if profile_skips("commit/replay") {
+        group.finish();
+        return;
+    }
+    let (daemon, token_ids) = commit_fixture();
     let request = commit_envelope(&daemon, "replayed", 16, &token_ids);
     let first = daemon.assert_available(request.clone());
     assert_eq!(first["receipt"]["replayed"], false);
@@ -722,7 +739,13 @@ fn bench_commit(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("replay", "16-ops"),
             &request,
-            |b, request| b.iter(|| black_box(daemon.call(request.clone()))),
+            |b, request| {
+                b.iter_batched(
+                    || request.clone(),
+                    |request| black_box(daemon.call(request)),
+                    BatchSize::PerIteration,
+                )
+            },
         );
     }
     daemon.shutdown();
@@ -746,6 +769,11 @@ fn bench_eligibility(c: &mut Criterion) {
     }
     let mut group = c.benchmark_group("eligibility");
     for count in [1usize, 64, 1024] {
+        let cold = format!("eligibility/{count}-candidates/cold");
+        let warm_case = format!("eligibility/{count}-candidates/warm");
+        if profile_skips(&cold) && profile_skips(&warm_case) {
+            continue;
+        }
         let daemon = Daemon::start();
         let own_scope = daemon.project_scope_id();
         let store = daemon.store();
@@ -797,7 +825,6 @@ fn bench_eligibility(c: &mut Criterion) {
         assert!(verdicts.iter().all(|v| v["verdict"] == "ok"), "{response}");
         drop(store);
 
-        let cold = format!("eligibility/{count}-candidates/cold");
         if !profile_or_bench(&cold, || {
             daemon.handler.clear_eligibility_cache_for_test();
             black_box(daemon.call(request.clone()));
@@ -821,7 +848,6 @@ fn bench_eligibility(c: &mut Criterion) {
         }
         let warm = daemon.assert_available(request.clone());
         assert_eq!(warm["cache_hits"], count, "{warm}");
-        let warm_case = format!("eligibility/{count}-candidates/warm");
         if profile_or_bench(&warm_case, || {
             black_box(daemon.call(request.clone()));
         }) {
@@ -833,7 +859,13 @@ fn bench_eligibility(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new(format!("{count}-candidates"), "warm"),
             &request,
-            |b, request| b.iter(|| black_box(daemon.call(request.clone()))),
+            |b, request| {
+                b.iter_batched(
+                    || request.clone(),
+                    |request| black_box(daemon.call(request)),
+                    BatchSize::PerIteration,
+                )
+            },
         );
         daemon.shutdown();
     }
@@ -983,7 +1015,11 @@ fn bench_egress(c: &mut Criterion) {
             continue;
         }
         group.bench_with_input(BenchmarkId::new("decide", name), &request, |b, request| {
-            b.iter(|| black_box(daemon.call(request.clone())))
+            b.iter_batched(
+                || request.clone(),
+                |request| black_box(daemon.call(request)),
+                BatchSize::PerIteration,
+            )
         });
     }
     daemon.shutdown();
@@ -1094,6 +1130,10 @@ fn bench_ingest_page(c: &mut Criterion) {
         ("256k", 256 * 1024),
         ("PAGE_BYTES_MAX", PAGE_BYTES_MAX),
     ] {
+        let case = format!("ingest/page/{label}");
+        if profile_skips(&case) {
+            continue;
+        }
         let daemon = Daemon::start();
         // One page of `bytes` inside a two-page upload, so `page` never
         // completes it and `finish` is never reached. Each iteration begins a
@@ -1107,7 +1147,6 @@ fn bench_ingest_page(c: &mut Criterion) {
         let staged = daemon.assert_available(page.clone());
         assert_eq!(staged["received_pages"], 1, "{staged}");
         let mut counter = 0usize;
-        let case = format!("ingest/page/{label}");
         if profile_or_bench(&case, || {
             counter += 1;
             let id = format!("u{counter}");
@@ -1145,31 +1184,39 @@ fn bench_ingest_finish(c: &mut Criterion) {
         return;
     }
     let mut group = c.benchmark_group("ingest/finish");
-    for (label, bytes) in [("1MiB", 1usize << 20), ("64MiB", 64usize << 20)] {
-        let daemon = Daemon::start();
+    for (label, bytes, reset_every) in
+        [("1MiB", 1usize << 20, 16usize), ("64MiB", 64usize << 20, 4)]
+    {
+        let case = format!("ingest/finish/{label}");
+        if profile_skips(&case) {
+            continue;
+        }
         let payload = text_payload(bytes, 0);
         assert!(
             payload.len() > COUNTER_TAG_BYTES,
             "ingest/finish/{label} payload must hold a {COUNTER_TAG_BYTES}-byte tag plus newline"
         );
         let page_count = bytes.div_ceil(PAGE_BYTES_MAX) as u32;
-        let pages: Vec<Value> = payload
-            .chunks(PAGE_BYTES_MAX)
-            .enumerate()
-            .map(|(i, chunk)| ingest_page_request(&daemon, "u", i as u32, chunk))
-            .collect();
-        let begin = ingest_begin_request(&daemon, "u", &payload, page_count);
-        let mut counter = 0usize;
-        // Every iteration ingests distinct bytes so the CAS never dedups: the
-        // last line carries the counter, which changes the payload digest and
-        // the last page's digest.
-        let stage = |daemon: &Daemon, counter: usize| -> Value {
-            let id = format!("u{counter}");
+        let mut cycle = Cycled::new(reset_every, || {
+            let daemon = Daemon::start();
+            let pages: Vec<Value> = payload
+                .chunks(PAGE_BYTES_MAX)
+                .enumerate()
+                .map(|(i, chunk)| ingest_page_request(&daemon, "u", i as u32, chunk))
+                .collect();
+            let begin = ingest_begin_request(&daemon, "u", &payload, page_count);
+            (daemon, (pages, begin))
+        });
+        // Every use ingests distinct bytes so the CAS never dedups: the last
+        // line carries the use index, which changes the payload digest and the
+        // last page's digest.
+        let stage = |daemon: &Daemon, (pages, begin): &(Vec<Value>, Value), n: usize| -> Value {
+            let id = format!("u{n}");
             let mut payload = payload.clone();
-            let tag = format!("{counter:0COUNTER_TAG_BYTES$}");
-            let n = payload.len();
-            payload[n - 1 - COUNTER_TAG_BYTES..n - 1].copy_from_slice(tag.as_bytes());
-            let mut begin = rekey_begin(&begin, &id);
+            let tag = format!("{n:0COUNTER_TAG_BYTES$}");
+            let len = payload.len();
+            payload[len - 1 - COUNTER_TAG_BYTES..len - 1].copy_from_slice(tag.as_bytes());
+            let mut begin = rekey_begin(begin, &id);
             begin["payload_digest"] = json!(sha256_hex(&payload));
             daemon.assert_available(begin);
             let last = pages.len() - 1;
@@ -1185,28 +1232,20 @@ fn bench_ingest_finish(c: &mut Criterion) {
             }
             ingest_finish_request(daemon, &id)
         };
-        let case = format!("ingest/finish/{label}");
         if profile_or_bench(&case, || {
-            counter += 1;
-            let finish = stage(&daemon, counter);
-            black_box(daemon.call(finish));
+            let (daemon, state, n) = cycle.stage();
+            black_box(daemon.call(stage(daemon, state, n)));
         }) {
-            daemon.shutdown();
+            cycle.reset();
             continue;
         }
         group.sample_size(10);
+        group.sampling_mode(SamplingMode::Flat);
         group.throughput(Throughput::Bytes(bytes as u64));
         group.bench_function(BenchmarkId::new("finish", label), |b| {
-            b.iter_batched(
-                || {
-                    counter += 1;
-                    stage(&daemon, counter)
-                },
-                |finish| black_box(daemon.call(finish)),
-                BatchSize::PerIteration,
-            )
+            b.iter_custom(|iters| time_cycled(&mut cycle, iters, stage))
         });
-        daemon.shutdown();
+        cycle.reset();
     }
     group.finish();
 }
