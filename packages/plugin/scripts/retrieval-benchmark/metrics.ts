@@ -315,6 +315,7 @@ export interface ScoredQuery {
         recallAt50: number | null;
         reciprocalRank: number;
         ndcgAt10: number | null;
+        duplicateRateAt50: number | null;
     };
 }
 
@@ -328,6 +329,7 @@ export interface MacroAggregate {
     recallAt50: number | null;
     mrr: number | null;
     ndcgAt10: number | null;
+    duplicateRateAt50: number | null;
 }
 
 /* */
@@ -339,6 +341,7 @@ export function scoredQueryValues(metrics: QueryMetrics): ScoredQuery["values"] 
         recallAt50: at(50),
         reciprocalRank: metrics.reciprocalRank,
         ndcgAt10: metrics.ndcgAt10,
+        duplicateRateAt50: metrics.cutoffs.find((c) => c.cutoff === 50)?.duplicateRate ?? null,
     };
 }
 
@@ -373,6 +376,7 @@ export function macroAggregate(queries: readonly ScoredQuery[]): MacroAggregate[
             recallAt50: meanOrNull(group.map((q) => q.values.recallAt50)),
             mrr: meanOrNull(group.map((q) => q.values.reciprocalRank)),
             ndcgAt10: meanOrNull(group.map((q) => q.values.ndcgAt10)),
+            duplicateRateAt50: meanOrNull(group.map((q) => q.values.duplicateRateAt50)),
         }));
         aggregates.push({
             metricPolicyVersion: METRIC_POLICY_VERSION,
@@ -384,6 +388,7 @@ export function macroAggregate(queries: readonly ScoredQuery[]): MacroAggregate[
             recallAt50: meanOrNull(groupMeans.map((g) => g.recallAt50)),
             mrr: meanOrNull(groupMeans.map((g) => g.mrr)),
             ndcgAt10: meanOrNull(groupMeans.map((g) => g.ndcgAt10)),
+            duplicateRateAt50: meanOrNull(groupMeans.map((g) => g.duplicateRateAt50)),
         });
     }
     return aggregates.sort((a, b) =>

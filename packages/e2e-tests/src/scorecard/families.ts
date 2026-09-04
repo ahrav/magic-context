@@ -1,5 +1,5 @@
 import { aggregateReportQuality, type BenchmarkReport } from "../../../plugin/scripts/retrieval-benchmark/report";
-import { gateAggregates } from "../../../plugin/scripts/retrieval-benchmark/metrics";
+import { gateAggregates, type MacroAggregate } from "../../../plugin/scripts/retrieval-benchmark/metrics";
 import { compareCodeUnits } from "../code-unit-order";
 import type { DreamerEvalRunReport } from "../dreamer-eval/contract";
 import type { LaneReport as HistorianReport } from "../historian-eval/scorer";
@@ -16,7 +16,7 @@ import {
     type ScoreFamilyId,
     type SecondaryMetricKey,
 } from "./policy";
-import type { FamilyEstimateRow, MetricSlot, MetricUnit, ScoreFamilySection, UtilitySection } from "./report-contract";
+import { estimateId, type FamilyEstimateRow, type MetricSlot, type MetricUnit, type ScoreFamilySection, type UtilitySection } from "./report-contract";
 
 /** The incident-pool family whose cases compare the same scenario across harnesses. */
 export const PARITY_FAMILY_ID = "fam-parity-harness-gaps";
@@ -78,7 +78,7 @@ export function familyEstimateRows(report: PairedDeltaReport): FamilyEstimateRow
     return report.body.analysis.endpoints
         .flatMap((estimate) => estimate.families.map((family): FamilyEstimateRow => ({
             endpoint: estimate.endpoint as FamilyEstimateRow["endpoint"],
-            familyId: family.familyId,
+            familyId: estimateId(family.familyId, "paired-delta.familyId"),
             pointEstimate: family.pointEstimate,
             interval: family.interval,
             noiseLabel: family.noise.label,
@@ -107,28 +107,23 @@ function formationReading(report: HistorianReport, id: MetricSlotId): Reading {
 
 const RETRIEVAL_SLOT_RE = /^(recall-at-10|recall-at-50|reciprocal-rank|ndcg-at-10|duplicate-rate-at-50)-(explicit|automatic)$/;
 
+const RETRIEVAL_AGGREGATE_FIELDS: Readonly<Record<string, keyof Pick<MacroAggregate, "recallAt10" | "recallAt50" | "mrr" | "ndcgAt10" | "duplicateRateAt50">>> = {
+    "recall-at-10": "recallAt10",
+    "recall-at-50": "recallAt50",
+    "reciprocal-rank": "mrr",
+    "ndcg-at-10": "ndcgAt10",
+    "duplicate-rate-at-50": "duplicateRateAt50",
+};
+
+/** Every retrieval slot reads the lane's gate aggregate, so lane-restricted diagnostic cases and paraphrase weighting apply uniformly. */
 function retrievalReading(report: BenchmarkReport, id: MetricSlotId): Reading {
     const match = RETRIEVAL_SLOT_RE.exec(id);
     if (match === null) return PENDING;
-    const metric = match[1]!;
+    const field = RETRIEVAL_AGGREGATE_FIELDS[match[1]!]!;
     const mode = match[2]! as "explicit" | "automatic";
-    if (metric === "duplicate-rate-at-50") {
-        const rates = report.evidence.scenarios
-            .filter((scenario) => scenario.partition === "holdout" && scenario.mode === mode)
-            .map((scenario) => scenario.metrics.duplicateRateAt50)
-            .filter((rate): rate is number => rate !== null);
-        return ratio(mean(rates), "no-holdout-queries");
-    }
     const aggregate = gateAggregates(aggregateReportQuality(report)).find((entry) => entry.mode === mode);
     if (aggregate === undefined) return { reason: "no-holdout-queries" };
-    const value = metric === "recall-at-10"
-        ? aggregate.recallAt10
-        : metric === "recall-at-50"
-            ? aggregate.recallAt50
-            : metric === "reciprocal-rank"
-                ? aggregate.mrr
-                : aggregate.ndcgAt10;
-    return ratio(value, "no-holdout-queries");
+    return ratio(aggregate[field], "no-holdout-queries");
 }
 
 function pairedDeltaReliability(report: PairedDeltaReport, id: MetricSlotId): Reading {

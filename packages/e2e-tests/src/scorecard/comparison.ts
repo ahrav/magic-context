@@ -1,7 +1,7 @@
 import { compareCodeUnits } from "../code-unit-order";
 import type { RawRegretLadder } from "../paired-delta/report";
 import { laneEvidence, type BaselineEvidence, type ScorecardEvidenceBundle } from "./evidence";
-import type { AdverseRow, BaselineStatus, DeltaRow, FamilyEstimateRow } from "./report-contract";
+import { estimateId, type AdverseRow, type BaselineStatus, type DeltaRow, type FamilyEstimateRow } from "./report-contract";
 
 export interface BaselineEstimates {
     status: BaselineStatus;
@@ -93,5 +93,10 @@ export function compareWithBaseline(current: readonly FamilyEstimateRow[], basel
 /** The paired-delta ladder runs only for coordinates the treatment arm failed, so its raw rows are already the failures-only decomposition. */
 export function regretRows(bundle: ScorecardEvidenceBundle): RawRegretLadder[] {
     const pairedDelta = laneEvidence(bundle, "paired-delta");
-    return pairedDelta.status === "present" && pairedDelta.report !== null ? pairedDelta.report.body.regret.raw : [];
+    if (pairedDelta.status !== "present" || pairedDelta.report === null) return [];
+    return pairedDelta.report.body.regret.raw.map((row) => ({
+        ...row,
+        coordinateId: estimateId(row.coordinateId, "paired-delta.regret.coordinateId"),
+        familyId: estimateId(row.familyId, "paired-delta.regret.familyId"),
+    }));
 }

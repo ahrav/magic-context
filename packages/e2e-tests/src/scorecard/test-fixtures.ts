@@ -356,14 +356,20 @@ export function incidentReportFixture(results: readonly IncidentCaseResult[] = [
 
 export function retrievalScenarioFixture(
     queryId: string,
-    overrides: { mode?: ReportScenario["mode"]; partition?: ReportScenario["partition"]; metricValue?: number; duplicateRateAt50?: number | null } = {},
+    overrides: {
+        mode?: ReportScenario["mode"];
+        partition?: ReportScenario["partition"];
+        paraphraseGroup?: string;
+        metricValue?: number;
+        duplicateRateAt50?: number | null;
+    } = {},
 ): ReportScenario {
     const metricValue = overrides.metricValue ?? 1;
     return {
         queryId,
         mode: overrides.mode ?? "explicit",
         partition: overrides.partition ?? "holdout",
-        paraphraseGroup: `pg-${queryId}`,
+        paraphraseGroup: overrides.paraphraseGroup ?? `pg-${queryId}`,
         rankedPhysical: ["memory:1", "memory:2"],
         deliveredPhysical: ["memory:1"],
         deliveredTokens: 120,
@@ -385,7 +391,17 @@ export function retrievalScenarioFixture(
     };
 }
 
-export function retrievalReportFixture(options: { status?: BenchmarkReport["status"]; scenarios?: ReportScenario[] } = {}): BenchmarkReport {
+export function retrievalReportFixture(options: {
+    status?: BenchmarkReport["status"];
+    scenarios?: ReportScenario[];
+    /** Case ids whose queries the lane treats as diagnostic and excludes from gate aggregates. */
+    laneRestrictedCaseIds?: readonly string[];
+} = {}): BenchmarkReport {
+    const scenarios = options.scenarios ?? [
+        retrievalScenarioFixture("case-1:q-1", { mode: "explicit" }),
+        retrievalScenarioFixture("case-1:q-2", { mode: "automatic", metricValue: 0.5, duplicateRateAt50: 0.2 }),
+    ];
+    const caseIds = [...new Set(scenarios.map((scenario) => scenario.queryId.split(":", 1)[0]!))].sort();
     return parseRetrievalReport({
         schemaVersion: RETRIEVAL_REPORT_SCHEMA_VERSION,
         status: options.status ?? "complete",
@@ -404,21 +420,18 @@ export function retrievalReportFixture(options: { status?: BenchmarkReport["stat
                 workingDirectory: null,
                 diagnostics: [],
             }],
-            scenarios: options.scenarios ?? [
-                retrievalScenarioFixture("case-1:q-1", { mode: "explicit" }),
-                retrievalScenarioFixture("case-1:q-2", { mode: "automatic", metricValue: 0.5, duplicateRateAt50: 0.2 }),
-            ],
-            cases: [{
-                caseId: "case-1",
+            scenarios,
+            cases: caseIds.map((caseId) => ({
+                caseId,
                 workerCount: 1,
                 warmups: 1,
                 samplesPerQuery: 3,
                 fixture: { manifestFingerprint: H4, indexBuildMs: 250, snapshotBytes: 4096 },
                 selectivityObserved: { preFilterDenominator: 100, eligibleCount: 100 },
                 cacheLayers: [],
-                laneRestricted: false,
+                laneRestricted: options.laneRestrictedCaseIds?.includes(caseId) ?? false,
                 latencySummary: null,
-            }],
+            })),
         },
         candidatePool: {
             schemaVersion: CANDIDATE_POOL_SCHEMA_VERSION,

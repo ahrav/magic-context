@@ -73,4 +73,10 @@ describe("compareWithBaseline", () => {
         expect(report.body.regret.raw.length).toBeGreaterThan(0);
         expect(regretRows(bundleFixture({ statuses: { "paired-delta": "incomplete" } }))).toEqual([]);
     });
+
+    it("rejects regret ladder ids outside the report contract's id shape", () => {
+        const report = structuredClone(pairedDeltaReportFixture());
+        report.body.regret.raw[0]!.coordinateId = "var-a:0 ";
+        expect(() => regretRows(bundleFixture({ lanes: { "paired-delta": report } }))).toThrow(/coordinateId/);
+    });
 });

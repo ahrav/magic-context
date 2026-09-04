@@ -96,6 +96,29 @@ describe("buildScoreFamilies", () => {
         expect(slot(families.retrieval.slots, "currentness")).toMatchObject({ reason: "producer-pending" });
     });
 
+    it("weights the duplicate rate by paraphrase group and drops lane-restricted cases like its sibling slots", () => {
+        const retrieval = retrievalReportFixture({
+            scenarios: [
+                retrievalScenarioFixture("case-1:q-1", { paraphraseGroup: "pg-a", metricValue: 1, duplicateRateAt50: 1 }),
+                retrievalScenarioFixture("case-1:q-2", { paraphraseGroup: "pg-a", metricValue: 1, duplicateRateAt50: 1 }),
+                retrievalScenarioFixture("case-1:q-3", { paraphraseGroup: "pg-a", metricValue: 1, duplicateRateAt50: 1 }),
+                retrievalScenarioFixture("case-1:q-4", { paraphraseGroup: "pg-b", metricValue: 0, duplicateRateAt50: 0 }),
+                retrievalScenarioFixture("case-2:q-5", { paraphraseGroup: "pg-c", metricValue: 0, duplicateRateAt50: 0 }),
+            ],
+            laneRestrictedCaseIds: ["case-2"],
+        });
+        const families = buildScoreFamilies(bundleFixture({ lanes: { retrieval } }));
+        // Micro-averaging over the five queries would give 0.6; the lane's gate policy gives each intent equal weight and excludes case-2.
+        expect(value(families.retrieval.slots, "duplicate-rate-at-50-explicit")).toBeCloseTo(0.5);
+        expect(value(families.retrieval.slots, "recall-at-10-explicit")).toBeCloseTo(0.5);
+    });
+
+    it("rejects a paired-delta estimate family id outside the report contract's id shape", () => {
+        const report = structuredClone(pairedDeltaReportFixture());
+        report.body.analysis.endpoints[0]!.families[0]!.familyId = "fam a";
+        expect(() => buildScoreFamilies(bundleFixture({ lanes: { "paired-delta": report } }))).toThrow(/familyId/);
+    });
+
     it("measures cross-harness parity from incident-pool parity cases when present", () => {
         const incident = incidentReportFixture([
             incidentResultFixture(),

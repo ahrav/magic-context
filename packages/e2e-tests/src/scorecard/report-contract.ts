@@ -145,6 +145,10 @@ export const REPORT_BODY_KEYS = [
 const NOISE_LABELS = ["no-noise-floor", "inside-floor", "outside-floor"] as const satisfies readonly NoiseComparison[];
 const ESTIMATE_FAMILY_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
+export function estimateId(value: unknown, label: string): string {
+    return staticId(value, label, ESTIMATE_FAMILY_ID_RE);
+}
+
 function finiteNumber(value: unknown, label: string): number {
     if (typeof value !== "number" || !Number.isFinite(value)) fail(`${label}: number-invalid`);
     return value as number;
@@ -227,7 +231,7 @@ function parseFamilyEstimateRow(raw: unknown, label: string): FamilyEstimateRow 
     exact(value, ["endpoint", "familyId", "pointEstimate", "interval", "noiseLabel"], label);
     return {
         endpoint: enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`),
-        familyId: staticId(value.familyId, `${label}.familyId`, ESTIMATE_FAMILY_ID_RE),
+        familyId: estimateId(value.familyId, `${label}.familyId`),
         pointEstimate: finiteNumber(value.pointEstimate, `${label}.pointEstimate`),
         interval: parseInterval(value.interval, `${label}.interval`),
         noiseLabel: enumeration(value.noiseLabel, NOISE_LABELS, `${label}.noiseLabel`),
@@ -238,7 +242,7 @@ function parseDeltaRow(raw: unknown, label: string): DeltaRow {
     const value = record(raw, label);
     const status = enumeration(value.status, ["compared", "no-baseline"] as const, `${label}.status`);
     const endpoint = enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`);
-    const familyId = staticId(value.familyId, `${label}.familyId`, ESTIMATE_FAMILY_ID_RE);
+    const familyId = estimateId(value.familyId, `${label}.familyId`);
     if (status === "compared") {
         exact(value, ["endpoint", "familyId", "status", "delta", "interval", "noiseLabel"], label);
         return {
@@ -272,7 +276,7 @@ function parseAdverseRow(raw: unknown, index: number): AdverseRow {
     const value = record(raw, label);
     exact(value, ["familyId", "endpoint", "kind", "noiseLabel", "delta", "interval", "blocking"], label);
     const row: AdverseRow = {
-        familyId: staticId(value.familyId, `${label}.familyId`, ESTIMATE_FAMILY_ID_RE),
+        familyId: estimateId(value.familyId, `${label}.familyId`),
         endpoint: nullable(value.endpoint, (endpoint) => enumeration(endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`)),
         kind: enumeration(value.kind, ADVERSE_KINDS, `${label}.kind`),
         noiseLabel: nullable(value.noiseLabel, (noise) => enumeration(noise, NOISE_LABELS, `${label}.noiseLabel`)),
@@ -296,8 +300,8 @@ function parseRegretRow(raw: unknown, index: number): RawRegretLadder {
     const rung = (field: "retrieval" | "formation" | "representation"): number | null =>
         nullable(value[field], (delta) => finiteNumber(delta, `${label}.${field}`));
     return {
-        coordinateId: staticId(value.coordinateId, `${label}.coordinateId`, ESTIMATE_FAMILY_ID_RE),
-        familyId: staticId(value.familyId, `${label}.familyId`, ESTIMATE_FAMILY_ID_RE),
+        coordinateId: estimateId(value.coordinateId, `${label}.coordinateId`),
+        familyId: estimateId(value.familyId, `${label}.familyId`),
         retrieval: rung("retrieval"),
         formation: rung("formation"),
         representation: rung("representation"),

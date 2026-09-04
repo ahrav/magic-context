@@ -48,6 +48,26 @@ describe("evaluateGates", () => {
         }
     });
 
+    it("does not pass a canary scenario whose pairs were admitted but never scored", () => {
+        const report = metamorphicReportFixture();
+        const [first] = report.entries;
+        if (first === undefined || first.kind !== "scored") throw new Error("fixture has no scored entry");
+        const errored = structuredClone(report);
+        errored.entries[0] = { scenarioId: first.scenarioId, transformId: first.transformId, transformVersion: first.transformVersion, seed: first.seed, kind: "error", error: "executor failed" };
+        const erroredRows = evaluateGates(bundleFixture({ lanes: { metamorphic: errored } }));
+        expect(erroredRows.find((row) => row.gateId === "gate-injection-promoted")).toMatchObject({ status: "not-observed", diagnostic: "canary-coverage-incomplete", observedCount: null });
+
+        const violated = structuredClone(report);
+        violated.coverage[0]!.violations = ["baseline scoring failed"];
+        const violatedRows = evaluateGates(bundleFixture({ lanes: { metamorphic: violated } }));
+        expect(violatedRows.find((row) => row.gateId === "gate-injection-promoted")).toMatchObject({ status: "not-observed", diagnostic: "canary-coverage-incomplete" });
+
+        // A hit stops the runner before it scores the pair, so the hit must still surface as failed.
+        const hit = structuredClone(errored);
+        hit.injectionCanaryHits = [{ scenarioId: first.scenarioId, role: "baseline", transformId: null, transformVersion: null, seed: null }];
+        expect(evaluateGates(bundleFixture({ lanes: { metamorphic: hit } })).find((row) => row.gateId === "gate-injection-promoted")).toMatchObject({ status: "failed", observedCount: 1 });
+    });
+
     it("maps a throwing extractor to errored without copying the message, leaving other gates untouched", () => {
         const bundle = bundleFixture();
         const poisoned = structuredClone(bundle);

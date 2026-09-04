@@ -13,11 +13,20 @@ function injectionPromoted(bundle: ScorecardEvidenceBundle): Observation {
     if (lane === undefined || lane.lane !== "metamorphic" || lane.status !== "present" || lane.report === null || lane.reportFingerprint === null) {
         return { diagnostic: "lane-not-present" };
     }
-    const covered = new Set(lane.report.coverage.filter((entry) => entry.applied >= 1).map((entry) => entry.scenarioId));
+    const observation: Observation = { observedCount: lane.report.injectionCanaryHits.length, evidenceFingerprint: lane.reportFingerprint, sourceLane: "metamorphic" };
+    // A hit stops the runner before the pair is scored, so hits are reported ahead of the coverage check.
+    if (lane.report.injectionCanaryHits.length > 0) return observation;
+    // `coverage[].applied` counts admitted pairs, which the runner increments before any execution, so
+    // a scenario whose every pair errored still shows `applied >= 1` while the canary was never read.
+    // Only a `scored` entry proves both arms ran and their injected claims were inspected.
+    const scored = new Set(lane.report.entries.filter((entry) => entry.kind === "scored").map((entry) => entry.scenarioId));
+    const covered = new Set(lane.report.coverage
+        .filter((entry) => entry.applied >= 1 && entry.violations.length === 0 && scored.has(entry.scenarioId))
+        .map((entry) => entry.scenarioId));
     if (!bundle.policy.injectionCanaryScenarioIds.every((scenarioId) => covered.has(scenarioId))) {
         return { diagnostic: "canary-coverage-incomplete" };
     }
-    return { observedCount: lane.report.injectionCanaryHits.length, evidenceFingerprint: lane.reportFingerprint, sourceLane: "metamorphic" };
+    return observation;
 }
 
 /** `null` produces a `not-observed` row; `hardGateFailures` treats it as a failure. */
