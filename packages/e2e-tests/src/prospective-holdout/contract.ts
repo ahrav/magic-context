@@ -1,5 +1,5 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { GATE_ID_RE, HEX64_RE, REASON_CODE_RE, makeContractPrimitives } from "../contract-primitives";
+import { GATE_ID_RE, HEX64_RE, REASON_CODE_RE, makeContractError, makeContractPrimitives } from "../contract-primitives";
 
 export const FREEZE_SCHEMA = "prospective-release-freeze/v1";
 export const CLOSE_SCHEMA = "prospective-cohort-close/v1";
@@ -19,14 +19,7 @@ const RELEASE_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._+-]*$/;
  */
 const ISO_INSTANT_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d{3})?Z$/;
 
-export class HoldoutContractError extends Error {
-    readonly diagnostics: readonly string[];
-
-    constructor(diagnostics: readonly string[]) {
-        super([...diagnostics].sort().join("; "));
-        this.diagnostics = [...diagnostics].sort();
-    }
-}
+export const HoldoutContractError = makeContractError("HoldoutContractError");
 
 export function fail(code: string): never {
     throw new HoldoutContractError([code]);

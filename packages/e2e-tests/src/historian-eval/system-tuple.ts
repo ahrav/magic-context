@@ -12,6 +12,11 @@ const SYSTEM_VERSION_TUPLE_KEYS = vocabulary<keyof SystemVersionTuple>({
     chunkTokenBudget: true,
 });
 
+// Mirrors `resolveRepoCommitSha` in runner.ts: a 40-hex HEAD, that sha plus `-dirty.` and 12 hex of the tree digest, or `unknown`. commentlint: allow(JUDGE)
+const COMMIT_SHA_RE = /^(?:[0-9a-f]{40}(?:-dirty\.[0-9a-f]{12})?|unknown)$/;
+/** No whitespace, so a tuple field cannot carry prose. */
+export const IDENTITY_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._:/+@-]*$/;
+
 /**
  * Parses a `SystemVersionTuple` with the caller's primitives so every lane report raises its own error class.
  *
@@ -23,11 +28,11 @@ export function parseSystemVersionTuple(p: ContractPrimitives, raw: unknown, lab
     p.exact(value, SYSTEM_VERSION_TUPLE_KEYS, label);
     if (value.parserImpl !== "ts") p.fail(`${label}.parserImpl: enum-invalid`);
     return {
-        repoCommitSha: p.string(value.repoCommitSha, `${label}.repoCommitSha`),
-        bunVersion: p.string(value.bunVersion, `${label}.bunVersion`),
-        opencodeVersion: p.string(value.opencodeVersion, `${label}.opencodeVersion`),
-        historianModelId: p.string(value.historianModelId, `${label}.historianModelId`),
-        probeModelId: p.string(value.probeModelId, `${label}.probeModelId`),
+        repoCommitSha: p.staticId(value.repoCommitSha, `${label}.repoCommitSha`, COMMIT_SHA_RE),
+        bunVersion: p.staticId(value.bunVersion, `${label}.bunVersion`, IDENTITY_TOKEN_RE),
+        opencodeVersion: p.staticId(value.opencodeVersion, `${label}.opencodeVersion`, IDENTITY_TOKEN_RE),
+        historianModelId: p.staticId(value.historianModelId, `${label}.historianModelId`, IDENTITY_TOKEN_RE),
+        probeModelId: p.staticId(value.probeModelId, `${label}.probeModelId`, IDENTITY_TOKEN_RE),
         parserImpl: "ts",
         chunkTokenBudget: value.chunkTokenBudget === null ? null : p.integer(value.chunkTokenBudget, `${label}.chunkTokenBudget`, 1),
     };

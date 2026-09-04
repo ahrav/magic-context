@@ -1,6 +1,6 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { REPORT_SCHEMA_VERSION as RETRIEVAL_REPORT_SCHEMA, type BenchmarkReport } from "../../../plugin/scripts/retrieval-benchmark/report";
-import { GATE_ID_RE, REASON_CODE_RE, makeContractPrimitives, vocabulary } from "../contract-primitives";
+import { GATE_ID_RE, REASON_CODE_RE, makeContractError, makeContractPrimitives, vocabulary } from "../contract-primitives";
 import { DREAMER_EVAL_REPORT_SCHEMA } from "../dreamer-eval/contract";
 import { SCENARIO_ID_RE } from "../historian-eval/contract";
 import type { SystemVersionTuple } from "../historian-eval/runner";
@@ -15,15 +15,7 @@ import { PAIRED_DELTA_REPORT_SCHEMA, type SecondaryMetrics } from "../paired-del
 export const SCORECARD_POLICY_SCHEMA = "scorecard-policy/v1";
 export const SCORECARD_POLICY_OWNER = "magic-context-x4l.15";
 
-export class ScorecardContractError extends Error {
-    readonly diagnostics: readonly string[];
-
-    constructor(diagnostics: readonly string[]) {
-        super([...diagnostics].sort().join("; "));
-        this.name = "ScorecardContractError";
-        this.diagnostics = [...diagnostics].sort();
-    }
-}
+export const ScorecardContractError = makeContractError("ScorecardContractError");
 
 const p = makeContractPrimitives(ScorecardContractError);
 export const {

@@ -267,7 +267,7 @@ function makeRecord(
         projectIdentity: PROJECT_IDENTITY,
         nowMs: fixture.nowMs,
         system: {
-            repoCommitSha: "test",
+            repoCommitSha: "c".repeat(40),
             bunVersion: "test-bun",
             opencodeVersion: "test",
             historianModelId: "scripted-mock",
@@ -1014,6 +1014,11 @@ describe("scoreRunRecord", () => {
                     expect(score.errorReason, `${field}=${JSON.stringify(empty)}`).toBe("record-malformed");
                 }
             }
+            // The record and the archived report share one tuple parser, so a field the report reader would
+            // refuse cannot be scored into it.
+            expect(scoreRunRecord({ ...record, system: { ...record.system, repoCommitSha: "not-a-sha" } }, scenario).errorReason).toBe("record-malformed");
+            expect(scoreRunRecord({ ...record, system: { ...record.system, bunVersion: "1.2.3 canary" } }, scenario).errorReason).toBe("record-malformed");
+            expect(scoreRunRecord({ ...record, system: { ...record.system, repoCommitSha: `${"a".repeat(40)}-dirty.${"b".repeat(12)}` } }, scenario).errorReason).not.toBe("record-malformed");
         } finally {
             fixture.cleanup();
         }
@@ -2554,6 +2559,12 @@ describe("buildLaneReport", () => {
         const badReason = structuredClone(report) as unknown as { scenarios: { failReasons: string[] }[] };
         badReason.scenarios[1]!.failReasons = ["vibes"];
         expect(() => parseLaneReport(badReason)).toThrow(/report\.scenarios\[1\]\.failReasons\[0\]: enum-invalid/);
+        const badSha = structuredClone(report) as unknown as { system: { repoCommitSha: string; probeModelId: string } };
+        badSha.system.repoCommitSha = "not a sha";
+        expect(() => parseLaneReport(badSha)).toThrow(/report\.system\.repoCommitSha: id-invalid/);
+        badSha.system.repoCommitSha = report.system!.repoCommitSha;
+        badSha.system.probeModelId = "anthropic/claude sonnet";
+        expect(() => parseLaneReport(badSha)).toThrow(/report\.system\.probeModelId: id-invalid/);
         const badVerdict = structuredClone(report) as unknown as { scenarios: { verdict: string }[] };
         badVerdict.scenarios[0]!.verdict = "GREEN";
         // Error metadata belongs to ERROR alone, and every ERROR names its reason.

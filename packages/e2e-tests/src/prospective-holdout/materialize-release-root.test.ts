@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ContractError } from "../contract-primitives";
 import { HoldoutContractError } from "./contract";
 import { LOCK_LEASE_MS, LOCK_OWNER_FILE } from "./lock";
 import { materializeReleaseRoot } from "./materialize-release-root";
@@ -84,7 +85,7 @@ describe("release root materialization", () => {
                 rmSync(conflicting, { recursive: true, force: true });
             }
             expect(rejected).toBeInstanceOf(HoldoutContractError);
-            expect((rejected as HoldoutContractError).diagnostics).toEqual([
+            expect((rejected as ContractError).diagnostics).toEqual([
                 "release-root-materialize: destination-conflict",
             ]);
             expect(existsSync(join(parent, ".v3.publish-lock"))).toBe(false);

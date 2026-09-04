@@ -25,7 +25,7 @@ import { createClaimReaderTestDatabase } from "../../../plugin/src/features/magi
 import type { Database } from "../../../plugin/src/shared/sqlite";
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { compareCodeUnits } from "../code-unit-order";
-import { makeContractPrimitives, type ContractPrimitives } from "../contract-primitives";
+import { makeContractError, makeContractPrimitives, type ContractPrimitives } from "../contract-primitives";
 import { openTestDb } from "../test-db";
 import { parseSystemVersionTuple, requireScoreSystemBinding } from "./system-tuple";
 import {
@@ -756,15 +756,13 @@ function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
 }
 
-/**
- *
- */
-/**
- *
- */
-/* */
-function isIdentityValue(value: unknown): boolean {
-    return typeof value === "string" && value.trim().length > 0;
+/** The run record and the archived report carry the same tuple, so one parser decides its shape for both. */
+function isSystemTuple(system: unknown): boolean {
+    try {
+        return parseSystemVersionTuple(p, system, "system") !== null;
+    } catch {
+        return false;
+    }
 }
 
 /** The id a malformed record's ERROR score carries; `parseScenarioScore` admits only a non-blank id. */
@@ -793,20 +791,7 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
     if (typeof record.sessionId !== "string") problems.push("sessionId");
     if (typeof record.projectIdentity !== "string") problems.push("projectIdentity");
     if (typeof record.nowMs !== "number" || !Number.isFinite(record.nowMs)) problems.push("nowMs");
-    if (
-        record.system === null ||
-        typeof record.system !== "object" ||
-        !isIdentityValue(record.system.repoCommitSha) ||
-        !isIdentityValue(record.system.bunVersion) ||
-        !isIdentityValue(record.system.opencodeVersion) ||
-        !isIdentityValue(record.system.historianModelId) ||
-        !isIdentityValue(record.system.probeModelId) ||
-        record.system.parserImpl !== "ts" ||
-        !(record.system.chunkTokenBudget === null ||
-            (Number.isSafeInteger(record.system.chunkTokenBudget) && record.system.chunkTokenBudget >= 1))
-    ) {
-        problems.push("system");
-    }
+    if (!isSystemTuple(record.system)) problems.push("system");
     if (typeof record.expectedHistorianRuns !== "number") problems.push("expectedHistorianRuns");
     if (!Array.isArray(record.historianRuns)) {
         problems.push("historianRuns");
@@ -1847,15 +1832,7 @@ export function buildLaneReport(
     };
 }
 
-export class HistorianReportError extends Error {
-    readonly diagnostics: readonly string[];
-
-    constructor(diagnostics: readonly string[]) {
-        super(diagnostics.join("; "));
-        this.name = "HistorianReportError";
-        this.diagnostics = diagnostics;
-    }
-}
+export const HistorianReportError = makeContractError("HistorianReportError");
 
 const p = makeContractPrimitives(HistorianReportError);
 
