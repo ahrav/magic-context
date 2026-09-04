@@ -2266,6 +2266,42 @@ async fn egress_gate_requires_the_owning_object_to_be_served() {
     daemon.handler.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn egress_gate_judges_the_owner_by_its_served_class() {
+    let daemon = Daemon::start().await;
+    let [normal, _, _] = egress_fixture(&daemon).await;
+    let recorder = Recorder(std::sync::atomic::AtomicUsize::new(0));
+    // Written `normal`, admitted under a `personal` taint: the serving view
+    // classes the owner `sensitive` even though the artifact it cites is normal.
+    let mut personal = commit_request(
+        &daemon.project,
+        "personal-owner",
+        vec![citing_decision(5, "evidence-normal")],
+        vec![],
+    );
+    personal["asserted_taint_class"] = json!("personal");
+    assert_state(
+        &daemon.call(daemon.route, personal).await,
+        "available",
+        None,
+    );
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-5")
+            .await,
+        refused("owner_sensitive")
+    );
+    assert_eq!(recorder.requests(), 0);
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "local", "normal", "decision-object-5")
+            .await,
+        json!("allowed")
+    );
+    assert_eq!(recorder.requests(), 1);
+    daemon.handler.shutdown().await.unwrap();
+}
+
 async fn commit_b(
     daemon: &Daemon,
     route_b: RouteHandle,

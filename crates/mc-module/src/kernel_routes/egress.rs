@@ -31,6 +31,9 @@ pub enum RefusalReason {
     /// The owning object does not tie the artifact to the bound project: it is
     /// scoped elsewhere, cites other evidence, or is no longer live.
     WrongScope,
+    /// The owning object's served class bars the destination: secret for any
+    /// destination, or above normal for a remote one.
+    OwnerSensitive,
     Eligibility(EligibilityDeniedReason),
 }
 
@@ -39,6 +42,7 @@ impl RefusalReason {
         match self {
             Self::UnderDeclared => "under_declared",
             Self::WrongScope => "wrong_scope",
+            Self::OwnerSensitive => "owner_sensitive",
             Self::Eligibility(EligibilityDeniedReason::UnknownSensitive) => "unknown_sensitive",
             Self::Eligibility(EligibilityDeniedReason::SensitiveRemote) => "sensitive_remote",
             Self::Eligibility(EligibilityDeniedReason::ProviderRestricted) => "provider_restricted",
@@ -145,11 +149,21 @@ fn evaluate(
         && ScopeFilter::new(project)
             .matches(scope_id, &mut stored_terms(store))
             .map_err(KernelOutcome::from)?;
-    Ok(decide_egress(
-        &facts,
-        request.asserted_sensitivity,
-        scope_matches,
-    ))
+    let decision = decide_egress(&facts, request.asserted_sensitivity, scope_matches);
+    // The owner is judged by the class the serving view gives it, as the
+    // eligibility route judges a candidate: a normal artifact cited by an
+    // owner admitted as sensitive does not go remote.
+    let owner_barred = candidate.served.is_some_and(|served| {
+        served.sensitivity == Sensitivity::Secret
+            || (destination == ArtifactDestination::Remote
+                && served.sensitivity != Sensitivity::Normal)
+    });
+    Ok(match decision {
+        EgressDecision::Allowed if owner_barred => {
+            EgressDecision::Refused(RefusalReason::OwnerSensitive)
+        }
+        decision => decision,
+    })
 }
 
 impl McHandler {
