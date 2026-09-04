@@ -2420,6 +2420,19 @@ async fn another_projects_objects_are_not_found_through_commit_targets_or_tokens
         )
         .await;
     assert_state(&implements, "invalid", Some("not_found"));
+    // The applicability reducer reads `applicability_target` the same way.
+    let targets = daemon
+        .commit(
+            "target-foreign",
+            vec![observation_depending(
+                4,
+                "decision-object-2",
+                "applicability_target",
+            )],
+            vec![],
+        )
+        .await;
+    assert_state(&targets, "invalid", Some("not_found"));
     assert_eq!(daemon.tip(), tip, "a refused commit writes nothing");
 
     let own = daemon

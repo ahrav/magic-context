@@ -70,11 +70,13 @@ pub const MAX_STAGED_BYTES: u64 = UPLOAD_ALLOWANCE_BYTES * MAX_PENDING_UPLOADS a
 /// artifact. Every finish occupies a pending slot, so at most
 /// [`MAX_PENDING_UPLOADS`] run at once, each at the allowance.
 pub const FINISH_WORKING_BYTES_MAX: u64 = 2 * MAX_STAGED_BYTES;
-/// Decoded page bytes in flight across every route: a page is decoded and
-/// hashed before it is staged, and until then its bytes are charged to
-/// neither the staging budget nor any upload, so concurrent page requests
-/// are bounded here. Enough for one page per pending upload at once.
-pub const PAGE_DECODE_BYTES_MAX: u64 = PAGE_BYTES_MAX * MAX_PENDING_UPLOADS as u64;
+/// Page bytes in flight across every route: a page's encoded text and its
+/// decoded bytes both live on the worker until the page is staged, and until
+/// then neither is charged to the staging budget or any upload, so concurrent
+/// page requests are bounded here. Enough for one full page per pending
+/// upload at once.
+pub const PAGE_DECODE_BYTES_MAX: u64 =
+    (PAGE_BASE64_BYTES_MAX as u64 + PAGE_BYTES_MAX) * MAX_PENDING_UPLOADS as u64;
 /// Page jobs in flight across every route. A tiny page charges almost no
 /// bytes but still holds a blocking-pool worker and its frame, so the count is
 /// bounded on its own: four concurrent pages per pending upload.
@@ -537,13 +539,14 @@ impl Drop for DecodeReservation {
     }
 }
 
-enum FinishOutcome {
+enum FinishOutcome<Held = Box<Upload>> {
     Ingested(ArtifactHandle),
     /// The payload or the request is wrong; the pages are dropped.
     Refused(KernelOutcome),
-    /// The store could not take the artifact right now; the pages come back
-    /// so the route can hold them for a retry.
-    Retry(KernelOutcome, Box<Upload>),
+    /// The store could not take the artifact right now. `finish_upload` hands
+    /// the pages back for the route to hold; once held, only the outcome
+    /// remains.
+    Retry(KernelOutcome, Held),
 }
 
 /// Concatenates the pages in index order and ingests the result when it
@@ -679,8 +682,10 @@ impl McHandler {
         if parsed.bytes_base64.len() > PAGE_BASE64_BYTES_MAX {
             return state_only(KernelOutcome::invalid(InvalidReason::PageTooLarge));
         }
-        // Padded base64 decodes to at most three bytes per four characters.
-        let decode_bytes = (parsed.bytes_base64.len() as u64).div_ceil(4) * 3;
+        // The worker holds the encoded text and, once decoded, at most three
+        // bytes per four characters beside it.
+        let encoded_bytes = parsed.bytes_base64.len() as u64;
+        let decode_bytes = encoded_bytes + encoded_bytes.div_ceil(4) * 3;
         let generation = {
             let mut uploads = self.kernel.uploads();
             let generation = match uploads.accepts_page(
@@ -778,9 +783,30 @@ impl McHandler {
             bytes: Some(upload.total_bytes),
         };
         let store = scope.store;
-        // The reservation rides in the worker's result: a handler cancelled
-        // here drops that result on the worker, and the guard releases there.
-        let finished = blocking(move || (finish_upload(&store, upload), reservation)).await;
+        let kernel = Arc::clone(&self.kernel);
+        // Everything that must happen to the upload happens on the worker: a
+        // handler cancelled here drops the worker's result unread, so a
+        // retryable finish restores the upload before the worker returns and
+        // the reservation guard rides in the result to release otherwise.
+        let finished = blocking(move || {
+            let outcome = finish_upload(&store, upload);
+            let outcome: FinishOutcome<()> = match outcome {
+                FinishOutcome::Retry(outcome, upload) => {
+                    if kernel
+                        .uploads()
+                        .restore(channel, *upload, Instant::now())
+                        .is_none()
+                    {
+                        reservation.keep();
+                    }
+                    return (FinishOutcome::Retry(outcome, ()), None);
+                }
+                FinishOutcome::Ingested(handle) => FinishOutcome::Ingested(handle),
+                FinishOutcome::Refused(outcome) => FinishOutcome::Refused(outcome),
+            };
+            (outcome, Some(reservation))
+        })
+        .await;
         match finished {
             Ok((FinishOutcome::Ingested(handle), _reservation)) => kernel_response(
                 &KernelOutcome::Available,
@@ -789,16 +815,7 @@ impl McHandler {
                     "handle": {"digest": handle.digest, "evidence_id": handle.evidence_id},
                 }),
             ),
-            Ok((FinishOutcome::Refused(outcome), _reservation)) => state_only(outcome),
-            Ok((FinishOutcome::Retry(outcome, upload), reservation)) => {
-                if self
-                    .kernel
-                    .uploads()
-                    .restore(channel, *upload, Instant::now())
-                    .is_none()
-                {
-                    reservation.keep();
-                }
+            Ok((FinishOutcome::Refused(outcome) | FinishOutcome::Retry(outcome, ()), _)) => {
                 state_only(outcome)
             }
             Err(outcome) => state_only(outcome),

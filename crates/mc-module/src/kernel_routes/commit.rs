@@ -42,6 +42,12 @@ const MAX_TOKENS: usize = 1024;
 pub const MAX_DEPENDENCIES: usize = 1024;
 /// Reason recorded on the admission decision of every route-written object.
 const ADMISSION_REASON: &str = "kernel.commit";
+/// Dependency kinds a kernel projection reads without comparing scopes, so
+/// their targets must belong to the bound project.
+const PROJECTED_DEPENDENCY_KINDS: [&str; 2] = [
+    ALIGNMENT_DEPENDENCY_KIND,
+    mc_kernel::applicability::DEPENDENCY_KIND_TARGET,
+];
 
 #[derive(Debug, Deserialize)]
 struct CommitRequest {
@@ -480,12 +486,14 @@ fn apply(
                     refused,
                 )?;
                 // The alignment projection pairs an observation with the
-                // decision its `implements` dependency names without comparing
-                // scopes, so a foreign target would let this project alter
-                // another project's derived results. Other dependency kinds
-                // may cite any live registry object, as the kernel allows.
+                // decision its `implements` dependency names, and the
+                // applicability reducer with the object its
+                // `applicability_target` names, without comparing scopes, so
+                // a foreign target would let this project alter another
+                // project's derived results. Other dependency kinds may cite
+                // any live registry object, as the kernel allows.
                 for dependency in &spec.dependencies {
-                    if dependency.dependency_kind == ALIGNMENT_DEPENDENCY_KIND {
+                    if PROJECTED_DEPENDENCY_KINDS.contains(&dependency.dependency_kind.as_str()) {
                         scoped_object_state(envelope, filter, &dependency.dependency_object_id)?;
                     }
                 }
