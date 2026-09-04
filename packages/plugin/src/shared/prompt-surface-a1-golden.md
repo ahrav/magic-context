@@ -325,7 +325,7 @@ Example: ctx_note(action="write", content="Re-run the perf benchmark once the bo
 }
 ```
 
-### ctx_memory — description ~179 tokens, params ~376 tokens (total ~555)
+### ctx_memory — description ~179 tokens, params ~417 tokens (total ~596)
 
 **Description:**
 
@@ -461,6 +461,7 @@ Memories created here start at candidate maturity and are surfaced through expli
         ]
       },
       "expiresAt": {
+        "description": "Epoch ms after which the warning stops surfacing; omitted writes default to 90 days out",
         "anyOf": [
           {
             "type": "number"
@@ -468,8 +469,7 @@ Memories created here start at candidate maturity and are surfaced through expli
           {
             "type": "null"
           }
-        ],
-        "description": "Epoch ms after which the warning stops surfacing; omitted writes default to 90 days out"
+        ]
       }
     },
     "required": [
@@ -485,6 +485,7 @@ Memories created here start at candidate maturity and are surfaced through expli
   },
   "objectIds": {
     "description": "Object ids for get, or the objects merge folds into one survivor",
+    "maxItems": 20,
     "type": "array",
     "items": {
       "type": "string"

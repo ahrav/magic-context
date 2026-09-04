@@ -31,7 +31,7 @@ import {
     type SourceKind,
     sha256Hex,
 } from "../../shared/kernel-client";
-import { DEFAULT_SEARCH_LIMIT, GET_MAX_CLAIMS } from "./constants";
+import { DEFAULT_SEARCH_LIMIT, GET_MAX_CLAIMS, MERGE_MAX_TARGETS } from "./constants";
 import type { CtxMemoryAction, CtxMemoryArgs } from "./types";
 import { assertCtxMemoryWriteShape } from "./write-shape";
 
@@ -323,10 +323,16 @@ function withAntiMemoryExpiry(args: CtxMemoryArgs): CtxMemoryArgs {
     return { ...args, antiMemory: { ...args.antiMemory, expiresAt } };
 }
 
-/** Replay recovery answers "already applied" only when the request's content matches the row this identity already wrote: a caller-supplied summary must equal the stored one byte for byte, and an anti-memory must re-render to the stored payload under the stored expiry, so changed content still surfaces the daemon's `operation_key_reused` rejection. commentlint: allow(JUDGE) */
+/** Replay recovery answers "already applied" only when the request's content matches the row this identity already wrote: a caller-supplied summary must equal the stored one byte for byte, an anti-memory must re-render to the stored payload under the stored expiry, and a caller-supplied category or reason must equal the stored decision kind or rationale, so changed content still surfaces the daemon's `operation_key_reused` rejection. commentlint: allow(JUDGE) */
 function replayMatchesRow(args: CtxMemoryArgs, row: ReadRow): boolean {
     const decision = row.decision;
     if (!decision) return false;
+    const category = args.category?.trim();
+    if (category !== undefined && category !== "" && decision.decision_kind !== category) {
+        return false;
+    }
+    const reason = args.reason?.trim();
+    if (reason !== undefined && decision.payload.rationale !== reason) return false;
     if (args.antiMemory) {
         try {
             const stored = parseAntiMemoryContent(decision.payload.summary);
@@ -343,7 +349,7 @@ function replayMatchesRow(args: CtxMemoryArgs, row: ReadRow): boolean {
     return true;
 }
 
-/** The row a redelivered revise or merge already wrote: the successor id derives from the write identity, so its presence while a named target is gone proves this exact tool call committed. `null` keeps the ordinary visibility error. commentlint: allow(JUDGE) */
+/** The row a redelivered revise or merge already wrote: the successor id derives from the write identity, and a committed request retired every one of its targets, so recovery requires all named targets gone. A redelivery naming a still-visible target differs from what committed and keeps the ordinary visibility error. commentlint: allow(JUDGE) */
 function redeliveredSuccessor(
     args: CtxMemoryArgs,
     identity: CtxMemoryWriteIdentity,
@@ -351,7 +357,7 @@ function redeliveredSuccessor(
     targets: readonly string[],
 ): ReadRow | null {
     const present = new Set(rows.map((row) => row.object.object_id));
-    if (targets.every((id) => present.has(id))) return null;
+    if (targets.some((id) => present.has(id))) return null;
     const successor = rows.find((row) => row.object.object_id === derivedId("mem", identity, 0));
     if (!successor || !replayMatchesRow(args, successor)) return null;
     return successor;
@@ -494,6 +500,11 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
     const targets = uniqueIds(args.objectIds);
     if (targets.length < 2) {
         throw new ClaimOperationInputError("merge requires at least two objectIds");
+    }
+    if (targets.length > MERGE_MAX_TARGETS) {
+        throw new ClaimOperationInputError(
+            `merge accepts at most ${MERGE_MAX_TARGETS} objectIds; ${targets.length} were given. Merge in smaller batches.`,
+        );
     }
     const read = await readMemoryRows(client, signal);
     if (!read.ok) return renderCtxMemoryStateText(read.state, targets);

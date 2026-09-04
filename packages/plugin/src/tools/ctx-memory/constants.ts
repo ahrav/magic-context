@@ -16,6 +16,8 @@ Actions:
 Memories created here start at candidate maturity and are surfaced through explicit search until promoted. Agent calls to approve/enforce are rejected.`;
 export const DEFAULT_SEARCH_LIMIT = 10;
 export const GET_MAX_CLAIMS = 20;
+/** Merge emits one `supersede_decision` per target; the cap keeps a schema-valid request from failing only at the daemon's envelope limit. */
+export const MERGE_MAX_TARGETS = 20;
 
 /**
  */

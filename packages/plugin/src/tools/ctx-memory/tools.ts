@@ -63,6 +63,7 @@ const ctxMemoryArgsShape = {
     objectId: tool.schema.string().optional().describe("Object id for revise/archive"),
     objectIds: tool.schema
         .array(tool.schema.string())
+        .max(20)
         .optional()
         .describe("Object ids for get, or the objects merge folds into one survivor"),
     limit: tool.schema.number().optional().describe("Maximum list results"),

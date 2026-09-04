@@ -53,6 +53,8 @@ function normalizeSources(sources?: string[]): CtxSearchSource[] | undefined {
 export interface CtxSearchCallContext {
     sessionID: string;
     directory: string;
+    /** The host tool call's abort signal, forwarded into the kernel read and the local search's embedding requests. */
+    abort?: AbortSignal;
 }
 
 /**
@@ -172,6 +174,7 @@ export async function executeCtxSearch(
             gitCommitsEnabled,
             sources: localSources,
             explicitSearch: true,
+            ...(toolContext.abort ? { signal: toolContext.abort } : {}),
         });
     // An object-id query is daemon-first with local search as fallback only, and a memory-only request has no local sources, so neither starts the local search eagerly. commentlint: allow(JUDGE)
     let localResultsPromise: ReturnType<typeof startLocalSearch> | null = null;
@@ -185,7 +188,11 @@ export async function executeCtxSearch(
             sessionId: toolContext.sessionID,
             projectRoot,
         });
-        const read = await client.read({ surface: "explicit_search", gated: true });
+        const read = await client.read({
+            surface: "explicit_search",
+            gated: true,
+            ...(toolContext.abort ? { signal: toolContext.abort } : {}),
+        });
         if (isAvailable(read)) {
             const hits = searchKernelMemoryRows({
                 rows: read.rows,

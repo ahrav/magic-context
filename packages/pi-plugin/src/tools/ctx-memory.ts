@@ -84,6 +84,7 @@ const ParamsSchema = Type.Object(
 		),
 		objectIds: Type.Optional(
 			Type.Array(Type.String(), {
+				maxItems: 20,
 				description:
 					"Object ids for get, or the objects merge folds into one survivor",
 			}),

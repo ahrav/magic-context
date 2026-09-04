@@ -75,7 +75,7 @@ export function createCtxSearchTool(
 		async execute(
 			_toolCallId,
 			params: CtxSearchParams,
-			_signal,
+			signal,
 			_onUpdate,
 			ctx,
 		) {
@@ -100,7 +100,11 @@ export function createCtxSearchTool(
 					gitCommitsEnabled: deps.gitCommitsEnabled,
 				},
 				params,
-				{ sessionID: ctx.sessionManager.getSessionId(), directory: ctx.cwd },
+				{
+					sessionID: ctx.sessionManager.getSessionId(),
+					directory: ctx.cwd,
+					...(signal ? { abort: signal } : {}),
+				},
 			);
 			return {
 				content: [{ type: "text", text: execution.text }],
