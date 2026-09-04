@@ -37,7 +37,10 @@ export interface FamilyEstimatorAdapter {
 }
 export interface ScorecardAdapter {
     owner: "magic-context-x4l.15";
-    evaluate(input: { pairs: readonly PairedCaseFact[]; estimator: EstimatorOutcome }, policyFingerprint: string): ScorecardOutcome;
+    evaluate(
+        input: { pairs: readonly PairedCaseFact[]; estimator: EstimatorOutcome; freezeManifestFingerprint: string },
+        policyFingerprint: string,
+    ): ScorecardOutcome;
 }
 export interface ReportRecomputers {
     estimator: FamilyEstimatorAdapter;
@@ -130,7 +133,10 @@ export function buildProspectiveReport(input: {
     if (input.estimator.owner !== "magic-context-x4l.14") fail("report.estimator: wrong-owner");
     if (input.scorecard.owner !== "magic-context-x4l.15") fail("report.scorecard: wrong-owner");
     const estimator = input.estimator.analyze(input.pairs, input.analysisPolicyFingerprint);
-    const scorecard = input.scorecard.evaluate({ pairs: input.pairs, estimator }, input.scorecardPolicyFingerprint);
+    const scorecard = input.scorecard.evaluate(
+        { pairs: input.pairs, estimator, freezeManifestFingerprint: input.freezeManifestFingerprint },
+        input.scorecardPolicyFingerprint,
+    );
     const summary = summarizePairs(input.pairs);
     if (estimator.completeFamilyCount !== summary.completeFamilyCount) fail("report.estimator: complete-family-count-mismatch");
     if (scorecard.promotionAllowed && (!scorecard.mandatoryEvidenceComplete || scorecard.hardGateFailures.length > 0)) {
