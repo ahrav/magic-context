@@ -12056,6 +12056,12 @@ impl McHandler {
         self.kernel.eligibility_cache().len()
     }
 
+    /// Empties the verdict cache so the next batch judges every candidate.
+    #[cfg(feature = "test-support")]
+    pub fn clear_eligibility_cache_for_test(&self) {
+        self.kernel.eligibility_cache().clear();
+    }
+
     /// `(total_bytes, pending)` of the artifact upload staging budget.
     #[cfg(feature = "test-support")]
     pub fn staging_budget_for_test(&self) -> (u64, usize) {
