@@ -70,10 +70,11 @@ function row(objectId: string, knownAsOf: number) {
             superseded_by: null,
             sensitivity: "normal",
         },
-        visibility: "visible",
-        labeled: false,
+        visibility: "labeled",
+        labeled: true,
         scope_id: "project:x",
         token: { object_id: objectId, known_as_of: knownAsOf },
+        decision: { decision_kind: "memory", payload: { summary: objectId, rationale: "" } },
     };
 }
 
@@ -237,6 +238,29 @@ describe("KernelClient transport mapping", () => {
     test("an unparseable success body is unrecognized_state", async () => {
         const transport = new FakeTransport().queue({ state: { kind: "available" }, rows: 3 });
         const result = await client(transport).read({ surface: "auto_inject" });
+        expect(result.state).toEqual({ kind: "invalid", reason: "unrecognized_state" });
+    });
+
+    test("a daemon without kernel routes is unrecognized_state, not internal", async () => {
+        for (const code of ["unrecognized_request_shape", "facade_envelope_not_supported"]) {
+            const transport = new FakeTransport().queue(
+                new McHostCallError("terminal", "no such method", code),
+            );
+            const result = await client(transport).read({ surface: "auto_inject" });
+            expect(result.state).toEqual({ kind: "invalid", reason: "unrecognized_state" });
+        }
+    });
+
+    test("a decision row without its decision payload fails the whole read", async () => {
+        const { decision: _decision, ...bare } = row("o1", 3);
+        const transport = new FakeTransport().queue({
+            state: { kind: "available" },
+            known_as_of: 3,
+            tip: 3,
+            gated: false,
+            rows: [bare],
+        });
+        const result = await client(transport).read({ surface: "explicit_search" });
         expect(result.state).toEqual({ kind: "invalid", reason: "unrecognized_state" });
     });
 });
@@ -437,94 +461,18 @@ describe("KernelClient mutations", () => {
         expect(c.tokens.get(PROJECT, "o1")).toBeUndefined();
     });
 
+    test("a target still absent after the refresh read is never committed", async () => {
+        const transport = new FakeTransport().queue(readReply(3, "other"));
+        const result = await client(transport).archive("foreign", intent);
+        expect(result.state).toEqual({ kind: "conflict", reason: "retracted" });
+        expect(transport.bodies("kernel.commit")).toHaveLength(0);
+    });
+
     test("a conflict from the daemon passes through", async () => {
         const transport = new FakeTransport().queue(readReply(3, "o1"), {
             state: { kind: "conflict", reason: "known_as_of_advanced" },
         });
         const result = await client(transport).archive("o1", intent);
         expect(result.state).toEqual({ kind: "conflict", reason: "known_as_of_advanced" });
-    });
-});
-
-describe("KernelClient other routes", () => {
-    test("eligibilityBatch returns typed verdicts", async () => {
-        const transport = new FakeTransport().queue({
-            state: { kind: "available" },
-            known_as_of: 2,
-            verdicts: [{ object_id: "o1", verdict: "stale" }],
-            cache_hits: 0,
-        });
-        const result = await client(transport).eligibilityBatch({
-            destination: "remote",
-            candidates: [{ object_id: "o1", source_revision: 2 }],
-        });
-        expect(isAvailable(result) && result.verdicts).toEqual([
-            { object_id: "o1", verdict: "stale" },
-        ]);
-        expect(transport.bodies("kernel.eligibility.batch")[0]?.destination).toBe("remote");
-    });
-
-    test("egressDecide maps allowed and refused", async () => {
-        const transport = new FakeTransport().queue({
-            state: { kind: "available" },
-            decision: { refused: "secret" },
-        });
-        const result = await client(transport).egressDecide({
-            artifactDigest: "d".repeat(64),
-            destination: "remote",
-            assertedSensitivity: "normal",
-            owningObjectId: "o1",
-        });
-        expect(isAvailable(result) && result.decision).toEqual({
-            kind: "refused",
-            reason: "secret",
-        });
-    });
-
-    test("ingestArtifact pages, digests, and finishes", async () => {
-        const payload = new TextEncoder().encode("hello artifact");
-        const transport = new FakeTransport().queue(
-            { state: { kind: "available" }, upload_id: "x", page_bytes_max: 16 * 1024 * 1024 },
-            { state: { kind: "available" }, upload_id: "x", received_pages: 1, received_bytes: 14 },
-            {
-                state: { kind: "available" },
-                upload_id: "x",
-                handle: { digest: "e".repeat(64), evidence_id: "ev" },
-            },
-        );
-        const result = await client(transport).ingestArtifact(
-            payload,
-            {
-                evidence_id: "ev",
-                object_id: "o1",
-                object_kind: "artifact",
-                domain_id: "memory",
-                source_kind: "assistant",
-                source_id: "s",
-                source_revision: 1,
-                media_type: "text/plain",
-                retention_class: "durable",
-                asserted_sensitivity: "normal",
-                provider_egress: "remote_allowed",
-            },
-            intent,
-        );
-        expect(isAvailable(result) && result.handle.evidence_id).toBe("ev");
-        expect(transport.calls.map((call) => call.method)).toEqual([
-            "kernel.artifact.ingest.begin",
-            "kernel.artifact.ingest.page",
-            "kernel.artifact.ingest.finish",
-        ]);
-        const begin = transport.bodies("kernel.artifact.ingest.begin")[0] as Record<
-            string,
-            unknown
-        >;
-        expect(begin.page_count).toBe(1);
-        expect(begin.total_bytes).toBe(payload.byteLength);
-        expect(begin.payload_digest).toMatch(/^[0-9a-f]{64}$/);
-        const page = transport.bodies("kernel.artifact.ingest.page")[0] as Record<string, unknown>;
-        expect(page.bytes_base64).toBe(Buffer.from(payload).toString("base64"));
-        expect(page.page_digest).toBe(begin.payload_digest);
-        expect(page.upload_id).toBe(begin.upload_id);
     });
 });

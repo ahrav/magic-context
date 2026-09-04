@@ -2039,27 +2039,6 @@ export function recordClaimUsage(
     }).immediate();
 }
 
-/**
- *
- */
-export function recordDeliveredAntiMemoryUsage(
-    db: Database,
-    delivered: readonly { source: string; publicClaimId?: string }[],
-    nowMs?: number,
-): void {
-    const publicClaimIds = delivered.flatMap((result) =>
-        result.source === "anti_memory" && result.publicClaimId !== undefined
-            ? [result.publicClaimId]
-            : [],
-    );
-    if (publicClaimIds.length === 0) return;
-    recordClaimUsage(db, {
-        publicClaimIds,
-        kind: "retrieved",
-        ...(nowMs === undefined ? {} : { nowMs }),
-    });
-}
-
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 

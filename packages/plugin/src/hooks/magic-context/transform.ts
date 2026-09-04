@@ -56,12 +56,7 @@ import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
-import {
-    disabled,
-    type KernelClientResolver,
-    type KernelMemorySnapshot,
-    kernelMemorySnapshotFrom,
-} from "../../shared/kernel-client";
+import type { KernelClientResolver } from "../../shared/kernel-client";
 import { log, sessionLog } from "../../shared/logger";
 import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
@@ -69,6 +64,7 @@ import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import { applyMidTurnDeferral, detectMidTurnBypassReason } from "./boundary-execution";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import { replayCavemanCompression } from "./caveman-cleanup";
+import { scheduleClaimLaneImport } from "./claim-lane-import";
 import { commitCompactionModeRecord, reconcileCompactionMode } from "./compaction-off-transition";
 import { getActiveCompartmentRun, startCompartmentAgent } from "./compartment-runner";
 import { buildTriggerInMemoryTail, checkCompartmentTrigger } from "./compartment-trigger";
@@ -98,7 +94,7 @@ import {
     type PreparedCompartmentInjection,
     prepareCompartmentInjection,
 } from "./inject-compartments";
-import { daemonAbsentSnapshot } from "./kernel-memory-render";
+import { readInjectionMemorySnapshot } from "./kernel-memory-render";
 import { captureLkgSlot, projectLkgEntry, resolveLkgModelKeys } from "./lkg-replay";
 import { dropSlot } from "./lkg-slot";
 import { onNoteTrigger } from "./note-nudger";
@@ -457,28 +453,6 @@ export function scheduleTsAuthorityRecovery(args: {
                 );
             }
         });
-}
-
-/**
- * The m[0] memory read. `auto_inject` is ungated, so lag never withholds
- * baseline memory; a session without a memory-enabled project identity has no
- * scope to bind, so its snapshot is `disabled` and renders nothing.
- */
-async function readInjectionMemory(args: {
-    deps: Pick<TransformDeps, "kernelClient" | "memoryConfig">;
-    sessionId: string;
-    projectIdentity: string | undefined;
-    projectRoot: string;
-}): Promise<KernelMemorySnapshot> {
-    if (!args.deps.memoryConfig?.enabled || args.projectIdentity === undefined) {
-        return { state: disabled(), rows: [], knownAsOf: null };
-    }
-    if (!args.deps.kernelClient) return daemonAbsentSnapshot();
-    const client = args.deps.kernelClient({
-        sessionId: args.sessionId,
-        projectRoot: args.projectRoot,
-    });
-    return kernelMemorySnapshotFrom(await client.read({ surface: "auto_inject", gated: false }));
 }
 
 export interface TransformDeps {
@@ -1518,11 +1492,21 @@ export function createTransform(deps: TransformDeps) {
         // One read serves this pass's m[0]/m[1] render; the compartment and
         // postprocess phases take it as a value and issue no memory RPC.
         const tMemoryRead = performance.now();
-        const memory = await readInjectionMemory({
-            deps,
+        const memoryProjectRoot = resolveProjectRootDirectory(memoryProjectDirectory);
+        if (deps.memoryConfig?.enabled === true && projectIdentity !== undefined) {
+            scheduleClaimLaneImport({
+                db: deps.db,
+                client: deps.kernelClient?.({ sessionId, projectRoot: memoryProjectRoot }),
+                projectPath: projectIdentity,
+                sessionId,
+            });
+        }
+        const memory = await readInjectionMemorySnapshot({
+            kernelClient: deps.kernelClient,
+            memoryEnabled: deps.memoryConfig?.enabled === true,
             sessionId,
             projectIdentity,
-            projectRoot: resolveProjectRootDirectory(memoryProjectDirectory),
+            projectRoot: memoryProjectRoot,
         });
         logTransformTiming(sessionId, "kernelMemoryRead", tMemoryRead);
 

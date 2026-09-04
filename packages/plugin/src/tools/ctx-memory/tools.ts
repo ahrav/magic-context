@@ -41,7 +41,7 @@ const ctxMemoryArgsShape = {
     action: tool.schema
         .enum([...CTX_MEMORY_DREAMER_ACTIONS])
         .optional()
-        .describe("create, get, list, revise, archive, restore, or merge"),
+        .describe("create, get, list, revise, archive, or merge"),
     content: tool.schema.string().optional().describe("Memory content for create/revise/merge"),
     category: tool.schema
         .enum([...WRITABLE_MEMORY_CATEGORIES])
@@ -53,7 +53,7 @@ const ctxMemoryArgsShape = {
         .describe(
             "Rejected-approach payload. Required with category REJECTED_APPROACH, and content must be omitted; invalid with any other category.",
         ),
-    objectId: tool.schema.string().optional().describe("Object id for revise/archive/restore"),
+    objectId: tool.schema.string().optional().describe("Object id for revise/archive"),
     objectIds: tool.schema
         .array(tool.schema.string())
         .optional()

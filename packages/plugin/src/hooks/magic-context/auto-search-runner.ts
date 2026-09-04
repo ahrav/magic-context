@@ -44,6 +44,7 @@ import {
     hasStackedAugmentation,
     unifiedSearchWithTimeout,
 } from "./auto-search-shared";
+import { MEMORY_READ_SURFACE, withholdLaggingMemory } from "./kernel-memory-render";
 import { hasMeaningfulUserText } from "./read-session-formatting";
 import { appendReminderToUserMessageById } from "./transform-message-helpers";
 import type { MessageLike } from "./transform-operations";
@@ -154,13 +155,15 @@ export async function executeAutoSearchDelivery(args: {
             args.timeoutMs ?? AUTO_SEARCH_TIMEOUT_MS,
             kernelClient
                 ? async (signal, deadlineMs) =>
-                      kernelMemorySnapshotFrom(
-                          await kernelClient.read({
-                              surface: "auto_search",
-                              gated: true,
-                              signal,
-                              deadlineMs,
-                          }),
+                      withholdLaggingMemory(
+                          kernelMemorySnapshotFrom(
+                              await kernelClient.read({
+                                  surface: MEMORY_READ_SURFACE,
+                                  gated: true,
+                                  signal,
+                                  deadlineMs,
+                              }),
+                          ),
                       )
                 : undefined,
         );

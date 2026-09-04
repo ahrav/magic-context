@@ -176,29 +176,3 @@ export function buildAutoSearchHint(
 ): string | null {
     return packAutoSearchHint(results, options).text;
 }
-
-export interface AntiMemoryWarningDelivery {
-    /** `warningResults` preserves delivery order. */
-    warningResults: Extract<UnifiedSearchResult, { source: "anti_memory" }>[];
-    /**
-     * */
-    memoryFragments: Array<{ id: number; hash: string }>;
-}
-
-/**
- * */
-export function collectAntiMemoryWarningFragments(
-    delivered: readonly UnifiedSearchResult[],
-): AntiMemoryWarningDelivery {
-    const warningResults = delivered.filter(
-        (result): result is Extract<UnifiedSearchResult, { source: "anti_memory" }> =>
-            result.source === "anti_memory",
-    );
-    return {
-        warningResults,
-        memoryFragments: warningResults.map((result) => ({
-            id: result.claimId,
-            hash: result.normalizedHash,
-        })),
-    };
-}

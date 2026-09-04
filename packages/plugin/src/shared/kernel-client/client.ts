@@ -8,21 +8,13 @@ import { createHash } from "node:crypto";
 import { Deadline, isConsumerReconnectTransient, isMcHostCallError } from "../mc-host-client";
 import { isRecord } from "../record-type-guard";
 import { stableStringify } from "../stable-json";
-import { cancelled, disabled, invalid, type MemoryState, unavailable } from "./state";
+import { cancelled, conflict, disabled, invalid, type MemoryState, unavailable } from "./state";
 import { TokenCache } from "./token";
 import {
     type CommitPayload,
-    type EgressPayload,
-    type EligibilityPayload,
-    type IngestFinishPayload,
     type MutationToken,
     type Parsed,
     parseCommitResponse,
-    parseEgressResponse,
-    parseEligibilityResponse,
-    parseIngestBeginResponse,
-    parseIngestFinishResponse,
-    parseKernelResponse,
     parseReadResponse,
     type ReadPayload,
     type ReadRow,
@@ -47,7 +39,6 @@ export interface KernelTransport {
 }
 
 export type Surface = "auto_inject" | "auto_search" | "explicit_search";
-export type Destination = "local" | "remote";
 export type SourceKind = "assistant" | "model" | "dreamer" | "user";
 
 export interface DecisionSpecInput {
@@ -64,31 +55,10 @@ export interface DecisionSpecInput {
     sensitivity?: Sensitivity;
 }
 
-export interface ObservationSpecInput {
-    observation_id: string;
-    object_id: string;
-    domain_id: string;
-    proposition_id?: string;
-    anchor_id?: string;
-    evidence_id?: string;
-    observation_kind: string;
-    payload: { summary: string; classification: string; detail?: unknown };
-    observed_at: number;
-    dependencies?: {
-        dependency_object_id: string;
-        dependency_kind: string;
-        dependency_payload?: string;
-    }[];
-    source_id: string;
-    source_revision: number;
-    sensitivity?: Sensitivity;
-}
-
 export type CommitOperation =
     | { op: "insert_decision"; spec: DecisionSpecInput }
     | { op: "supersede_decision"; replaced_object_id: string; spec: DecisionSpecInput }
-    | { op: "retire_decision"; object_id: string }
-    | { op: "insert_observation"; spec: ObservationSpecInput };
+    | { op: "retire_decision"; object_id: string };
 
 export interface CallOptions {
     signal?: AbortSignal;
@@ -115,8 +85,7 @@ export interface CommitArgs extends CallOptions, IntentArgs {
     /**
      * The complete token set for the envelope. When omitted, the cache supplies
      * one token per replaced or retired object and a missing one triggers a
-     * read; when given (even empty), no cache lookup happens, which is how a
-     * restore supersedes a retired object no live token can describe.
+     * read; when given, no cache lookup happens.
      */
     tokens?: MutationToken[];
     sourceKind?: SourceKind;
@@ -125,35 +94,6 @@ export interface CommitArgs extends CallOptions, IntentArgs {
 }
 
 export type MutationArgs = Omit<CommitArgs, "operations" | "tokens">;
-
-export interface EligibilityArgs extends CallOptions {
-    destination: Destination;
-    candidates: { object_id: string; source_revision: number; artifact_digest?: string }[];
-}
-
-export interface EgressArgs extends CallOptions {
-    artifactDigest: string;
-    evidenceId?: string;
-    destination: Destination;
-    assertedSensitivity: Sensitivity;
-    owningObjectId: string;
-}
-
-export interface ArtifactRequest {
-    evidence_id: string;
-    object_id: string;
-    object_kind: string;
-    domain_id: string;
-    source_kind: string;
-    source_id: string;
-    source_revision: number;
-    media_type: string;
-    retention_class: string;
-    retain_until?: number;
-    asserted_sensitivity: Sensitivity;
-    provider_egress: "remote_allowed" | "local_only";
-    provenance?: { repository_id: string; revision: string };
-}
 
 export type AvailableState = Extract<MemoryState, { kind: "available" }>;
 export type NonAvailableState = Exclude<MemoryState, { kind: "available" }>;
@@ -191,9 +131,6 @@ export function kernelMemorySnapshotFrom(result: ReadResult): KernelMemorySnapsh
         : { state: result.state, rows: [], knownAsOf: null };
 }
 export type CommitResult = KernelResult<CommitPayload>;
-export type EligibilityResult = KernelResult<EligibilityPayload>;
-export type EgressResult = KernelResult<EgressPayload>;
-export type IngestResult = KernelResult<IngestFinishPayload>;
 
 export interface KernelClientOptions {
     transport: KernelTransport;
@@ -209,12 +146,6 @@ export interface KernelClientOptions {
 
 const DEFAULT_PRODUCER = "plugin";
 const DEFAULT_DEADLINE_MS = 10_000;
-/**
- * Decoded bytes per upload page. Declared at `begin`, before the daemon
- * reports its own cap, so it sits well under the daemon's 16 MiB page maximum
- * and the reply's `page_bytes_max` is checked against it.
- */
-export const INGEST_PAGE_BYTES = 4 * 1024 * 1024;
 /**
  * Fields of the operation key are joined with the ASCII unit separator, which
  * no path, producer, actor, cause, or hex digest contains, so distinct inputs
@@ -263,6 +194,19 @@ function isDaemonAbsent(error: unknown): boolean {
         errorCodeOf(error) === "MC_HOST_CONNECTION_BACKOFF" ||
         (isRecord(error) && error.name === "ConnectionFileError")
     );
+}
+
+/**
+ * Codes a daemon answers when no `kernel.*` route matches the request, so the
+ * caller sees the version-skew state rather than an internal error.
+ */
+const UNKNOWN_METHOD_CODES: ReadonlySet<string> = new Set([
+    "unrecognized_request_shape",
+    "facade_envelope_not_supported",
+]);
+
+function isUnknownMethod(code: string | undefined): boolean {
+    return code !== undefined && UNKNOWN_METHOD_CODES.has(code);
 }
 
 function nonAvailable(state: MemoryState): NonAvailableState {
@@ -367,6 +311,9 @@ export class KernelClient {
                             return absent();
                         }
                         continue;
+                    }
+                    if (isUnknownMethod(error.code)) {
+                        return { ok: false, state: nonAvailable(invalid("unrecognized_state")) };
                     }
                     return { ok: false, state: nonAvailable(invalid("internal")) };
                 }
@@ -477,6 +424,12 @@ export class KernelClient {
         return { tokens, missing };
     }
 
+    /**
+     * A target still absent after the refresh read is not live in this
+     * project's scope (retired, hidden, or foreign), so the envelope is never
+     * sent: the daemon checks only the tokens it receives and would otherwise
+     * mutate the object unfenced.
+     */
     private async commitOnce(args: CommitArgs, deadline: Deadline): Promise<CommitResult> {
         let { tokens, missing } = this.collectTokens(args);
         if (missing.length > 0) {
@@ -486,7 +439,8 @@ export class KernelClient {
                 deadline,
             );
             if (refreshed.state.kind !== "available") return { state: refreshed.state };
-            ({ tokens } = this.collectTokens(args));
+            ({ tokens, missing } = this.collectTokens(args));
+            if (missing.length > 0) return { state: nonAvailable(conflict("retracted")) };
         }
         const result = await this.call(
             "kernel.commit",
@@ -547,123 +501,5 @@ export class KernelClient {
             ...args,
             operations: [{ op: "retire_decision", object_id: objectId }],
         });
-    }
-
-    /**
-     * A retired object is restored by superseding it with a live replacement.
-     * The envelope carries no token: the daemon rejects any token for an
-     * invalidated object as `conflict(retracted)`, so the restore's freshness
-     * claim is the retirement itself.
-     */
-    restore(objectId: string, spec: DecisionSpecInput, args: MutationArgs): Promise<CommitResult> {
-        return this.commit({
-            ...args,
-            operations: [{ op: "supersede_decision", replaced_object_id: objectId, spec }],
-            tokens: [],
-        });
-    }
-
-    async eligibilityBatch(args: EligibilityArgs): Promise<EligibilityResult> {
-        return await this.call(
-            "kernel.eligibility.batch",
-            this.wireBody("kernel.eligibility.batch", {
-                destination: args.destination,
-                candidates: args.candidates,
-            }),
-            { signal: args.signal, deadline: this.deadline(args), reissuable: false },
-            parseEligibilityResponse,
-        );
-    }
-
-    async egressDecide(args: EgressArgs): Promise<EgressResult> {
-        return await this.call(
-            "kernel.egress.decide",
-            this.wireBody("kernel.egress.decide", {
-                artifact_digest: args.artifactDigest,
-                ...(args.evidenceId === undefined ? {} : { evidence_id: args.evidenceId }),
-                destination: args.destination,
-                asserted_sensitivity: args.assertedSensitivity,
-                owning_object_id: args.owningObjectId,
-            }),
-            { signal: args.signal, deadline: this.deadline(args), reissuable: false },
-            parseEgressResponse,
-        );
-    }
-
-    /**
-     * Pages `payload` at `INGEST_PAGE_BYTES`. `begin` and `finish` are not
-     * reissued after `outcome_unknown`: a second `begin` collides with the
-     * staged upload and a second `finish` finds it consumed. A page resent with
-     * identical bytes is accepted, so pages are.
-     */
-    async ingestArtifact(
-        payload: Uint8Array,
-        request: ArtifactRequest,
-        args: IntentArgs & CallOptions,
-    ): Promise<IngestResult> {
-        if (payload.byteLength === 0) return { state: nonAvailable(invalid("invalid_input")) };
-        const deadline = this.deadline(args);
-        const producer = args.producer ?? this.producer;
-        const payloadDigest = sha256Hex(payload);
-        const requestDigest = args.requestDigest ?? payloadDigest;
-        const operationKey = deriveOperationKey({
-            projectRoot: this.projectRoot,
-            producer,
-            actor: args.actor,
-            cause: args.cause,
-            requestDigest,
-        });
-        const uploadId = operationKey;
-        const pageCount = Math.ceil(payload.byteLength / INGEST_PAGE_BYTES);
-        const begun = await this.call(
-            "kernel.artifact.ingest.begin",
-            this.wireBody("kernel.artifact.ingest.begin", {
-                upload_id: uploadId,
-                total_bytes: payload.byteLength,
-                page_count: pageCount,
-                payload_digest: payloadDigest,
-                request,
-                intent: {
-                    producer,
-                    operation_key: operationKey,
-                    request_digest: requestDigest,
-                    actor: args.actor,
-                    cause: args.cause,
-                },
-            }),
-            { signal: args.signal, deadline, reissuable: false },
-            parseIngestBeginResponse,
-        );
-        if (!isAvailable(begun)) return { state: begun.state };
-        if (begun.page_bytes_max < INGEST_PAGE_BYTES) {
-            return { state: nonAvailable(invalid("page_too_large")) };
-        }
-        for (let index = 0; index < pageCount; index += 1) {
-            const page = payload.subarray(
-                index * INGEST_PAGE_BYTES,
-                (index + 1) * INGEST_PAGE_BYTES,
-            );
-            const staged = await this.call(
-                "kernel.artifact.ingest.page",
-                this.wireBody("kernel.artifact.ingest.page", {
-                    upload_id: uploadId,
-                    index,
-                    bytes_base64: Buffer.from(page).toString("base64"),
-                    page_digest: sha256Hex(page),
-                }),
-                { signal: args.signal, deadline, reissuable: true },
-                (raw) => {
-                    const parsed = parseKernelResponse(raw);
-                    return { state: parsed.state, payload: parsed.payload };
-                },
-            );
-            if (staged.state.kind !== "available") return { state: staged.state };
-        }
-        return await this.call(
-            "kernel.artifact.ingest.finish",
-            this.wireBody("kernel.artifact.ingest.finish", { upload_id: uploadId }),
-            { signal: args.signal, deadline, reissuable: false },
-            parseIngestFinishResponse,
-        );
     }
 }

@@ -7,24 +7,17 @@ import {
 import { sanitizeFtsQuery } from "./fts-query";
 import { type GitCommitSearchHit, searchGitCommitsSync } from "./git-commits";
 import { containsProbeVerbatim, extractLiteralProbes } from "./literal-probes";
-import { readProjectIdentityMap } from "./memory/claim-memory-render";
-import { isValidPublicClaimId, parseRevisionLocator } from "./memory/claim-operation-contract";
 import { CLAIM_POLICY_VERSION } from "./memory/claim-visibility-policy";
 import { ANTI_MEMORY_CATEGORY } from "./memory/constants";
 import { cosineSimilarity } from "./memory/cosine-similarity";
 import { embedBatchForProject, getProjectEmbeddingSnapshot } from "./memory/embedding";
 import type { EmbeddingPurpose } from "./memory/embedding-provider";
-import {
-    listActiveAntiMemoryPublicIds,
-    readAntiMemories,
-    readAntiMemory,
-} from "./memory/storage-anti-memory";
+import { listActiveAntiMemoryPublicIds, readAntiMemories } from "./memory/storage-anti-memory";
 import {
     type ProjectMemoryClaimSnapshot,
     readProjectMemoryCurrentState,
     resolveProjectIdsForIdentities,
 } from "./memory/storage-claim-current-state";
-import { recordClaimUsage } from "./memory/storage-claim-operations";
 import { getIndexedMessageCorpusSize } from "./message-index";
 import {
     DEFAULT_SEARCH_RESULT_LIMIT,
@@ -61,7 +54,6 @@ import {
     expandWorkspaceIdentitySetWithAliases,
     resolveWorkspaceIdentitySet,
     resolveWorkspaceShareCategories,
-    sourceNameForMemory,
     type WorkspaceIdentitySet,
 } from "./workspaces";
 
@@ -1630,185 +1622,6 @@ function resolveSources(sources: SearchSource[] | undefined): Set<SearchSource> 
         }
     }
     return set;
-}
-
-/**
- */
-export function parseLocatorShapedQuery(query: string): string[] | null {
-    const tokens = query
-        .trim()
-        .split(/[\s,]+/)
-        .filter(Boolean);
-    if (tokens.length === 0) return null;
-    const publicClaimIds: string[] = [];
-    for (const token of tokens) {
-        if (isValidPublicClaimId(token)) {
-            publicClaimIds.push(token);
-            continue;
-        }
-        const locator = parseRevisionLocator(token);
-        if (locator === null) return null;
-        publicClaimIds.push(locator.publicClaimId);
-    }
-    return publicClaimIds;
-}
-
-/**
- */
-export function resolveClaimsByLocatorsForSearch(args: {
-    db: Database;
-    projectPath: string;
-    locators: readonly string[];
-    limit: number;
-    /* */
-    visibleRevisionLocators?: ReadonlySet<string> | null;
-    /* */
-    countRetrievals?: boolean;
-}): Array<MemorySearchResult | AntiMemorySearchResult> | null {
-    if (args.locators.length === 0) return null;
-    const publicClaimIds: string[] = [];
-    for (const raw of args.locators) {
-        if (isValidPublicClaimId(raw)) {
-            publicClaimIds.push(raw);
-            continue;
-        }
-        const parsed = parseRevisionLocator(raw);
-        if (parsed !== null) publicClaimIds.push(parsed.publicClaimId);
-    }
-    if (publicClaimIds.length === 0) return null;
-    const workspace = resolveSearchWorkspaceContext(args.db, args.projectPath);
-    const authorizedIdentities = workspace.isWorkspaced
-        ? workspace.expandedIdentities
-        : [args.projectPath];
-    const authorizedProjectIds = new Set(
-        resolveProjectIdsForIdentities(args.db, authorizedIdentities),
-    );
-    const ownProjectIds = new Set(
-        resolveProjectIdsForIdentities(
-            args.db,
-            workspace.isWorkspaced ? workspace.ownIdentities : [args.projectPath],
-        ),
-    );
-    const readVisibleClaims = (): ProjectMemoryClaimSnapshot[] | null => {
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-            const result = readProjectMemoryCurrentState(args.db, {
-                publicClaimIds: [...new Set(publicClaimIds)],
-                projectIds: [...authorizedProjectIds],
-                workspaceAuthorization: {
-                    ownProjectIds: [...ownProjectIds],
-                    sharedCategories: workspace.shareCategories ?? [],
-                },
-                workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, workspace.identities),
-                // undetected.
-                workspaceIdentities: workspace.identities,
-                surface: "explicit_search",
-                lifecycleStates: ["active", "archived"],
-            });
-            if (result.status === "ok") return result.items;
-        }
-        return null;
-    };
-    const items = readVisibleClaims();
-    if (items === null) return null;
-    const visible = items;
-    const identityByProjectId = readProjectIdentityMap(
-        args.db,
-        visible.map((item) => item.projectId),
-    );
-    const ordered: Array<MemorySearchResult | AntiMemorySearchResult> = [];
-    for (const item of visible) {
-        if (args.visibleRevisionLocators?.has(item.revisionLocator)) continue;
-        const identity = identityByProjectId.get(item.projectId);
-        const sourceName =
-            workspace.isWorkspaced && identity
-                ? (sourceNameForMemory(
-                      identity,
-                      args.projectPath,
-                      workspace.identities,
-                      workspace.namesByIdentity,
-                      workspace.canonicalIdentityByStoredPath,
-                  ) ?? undefined)
-                : undefined;
-        if (item.category === ANTI_MEMORY_CATEGORY) {
-            if (item.lifecycleState !== "active") continue;
-            const record = readAntiMemory(args.db, item.publicClaimId);
-            if (record === null) continue;
-            ordered.push({
-                source: "anti_memory",
-                score: 1,
-                publicClaimId: record.publicClaimId,
-                revisionLocator: record.revisionLocator,
-                contentDigest: record.contentDigest,
-                claimId: record.claimId,
-                normalizedHash: record.normalizedHash,
-                trigger: record.payload.trigger,
-                rejectedStrategy: record.payload.rejectedStrategy,
-                rejectionReason: record.payload.rejectionReason,
-                saferAlternative: record.payload.saferAlternative,
-                matchType: "exact",
-                ...(item.explicitLabel === null ? {} : { policyLabel: item.explicitLabel }),
-            });
-        } else
-            ordered.push({
-                source: "memory",
-                content: item.content,
-                score: 1,
-                publicClaimId: item.publicClaimId,
-                revisionLocator: item.revisionLocator,
-                category: item.category,
-                matchType: "exact",
-                ...(sourceName === undefined ? {} : { sourceName }),
-                ...(item.explicitLabel === null ? {} : { policyLabel: item.explicitLabel }),
-                contentDigest: item.contentDigest,
-            });
-        if (ordered.length >= args.limit) break;
-    }
-    if (ordered.length === 0) return null;
-    if (args.countRetrievals !== false) {
-        recordClaimUsage(args.db, {
-            publicClaimIds: ordered
-                .filter((result): result is MemorySearchResult => result.source === "memory")
-                .map((result) => result.publicClaimId),
-            kind: "retrieved",
-        });
-    }
-    // The provider closes its snapshot before revalidation.
-    // The initial read may be stale at revalidation.
-    // Under WAL, another process can write while this process reads old committed state.
-    // Another process can commit a quarantine, rejection, or revision before this call returns.
-    // Telemetry can delay revalidation by up to `busy_timeout`.
-    // The telemetry write does not create the stale-read window.
-    // The provider revalidates even when `countRetrievals === false`.
-    const current = readVisibleClaims();
-    if (current === null) return null;
-    const currentByClaimId = new Map(current.map((item) => [item.publicClaimId, item]));
-    // Revalidation publishes a result only when every field copied from the snapshot still matches.
-    // A missing current claim is either hidden or deleted.
-    // The initial copy can predate a quarantine, rejection, or revision.
-    const confirmed = ordered.filter((result) => {
-        const item = currentByClaimId.get(result.publicClaimId);
-        if (item === undefined) return false;
-        if (
-            item.revisionLocator !== result.revisionLocator ||
-            item.contentDigest !== result.contentDigest ||
-            (item.explicitLabel ?? undefined) !== result.policyLabel
-        ) {
-            return false;
-        }
-        // An anti-memory result carries payload fields instead of `content` and `category`.
-        // The preceding equality checks do not cover anti-memory payload fields.
-        // Revalidation reapplies hydration's lifecycle and category gates.
-        // Otherwise, revalidation can publish a warning archived after hydration.
-        // still published.
-        if (result.source === "anti_memory") {
-            return item.category === ANTI_MEMORY_CATEGORY && item.lifecycleState === "active";
-        }
-        return item.content === result.content && item.category === result.category;
-    });
-    // `null` also represents a missing or foreign-hidden locator.
-    // Callers cannot distinguish a hidden claim from a missing claim.
-    if (confirmed.length === 0) return null;
-    return confirmed;
 }
 
 export async function unifiedSearch(

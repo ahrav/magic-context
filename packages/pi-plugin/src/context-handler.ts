@@ -114,6 +114,7 @@ import {
 	rearmChannel2AfterCoverageAdvancingHardFold,
 	rearmChannel2AfterMeasuredCollapse,
 } from "@magic-context/core/hooks/magic-context/channel2-cycle";
+import { scheduleClaimLaneImport } from "@magic-context/core/hooks/magic-context/claim-lane-import";
 import { checkCompartmentTrigger } from "@magic-context/core/hooks/magic-context/compartment-trigger";
 import { evaluateChannel2 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
@@ -122,7 +123,7 @@ import {
 	resolveExecuteThreshold,
 } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import { foldExecutesThisPass } from "@magic-context/core/hooks/magic-context/fold-execution-gate";
-import { daemonAbsentSnapshot } from "@magic-context/core/hooks/magic-context/kernel-memory-render";
+import { readInjectionMemorySnapshot } from "@magic-context/core/hooks/magic-context/kernel-memory-render";
 import {
 	markNoteNudgeDelivered,
 	onNoteTrigger,
@@ -152,11 +153,9 @@ import {
 } from "@magic-context/core/hooks/magic-context/tool-reclaim";
 import { escalationBands } from "@magic-context/core/shared/escalation-bands";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
-import {
-	disabled,
-	type KernelClientResolver,
-	type KernelMemorySnapshot,
-	kernelMemorySnapshotFrom,
+import type {
+	KernelClientResolver,
+	KernelMemorySnapshot,
 } from "@magic-context/core/shared/kernel-client";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
@@ -2478,12 +2477,29 @@ export function registerPiContextHandler(
 			// One read serves this pass's m[0]/m[1] render; the pipeline takes it as a
 			// value and issues no memory RPC.
 			const tMemoryRead = performance.now();
+			const memoryProjectRoot = resolveProjectRootDirectory(projectDirectory);
+			if (
+				options.injection &&
+				options.injection.memoryEnabled !== false &&
+				projectIdentity.length > 0
+			) {
+				scheduleClaimLaneImport({
+					db: options.db,
+					client: options.kernelClient?.({
+						sessionId,
+						projectRoot: memoryProjectRoot,
+					}),
+					projectPath: projectIdentity,
+					sessionId,
+				});
+			}
 			const memory = options.injection
-				? await readPiInjectionMemory({
-						options,
+				? await readInjectionMemorySnapshot({
+						kernelClient: options.kernelClient,
+						memoryEnabled: options.injection.memoryEnabled !== false,
 						sessionId,
 						projectIdentity,
-						projectDirectory,
+						projectRoot: memoryProjectRoot,
 					})
 				: null;
 			logTransformTiming(sessionId, "kernelMemoryRead", tMemoryRead);
@@ -3571,33 +3587,6 @@ function maybeFireHistorian(args: {
 		if (!triggered) unregister();
 	}
 }
-/**
- * The m[0] memory read. `auto_inject` is ungated, so lag never withholds
- * baseline memory; a session without a memory-enabled project identity has no
- * kernel scope to read under and renders the disabled marker.
- */
-async function readPiInjectionMemory(args: {
-	options: Pick<PiContextHandlerOptions, "kernelClient" | "injection">;
-	sessionId: string;
-	projectIdentity: string;
-	projectDirectory: string;
-}): Promise<KernelMemorySnapshot> {
-	if (
-		args.options.injection?.memoryEnabled === false ||
-		args.projectIdentity.length === 0
-	) {
-		return { state: disabled(), rows: [], knownAsOf: null };
-	}
-	if (!args.options.kernelClient) return daemonAbsentSnapshot();
-	const client = args.options.kernelClient({
-		sessionId: args.sessionId,
-		projectRoot: resolveProjectRootDirectory(args.projectDirectory),
-	});
-	return kernelMemorySnapshotFrom(
-		await client.read({ surface: "auto_inject", gated: false }),
-	);
-}
-
 interface RunPipelineArgs {
 	db: ContextDatabase;
 	tagger: Tagger;

@@ -108,7 +108,11 @@ function insertMemory(
 
 /** A change to the object outside this pass's view; the next snapshot key differs. */
 function reviseSeededMemory(database: Database, id: string): void {
-    kernelFor(database).touch(id);
+    const kernel = kernelFor(database);
+    const object = kernel.objects.get(id);
+    if (!object?.decision) throw new Error(`missing seeded memory ${id}`);
+    kernel.touch(id);
+    object.decision.payload.summary = `${object.decision.payload.summary} (revised)`;
 }
 
 function archiveSeededMemory(database: Database, id: string): void {
@@ -890,6 +894,9 @@ describe("m[0]/m[1] materialization", () => {
         });
         const afterWrite = read();
         expect(afterWrite.memorySnapshotKey).not.toBe(before.memorySnapshotKey);
+
+        kernelFor(db).touch(seeded.id);
+        expect(read().memorySnapshotKey).toBe(afterWrite.memorySnapshotKey);
 
         reviseSeededMemory(db, seeded.id);
         const afterRevision = read();

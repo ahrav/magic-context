@@ -3,14 +3,7 @@ import type { KernelClientResolver } from "../../shared/kernel-client";
 import type { ImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 
 /* */
-export const CTX_MEMORY_ACTIONS = [
-    "create",
-    "get",
-    "revise",
-    "archive",
-    "restore",
-    "merge",
-] as const;
+export const CTX_MEMORY_ACTIONS = ["create", "get", "revise", "archive", "merge"] as const;
 
 /* */
 export const CTX_MEMORY_DREAMER_ACTIONS = [...CTX_MEMORY_ACTIONS, "list"] as const;
@@ -22,7 +15,7 @@ export interface CtxMemoryArgs extends ImitatedReducedArgs {
     content?: string;
     category?: string;
     antiMemory?: AntiMemoryPayload;
-    /** The one target of `revise`, `archive`, or `restore`. */
+    /** The one target of `revise` or `archive`. */
     objectId?: string;
     /** `get` targets; for `merge`, the objects folded into one survivor. */
     objectIds?: string[];

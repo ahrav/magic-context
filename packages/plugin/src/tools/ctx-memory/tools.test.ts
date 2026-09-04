@@ -222,10 +222,11 @@ describe("ctx_memory reads", () => {
 });
 
 describe("ctx_memory lifecycle and merge", () => {
-    test("archive retires, restore supersedes the retired object, merge folds two into one", async () => {
+    test("archive retires and merge folds two into one", async () => {
         const kernel = new FakeKernel();
         kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
         kernel.seedDecision({ object_id: "mem_b", decision_kind: "ARCHITECTURE", summary: "B." });
+        kernel.seedDecision({ object_id: "mem_c", decision_kind: "ARCHITECTURE", summary: "C." });
         const tool = harness(kernel);
         const archived = parseJson<CommitJson>(
             await tool.execute(
@@ -236,29 +237,49 @@ describe("ctx_memory lifecycle and merge", () => {
         expect(archived.outcome).toBe("applied");
         expect(kernel.objects.get("mem_a")?.invalidated_commit_seq).not.toBeNull();
 
-        const restored = parseJson<CommitJson>(
-            await tool.execute(
-                { action: "restore", objectId: "mem_a", category: "ARCHITECTURE", content: "A." },
-                "call-restore",
-            ),
-        );
-        expect(restored.outcome).toBe("applied");
-        const restoredId = restored.objects.find((id) => id !== "mem_a") as string;
-        expect(kernel.objects.get(restoredId)?.decision?.payload.summary).toBe("A.");
-
         const merged = parseJson<CommitJson>(
             await tool.execute(
-                { action: "merge", objectIds: [restoredId, "mem_b"], content: "A and B." },
+                { action: "merge", objectIds: ["mem_b", "mem_c"], content: "B and C." },
                 "call-merge",
             ),
         );
         expect(merged.outcome).toBe("applied");
-        expect(merged.objects).toContain(restoredId);
         expect(merged.objects).toContain("mem_b");
-        expect(kernel.liveRows().map((row) => row.decision?.payload.summary)).toEqual(["A and B."]);
+        expect(merged.objects).toContain("mem_c");
+        expect(kernel.liveRows().map((row) => row.decision?.payload.summary)).toEqual(["B and C."]);
         expect(await tool.execute({ action: "merge", objectIds: ["only"] }, "call-merge-one")).toBe(
             "Error: merge requires at least two objectIds",
         );
+    });
+
+    test("a target the project cannot read is refused before any commit", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        kernel.seedDecision({
+            object_id: "mem_secret",
+            decision_kind: "ARCHITECTURE",
+            summary: "S.",
+            sensitivity: "secret",
+        });
+        const tool = harness(kernel);
+        const refused = "Error: memory not found or not visible from this project: mem_secret";
+        expect(
+            await tool.execute({ action: "archive", objectId: "mem_secret" }, "call-archive-x"),
+        ).toBe(refused);
+        expect(
+            await tool.execute(
+                { action: "revise", objectId: "mem_secret", content: "S2." },
+                "call-revise-x",
+            ),
+        ).toBe(refused);
+        expect(
+            await tool.execute(
+                { action: "merge", objectIds: ["mem_a", "mem_secret"], content: "AS." },
+                "call-merge-x",
+            ),
+        ).toBe(refused);
+        expect(tool.transport.methods()).not.toContain("kernel.commit");
+        expect(kernel.objects.get("mem_secret")?.invalidated_commit_seq).toBeNull();
     });
 });
 

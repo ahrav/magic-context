@@ -377,8 +377,9 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             expect(headText(foldMessages)).toContain("<memory-mural>");
             expect(headText(foldMessages)).toContain("<project-memory>");
 
-            // A kernel change forces the next pass to fold.
+            // A content change to the rendered memory forces the next pass to fold.
             kernel.touch(seeded.object_id);
+            if (seeded.decision) seeded.decision.payload.summary = "Claim revised for the fold.";
 
             // A sibling writer makes every materialize attempt fail its staleness check, so the pass falls back without a cached payload for this snapshot.
             const staleMessages: MessageLike[] = [];

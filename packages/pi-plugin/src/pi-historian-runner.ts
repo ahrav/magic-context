@@ -24,7 +24,11 @@ import {
 	appendCompartments,
 	getCompartments,
 } from "@magic-context/core/features/magic-context/compartment-storage";
-import { promoteSessionFactsDurable } from "@magic-context/core/features/magic-context/memory";
+import {
+	type HistorianPromotionIdentity,
+	type PromotedMemoryRef,
+	promoteSessionFactsDurable,
+} from "@magic-context/core/features/magic-context/memory";
 import {
 	resolveProjectIdentityForSession,
 	resolveProjectRootDirectory,
@@ -74,10 +78,8 @@ import {
 	isTransientHistorianPromptError,
 	MAX_HISTORIAN_RETRIES,
 } from "@magic-context/core/hooks/magic-context/historian-retry-policy";
-import {
-	memoryRows,
-	renderKernelMemoryBlock,
-} from "@magic-context/core/hooks/magic-context/kernel-memory-render";
+import { commitPromotedFactsToKernel } from "@magic-context/core/hooks/magic-context/kernel-memory-promotion";
+import { readHistorianMemoryBlock } from "@magic-context/core/hooks/magic-context/kernel-memory-render";
 import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudger";
 import {
 	createDefaultBoundarySnapshotForTests,
@@ -95,11 +97,7 @@ import {
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { buildReferenceBlocks } from "@magic-context/core/hooks/magic-context/reference-retrieval";
 import { describeError } from "@magic-context/core/shared/error-message";
-import {
-	isAvailable,
-	type KernelClientResolver,
-	stateKey,
-} from "@magic-context/core/shared/kernel-client";
+import type { KernelClientResolver } from "@magic-context/core/shared/kernel-client";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import type {
@@ -626,31 +624,16 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				rollbackDrainReservation();
 				return;
 			}
-			// The historian sees the same baseline the model saw so it does not
-			// re-derive facts already held as project memory. A non-available
-			// read omits the block; the marker line is for the model, not the historian.
-			let projectMemory = "";
-			if (memoryEnabled !== false && kernelClient) {
-				const read = await kernelClient({
-					sessionId,
-					projectRoot: resolveProjectRootDirectory(directory),
-				}).read({ surface: "auto_inject", gated: false });
-				if (isAvailable(read)) {
-					projectMemory = renderKernelMemoryBlock(
-						memoryRows({
-							state: read.state,
-							rows: read.rows,
-							knownAsOf: read.known_as_of,
-						}),
-						read.state,
-					);
-				} else {
-					sessionLog(
-						sessionId,
-						`historian memory read answered ${stateKey(read.state)}; omitting memories`,
-					);
-				}
-			}
+			const projectMemory =
+				memoryEnabled !== false
+					? await readHistorianMemoryBlock({
+							client: kernelClient?.({
+								sessionId,
+								projectRoot: resolveProjectRootDirectory(directory),
+							}),
+							sessionId,
+						})
+					: "";
 
 			// The historian receives bounded reference blocks instead of all prior compartments.
 			// The historian receives four rotating cross-project seed examples for importance-band calibration and the last six same-session compartments for continuity.
@@ -1054,6 +1037,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				return true;
 			});
 			let persistedIds: number[] = [];
+			let promotionIdentity: HistorianPromotionIdentity | null = null;
+			let promotedRefs: PromotedMemoryRef[] = [];
 
 			// The transaction atomically publishes appended compartments, durable facts, events, the drop queue, and failure-state clearing.
 			// Stage the Pi-native compaction marker payload in the transaction so a crash cannot leave compartments without a marker queued for deferred materialization.
@@ -1086,18 +1071,19 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				// Promote only facts from this chunk; do not replace the session fact list.
 				// Promotion and boundary-floor updates commit or roll back together.
 				if (promotionActive && !skipUnanchoredPromotion) {
-					promoteSessionFactsDurable(
+					promotionIdentity = {
+						producer: "pi-historian",
+						runId: `${sessionId}:${chunk.startIndex}:${chunk.endIndex}`,
+						leaseKey: `compartment:${sessionId}`,
+						leaseGeneration: compartmentLeaseHolderId,
+						batchId: `${chunk.startIndex}-${lastNewEnd}`,
+					};
+					promotedRefs = promoteSessionFactsDurable(
 						db,
 						sessionId,
 						projectPath,
 						validatedPass.facts ?? [],
-						{
-							producer: "pi-historian",
-							runId: `${sessionId}:${chunk.startIndex}:${chunk.endIndex}`,
-							leaseKey: `compartment:${sessionId}`,
-							leaseGeneration: compartmentLeaseHolderId,
-							batchId: `${chunk.startIndex}-${lastNewEnd}`,
-						},
+						promotionIdentity,
 					);
 				}
 
@@ -1151,6 +1137,18 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// The transaction contains all publish-visible durable state; embedding registration and provider calls run post-commit on a best-effort basis.
 			onPublished?.();
 			completedSuccessfully = true;
+
+			if (promotionIdentity && promotedRefs.length > 0) {
+				await commitPromotedFactsToKernel({
+					client: kernelClient?.({
+						sessionId,
+						projectRoot: resolveProjectRootDirectory(directory),
+					}),
+					sessionId,
+					refs: promotedRefs,
+					identity: promotionIdentity,
+				});
+			}
 
 			sessionLog(
 				sessionId,

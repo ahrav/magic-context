@@ -1,11 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-    parseCommitResponse,
-    parseEgressResponse,
-    parseEligibilityResponse,
-    parseKernelResponse,
-    parseReadResponse,
-} from "./wire";
+import { parseCommitResponse, parseKernelResponse, parseReadResponse } from "./wire";
 
 const UNRECOGNIZED = { kind: "invalid", reason: "unrecognized_state" };
 
@@ -24,10 +18,11 @@ function readRow(objectId: string, knownAsOf: number, extra: Record<string, unkn
             sensitivity: "normal",
             ...extra,
         },
-        visibility: "visible",
-        labeled: false,
+        visibility: "labeled",
+        labeled: true,
         scope_id: "project:x",
         token: { object_id: objectId, known_as_of: knownAsOf },
+        decision: { decision_kind: "memory", payload: { summary: objectId, rationale: "" } },
     };
 }
 
@@ -99,7 +94,7 @@ describe("parseReadResponse", () => {
         expect(parsed.payload?.rows[0]?.token).toEqual({ object_id: "o1", known_as_of: 7 });
     });
 
-    test("a decision row is typed and a null decision is absent", () => {
+    test("a decision row is typed and a non-decision object carries no decision", () => {
         const decision = {
             decision_kind: "memory",
             payload: { summary: "s", rationale: "r" },
@@ -108,7 +103,7 @@ describe("parseReadResponse", () => {
             ...good,
             rows: [
                 { ...readRow("o1", 7), decision },
-                { ...readRow("o2", 7), decision: null },
+                { ...readRow("o2", 7, { object_kind: "observation" }), decision: null },
             ],
         });
         expect(parsed.payload?.rows[0]?.decision).toEqual(decision);
@@ -140,6 +135,10 @@ describe("parseReadResponse", () => {
         [
             "row with bad visibility",
             { ...good, rows: [{ ...readRow("o1", 7), visibility: "shown" }] },
+        ],
+        [
+            "decision object without its decision row",
+            { ...good, rows: [{ ...readRow("o1", 7), decision: undefined }] },
         ],
         [
             "row with a decision missing its rationale",
@@ -193,43 +192,5 @@ describe("parseCommitResponse", () => {
         const parsed = parseCommitResponse({ state: { kind: "conflict", reason: "retracted" } });
         expect(parsed.state).toEqual({ kind: "conflict", reason: "retracted" });
         expect(parsed.payload).toBeNull();
-    });
-});
-
-describe("parseEligibilityResponse", () => {
-    test("verdicts are validated against the closed set", () => {
-        const good = {
-            state: { kind: "available" },
-            known_as_of: 2,
-            verdicts: [{ object_id: "o1", verdict: "provider_sensitive" }],
-            cache_hits: 1,
-        };
-        expect(parseEligibilityResponse(good).payload?.verdicts[0]?.verdict).toBe(
-            "provider_sensitive",
-        );
-        expect(
-            parseEligibilityResponse({
-                ...good,
-                verdicts: [{ object_id: "o1", verdict: "maybe" }],
-            }).state,
-        ).toEqual(UNRECOGNIZED);
-    });
-});
-
-describe("parseEgressResponse", () => {
-    test("allowed and refused shapes both parse", () => {
-        expect(
-            parseEgressResponse({ state: { kind: "available" }, decision: "allowed" }).payload,
-        ).toEqual({ decision: { kind: "allowed" } });
-        expect(
-            parseEgressResponse({
-                state: { kind: "available" },
-                decision: { refused: "under_declared" },
-            }).payload,
-        ).toEqual({ decision: { kind: "refused", reason: "under_declared" } });
-        expect(
-            parseEgressResponse({ state: { kind: "available" }, decision: { refused: "meh" } })
-                .state,
-        ).toEqual(UNRECOGNIZED);
     });
 });

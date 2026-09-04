@@ -8,29 +8,100 @@
 import { escapeXmlAttr, escapeXmlContent } from "../../features/magic-context/compartment-storage";
 import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
 import {
+    abstained,
+    disabled,
+    isAvailable,
+    type KernelClient,
+    type KernelClientResolver,
     type KernelMemorySnapshot,
+    kernelMemorySnapshotFrom,
     type MemoryState,
     type ReadRow,
     renderMemoryStateMarker,
+    sha256Hex,
     stateKey,
     unavailable,
 } from "../../shared/kernel-client";
+import { sessionLog } from "../../shared/logger";
 import { estimateTokens } from "../../shared/token-estimator";
 
 export const PROJECT_MEMORY_WRAPPER = "project-memory";
+
+/** The daemon's automatic surfaces hide every `kernel.commit`-written row; `explicit_search` serves them as `labeled`. commentlint: allow(JUDGE) */
+export const MEMORY_READ_SURFACE = "explicit_search";
+
+/** The host waits at most this long for a memory read before the model call. */
+export const INJECTION_READ_DEADLINE_MS = 3_000;
 
 /** The snapshot an injector renders when no client can be reached at all. */
 export function daemonAbsentSnapshot(): KernelMemorySnapshot {
     return { state: unavailable("daemon_absent"), rows: [], knownAsOf: null };
 }
 
-/**
- * One string that changes whenever the rendered memory could: the state, the
- * snapshot position, and the row count. Cache keys embed it so a state flip
- * with identical rows still busts the cached block.
- */
+function disabledSnapshot(): KernelMemorySnapshot {
+    return { state: disabled(), rows: [], knownAsOf: null };
+}
+
+export async function readInjectionMemorySnapshot(args: {
+    kernelClient: KernelClientResolver | undefined;
+    memoryEnabled: boolean;
+    projectIdentity: string | undefined;
+    sessionId: string;
+    projectRoot: string;
+}): Promise<KernelMemorySnapshot> {
+    if (!args.memoryEnabled || !args.projectIdentity) return disabledSnapshot();
+    if (!args.kernelClient) return daemonAbsentSnapshot();
+    const client = args.kernelClient({ sessionId: args.sessionId, projectRoot: args.projectRoot });
+    return kernelMemorySnapshotFrom(
+        await client.read({
+            surface: MEMORY_READ_SURFACE,
+            gated: false,
+            deadlineMs: INJECTION_READ_DEADLINE_MS,
+        }),
+    );
+}
+
+/** Automatic consumers treat a `stale` read as `abstained` and surface none of its rows. */
+export function withholdLaggingMemory(snapshot: KernelMemorySnapshot): KernelMemorySnapshot {
+    if (snapshot.state.kind !== "stale") return snapshot;
+    const { lag_positions, oldest_unconsumed_age_ms } = snapshot.state;
+    return {
+        state: abstained({ lag_positions, oldest_unconsumed_age_ms }),
+        rows: [],
+        knownAsOf: null,
+    };
+}
+
+/** The historian deduplicates against the block the model saw; a non-`available` read yields no baseline. */
+export async function readHistorianMemoryBlock(args: {
+    client: KernelClient | undefined;
+    sessionId: string;
+}): Promise<string> {
+    if (!args.client) return "";
+    const read = await args.client.read({
+        surface: MEMORY_READ_SURFACE,
+        gated: false,
+        deadlineMs: INJECTION_READ_DEADLINE_MS,
+    });
+    if (!isAvailable(read)) {
+        sessionLog(
+            args.sessionId,
+            `historian memory read answered ${stateKey(read.state)}; omitting memories`,
+        );
+        return "";
+    }
+    return renderKernelMemoryBlock(memoryRows(kernelMemorySnapshotFrom(read)), read.state);
+}
+
+/** Excludes the store-wide `known_as_of`, which every commit to any project advances; a changed key rematerializes m[0] and the prompt prefix. commentlint: allow(JUDGE) */
 export function memorySnapshotKey(snapshot: KernelMemorySnapshot): string {
-    return `${stateKey(snapshot.state)}@${snapshot.knownAsOf ?? "-"}#${snapshot.rows.length}`;
+    const rows = memoryRows(snapshot)
+        .map(
+            (row) =>
+                `${row.object.object_id}\u001f${row.labeled ? 1 : 0}\u001f${memoryRowCategory(row)}\u001f${row.decision?.payload.summary ?? ""}`,
+        )
+        .sort();
+    return `${stateKey(snapshot.state)}#${rows.length}@${sha256Hex(rows.join("\u001e")).slice(0, 16)}`;
 }
 
 /** Rows with a decision payload are the only ones that render as memory text. */

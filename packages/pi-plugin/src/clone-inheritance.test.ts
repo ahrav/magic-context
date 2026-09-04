@@ -819,7 +819,7 @@ describe("Pi clone state inheritance", () => {
 			projectRoot,
 			tokens: parentTokens,
 		});
-		await parent.read({ surface: "auto_inject", gated: false });
+		await parent.read({ surface: "explicit_search", gated: false });
 		expect(parentTokens.size(projectRoot)).toBe(1);
 		expect(parentTokens.knownAsOfFor(projectRoot)).toBe(1);
 
@@ -857,7 +857,7 @@ describe("Pi clone state inheritance", () => {
 			projectRoot,
 			tokens: clone.tokens,
 		});
-		await cloneClient.read({ surface: "auto_inject", gated: false });
+		await cloneClient.read({ surface: "explicit_search", gated: false });
 		expect(cloneTransport.calls[0]?.body).toMatchObject({ as_of: null });
 		expect(clone.tokens.size(projectRoot)).toBe(1);
 		expect(parentTokens.size(projectRoot)).toBe(1);

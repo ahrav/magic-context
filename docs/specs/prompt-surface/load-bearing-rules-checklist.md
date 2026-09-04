@@ -469,7 +469,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Scope:** primary sessions with memory enabled
 - **Polarity:** contract
 - **Operative condition:** A fact must be available to future sessions.
-- **Mechanism:** Use ctx_memory to create durable claims and revise, archive, restore, or merge them when facts drift.
+- **Mechanism:** Use ctx_memory to create durable claims and revise, archive, or merge them when facts drift.
 - **Consequence:** Future sessions start with maintained project knowledge.
 - **Source evidence:** `Claims persist across sessions`
 
@@ -1194,7 +1194,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Scope:** ctx_memory tool users
 - **Polarity:** contract
 - **Operative condition:** A memory must be changed or fetched.
-- **Mechanism:** Use create, get, revise, archive, restore, or merge; list remains dreamer-only.
+- **Mechanism:** Use create, get, revise, archive, or merge; list remains dreamer-only.
 - **Consequence:** Primary agents cannot assume the dreamer-only list action is available.
 - **Source evidence:** `list: visible memories (dreamer maintenance only).`
 
@@ -1242,9 +1242,9 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Scope:** ctx_memory tool users
 - **Polarity:** contract
 - **Operative condition:** A memory must be fetched or changed.
-- **Mechanism:** Use get, revise, archive, restore, or merge with object ids; supersession returns the survivor's id and no token is passed.
+- **Mechanism:** Use get, revise, archive, or merge with object ids; supersession returns the survivor's id and no token is passed.
 - **Consequence:** Primary agents use canonical object identities and never carry mutation tokens.
-- **Source evidence:** `revise, merge, and restore supersede their targets with one new object and return its id; no token is passed`
+- **Source evidence:** `revise and merge supersede their targets with one new object and return its id; no token is passed`
 
 | Variant | Applicability status |
 | --- | --- |

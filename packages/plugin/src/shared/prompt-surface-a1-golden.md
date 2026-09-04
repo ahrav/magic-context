@@ -5,7 +5,7 @@ Token counts are Claude BPE estimates on the raw text.
 
 ## 1. System-prompt guidance section
 
-### PRIMARY full (reduce=on, memory=on, dreamer=on, temporal=on) — 8787 chars, ~2008 tokens
+### PRIMARY full (reduce=on, memory=on, dreamer=on, temporal=on) — 8778 chars, ~2006 tokens
 
 ```markdown
 ## Magic Context
@@ -26,7 +26,7 @@ Messages and tool outputs are tagged with §N§ identifiers (e.g., §1§, §42§
 Use `ctx_reduce` to mark spent tagged content as discardable and reclaim space. Marking is NOT an immediate delete — it queues the content, which stays fully visible until space is actually needed (as soon as the next turn if you're already under pressure, much later if not), so mark a tool output as soon as you're done with it rather than hoarding the call for the end of the turn. The last 20 tags are protected (marking one just queues it until it ages out). Syntax: "3-5", "1,2,9", or "1-5,8,12-15".
 Do not announce or narrate `ctx_reduce` drops — just call the tool silently. Saying "I'll drop these outputs" wastes tokens the user does not care about.
 Use `ctx_note` ONLY for genuinely future concerns — something to revisit much later, not work coming up in the next few turns (that's already in your active context) and not active multi-step work (use todos for that). Magic Context preserves your full context across both compaction and restarts, so an upcoming restart or "let's come back to this later" is never a reason to take a note — nothing is lost either way. Notes you do take survive compression and resurface at natural work boundaries (after commits, historian runs, todo completion).
-Use `ctx_memory` for durable project knowledge: create what future sessions must know, then revise, archive, restore, or merge claims shown in `<project-memory>` when they drift. Claims persist across sessions and every new session starts with them.
+Use `ctx_memory` for durable project knowledge: create what future sessions must know, then revise, archive, or merge claims shown in `<project-memory>` when they drift. Claims persist across sessions and every new session starts with them.
 Claims use opaque `mcm_…` public IDs. Pass the current mutation token returned by create/get/list when changing a claim; stale tokens make no change.
 **Save durable knowledge proactively**: If you spent multiple turns finding something (a file path, a DB location, a config pattern, a workaround), create a claim so future sessions don't repeat the search. Examples:
 - Found a project's source code path after searching → `ctx_memory(action="create", category="CONFIG_VALUES", content="OpenCode source is at ~/Work/OSS/opencode")`
@@ -131,7 +131,7 @@ Example: `ctx_note(action="write", content="Implement X because Y", surface_cond
 Prefer many small targeted operations over one large blanket operation, and keep the working set tidy as routine maintenance.
 ```
 
-### PRIMARY reduce-off (reduce=off, memory=on) — 6502 chars, ~1482 tokens
+### PRIMARY reduce-off (reduce=off, memory=on) — 6493 chars, ~1480 tokens
 
 ```markdown
 ## Magic Context
@@ -149,7 +149,7 @@ Because of this:
 Context is managed for you entirely automatically — there's nothing to prune and no warnings to act on. Stay reasonably concise per operation, and never let context size change *what* work you take on or *how thoroughly* you do it.
 
 Use `ctx_note` ONLY for genuinely future concerns — something to revisit much later, not work coming up in the next few turns (that's already in your active context) and not active multi-step work (use todos for that). Magic Context preserves your full context across both compaction and restarts, so an upcoming restart or "let's come back to this later" is never a reason to take a note — nothing is lost either way. Notes you do take survive compression and resurface at natural work boundaries (after commits, historian runs, todo completion).
-Use `ctx_memory` for durable project knowledge: create what future sessions must know, then revise, archive, restore, or merge claims shown in `<project-memory>` when they drift. Claims persist across sessions and every new session starts with them.
+Use `ctx_memory` for durable project knowledge: create what future sessions must know, then revise, archive, or merge claims shown in `<project-memory>` when they drift. Claims persist across sessions and every new session starts with them.
 Claims use opaque `mcm_…` public IDs. Pass the current mutation token returned by create/get/list when changing a claim; stale tokens make no change.
 **Save durable knowledge proactively**: If you spent multiple turns finding something (a file path, a DB location, a config pattern, a workaround), create a claim so future sessions don't repeat the search. Examples:
 - Found a project's source code path after searching → `ctx_memory(action="create", category="CONFIG_VALUES", content="OpenCode source is at ~/Work/OSS/opencode")`
@@ -325,21 +325,21 @@ Example: ctx_note(action="write", content="Re-run the perf benchmark once the bo
 }
 ```
 
-### ctx_memory — description ~186 tokens, params ~382 tokens (total ~568)
+### ctx_memory — description ~181 tokens, params ~376 tokens (total ~557)
 
 **Description:**
 
 ```
 Durable project memories shared across sessions, served by the memory daemon.
 
-Memories are addressed by object id (mem_<32hex>). revise, merge, and restore supersede their targets with one new object and return its id; no token is passed. A result starting with "Error:" names the memory state and what to do next.
+Memories are addressed by object id (mem_<32hex>). revise and merge supersede their targets with one new object and return its id; no token is passed. A result starting with "Error:" names the memory state and what to do next.
 
 Actions:
 - create: content + category, or antiMemory.
 - get: up to 20 object ids; hidden and missing objects read the same.
 - list: visible memories (dreamer maintenance only).
 - revise: objectId + content/category or antiMemory.
-- archive / restore: objectId.
+- archive: objectId.
 - merge: objectIds into one survivor + content/category or antiMemory.
 
 Approval and enforcement are human-owned /ctx-approve and /ctx-enforce commands. Agent calls to approve/enforce are rejected.
@@ -350,14 +350,13 @@ Approval and enforcement are human-owned /ctx-approve and /ctx-enforce commands.
 ```json
 {
   "action": {
-    "description": "create, get, list, revise, archive, restore, or merge",
+    "description": "create, get, list, revise, archive, or merge",
     "type": "string",
     "enum": [
       "create",
       "get",
       "revise",
       "archive",
-      "restore",
       "merge",
       "list"
     ]
@@ -470,7 +469,7 @@ Approval and enforcement are human-owned /ctx-approve and /ctx-enforce commands.
     "additionalProperties": false
   },
   "objectId": {
-    "description": "Object id for revise/archive/restore",
+    "description": "Object id for revise/archive",
     "type": "string"
   },
   "objectIds": {
@@ -549,9 +548,9 @@ The hash handler persists the MD5 of `output.system.join("\\n")`. The values bel
 
 | Variant | Guidance bytes | MD5 system-prompt hash |
 |---|---:|---|
-| PRIMARY full | 8853 | `f2a72e09409d8465f1ab0d8d89998ecc` |
+| PRIMARY full | 8844 | `edbb334285b14ab3f2e299b0efe3ec95` |
 | PRIMARY memory-off | 7737 | `4d528493cac10523f815689677c46ea1` |
-| PRIMARY reduce-off | 6546 | `210be9259c7c8beb20985deb41fa2e49` |
+| PRIMARY reduce-off | 6537 | `20bbacd5d9777e9e6668b29e39e60a95` |
 | SUBAGENT minimal | 691 | `83d69748f204fff98249565d5a31aa99` |
 
 The OpenCode and Pi runtime compatibility tests consume this snapshot for omitted `prompt_surface` and explicit `{ default: "full" }`: both assert guidance, registered tool descriptions, tool IDs, and hashes; OpenCode also asserts these parameter schemas directly, while Pi asserts its TypeBox-owned schemas stay byte-identical across both config forms.

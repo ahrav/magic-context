@@ -24,7 +24,6 @@ const ALL_ACTIONS = [
 	"list",
 	"revise",
 	"archive",
-	"restore",
 	"merge",
 ] as const;
 const DREAMER_ONLY_ACTIONS = new Set<string>(["list"]);
@@ -57,7 +56,7 @@ const ParamsSchema = Type.Object(
 			Type.Union(
 				ALL_ACTIONS.map((action) => Type.Literal(action)),
 				{
-					description: "create, get, list, revise, archive, restore, or merge",
+					description: "create, get, list, revise, archive, or merge",
 				},
 			),
 		),
@@ -75,7 +74,7 @@ const ParamsSchema = Type.Object(
 		),
 		antiMemory: Type.Optional(AntiMemorySchema),
 		objectId: Type.Optional(
-			Type.String({ description: "Object id for revise/archive/restore" }),
+			Type.String({ description: "Object id for revise/archive" }),
 		),
 		objectIds: Type.Optional(
 			Type.Array(Type.String(), {

@@ -1136,7 +1136,11 @@ describe("injectM0M1Pi", () => {
 			injectM0M1Pi(state, db, [userMessage("hello", 10)] as never, undefined, true);
 			expect(mustMaterializePi(state, db)).toEqual({ value: false, reason: null });
 
-			kernelFor(db, state.projectIdentity).touch(seeded.id);
+			const kernel = kernelFor(db, state.projectIdentity);
+			kernel.touch(seeded.id);
+			expect(mustMaterializePi(state, db)).toEqual({ value: false, reason: null });
+			const object = kernel.objects.get(seeded.id);
+			if (object?.decision) object.decision.payload.summary = "Revised snapshot memory.";
 			expect(mustMaterializePi(state, db)).toMatchObject({
 				value: true,
 				reason: "project_memory_change",

@@ -22,28 +22,6 @@ export type Sensitivity = (typeof SENSITIVITIES)[number];
 export const VISIBILITIES = ["visible", "labeled", "hidden"] as const;
 export type Visibility = (typeof VISIBILITIES)[number];
 
-export const ELIGIBILITY_VERDICTS = [
-    "ok",
-    "retracted",
-    "superseded",
-    "stale",
-    "wrong_scope",
-    "provider_sensitive",
-] as const;
-export type EligibilityVerdict = (typeof ELIGIBILITY_VERDICTS)[number];
-
-export const EGRESS_REFUSALS = [
-    "under_declared",
-    "wrong_scope",
-    "unknown_sensitive",
-    "sensitive_remote",
-    "provider_restricted",
-    "secret",
-    "tombstoned",
-] as const;
-export type EgressRefusal = (typeof EGRESS_REFUSALS)[number];
-export type EgressDecision = { kind: "allowed" } | { kind: "refused"; reason: EgressRefusal };
-
 export interface ObjectRow {
     object_id: string;
     object_kind: string;
@@ -93,26 +71,6 @@ export interface CommitPayload {
     receipt: { commit_seq: number; replayed: boolean };
     known_as_of: number;
     tokens: MutationToken[];
-}
-
-export interface EligibilityPayload {
-    known_as_of: number;
-    verdicts: { object_id: string; verdict: EligibilityVerdict }[];
-    cache_hits: number;
-}
-
-export interface EgressPayload {
-    decision: EgressDecision;
-}
-
-export interface IngestBeginPayload {
-    upload_id: string;
-    page_bytes_max: number;
-}
-
-export interface IngestFinishPayload {
-    upload_id: string;
-    handle: { digest: string; evidence_id: string };
 }
 
 export interface ParsedResponse {
@@ -248,6 +206,9 @@ function parseReadRow(raw: unknown): ReadRow | null {
     if (token.object_id !== object.object_id) return null;
     const decision = parseReadDecision(raw.decision);
     if (decision === null) return null;
+    // A decision object always carries its decision row; a daemon that omits it
+    // predates the field, and the row would otherwise vanish silently.
+    if (decision === undefined && object.object_kind === "decision") return null;
     return {
         object,
         visibility: raw.visibility,
@@ -298,66 +259,6 @@ export function parseCommitResponse(raw: unknown): Parsed<CommitPayload> {
             receipt: { commit_seq: receipt.commit_seq, replayed: receipt.replayed },
             known_as_of: payload.known_as_of,
             tokens,
-        },
-    };
-}
-
-export function parseEligibilityResponse(raw: unknown): Parsed<EligibilityPayload> {
-    const { state, payload } = parseKernelResponse(raw);
-    if (state.kind !== "available") return { state, payload: null };
-    if (!isNonNegativeInteger(payload.known_as_of) || !isNonNegativeInteger(payload.cache_hits)) {
-        return failed();
-    }
-    if (!Array.isArray(payload.verdicts)) return failed();
-    const verdicts: EligibilityPayload["verdicts"] = [];
-    for (const item of payload.verdicts) {
-        if (!isRecord(item) || typeof item.object_id !== "string") return failed();
-        if (!oneOf(ELIGIBILITY_VERDICTS, item.verdict)) return failed();
-        verdicts.push({ object_id: item.object_id, verdict: item.verdict });
-    }
-    return {
-        state,
-        payload: { known_as_of: payload.known_as_of, verdicts, cache_hits: payload.cache_hits },
-    };
-}
-
-export function parseEgressResponse(raw: unknown): Parsed<EgressPayload> {
-    const { state, payload } = parseKernelResponse(raw);
-    if (state.kind !== "available") return { state, payload: null };
-    const decision = payload.decision;
-    if (decision === "allowed") return { state, payload: { decision: { kind: "allowed" } } };
-    if (isRecord(decision) && oneOf(EGRESS_REFUSALS, decision.refused)) {
-        return { state, payload: { decision: { kind: "refused", reason: decision.refused } } };
-    }
-    return failed();
-}
-
-export function parseIngestBeginResponse(raw: unknown): Parsed<IngestBeginPayload> {
-    const { state, payload } = parseKernelResponse(raw);
-    if (state.kind !== "available") return { state, payload: null };
-    if (typeof payload.upload_id !== "string") return failed();
-    if (!isNonNegativeInteger(payload.page_bytes_max) || payload.page_bytes_max === 0) {
-        return failed();
-    }
-    return {
-        state,
-        payload: { upload_id: payload.upload_id, page_bytes_max: payload.page_bytes_max },
-    };
-}
-
-export function parseIngestFinishResponse(raw: unknown): Parsed<IngestFinishPayload> {
-    const { state, payload } = parseKernelResponse(raw);
-    if (state.kind !== "available") return { state, payload: null };
-    const handle = payload.handle;
-    if (typeof payload.upload_id !== "string" || !isRecord(handle)) return failed();
-    if (typeof handle.digest !== "string" || typeof handle.evidence_id !== "string") {
-        return failed();
-    }
-    return {
-        state,
-        payload: {
-            upload_id: payload.upload_id,
-            handle: { digest: handle.digest, evidence_id: handle.evidence_id },
         },
     };
 }

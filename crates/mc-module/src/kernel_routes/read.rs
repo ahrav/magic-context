@@ -50,8 +50,9 @@ pub(crate) struct ReadResponse {
     known_as_of: i64,
     tip: i64,
     rows: Vec<VisibleRow>,
-    /// Decision rows keyed by `object_id`, loaded at `known_as_of` only when
-    /// at least one visible row is a decision object.
+    /// Decision rows keyed by `object_id`, looked up at `known_as_of` for
+    /// exactly the visible decision objects; a read with none skips the
+    /// query entirely.
     decisions: HashMap<String, DecisionRow>,
 }
 
@@ -73,16 +74,16 @@ pub(crate) fn read_visible(
             rows.push(row);
         }
     }
-    let decisions = if rows.iter().any(|row| row.object.object_kind == "decision") {
-        store
-            .slice_as_of(visible.known_as_of)?
-            .decisions
-            .into_iter()
-            .map(|decision| (decision.object_id.clone(), decision))
-            .collect()
-    } else {
-        HashMap::new()
-    };
+    let decision_ids: Vec<String> = rows
+        .iter()
+        .filter(|row| row.object.object_kind == "decision")
+        .map(|row| row.object.object_id.clone())
+        .collect();
+    let decisions = store
+        .decisions_for_objects_as_of(&decision_ids, visible.known_as_of)?
+        .into_iter()
+        .map(|decision| (decision.object_id.clone(), decision))
+        .collect();
     Ok(ReadResponse {
         known_as_of: visible.known_as_of,
         tip: visible.tip,

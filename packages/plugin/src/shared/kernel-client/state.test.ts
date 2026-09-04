@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { renderMemoryStateMarker, renderToolStateText } from "./render";
 import {
     ALL_STATE_KEYS,
@@ -13,44 +15,14 @@ import {
 import { parseKernelState } from "./wire";
 
 /**
- * Source of truth: `crates/mc-module/src/kernel_routes/state.rs`. Each entry is
- * the serde output of one `KernelOutcome` variant; the two vocabularies must
- * match one to one.
+ * `daemon-states.fixture.json` is written by the Rust test
+ * `daemon_states_fixture_matches_the_serialized_outcome_vocabulary` from an
+ * exhaustive match over `KernelOutcome`, so a vocabulary change on either
+ * side fails one of the two suites.
  */
-const DAEMON_STATES: Record<string, unknown>[] = [
-    { kind: "available" },
-    { kind: "stale", lag_positions: 10_000, oldest_unconsumed_age_ms: 5 },
-    { kind: "abstained", lag_positions: 3, oldest_unconsumed_age_ms: 120_000 },
-    ...[
-        "store_starting",
-        "store_unavailable",
-        "store_unsupported",
-        "store_busy",
-        "no_required_consumer",
-        "snapshot_diverged",
-        "queue_full",
-    ].map((reason) => ({ kind: "unavailable", reason })),
-    ...["known_as_of_advanced", "retracted", "superseded"].map((reason) => ({
-        kind: "conflict",
-        reason,
-    })),
-    ...[
-        "project_mismatch",
-        "operation_key_reused",
-        "class_over_declared",
-        "invalid_input",
-        "admission_policy",
-        "payload_too_large",
-        "page_digest",
-        "page_index",
-        "page_too_large",
-        "payload_digest",
-        "upload_not_found",
-        "ingestion_fail_closed",
-        "artifact_unusable",
-        "internal",
-    ].map((reason) => ({ kind: "invalid", reason })),
-];
+const DAEMON_STATES = JSON.parse(
+    readFileSync(join(import.meta.dir, "daemon-states.fixture.json"), "utf8"),
+) as Record<string, unknown>[];
 
 const CLIENT_ONLY_KEYS: StateKey[] = [
     "disabled",

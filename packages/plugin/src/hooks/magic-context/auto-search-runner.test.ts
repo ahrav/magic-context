@@ -2,12 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as searchModule from "../../features/magic-context/search";
 import { getAutoSearchHintDecisions } from "../../features/magic-context/storage-meta-persisted";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
-import {
-    abstained,
-    KernelClient,
-    type KernelClientResolver,
-    unavailable,
-} from "../../shared/kernel-client";
+import { KernelClient, type KernelClientResolver, unavailable } from "../../shared/kernel-client";
 import { FakeKernel, FakeKernelTransport } from "../../shared/kernel-client-testing/fake-kernel";
 import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -124,7 +119,10 @@ describe("auto-search-runner", () => {
             ).toEqual({ ok: true });
             expect(findUserPromptText(messages[0])).toContain("<ctx-search-hint>");
             expect(transport.calls.map((call) => call.method)).toEqual(["kernel.read"]);
-            expect(transport.calls[0]?.body).toMatchObject({ surface: "auto_search", gated: true });
+            expect(transport.calls[0]?.body).toMatchObject({
+                surface: "explicit_search",
+                gated: true,
+            });
             const decision = getAutoSearchHintDecisions(db, "s-kernel")[0];
             expect(decision?.decision).toBe("hint");
         } finally {
@@ -134,8 +132,8 @@ describe("auto-search-runner", () => {
 
     test.each([
         [
-            "abstained",
-            abstained({ lag_positions: 3, oldest_unconsumed_age_ms: 500 }),
+            "stale",
+            { kind: "stale", lag_positions: 3, oldest_unconsumed_age_ms: 500 } as const,
             "memory-abstained",
         ],
         ["unavailable", unavailable("store_busy"), "memory-unavailable"],
@@ -147,7 +145,7 @@ describe("auto-search-runner", () => {
             decision_kind: "PROJECT_RULES",
             summary: "the historian decides to run when context passes the execute threshold",
         });
-        kernel.surfaceStates.set("auto_search", state);
+        kernel.surfaceStates.set("explicit_search", state);
         try {
             const messages = [
                 makeUserMsg("u-typed", "please explain how the historian decides when to run"),

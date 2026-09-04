@@ -436,6 +436,83 @@ fn decision_event_preserves_valid_evidence_identifier() {
 }
 
 #[test]
+fn decisions_for_objects_as_of_returns_only_requested_live_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    seed_domain(&store);
+    let inserted = store
+        .commit(intent("decisions", '1'), |envelope| {
+            envelope.insert_decision(decision(1))?;
+            envelope.insert_decision(decision(2))?;
+            envelope.insert_decision(decision(3))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let retired = store
+        .commit(intent("retire", '2'), |envelope| {
+            Ok(envelope.retire_decision("decision-object-2")?.result_json())
+        })
+        .unwrap();
+    let tip = store.tip().unwrap();
+    assert_eq!(tip, retired.commit_seq);
+
+    let ids = |rows: Vec<mc_kernel::DecisionRow>| -> Vec<String> {
+        rows.into_iter().map(|row| row.object_id).collect()
+    };
+    let requested = [
+        "decision-object-1".to_string(),
+        "decision-object-2".to_string(),
+        "decision-object-9".to_string(),
+    ];
+
+    assert_eq!(
+        ids(store.decisions_for_objects_as_of(&requested, tip).unwrap()),
+        ["decision-object-1"]
+    );
+    assert_eq!(
+        ids(store
+            .decisions_for_objects_as_of(&requested, inserted.commit_seq)
+            .unwrap()),
+        ["decision-object-1", "decision-object-2"]
+    );
+    let full = store.slice_as_of(tip).unwrap();
+    assert_eq!(
+        store
+            .decisions_for_objects_as_of(&["decision-object-3".to_string()], tip)
+            .unwrap(),
+        full.decisions
+            .into_iter()
+            .filter(|row| row.object_id == "decision-object-3")
+            .collect::<Vec<_>>()
+    );
+
+    assert!(store
+        .decisions_for_objects_as_of(&[], tip)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .decisions_for_objects_as_of(&requested, tip + 1)
+            .unwrap_err(),
+        KernelError::FutureSnapshot
+    );
+    assert_eq!(
+        store
+            .decisions_for_objects_as_of(&requested, -1)
+            .unwrap_err(),
+        KernelError::InvalidInput
+    );
+
+    let many: Vec<String> = (0..1_200)
+        .map(|index| format!("decision-object-{index}"))
+        .collect();
+    assert_eq!(
+        ids(store.decisions_for_objects_as_of(&many, tip).unwrap()),
+        ["decision-object-1", "decision-object-3"]
+    );
+}
+
+#[test]
 fn corrections_preserve_old_rows_and_reauthor_observation_dependencies() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();

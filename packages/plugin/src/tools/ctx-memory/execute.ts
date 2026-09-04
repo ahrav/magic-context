@@ -125,6 +125,23 @@ function decisionSpec(
     };
 }
 
+/**
+ * Every mutation target must be a memory this project can read: the daemon
+ * resolves ids store-wide and checks only the tokens it is handed, so the
+ * project-scoped read is the authorization boundary.
+ */
+function requireVisible(rows: readonly ReadRow[], targets: readonly string[]): ReadRow[] {
+    const visible = rows.filter((row) => targets.includes(row.object.object_id));
+    const seen = new Set(visible.map((row) => row.object.object_id));
+    const missing = targets.filter((id) => !seen.has(id));
+    if (missing.length > 0) {
+        throw new ClaimOperationInputError(
+            `memory not found or not visible from this project: ${missing.join(", ")}`,
+        );
+    }
+    return visible;
+}
+
 function requireTarget(args: CtxMemoryArgs): string {
     const objectId = args.objectId?.trim();
     if (!objectId) {
@@ -224,26 +241,25 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
 
     if (action === "archive") {
         const target = requireTarget(args);
+        const read = await readMemoryRows(client);
+        if (!read.ok) return renderCtxMemoryStateText(read.state, [target]);
+        requireVisible(read.rows, [target]);
         return renderCommit(action, await client.archive(target, mutation), [target]);
     }
 
-    if (action === "revise" || action === "restore") {
+    if (action === "revise") {
         const target = requireTarget(args);
         const read = await readMemoryRows(client);
         if (!read.ok) return renderCtxMemoryStateText(read.state, [target]);
-        const predecessors = read.rows.filter((row) => row.object.object_id === target);
+        const predecessors = requireVisible(read.rows, [target]);
         const merged = revisionArgs(args, predecessors);
         assertCtxMemoryWriteShape({ ...merged, action: "revise" });
         const category = merged.category?.trim();
         if (!category) {
-            throw new ClaimOperationInputError(`${action} requires a category for ${target}`);
+            throw new ClaimOperationInputError(`revise requires a category for ${target}`);
         }
         const spec = decisionSpec(merged, category, identity, nextSourceRevision(predecessors));
-        const result =
-            action === "revise"
-                ? await client.revise(target, spec, mutation)
-                : await client.restore(target, spec, mutation);
-        return renderCommit(action, result, [target]);
+        return renderCommit(action, await client.revise(target, spec, mutation), [target]);
     }
 
     const targets = uniqueIds(args.objectIds);
@@ -252,7 +268,7 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
     }
     const read = await readMemoryRows(client);
     if (!read.ok) return renderCtxMemoryStateText(read.state, targets);
-    const predecessors = read.rows.filter((row) => targets.includes(row.object.object_id));
+    const predecessors = requireVisible(read.rows, targets);
     const merged = revisionArgs(args, predecessors);
     assertCtxMemoryWriteShape({ ...merged, action: "revise" });
     const category = merged.category?.trim();

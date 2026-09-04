@@ -74,7 +74,7 @@
 									},
 									{
 										"group": ["**"],
-										"importNamePattern": "readAuthorizedClaimMemorySnapshot|readProjectClaimLaneSnapshot|executeCtxMemoryClaimAction",
+										"importNamePattern": "readAuthorizedClaimMemorySnapshot",
 										"message": "Memory-path files read and write project memory through the kernel client, never the claim lane."
 									}
 								]

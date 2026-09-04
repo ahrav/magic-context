@@ -5,7 +5,11 @@ import {
     appendCompartments,
     getCompartments,
 } from "../../features/magic-context/compartment-storage";
-import { promoteSessionFactsDurable } from "../../features/magic-context/memory";
+import {
+    type HistorianPromotionIdentity,
+    type PromotedMemoryRef,
+    promoteSessionFactsDurable,
+} from "../../features/magic-context/memory";
 import {
     resolveProjectIdentity,
     resolveProjectRootDirectory,
@@ -35,7 +39,6 @@ import { insertPrimerCandidates } from "../../features/magic-context/storage-pri
 import { getLatestHistorianInvocationId } from "../../features/magic-context/storage-subagent-invocations";
 import { insertUserMemoryCandidates } from "../../features/magic-context/user-memory/storage-user-memory";
 import { describeError } from "../../shared/error-message";
-import { isAvailable, stateKey } from "../../shared/kernel-client";
 import { sessionLog } from "../../shared/logger";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
@@ -52,7 +55,8 @@ import {
 } from "./compartment-runner-validation";
 import { cleanupHistorianStateFile } from "./historian-state-file";
 import { clearInjectionCache } from "./inject-compartments";
-import { memoryRows, renderKernelMemoryBlock } from "./kernel-memory-render";
+import { commitPromotedFactsToKernel } from "./kernel-memory-promotion";
+import { readHistorianMemoryBlock } from "./kernel-memory-render";
 import { onNoteTrigger } from "./note-nudger";
 import {
     createDefaultBoundarySnapshotForTests,
@@ -381,29 +385,16 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
 
         const sessionDirectory = await resolveSessionDirectory(client, sessionId, directory);
 
-        // The historian sees the same baseline the model saw so it does not
-        // re-derive facts already held as project memory. A non-available
-        // read omits the block; the marker line is for the model, not the historian.
-        let projectMemory = "";
-        if (deps.memoryEnabled !== false && deps.kernelClient) {
-            const read = await deps
-                .kernelClient({
-                    sessionId,
-                    projectRoot: resolveProjectRootDirectory(sessionDirectory ?? directory),
-                })
-                .read({ surface: "auto_inject", gated: false });
-            if (isAvailable(read)) {
-                projectMemory = renderKernelMemoryBlock(
-                    memoryRows({ state: read.state, rows: read.rows, knownAsOf: read.known_as_of }),
-                    read.state,
-                );
-            } else {
-                sessionLog(
-                    sessionId,
-                    `historian memory read answered ${stateKey(read.state)}; omitting memories`,
-                );
-            }
-        }
+        const projectMemory =
+            deps.memoryEnabled !== false
+                ? await readHistorianMemoryBlock({
+                      client: deps.kernelClient?.({
+                          sessionId,
+                          projectRoot: resolveProjectRootDirectory(sessionDirectory ?? directory),
+                      }),
+                      sessionId,
+                  })
+                : "";
 
         const prompt = buildCompartmentAgentPrompt({
             seedExamples: references.seedExamples,
@@ -543,6 +534,8 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             return true;
         });
         let persistedIds: number[] = [];
+        let promotionIdentity: HistorianPromotionIdentity | null = null;
+        let promotedRefs: PromotedMemoryRef[] = [];
 
         // The transaction atomically appends compartments and publishes synchronous durable side effects.
         // `BEGIN IMMEDIATE` makes the lease check and subsequent writes share a fresh write-locked snapshot across sibling processes.
@@ -574,18 +567,19 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             // Promotion and boundary-floor updates share one transaction so a crash cannot advance the boundary past unpersisted facts.
             // project memories.
             if (promotionActive && !skipUnanchoredPromotion) {
-                promoteSessionFactsDurable(
+                promotionIdentity = {
+                    producer: "opencode-historian",
+                    runId: `${sessionId}:${chunk.startIndex}:${chunk.endIndex}`,
+                    leaseKey: `compartment:${sessionId}`,
+                    leaseGeneration: holderId,
+                    batchId: `${chunk.startIndex}-${lastCompartmentEnd}`,
+                };
+                promotedRefs = promoteSessionFactsDurable(
                     db,
                     sessionId,
                     promotionProjectIdentity,
                     validatedPass.facts ?? [],
-                    {
-                        producer: "opencode-historian",
-                        runId: `${sessionId}:${chunk.startIndex}:${chunk.endIndex}`,
-                        leaseKey: `compartment:${sessionId}`,
-                        leaseGeneration: holderId,
-                        batchId: `${chunk.startIndex}-${lastCompartmentEnd}`,
-                    },
+                    promotionIdentity,
                 );
             }
 
@@ -641,6 +635,18 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // The transaction persists compartments, the boundary floor, promoted facts, event attempts, and the drop queue before publication is signaled.
         // Post-commit provider failures do not change the published state.
         deps.onCompartmentStatePublished?.(sessionId);
+
+        if (promotionIdentity && promotedRefs.length > 0) {
+            await commitPromotedFactsToKernel({
+                client: deps.kernelClient?.({
+                    sessionId,
+                    projectRoot: resolveProjectRootDirectory(sessionDirectory ?? directory),
+                }),
+                sessionId,
+                refs: promotedRefs,
+                identity: promotionIdentity,
+            });
+        }
 
         // updateCompactionMarkerAfterPublication writes the compaction marker to OpenCode's DB.
         // When deferMarkerApplication is true, the transaction writes the pending marker before onDeferredMarkerPending signals the drain set.

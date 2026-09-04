@@ -3,7 +3,9 @@
  * the `KernelTransport` surface so consumers are tested against the same
  * client they ship with. It keeps the semantics the client relies on:
  * `known_as_of` tokens, the three conflict reasons, replay by operation key,
- * and supersession chains. Anything else answers with a scripted state.
+ * supersession chains, and per-surface visibility: a `labeled` row serves only
+ * on `explicit_search`, `sensitive` rows hide from the automatic surfaces, and
+ * `secret` rows hide everywhere. Anything else answers with a scripted state.
  */
 
 import {
@@ -56,13 +58,18 @@ export class FakeKernel {
         return this.tip;
     }
 
-    /** Seeds a live decision object as if a prior commit had written it. */
+    /**
+     * Seeds a live decision object as if a prior commit had written it. Route
+     * writes are `labeled`; `labeled: false` stands in for a verified object
+     * only a direct store commit can produce.
+     */
     seedDecision(input: {
         object_id: string;
         decision_kind: string;
         summary: string;
         rationale?: string;
         labeled?: boolean;
+        sensitivity?: FakeObject["sensitivity"];
         source_revision?: number;
     }): FakeObject {
         const seq = this.nextSeq();
@@ -76,8 +83,8 @@ export class FakeKernel {
             created_commit_seq: seq,
             invalidated_commit_seq: null,
             superseded_by: null,
-            sensitivity: "normal",
-            labeled: input.labeled ?? false,
+            sensitivity: input.sensitivity ?? "normal",
+            labeled: input.labeled ?? true,
             decision: {
                 decision_kind: input.decision_kind,
                 payload: { summary: input.summary, rationale: input.rationale ?? "" },
@@ -99,7 +106,7 @@ export class FakeKernel {
      * parsed through the same wire decoder, for consumers that take the
      * snapshot as a value instead of dialing.
      */
-    snapshot(surface: Surface = "auto_inject"): KernelMemorySnapshot {
+    snapshot(surface: Surface = "explicit_search"): KernelMemorySnapshot {
         const parsed = parseReadResponse(this.readReply({ surface, gated: false }));
         return parsed.payload
             ? {
@@ -116,6 +123,12 @@ export class FakeKernel {
             .sort((left, right) => (left.object_id < right.object_id ? -1 : 1));
     }
 
+    private static servesOn(object: FakeObject, surface: Surface): boolean {
+        if (object.sensitivity === "secret") return false;
+        if (surface === "explicit_search") return true;
+        return !object.labeled && object.sensitivity !== "sensitive";
+    }
+
     private readReply(body: Record<string, unknown>): unknown {
         const surface = body.surface as Surface;
         const forced = this.surfaceStates.get(surface);
@@ -127,7 +140,8 @@ export class FakeKernel {
                 (object) =>
                     object.created_commit_seq <= asOf &&
                     (object.invalidated_commit_seq === null ||
-                        asOf < object.invalidated_commit_seq),
+                        asOf < object.invalidated_commit_seq) &&
+                    FakeKernel.servesOn(object, surface),
             )
             .sort((left, right) => (left.object_id < right.object_id ? -1 : 1))
             .map((object) => {
@@ -219,7 +233,7 @@ export class FakeKernel {
                     invalidated_commit_seq: null,
                     superseded_by: null,
                     sensitivity: "normal",
-                    labeled: false,
+                    labeled: true,
                     decision: { decision_kind: spec.decision_kind as string, payload },
                 });
             }
@@ -231,7 +245,11 @@ export class FakeKernel {
                 insert(operation.spec as Record<string, unknown>);
             } else if (operation.op === "supersede_decision") {
                 const replaced = this.objects.get(operation.replaced_object_id as string);
-                if (!replaced) return { state: { kind: "invalid", reason: "invalid_input" } };
+                // The daemon looks the target up among live objects only; a
+                // missing or invalidated one is `NotFound`, which maps to `internal`.
+                if (!replaced || replaced.invalidated_commit_seq !== null) {
+                    return { state: { kind: "invalid", reason: "internal" } };
+                }
                 const spec = operation.spec as Record<string, unknown>;
                 insert(spec);
                 replaced.invalidated_commit_seq = seq;
@@ -240,7 +258,9 @@ export class FakeKernel {
                 touched.add(replaced.object_id);
             } else if (operation.op === "retire_decision") {
                 const retired = this.objects.get(operation.object_id as string);
-                if (!retired) return { state: { kind: "invalid", reason: "invalid_input" } };
+                if (!retired || retired.invalidated_commit_seq !== null) {
+                    return { state: { kind: "invalid", reason: "internal" } };
+                }
                 retired.invalidated_commit_seq = seq;
                 this.lastChange.set(retired.object_id, seq);
                 touched.add(retired.object_id);

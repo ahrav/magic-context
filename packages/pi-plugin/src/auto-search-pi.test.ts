@@ -5,7 +5,7 @@ import {
 	appendAutoSearchHintDecision,
 	getAutoSearchHintDecisions,
 } from "@magic-context/core/features/magic-context/storage";
-import { abstained, unavailable } from "@magic-context/core/shared/kernel-client";
+import { unavailable } from "@magic-context/core/shared/kernel-client";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	clearAutoSearchForPiSession,
@@ -147,7 +147,7 @@ describe("runAutoSearchHintForPi", () => {
 			expect(textOf(messages[0])).toContain("<ctx-search-hint>");
 			expect(fake.transport.methods()).toEqual(["kernel.read"]);
 			expect(fake.transport.calls[0]?.body).toMatchObject({
-				surface: "auto_search",
+				surface: "explicit_search",
 				gated: true,
 			});
 			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]).toMatchObject({
@@ -162,8 +162,8 @@ describe("runAutoSearchHintForPi", () => {
 
 	it.each([
 		[
-			"abstained",
-			abstained({ lag_positions: 3, oldest_unconsumed_age_ms: 500 }),
+			"stale",
+			{ kind: "stale", lag_positions: 3, oldest_unconsumed_age_ms: 500 } as const,
 			"memory-abstained",
 		],
 		["unavailable", unavailable("store_busy"), "memory-unavailable"],
@@ -179,7 +179,7 @@ describe("runAutoSearchHintForPi", () => {
 				summary:
 					"the historian decides to run when context passes the execute threshold",
 			});
-			fake.kernel.surfaceStates.set("auto_search", state);
+			fake.kernel.surfaceStates.set("explicit_search", state);
 			try {
 				const messages = [
 					userMessage("please explain how the historian decides when to run", 1),

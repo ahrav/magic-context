@@ -38,36 +38,36 @@
   "fullMeasurements": {
     "guidance": {
       "primary-full-reduce-memory-on": {
-        "chars": 8787,
-        "tokens": 2008
+        "chars": 8778,
+        "tokens": 2006
       },
       "primary-full-reduce-memory-off": {
         "chars": 7679,
         "tokens": 1744
       },
       "primary-full-no-reduce-memory-on": {
-        "chars": 6502,
-        "tokens": 1482
+        "chars": 6493,
+        "tokens": 1480
       },
       "primary-full-no-reduce-memory-off": {
         "chars": 5394,
         "tokens": 1218
       },
       "primary-full-reduce-dreamer-off": {
-        "chars": 8458,
-        "tokens": 1931
+        "chars": 8449,
+        "tokens": 1929
       },
       "primary-full-reduce-temporal-off": {
-        "chars": 8352,
-        "tokens": 1901
+        "chars": 8343,
+        "tokens": 1899
       },
       "primary-full-reduce-caveman-on": {
-        "chars": 9402,
-        "tokens": 2134
+        "chars": 9393,
+        "tokens": 2132
       },
       "primary-full-reduce-language-on": {
-        "chars": 8987,
-        "tokens": 2054
+        "chars": 8978,
+        "tokens": 2052
       },
       "subagent-reduce": {
         "chars": 679,
@@ -88,8 +88,8 @@
         "tokens": 391
       },
       "ctx_memory": {
-        "chars": 775,
-        "tokens": 186
+        "chars": 755,
+        "tokens": 181
       },
       "ctx_search": {
         "chars": 1373,
@@ -110,18 +110,18 @@
         "tokens": 317
       },
       "ctx_memory": {
-        "chars": 1617,
-        "tokens": 382
+        "chars": 1590,
+        "tokens": 376
       },
       "ctx_search": {
         "chars": 878,
         "tokens": 207
       },
-      "totalTokens": 1114
+      "totalTokens": 1108
     },
-    "builtInProviderVisibleTotal": 4740
+    "builtInProviderVisibleTotal": 4727
   },
-  "mutableProseBaseline": 3626,
+  "mutableProseBaseline": 3619,
   "integerLightCeiling": 1825,
   "includedSurfaces": [
     "The primary built-in full guidance section for the exact feature variant above.",
