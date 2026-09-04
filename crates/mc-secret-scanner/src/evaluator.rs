@@ -917,6 +917,15 @@ fn token_matches_any_key_name<Name: AsRef<[u8]>>(token: &[u8], names: &[Name]) -
     {
         return true;
     }
+    // A name has to occur inside the token before any qualifier chain can frame
+    // it, and most tokens on a line hold none, so the two reach walks are skipped
+    // for them.
+    if !names
+        .iter()
+        .any(|name| find_ignore_ascii_case(token, name.as_ref()))
+    {
+        return false;
+    }
     let from_start = qualifier_reach(token, false);
     let to_end = qualifier_reach(token, true);
     names.iter().any(|name| {
@@ -925,20 +934,58 @@ fn token_matches_any_key_name<Name: AsRef<[u8]>>(token: &[u8], names: &[Name]) -
             return false;
         };
         (0..=last).any(|start| {
-            from_start[start]
-                && to_end[start + name.len()]
+            from_start.get(start)
+                && to_end.get(start + name.len())
                 && token[start..start + name.len()].eq_ignore_ascii_case(name)
         })
     })
 }
 
-fn qualifier_reach(token: &[u8], reverse: bool) -> Vec<bool> {
-    let mut reach = vec![false; token.len() + 1];
+/// Positions of a token a qualifier chain reaches, as a bit set; positions
+/// past the inline capacity spill to the heap.
+struct Reach {
+    inline: [u64; 2],
+    spill: Vec<bool>,
+}
+
+impl Reach {
+    const INLINE_BITS: usize = 128;
+
+    fn new(len: usize) -> Self {
+        Self {
+            inline: [0; 2],
+            spill: if len >= Self::INLINE_BITS {
+                vec![false; len + 1 - Self::INLINE_BITS]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn set(&mut self, at: usize) {
+        if at < Self::INLINE_BITS {
+            self.inline[at / 64] |= 1u64 << (at % 64);
+        } else {
+            self.spill[at - Self::INLINE_BITS] = true;
+        }
+    }
+
+    fn get(&self, at: usize) -> bool {
+        if at < Self::INLINE_BITS {
+            self.inline[at / 64] & (1u64 << (at % 64)) != 0
+        } else {
+            self.spill[at - Self::INLINE_BITS]
+        }
+    }
+}
+
+fn qualifier_reach(token: &[u8], reverse: bool) -> Reach {
+    let mut reach = Reach::new(token.len());
     let origin = if reverse { token.len() } else { 0 };
-    reach[origin] = true;
+    reach.set(origin);
     for step in 0..token.len() {
         let at = if reverse { token.len() - step } else { step };
-        if !reach[at] {
+        if !reach.get(at) {
             continue;
         }
         for qualifier in KEY_QUALIFIERS {
@@ -951,7 +998,7 @@ fn qualifier_reach(token: &[u8], reverse: bool) -> Vec<bool> {
                 continue;
             };
             if token[start..end].eq_ignore_ascii_case(qualifier) {
-                reach[if reverse { start } else { end }] = true;
+                reach.set(if reverse { start } else { end });
             }
         }
     }
