@@ -82,16 +82,36 @@ function hasMetaTable(db: Database): boolean {
     );
 }
 
-/** Hashes authorization inputs only — sorted member identities and `share_categories`, never per-project write epochs — so the done marker survives ordinary writes and invalidates exactly when membership or sharing policy changes. A non-workspaced project answers a constant. commentlint: allow(JUDGE) */
-export function claimLaneAuthorizationFingerprint(db: Database, projectPath: string): string {
-    const resolved = resolveWorkspaceIdentitySet(db, projectPath);
-    if (resolved.identities.length <= 1) return "none";
-    const identities = [...resolved.identities].sort();
-    const share = resolveWorkspaceShareCategories(db, projectPath) ?? [];
-    return sha256Hex(`${JSON.stringify(identities)}\u001f${JSON.stringify(share)}`);
+/** Hashes what the bridge is authorized to serve: member identities, `share_categories`, and the revision locators of currently shared foreign claims — never per-project write epochs. A foreign member adding, revising, or archiving a shared claim changes the locator set, so the done marker invalidates and the next schedule reconciles; the project's own claims stay out of the hash because historian promotion already resets the producing project's marker. A non-workspaced project answers a constant; `null` means the lane projection answered stale and authorization is unknown. commentlint: allow(JUDGE) */
+export function claimLaneAuthorizationFingerprint(
+    db: Database,
+    projectPath: string,
+): string | null {
+    const ws = claimLaneWorkspace(db, projectPath);
+    if (!ws.isWorkspaced) return "none";
+    const claims = listClaimLaneMemories(db, projectPath);
+    if (claims === null) return null;
+    return claimLaneAuthorizationFingerprintFromClaims(db, ws, claims);
 }
 
-/** Done means done under the current workspace authorization: a marker written before a membership or share-policy change (or one predating the authorization field) answers false, so the next schedule reconciles imports against the new policy. commentlint: allow(JUDGE) */
+function claimLaneAuthorizationFingerprintFromClaims(
+    db: Database,
+    ws: ClaimLaneWorkspace,
+    claims: readonly ProjectMemoryClaimSnapshot[],
+): string {
+    if (!ws.isWorkspaced) return "none";
+    const ownProjectIds = new Set(resolveProjectIdsForIdentities(db, ws.ownIdentities));
+    const foreignLocators = claims
+        .filter((claim) => !ownProjectIds.has(claim.projectId))
+        .map((claim) => claim.revisionLocator)
+        .sort();
+    const identities = [...ws.resolvedIdentities].sort();
+    return sha256Hex(
+        `${JSON.stringify(identities)}\u001f${JSON.stringify(ws.sharedCategories)}\u001f${JSON.stringify(foreignLocators)}`,
+    );
+}
+
+/** Done means done under the current workspace authorization: a marker written before a membership, share-policy, or shared-claim change (or one predating the authorization field) answers false, so the next schedule reconciles imports against the new policy. An unknown authorization also answers false; the import path defers on the same stale projection. commentlint: allow(JUDGE) */
 export function claimLaneImportDone(
     db: Database,
     projectPath: string,
@@ -104,7 +124,8 @@ export function claimLaneImportDone(
     if (row?.value === undefined) return false;
     try {
         const detail = JSON.parse(row.value) as { authorization?: string };
-        return detail.authorization === claimLaneAuthorizationFingerprint(db, projectPath);
+        const current = claimLaneAuthorizationFingerprint(db, projectPath);
+        return current !== null && detail.authorization === current;
     } catch {
         return false;
     }
@@ -315,7 +336,6 @@ export async function importClaimLaneMemories(args: {
     const { db, client, projectPath, projectRoot, sessionId } = args;
     if (claimLaneImportDone(db, projectPath, projectRoot)) return "skipped";
     const generation = claimLaneImportGeneration(db, projectPath, projectRoot);
-    const authorization = claimLaneAuthorizationFingerprint(db, projectPath);
     const claims = listClaimLaneMemories(db, projectPath);
     if (claims === null) {
         sessionLog(
@@ -324,6 +344,11 @@ export async function importClaimLaneMemories(args: {
         );
         return "deferred";
     }
+    const authorization = claimLaneAuthorizationFingerprintFromClaims(
+        db,
+        claimLaneWorkspace(db, projectPath),
+        claims,
+    );
     // Without lane tables no import ever ran on this store, so there is nothing to insert or reconcile. commentlint: allow(JUDGE)
     if (claims.length === 0 && !hasClaimMemoryFragment(db)) {
         return markDone(db, projectPath, projectRoot, generation, { imported: 0, authorization })
@@ -335,6 +360,14 @@ export async function importClaimLaneMemories(args: {
         sessionLog(
             sessionId,
             `claim-lane import deferred: kernel read answered ${stateKey(existing.state)}`,
+        );
+        return "deferred";
+    }
+    // A truncated read serves only a prefix, so a revoked import outside it would survive reconciliation and the marker would record a complete pass that never happened; the authorization boundary fails closed instead. commentlint: allow(JUDGE)
+    if (existing.truncated) {
+        sessionLog(
+            sessionId,
+            "claim-lane import deferred: the kernel read was truncated; reconciliation needs the complete row set",
         );
         return "deferred";
     }

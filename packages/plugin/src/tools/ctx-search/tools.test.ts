@@ -155,6 +155,56 @@ describe("createCtxSearchTools", () => {
         expect(result).toContain("No results found");
     });
 
+    it("rejects a non-array or unknown sources value instead of searching nothing", async () => {
+        const tools = createCtxSearchTools({
+            db,
+            kernelClient: kernelHarness().kernelClient,
+            resolveProjectPath: () => "/repo/project",
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            readMessages: () => [],
+        });
+
+        const nonArray = await tools.ctx_search.execute(
+            { query: "appear", sources: 42 as unknown as string[] },
+            toolContext(),
+        );
+        expect(nonArray).toContain("Error: 'sources' must be an array");
+
+        // A misspelled source silently dropped would run an empty-source search and report a misleading "No results found". commentlint: allow(JUDGE)
+        const misspelled = await tools.ctx_search.execute(
+            { query: "appear", sources: ["memor"] },
+            toolContext(),
+        );
+        expect(misspelled).toContain('Error: unknown source: "memor"');
+        expect(misspelled).not.toContain("No results found");
+    });
+
+    it("notes a truncated memory read so partial hits do not read as a complete search", async () => {
+        const harness = kernelHarness();
+        harness.kernel.seedDecision({
+            object_id: OBJECT_A,
+            decision_kind: "ARCHITECTURE",
+            summary: "Alpha memory truncation probe.",
+        });
+        harness.kernel.readTruncated = true;
+        const tools = createCtxSearchTools({
+            db,
+            kernelClient: harness.kernelClient,
+            resolveProjectPath: () => "git:repo-project",
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            readMessages: () => [],
+        });
+
+        const result = await tools.ctx_search.execute(
+            { query: "truncation probe", sources: ["memory"] },
+            toolContext(),
+        );
+
+        expect(result).toContain("the memory read was truncated");
+    });
+
     it("formats message results with inline ranges and one trailing expand hint", async () => {
         replaceAllCompartments(db, "ses-message", [
             {

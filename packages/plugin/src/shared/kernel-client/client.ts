@@ -200,6 +200,8 @@ interface InvokeOptions {
     deadline: Deadline;
     /** A write whose `outcome_unknown` is reissued once with identical bytes. */
     reissuable: boolean;
+    /** A mutating call whose exhausted `outcome_unknown` must stay ambiguous: reads answer `daemon_absent` because re-reading is always safe, but a sent write may have committed and a definitive-looking failure invites a retry under a fresh identity. commentlint: allow(JUDGE) */
+    mutating?: boolean;
 }
 
 function errorCodeOf(error: unknown): string | undefined {
@@ -293,12 +295,13 @@ export class KernelClient {
         let reissued = false;
         for (;;) {
             if (options.deadline.isExpired()) {
-                // After a reissued unknown outcome, an expired deadline still leaves the original request possibly applied; a plain cancellation would invite a retry under a fresh identity. commentlint: allow(JUDGE)
+                // After a reissued unknown outcome on a write, an expired deadline still leaves the original request possibly applied; a plain cancellation would invite a retry under a fresh identity. commentlint: allow(JUDGE)
                 return {
                     ok: false,
-                    state: reissued
-                        ? nonAvailable(unavailable("outcome_unknown"))
-                        : nonAvailable(cancelled()),
+                    state:
+                        reissued && options.mutating
+                            ? nonAvailable(unavailable("outcome_unknown"))
+                            : nonAvailable(cancelled()),
                 };
             }
             try {
@@ -312,14 +315,15 @@ export class KernelClient {
                 });
                 return { ok: true, raw };
             } catch (error) {
-                // An `outcome_unknown` thrown while cancellation or the deadline fires must keep its classification: the daemon may have committed, and reporting an ordinary cancellation would claim a definitively unapplied request. commentlint: allow(JUDGE)
+                // An `outcome_unknown` thrown from a write while cancellation or the deadline fires must keep its classification: the daemon may have committed, and reporting an ordinary cancellation would claim a definitively unapplied request. commentlint: allow(JUDGE)
                 const unknownOutcome = isMcHostCallError(error) && error.kind === "outcome_unknown";
                 if (options.signal?.aborted || options.deadline.isExpired()) {
                     return {
                         ok: false,
-                        state: unknownOutcome
-                            ? nonAvailable(unavailable("outcome_unknown"))
-                            : nonAvailable(cancelled()),
+                        state:
+                            unknownOutcome && options.mutating
+                                ? nonAvailable(unavailable("outcome_unknown"))
+                                : nonAvailable(cancelled()),
                     };
                 }
                 if (isMcHostCallError(error)) {
@@ -329,7 +333,9 @@ export class KernelClient {
                             reissued = true;
                             continue;
                         }
-                        return absent();
+                        return options.mutating
+                            ? { ok: false, state: nonAvailable(unavailable("outcome_unknown")) }
+                            : absent();
                     }
                     if (error.code === "route_unbound") {
                         if (rebound) return absent();
@@ -487,7 +493,7 @@ export class KernelClient {
         const result = await this.call(
             "kernel.commit",
             this.commitBody(args, tokens),
-            { signal: args.signal, deadline, reissuable: true },
+            { signal: args.signal, deadline, reissuable: true, mutating: true },
             parseCommitResponse,
         );
         if (isAvailable(result)) {

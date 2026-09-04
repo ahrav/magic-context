@@ -227,13 +227,14 @@ describe("KernelClient transport mapping", () => {
         expect(JSON.stringify(bodies[0])).toBe(JSON.stringify(bodies[1]));
     });
 
-    test("a second outcome_unknown on the same write is daemon_absent", async () => {
+    test("a second outcome_unknown on the same write stays ambiguous", async () => {
         const transport = new FakeTransport().queue(
             new McHostCallError("outcome_unknown", "deadline"),
             new McHostCallError("outcome_unknown", "deadline"),
         );
         const result = await client(transport).create(spec, intent);
-        expect(result.state).toEqual({ kind: "unavailable", reason: "daemon_absent" });
+        // Both attempts were sent and either may have committed; daemon_absent would read as a definitive failure and invite a fresh-identity retry. commentlint: allow(JUDGE)
+        expect(result.state).toEqual({ kind: "unavailable", reason: "outcome_unknown" });
         expect(transport.bodies("kernel.commit")).toHaveLength(2);
     });
 

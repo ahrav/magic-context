@@ -61,6 +61,21 @@ function normalizeSources(sources?: string[]): CtxSearchSource[] | undefined {
     return result;
 }
 
+/** The wrappers fall back to raw arguments when schema parsing fails, so `sources` is validated as an array of supported names before any iteration: a non-array would throw an unhandled TypeError, and a misspelled name silently dropped would search nothing and report a misleading "no results". Answers the error text or `null` when valid. commentlint: allow(JUDGE) */
+function invalidSourcesError(sources: unknown): string | null {
+    if (sources === undefined) return null;
+    if (!Array.isArray(sources)) {
+        return "Error: 'sources' must be an array of source names.";
+    }
+    const unknown = sources.filter(
+        (source) => typeof source !== "string" || !VALID_SOURCES.has(source as CtxSearchSource),
+    );
+    if (unknown.length > 0) {
+        return `Error: unknown source${unknown.length === 1 ? "" : "s"}: ${unknown.map((source) => JSON.stringify(source)).join(", ")}. Supported sources: ${[...VALID_SOURCES].join(", ")}.`;
+    }
+    return null;
+}
+
 export interface CtxSearchCallContext {
     sessionID: string;
     directory: string;
@@ -98,6 +113,10 @@ export async function executeCtxSearch(
     const query = preflight.query;
     if (!query) {
         return { status: "invalid", text: "Error: 'query' is required." };
+    }
+    const sourcesError = invalidSourcesError((rawArgs as { sources?: unknown }).sources);
+    if (sourcesError) {
+        return { status: "invalid", text: sourcesError };
     }
 
     // Search only messages before the last compartment boundary; the live tail is already visible to the agent.
@@ -210,6 +229,7 @@ export async function executeCtxSearch(
         const filteredIds = idQuery && idQuery.length <= MAX_READ_OBJECT_IDS ? idQuery : null;
         let memoryRows: ReadRow[] | null = null;
         let memoryState: MemoryState | null = null;
+        let memoryTruncated = false;
         let unresolvedObjectIds: string[] = [];
         if (filteredIds) {
             const read = await readObjectRowsChunked({
@@ -231,13 +251,27 @@ export async function executeCtxSearch(
                 gated: true,
                 ...(toolContext.abort ? { signal: toolContext.abort } : {}),
             });
-            if (isAvailable(read)) memoryRows = read.rows;
-            else memoryState = read.state;
+            if (isAvailable(read)) {
+                memoryRows = read.rows;
+                memoryTruncated = read.truncated;
+            } else {
+                memoryState = read.state;
+            }
         }
         if (memoryRows) {
+            const notes: string[] = [];
             if (unresolvedObjectIds.length > 0) {
-                memoryNote = `Memory: unresolved object id${unresolvedObjectIds.length === 1 ? "" : "s"} (the daemon read stayed truncated): ${unresolvedObjectIds.join(", ")}`;
+                notes.push(
+                    `Memory: unresolved object id${unresolvedObjectIds.length === 1 ? "" : "s"} (the daemon read stayed truncated): ${unresolvedObjectIds.join(", ")}`,
+                );
             }
+            // A truncated snapshot drops the oldest rows, so a lexical hit that lives only in an omitted memory is silently missing; the note keeps "no results" from reading as a complete search. commentlint: allow(JUDGE)
+            if (memoryTruncated) {
+                notes.push(
+                    "Memory: the memory read was truncated; older memories were not searched.",
+                );
+            }
+            if (notes.length > 0) memoryNote = notes.join("\n");
             const hits = searchKernelMemoryRows({
                 rows: memoryRows,
                 query,

@@ -232,6 +232,64 @@ describe("claim-lane import", () => {
         expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
     });
 
+    test("a foreign member's new shared claim invalidates the done marker and imports", async () => {
+        const { db, kernel, client } = harness();
+        db.exec(
+            `INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+             VALUES (1, 'shared', 0, 0, '["CONSTRAINTS"]');
+             INSERT INTO workspace_members
+                 (workspace_id, project_path, display_name, display_path, added_at)
+             VALUES
+                 (1, '${PROJECT}', 'own', '${PROJECT}', 0),
+                 (1, '${OTHER_PROJECT}', 'foreign', '${OTHER_PROJECT}', 0);`,
+        );
+        seedClaim(db, PROJECT, "a", "Own claim A.");
+        const run = () =>
+            importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            });
+        expect(await run()).toBe("done");
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
+        expect(kernel.liveRows()).toHaveLength(1);
+
+        // Identities and share_categories are unchanged; only the shared-claim set moved.
+        const sharedId = seedClaim(
+            db,
+            OTHER_PROJECT,
+            "b",
+            "Shared constraint added later.",
+            "CONSTRAINTS",
+            "shareable",
+        );
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(false);
+        expect(await run()).toBe("done");
+        expect(kernel.liveRows().map((row) => row.object_id)).toContain(
+            importedObjectId(sharedId, ROOT),
+        );
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
+    });
+
+    test("a truncated kernel read defers the import instead of reconciling a prefix", async () => {
+        const { db, kernel, client } = harness();
+        seedClaim(db, PROJECT, "a", "Own claim A.");
+        kernel.readTruncated = true;
+        expect(
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
+        ).toBe("deferred");
+        expect(kernel.liveRows()).toHaveLength(0);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(false);
+    });
+
     test("an anti-memory the lane withheld from automatic surfaces imports as sensitive", async () => {
         const { db, kernel, client } = harness();
         seedAntiMemory(db, PROJECT, "warn", Date.now());
