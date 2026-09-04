@@ -16,14 +16,18 @@ const USAGE = "Usage: run-scorecard.ts --freeze <manifest-dir> --freeze-fingerpr
     + "[--policies <dir>] [--paired-delta-policy <path>] [--baseline <path>]";
 const KNOWN_FLAGS = ["--freeze", "--freeze-fingerprint", "--artifacts", "--out", "--policies", "--paired-delta-policy", "--baseline"];
 
-export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): ScorecardCliArgs {
+export const HELP_REQUESTED = { kind: "help" } as const;
+export type ParsedArgs = ({ kind: "run" } & ScorecardCliArgs) | typeof HELP_REQUESTED;
+
+/**
+ * Help is reported as a value rather than exiting in place so the exported parser never terminates
+ * its host process; the entrypoint maps it to a non-promotion exit code.
+ */
+export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): ParsedArgs {
+    if (argv.includes("--help") || argv.includes("-h")) return HELP_REQUESTED;
     const values = new Map<string, string>();
     for (let index = 0; index < argv.length; index += 2) {
         const flag = argv[index]!;
-        if (flag === "--help" || flag === "-h") {
-            console.log(USAGE);
-            process.exit(0);
-        }
         const value = argv[index + 1];
         if (!KNOWN_FLAGS.includes(flag)) throw new Error(`unknown argument: ${flag}\n${USAGE}`);
         if (value === undefined || value.startsWith("--")) throw new Error(`${flag} requires a value\n${USAGE}`);
@@ -40,6 +44,7 @@ export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): Sco
     const policiesDir = resolve(values.get("--policies") ?? join(root, "prospective-holdout", "policies"));
     const baseline = values.get("--baseline");
     return {
+        kind: "run",
         sources: {
             freeze: { artifactDir: resolve(required("--freeze")), expectedManifestFingerprint: freezeFingerprint },
             policies: {
@@ -73,7 +78,13 @@ export function runScorecard(args: ScorecardCliArgs, log: (line: string) => void
 if (import.meta.main) {
     let code: number;
     try {
-        code = runScorecard(parseArgs(Bun.argv.slice(2)));
+        const parsed = parseArgs(Bun.argv.slice(2));
+        if (parsed.kind === "help") {
+            console.log(USAGE);
+            code = 2;
+        } else {
+            code = runScorecard(parsed);
+        }
     } catch (error) {
         console.error(`scorecard failed: ${error instanceof Error ? error.message : String(error)}`);
         code = 2;

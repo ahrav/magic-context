@@ -9,7 +9,7 @@ import { buildProspectiveReport, validateProspectiveReportEvidence } from "../pr
 import { H3 } from "../prospective-holdout/test-fixtures";
 import type { ScorecardEvidenceBundle } from "./evidence";
 import { SCORECARD_GATE_IDS, ScorecardContractError, LANE_IDS } from "./policy";
-import { REPORT_BODY_KEYS, parseScorecardReport, type ScorecardReport } from "./report-contract";
+import { REPORT_BODY_KEYS, baselineComparable, parseScorecardReport, type ScorecardReport } from "./report-contract";
 import { buildScorecardReport, createScorecardAdapter, publishScorecardReport, scorecardExitCode } from "./report";
 import {
     H1,
@@ -35,7 +35,9 @@ function allGatesPassed(bundle: ScorecardEvidenceBundle): ScorecardReport {
         : { ...row, status: "passed", observedCount: 0, evidenceFingerprint: H1, sourceLane: "incident", diagnostic: null });
     body.outcome.hardGateFailures = [];
     body.limitations = body.limitations.filter((code) => code !== "hard-gates-unobserved");
-    body.outcome.promotionAllowed = body.outcome.mandatoryEvidenceComplete && body.outcome.blockingRegressionCount <= bundle.policy.maxToleratedRegressions;
+    body.outcome.promotionAllowed = body.outcome.mandatoryEvidenceComplete
+        && baselineComparable(body.target, body.evidence.baseline)
+        && body.outcome.blockingRegressionCount <= bundle.policy.maxToleratedRegressions;
     return parseScorecardReport({ schema: report.schema, body, reportFingerprint: canonicalFingerprint(body) });
 }
 
@@ -118,6 +120,19 @@ describe("buildScorecardReport", () => {
         expect(tolerant.body.utility.deltas.every((row) => row.status === "compared")).toBe(true);
     });
 
+    it("denies promotion and exits 1 when the policy pins a baseline the bundle cannot compare against", () => {
+        const policy = policyFixture({ baselineScorecardReportFingerprint: H3 });
+        const report = allGatesPassed(bundleFixture({ policy, baseline: null }));
+        expect(report.body.adverseDeltas).toEqual([]);
+        expect(report.body.outcome).toMatchObject({ promotionAllowed: false, mandatoryEvidenceComplete: true, blockingRegressionCount: 0 });
+        expect(report.body.limitations).toContain("baseline-not-comparable");
+        expect(scorecardExitCode(report)).toBe(1);
+        const forged = structuredClone(report.body);
+        forged.outcome.promotionAllowed = true;
+        expect(() => parseScorecardReport({ schema: report.schema, body: forged, reportFingerprint: canonicalFingerprint(forged) }))
+            .toThrow(/outcome\.promotionAllowed: cross-field-invalid/);
+    });
+
     it("reports four not-observed gates and one passed injection gate from lane-built fixtures", () => {
         const report = buildScorecardReport(bundleFixture({ lanes: { metamorphic: metamorphicReportFixture() } }));
         expect(report.body.safetyGates.filter((row) => row.status === "not-observed")).toHaveLength(4);
@@ -154,6 +169,14 @@ describe("createScorecardAdapter", () => {
             analysis: pairedDelta.report.body.analysis,
         });
     }
+
+    it("rejects a report that was not derived from the supplied bundle", () => {
+        const bundle = bundleFixture();
+        const foreign = buildScorecardReport(bundleFixture({ freezeManifestFingerprint: H3 }));
+        expect(() => createScorecardAdapter({ bundle, report: foreign })).toThrow(/adapter: report-bundle-mismatch/);
+        expect(() => createScorecardAdapter({ bundle, report: allGatesPassed(bundle) })).toThrow(/adapter: report-bundle-mismatch/);
+        expect(() => createScorecardAdapter({ bundle, report: buildScorecardReport(bundle) })).not.toThrow();
+    });
 
     it("rejects a foreign policy fingerprint and paired facts the paired-delta report did not analyze", () => {
         const bundle = bundleFixture();

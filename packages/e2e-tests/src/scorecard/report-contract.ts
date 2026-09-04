@@ -319,6 +319,17 @@ function parseEvidenceRow(raw: unknown, index: number): EvidenceRow {
     };
 }
 
+/**
+ * A pre-registered baseline that is absent, unreadable, or bound to another fingerprint yields no
+ * adverse rows at all, so the regression tolerance is vacuously met; promotion must not follow from that.
+ */
+export function baselineComparable(
+    target: Pick<ScorecardReportBody["target"], "baselineScorecardReportFingerprint">,
+    baseline: Pick<ScorecardReportBody["evidence"]["baseline"], "status">,
+): boolean {
+    return target.baselineScorecardReportFingerprint === null || baseline.status === "present";
+}
+
 /** Whether every row and slot the policy requires supports promotion. Recomputed by the parser so a report cannot claim what its own rows deny. */
 export function deriveOutcome(input: {
     gates: readonly GateRow[];
@@ -327,6 +338,7 @@ export function deriveOutcome(input: {
     requiredMetricSlots: readonly MetricSlotId[];
     adverseDeltas: readonly AdverseRow[];
     maxToleratedRegressions: number;
+    baselineComparable: boolean;
 }): ScorecardReportBody["outcome"] {
     const hardGateFailures = input.gates.filter((row) => row.status !== "passed").map((row) => row.gateId).sort();
     const measured = new Set(input.families.flatMap((family) => family.slots)
@@ -337,6 +349,7 @@ export function deriveOutcome(input: {
     return {
         promotionAllowed: hardGateFailures.length === 0
             && mandatoryEvidenceComplete
+            && input.baselineComparable
             && blockingRegressionCount <= input.maxToleratedRegressions,
         mandatoryEvidenceComplete,
         hardGateFailures,
@@ -402,7 +415,8 @@ export function parseScorecardReport(raw: unknown): ScorecardReport {
     if (body.outcome.blockingRegressionCount !== body.adverseDeltas.filter((row) => row.blocking).length) {
         fail("report.body.outcome.blockingRegressionCount: cross-field-invalid");
     }
-    if (body.outcome.promotionAllowed && (expectedFailures.length > 0 || !body.outcome.mandatoryEvidenceComplete)) {
+    if (body.outcome.promotionAllowed
+        && (expectedFailures.length > 0 || !body.outcome.mandatoryEvidenceComplete || !baselineComparable(body.target, body.evidence.baseline))) {
         fail("report.body.outcome.promotionAllowed: cross-field-invalid");
     }
     if (body.outcome.mandatoryEvidenceComplete && body.evidence.lanes.some((row) => row.status !== "present")) {

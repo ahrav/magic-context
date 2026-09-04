@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { readCanonicalJsonFile } from "../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { parseScorecardReport } from "../src/scorecard/report-contract";
 import { policyFixture, scannableDreamerReportFixture, writeReleaseTree, type ReleaseTreeOptions } from "../src/scorecard/test-fixtures";
-import { parseArgs, runScorecard, type ScorecardCliArgs } from "./run-scorecard";
+import { HELP_REQUESTED, parseArgs, runScorecard, type ScorecardCliArgs } from "./run-scorecard";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -58,20 +58,32 @@ describe("run-scorecard parseArgs", () => {
     const hex = "a".repeat(64);
     const base = ["--freeze", "freeze", "--freeze-fingerprint", hex, "--artifacts", "artifacts", "--out", "out.json"];
 
+    function cli(argv: readonly string[]): ScorecardCliArgs {
+        const parsed = parseArgs(argv, "/root");
+        if (parsed.kind === "help") throw new Error("unexpected help request");
+        return parsed;
+    }
+
     it("resolves paths, defaults the policy locations to the e2e root, and accepts an optional baseline", () => {
-        const args = parseArgs(base, "/root");
+        const args = cli(base);
         expect(args.sources.freeze).toEqual({ artifactDir: join(process.cwd(), "freeze"), expectedManifestFingerprint: hex });
         expect(args.sources.policies.scorecardPath).toBe("/root/prospective-holdout/policies/scorecard-policy.json");
         expect(args.sources.pairedDeltaPolicyPath).toBe("/root/pools/paired-delta-policy.json");
         expect(args.sources.baselinePath).toBeNull();
-        expect(parseArgs([...base, "--baseline", "b.json"], "/root").sources.baselinePath).toBe(join(process.cwd(), "b.json"));
+        expect(cli([...base, "--baseline", "b.json"]).sources.baselinePath).toBe(join(process.cwd(), "b.json"));
+    });
+
+    it("reports a help request as a value instead of exiting, wherever the flag appears", () => {
+        expect(parseArgs(["--help"], "/root")).toBe(HELP_REQUESTED);
+        expect(parseArgs([...base, "-h"], "/root")).toBe(HELP_REQUESTED);
+        expect(parseArgs(["--freeze", "--help"], "/root")).toBe(HELP_REQUESTED);
     });
 
     it("rejects missing, repeated, unknown, and malformed flags", () => {
-        expect(() => parseArgs(base.slice(2), "/root")).toThrow(/--freeze is required/);
-        expect(() => parseArgs([...base, "--out", "twice"], "/root")).toThrow(/given twice/);
-        expect(() => parseArgs([...base, "--verbose", "1"], "/root")).toThrow(/unknown argument/);
-        expect(() => parseArgs([...base, "--baseline"], "/root")).toThrow(/requires a value/);
-        expect(() => parseArgs(["--freeze", "f", "--freeze-fingerprint", "nope", "--artifacts", "a", "--out", "o"], "/root")).toThrow(/hex64/);
+        expect(() => cli(base.slice(2))).toThrow(/--freeze is required/);
+        expect(() => cli([...base, "--out", "twice"])).toThrow(/given twice/);
+        expect(() => cli([...base, "--verbose", "1"])).toThrow(/unknown argument/);
+        expect(() => cli([...base, "--baseline"])).toThrow(/requires a value/);
+        expect(() => cli(["--freeze", "f", "--freeze-fingerprint", "nope", "--artifacts", "a", "--out", "o"])).toThrow(/hex64/);
     });
 });

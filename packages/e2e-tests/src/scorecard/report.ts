@@ -9,6 +9,7 @@ import { evaluateGates } from "./gates";
 import { SCORECARD_POLICY_OWNER, SCORE_FAMILY_IDS, ScorecardContractError, reasonCode } from "./policy";
 import {
     SCORECARD_REPORT_SCHEMA,
+    baselineComparable,
     deriveOutcome,
     parseScorecardReport,
     type EvidenceRow,
@@ -46,6 +47,7 @@ export function buildScorecardReport(bundle: ScorecardEvidenceBundle): Scorecard
         regret: regretRows(bundle),
         adverseDeltas: comparison.adverseDeltas,
     };
+    const comparable = baselineComparable(partial.target, bundle.baseline);
     const outcome = deriveOutcome({
         gates: safetyGates,
         lanes,
@@ -53,6 +55,7 @@ export function buildScorecardReport(bundle: ScorecardEvidenceBundle): Scorecard
         requiredMetricSlots: bundle.policy.requiredMetricSlots,
         adverseDeltas: comparison.adverseDeltas,
         maxToleratedRegressions: bundle.policy.maxToleratedRegressions,
+        baselineComparable: comparable,
     });
     const limitations = [
         ...bundle.limitations,
@@ -60,6 +63,7 @@ export function buildScorecardReport(bundle: ScorecardEvidenceBundle): Scorecard
         ...bundle.baseline.diagnostics,
         ...(safetyGates.some((row) => row.status === "not-observed" || row.status === "errored") ? ["hard-gates-unobserved"] : []),
         ...(outcome.mandatoryEvidenceComplete ? [] : ["mandatory-evidence-incomplete"]),
+        ...(comparable ? [] : ["baseline-not-comparable"]),
     ].map(reasonCode);
     const body: ScorecardReportBody = {
         ...partial,
@@ -72,7 +76,7 @@ export function buildScorecardReport(bundle: ScorecardEvidenceBundle): Scorecard
 
 export function scorecardExitCode(report: ScorecardReport): ScorecardExitCode {
     if (report.body.outcome.hardGateFailures.length > 0) return 2;
-    return report.body.outcome.promotionAllowed && report.body.evidence.baseline.status !== "schema-mismatch" ? 0 : 1;
+    return report.body.outcome.promotionAllowed ? 0 : 1;
 }
 
 /** Refuses to write when the report fails the shared privacy scan; otherwise publishes canonical two-space JSON atomically. */
@@ -81,8 +85,15 @@ export function publishScorecardReport(report: ScorecardReport, path: string): v
     writeJsonAtomically(path, report, "scorecard-report");
 }
 
+/**
+ * Rejects a report whose fingerprint differs from the report recomputed from the supplied bundle, so
+ * the attested outcome is always the one the bundle's own rows produce.
+ */
 export function createScorecardAdapter(input: { bundle: ScorecardEvidenceBundle; report: ScorecardReport }): ScorecardAdapter {
     const { bundle, report } = input;
+    if (buildScorecardReport(bundle).reportFingerprint !== report.reportFingerprint) {
+        throw new ScorecardContractError(["adapter: report-bundle-mismatch"]);
+    }
     return {
         owner: SCORECARD_POLICY_OWNER,
         evaluate(holdout, policyFingerprint): ScorecardOutcome {
