@@ -57,14 +57,21 @@ describe("compareWithBaseline", () => {
         expect(result.limitations).toEqual([]);
     });
 
-    it("emits a blocking family-missing row for a baseline family absent from the current release", () => {
+    it("emits a blocking family-missing row for every baseline (endpoint, family) key absent from the current release", () => {
+        const missing = { kind: "family-missing", noiseLabel: null, delta: null, interval: null, blocking: true } as const;
         const result = compareWithBaseline([estimate("fam-a", 0.1)], {
             status: "present",
             familyEstimates: [estimate("fam-a", 0.1), estimate("fam-gone", 0.4), estimate("fam-gone", 0.4, { endpoint: "mc-on-vs-compaction" })],
         });
         expect(result.adverseDeltas).toEqual([
-            { familyId: "fam-gone", endpoint: null, kind: "family-missing", noiseLabel: null, delta: null, interval: null, blocking: true },
+            { familyId: "fam-gone", endpoint: "mc-on-vs-compaction", ...missing },
+            { familyId: "fam-gone", endpoint: "mc-on-vs-mc-off", ...missing },
         ]);
+        const oneEndpoint = compareWithBaseline([estimate("fam-a", 0.1)], {
+            status: "present",
+            familyEstimates: [estimate("fam-a", 0.1), estimate("fam-a", 0.1, { endpoint: "mc-on-vs-compaction" })],
+        });
+        expect(oneEndpoint.adverseDeltas).toEqual([{ familyId: "fam-a", endpoint: "mc-on-vs-compaction", ...missing }]);
     });
 
     it("copies the paired-delta raw regret ladder only when the lane is present", () => {

@@ -337,8 +337,9 @@ fail-closed default, not a bug.
    gh run download <run-id> --name <artifact> --dir downloads/<artifact>/
    mv -f downloads/historian-eval-report/historian-eval-report.json artifacts/historian-report.json
    # ... one rename per lane; pick one retrieval candidate report.
-   # dreamer expects one JSON array of run reports, excluding the variance files:
-   find downloads/dreamer-eval-report -name '*.json' ! -name variance.json -print0 \
+   # dreamer expects one JSON array of the nested `<group>/<run-id>.json` run reports.
+   # -mindepth 2 skips the top-level coverage.json; the name filter skips variance.json.
+   find downloads/dreamer-eval-report -mindepth 2 -name '*.json' ! -name variance.json -print0 \
      | xargs -0 jq -s '.' > artifacts/dreamer-report.json
    ```
 

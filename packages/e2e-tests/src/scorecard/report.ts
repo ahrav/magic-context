@@ -81,9 +81,9 @@ export function scorecardExitCode(report: ScorecardReport): ScorecardExitCode {
     return report.body.outcome.promotionAllowed ? 0 : 1;
 }
 
-/** Refuses to write when the report fails the shared privacy scan; otherwise publishes canonical two-space JSON atomically. */
 export function publishScorecardReport(report: ScorecardReport, path: string): void {
     if (scanForSensitiveContent(report).length > 0) throw new ScorecardContractError(["scorecard: privacy-rejected"]);
+    parseScorecardReport(report);
     writeJsonAtomically(path, report, "scorecard-report");
 }
 

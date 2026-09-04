@@ -175,6 +175,11 @@ describe("publishScorecardReport", () => {
         const refused = join(root, "refused.json");
         expect(() => publishScorecardReport(leaking as unknown as ScorecardReport, refused)).toThrow(/scorecard: privacy-rejected/);
         expect(existsSync(refused)).toBe(false);
+        const drifted = structuredClone(report);
+        drifted.body.outcome.blockingRegressionCount = 7;
+        const mismatched = join(root, "mismatched.json");
+        expect(() => publishScorecardReport(drifted, mismatched)).toThrow(/report\.reportFingerprint: mismatch/);
+        expect(existsSync(mismatched)).toBe(false);
     });
 });
 

@@ -48,8 +48,8 @@ function adverseRow(row: Extract<DeltaRow, { status: "compared" }>): AdverseRow 
     };
 }
 
-function familyMissingRow(familyId: string): AdverseRow {
-    return { familyId, endpoint: null, kind: "family-missing", noiseLabel: null, delta: null, interval: null, blocking: true };
+function familyMissingRow(row: Pick<FamilyEstimateRow, "endpoint" | "familyId">): AdverseRow {
+    return { familyId: row.familyId, endpoint: row.endpoint, kind: "family-missing", noiseLabel: null, delta: null, interval: null, blocking: true };
 }
 
 function compareAdverseRows(left: AdverseRow, right: AdverseRow): number {
@@ -58,8 +58,8 @@ function compareAdverseRows(left: AdverseRow, right: AdverseRow): number {
 
 /**
  * Pairs every current `(endpoint, estimate family)` estimate with the baseline scorecard's row for
- * the same key. A pair whose shifted interval lies wholly below zero is adverse; an estimate family
- * the baseline carried but the current release does not is a blocking `family-missing` row.
+ * the same key. A pair whose shifted interval lies wholly below zero is adverse; a key the baseline
+ * carried but the current release does not is a blocking `family-missing` row.
  */
 export function compareWithBaseline(current: readonly FamilyEstimateRow[], baseline: BaselineEstimates): Comparison {
     if (baseline.status !== "present") {
@@ -76,12 +76,11 @@ export function compareWithBaseline(current: readonly FamilyEstimateRow[], basel
             ? { endpoint: row.endpoint, familyId: row.familyId, status: "no-baseline", value: row.pointEstimate }
             : compareRow(row, matched);
     });
-    const currentFamilies = new Set(current.map((row) => row.familyId));
-    const missingFamilies = [...new Set(baseline.familyEstimates.map((row) => row.familyId))]
-        .filter((familyId) => !currentFamilies.has(familyId));
+    const currentKeys = new Set(current.map(estimateKey));
+    const missing = baseline.familyEstimates.filter((row) => !currentKeys.has(estimateKey(row)));
     const adverseDeltas = [
         ...deltas.filter((row): row is Extract<DeltaRow, { status: "compared" }> => row.status === "compared" && row.interval.upper < 0).map(adverseRow),
-        ...missingFamilies.map(familyMissingRow),
+        ...missing.map(familyMissingRow),
     ].sort(compareAdverseRows);
     return {
         deltas,
