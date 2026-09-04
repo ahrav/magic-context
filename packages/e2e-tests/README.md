@@ -334,6 +334,7 @@ fail-closed default, not a bug.
    | `retrieval` | `retrieval-benchmark-ci` | `retrieval-check-report-<n>.json` |
 
    ```sh
+   mkdir -p artifacts
    gh run download <run-id> --name <artifact> --dir downloads/<artifact>/
    mv -f downloads/historian-eval-report/historian-eval-report.json artifacts/historian-report.json
    # ... one rename per lane; pick one retrieval candidate report.

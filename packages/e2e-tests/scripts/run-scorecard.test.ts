@@ -79,6 +79,8 @@ describe("removeNamedOutput", () => {
         removeNamedOutput(["--out"]);
         removeNamedOutput(["--out", "--freeze", out]);
         removeNamedOutput([]);
+        removeNamedOutput(["--help", "--out", out]);
+        removeNamedOutput(["--out", out, "-h"]);
         expect(existsSync(out)).toBe(true);
     });
 });

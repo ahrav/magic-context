@@ -24,8 +24,12 @@ export type ParsedArgs = ({ kind: "run" } & ScorecardCliArgs) | typeof HELP_REQU
  * Help is reported as a value rather than exiting in place so the exported parser never terminates
  * its host process; the entrypoint maps it to a non-promotion exit code.
  */
+function helpRequested(argv: readonly string[]): boolean {
+    return argv.includes("--help") || argv.includes("-h");
+}
+
 export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): ParsedArgs {
-    if (argv.includes("--help") || argv.includes("-h")) return HELP_REQUESTED;
+    if (helpRequested(argv)) return HELP_REQUESTED;
     const values = new Map<string, string>();
     for (let index = 0; index < argv.length; index += 2) {
         const flag = argv[index]!;
@@ -65,6 +69,7 @@ export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): Par
  * malformed rerun clears the path it names first.
  */
 export function removeNamedOutput(argv: readonly string[]): void {
+    if (helpRequested(argv)) return;
     const value = argv[argv.indexOf("--out") + 1];
     if (argv.includes("--out") && value !== undefined && !value.startsWith("--")) rmSync(resolve(value), { force: true });
 }
