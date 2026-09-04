@@ -491,12 +491,11 @@ export function scheduleClaimLaneImport(args: {
     const key = scheduleKey(args.projectPath, args.projectRoot);
     const last = attemptedAt.get(key);
     const now = Date.now();
-    if (last !== undefined && now - last < RETRY_AFTER_MS) return;
-    // Another process can clear the shared done marker with `resetClaimLaneImportMarker`; a permanent process-local pin would never observe that reset, so a done answer gets the ordinary cooldown and re-reads the marker after it elapses. commentlint: allow(JUDGE)
+    // The done check runs before the cooldown: it recomputes the authorization fingerprint, so a membership or share-policy revocation is noticed on the next schedule call instead of hiding behind up to five minutes of cooldown while revoked foreign memories stay servable. The cooldown rate-limits import attempts only. commentlint: allow(JUDGE)
     if (claimLaneImportDone(args.db, args.projectPath, args.projectRoot)) {
-        attemptedAt.set(key, now);
         return;
     }
+    if (last !== undefined && now - last < RETRY_AFTER_MS) return;
     attemptedAt.set(key, now);
     void importClaimLaneMemories({ ...args, client: args.client }).catch((error) => {
         log(`[magic-context] claim-lane import failed for ${args.projectPath}`, error);

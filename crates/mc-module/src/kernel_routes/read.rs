@@ -159,22 +159,58 @@ pub(crate) fn read_visible(
             newest.push(row);
         }
     }
-    let (rows, truncated) = newest.finish();
+    let (mut rows, mut truncated) = newest.finish();
+    // Payload sizes are read before any payload: a project can retain [`MAX_READ_ROWS`] decisions of ~1 MiB each, and materializing them all would allocate gigabytes for rows the serialization budget can never carry. A serialized row is at least its payload bytes, so cutting where cumulative payload size passes the budget keeps every row the serializer could keep. commentlint: allow(JUDGE)
     let decision_ids: Vec<String> = rows
         .iter()
         .filter(|row| row.object.object_kind == "decision")
         .map(|row| row.object.object_id.clone())
         .collect();
-    let decisions: HashMap<String, DecisionRow> = store
-        .decisions_for_objects_as_of(&decision_ids, visible.known_as_of)?
+    let payload_sizes: HashMap<String, u64> = store
+        .decision_payload_sizes_as_of(&decision_ids, visible.known_as_of)?
         .into_iter()
-        .map(|decision| (decision.object_id.clone(), decision))
         .collect();
     // A visible decision-kind row without its typed decision row at the same snapshot is a
     // canonical-integrity break. Serving it with `decision: null` would be indistinguishable
     // from a non-decision row and silently drop it from memory surfaces, so the read fails
     // closed instead.
-    if decision_ids.iter().any(|id| !decisions.contains_key(id)) {
+    if decision_ids
+        .iter()
+        .any(|id| !payload_sizes.contains_key(id))
+    {
+        return Err(KernelError::CorruptCanonicalRow);
+    }
+    let mut cumulative_payload_bytes: u64 = 0;
+    let mut cutoff = rows.len();
+    for (index, row) in rows.iter().enumerate() {
+        if row.object.object_kind != "decision" {
+            continue;
+        }
+        cumulative_payload_bytes = cumulative_payload_bytes
+            .saturating_add(*payload_sizes.get(&row.object.object_id).unwrap_or(&0));
+        if cumulative_payload_bytes > MAX_READ_ROW_BYTES as u64 {
+            cutoff = index;
+            break;
+        }
+    }
+    if cutoff < rows.len() {
+        rows.truncate(cutoff);
+        truncated = true;
+    }
+    let retained_decision_ids: Vec<String> = rows
+        .iter()
+        .filter(|row| row.object.object_kind == "decision")
+        .map(|row| row.object.object_id.clone())
+        .collect();
+    let decisions: HashMap<String, DecisionRow> = store
+        .decisions_for_objects_as_of(&retained_decision_ids, visible.known_as_of)?
+        .into_iter()
+        .map(|decision| (decision.object_id.clone(), decision))
+        .collect();
+    if retained_decision_ids
+        .iter()
+        .any(|id| !decisions.contains_key(id))
+    {
         return Err(KernelError::CorruptCanonicalRow);
     }
     Ok(ReadResponse {

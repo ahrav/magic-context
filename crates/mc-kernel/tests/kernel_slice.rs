@@ -515,6 +515,54 @@ fn decisions_for_objects_as_of_returns_only_requested_live_rows() {
 }
 
 #[test]
+fn decision_payload_sizes_match_the_stored_payload_bytes_of_live_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    seed_domain(&store);
+    store
+        .commit(intent("decisions", '1'), |envelope| {
+            envelope.insert_decision(decision(1))?;
+            envelope.insert_decision(decision(2))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    store
+        .commit(intent("retire", '2'), |envelope| {
+            Ok(envelope.retire_decision("decision-object-2")?.result_json())
+        })
+        .unwrap();
+    let tip = store.tip().unwrap();
+    let requested = [
+        "decision-object-1".to_string(),
+        "decision-object-2".to_string(),
+        "decision-object-9".to_string(),
+    ];
+
+    let sizes = store.decision_payload_sizes_as_of(&requested, tip).unwrap();
+    assert_eq!(sizes.len(), 1);
+    let (object_id, size) = &sizes[0];
+    assert_eq!(object_id, "decision-object-1");
+    // The reported size is the stored payload's byte length, the quantity a caller budgets full loads by.
+    let full = store
+        .decisions_for_objects_as_of(&requested, tip)
+        .unwrap()
+        .remove(0);
+    let stored = serde_json::to_vec(&full.payload).unwrap();
+    assert_eq!(*size, stored.len() as u64);
+
+    assert!(store
+        .decision_payload_sizes_as_of(&[], tip)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .decision_payload_sizes_as_of(&requested, tip + 1)
+            .unwrap_err(),
+        KernelError::FutureSnapshot
+    );
+}
+
+#[test]
 fn corrections_preserve_old_rows_and_reauthor_observation_dependencies() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();

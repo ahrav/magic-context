@@ -691,10 +691,9 @@ describe("claim-lane import", () => {
         resetClaimLaneImportScheduleForTest();
     });
 
-    test("a done marker cleared by another process is re-read after the cooldown", async () => {
+    test("a done marker cleared by another process is noticed on the next schedule call", async () => {
         const { db, kernel, client } = harness();
         resetClaimLaneImportScheduleForTest();
-        const start = Date.now();
         try {
             expect(
                 await importClaimLaneMemories({
@@ -705,7 +704,6 @@ describe("claim-lane import", () => {
                     sessionId: "s1",
                 }),
             ).toBe("done");
-            // This schedule observes the done marker and caches the answer.
             scheduleClaimLaneImport({
                 db,
                 client,
@@ -722,19 +720,7 @@ describe("claim-lane import", () => {
             ).run();
             expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(false);
 
-            // Within the cooldown the cached answer holds and no import runs.
-            scheduleClaimLaneImport({
-                db,
-                client,
-                projectPath: PROJECT,
-                projectRoot: ROOT,
-                sessionId: "s1",
-            });
-            await new Promise((resolve) => setTimeout(resolve, 5));
-            expect(kernel.liveRows()).toHaveLength(0);
-
-            // After the cooldown the marker is re-read and the claim imports.
-            setSystemTime(new Date(start + 6 * 60_000));
+            // The done check runs before the cooldown, so the cleared marker triggers a re-import without waiting out the retry window.
             scheduleClaimLaneImport({
                 db,
                 client,
@@ -751,6 +737,61 @@ describe("claim-lane import", () => {
             );
         } finally {
             setSystemTime();
+            resetClaimLaneImportScheduleForTest();
+        }
+    });
+
+    test("a revocation inside the retry cooldown reconciles on the next schedule call", async () => {
+        const { db, kernel, client } = harness();
+        resetClaimLaneImportScheduleForTest();
+        db.exec(
+            `INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+             VALUES (1, 'shared', 0, 0, '["CONSTRAINTS"]');
+             INSERT INTO workspace_members
+                 (workspace_id, project_path, display_name, display_path, added_at)
+             VALUES
+                 (1, '${PROJECT}', 'own', '${PROJECT}', 0),
+                 (1, '${OTHER_PROJECT}', 'foreign', '${OTHER_PROJECT}', 0);`,
+        );
+        const sharedId = seedClaim(
+            db,
+            OTHER_PROJECT,
+            "b",
+            "Shared constraint.",
+            "CONSTRAINTS",
+            "shareable",
+        );
+        try {
+            expect(
+                await importClaimLaneMemories({
+                    db,
+                    client,
+                    projectPath: PROJECT,
+                    projectRoot: ROOT,
+                    sessionId: "s1",
+                }),
+            ).toBe("done");
+            const importedForeign = importedObjectId(sharedId, ROOT);
+            expect(kernel.liveRows().map((row) => row.object_id)).toContain(importedForeign);
+
+            // Revoking sharing right after an import must not wait out the cooldown while the foreign copy stays servable.
+            db.exec(`UPDATE workspaces SET share_categories = '[]' WHERE id = 1`);
+            scheduleClaimLaneImport({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            });
+            for (
+                let waited = 0;
+                waited < 200 && kernel.liveRows().some((row) => row.object_id === importedForeign);
+                waited++
+            ) {
+                await new Promise((resolve) => setTimeout(resolve, 1));
+            }
+            expect(kernel.liveRows().map((row) => row.object_id)).not.toContain(importedForeign);
+        } finally {
             resetClaimLaneImportScheduleForTest();
         }
     });
