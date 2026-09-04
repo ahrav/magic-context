@@ -1144,6 +1144,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						sessionId,
 						projectRoot: resolveProjectRootDirectory(directory),
 					}),
+					db,
+					projectPath,
 					sessionId,
 					refs: promotedRefs,
 					identity: promotionIdentity,

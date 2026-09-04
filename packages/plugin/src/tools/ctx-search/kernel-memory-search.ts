@@ -5,8 +5,20 @@
  * second round trip.
  */
 
-import type { MemorySearchResult } from "../../features/magic-context/search";
+import { createHash } from "node:crypto";
+
+import {
+    type AntiMemoryPayload,
+    parseAntiMemoryContent,
+} from "../../features/magic-context/memory/anti-memory-content";
+import { ANTI_MEMORY_CATEGORY } from "../../features/magic-context/memory/constants";
+import type {
+    AntiMemorySearchResult,
+    MemorySearchResult,
+} from "../../features/magic-context/search";
 import type { ReadRow } from "../../shared/kernel-client";
+
+export type KernelMemorySearchResult = MemorySearchResult | AntiMemorySearchResult;
 
 const OBJECT_ID = /^mem_[0-9a-f]{32}$/;
 
@@ -36,14 +48,55 @@ function rowText(row: ReadRow): string {
     return decision ? `${decision.payload.summary}\n${decision.payload.rationale}` : "";
 }
 
-export function memoryResultFromRow(row: ReadRow, score: number): MemorySearchResult {
+/** `null` when the summary is not the field-labeled anti-memory text form. */
+function antiMemoryPayloadFromSummary(summary: string): AntiMemoryPayload | null {
+    try {
+        return parseAntiMemoryContent(summary);
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * A rejected-approach row with a parseable summary emits the `anti_memory`
+ * variant; anything else — including an unparseable summary — falls back to
+ * the generic memory shape so the row still surfaces.
+ */
+export function memoryResultFromRow(row: ReadRow, score: number): KernelMemorySearchResult {
+    const decision = row.decision;
+    const revisionLocator = `${row.object.object_id}@${row.object.created_commit_seq}`;
+    const payload =
+        decision?.decision_kind === ANTI_MEMORY_CATEGORY
+            ? antiMemoryPayloadFromSummary(decision.payload.summary)
+            : null;
+    if (decision && payload) {
+        // Kernel rows carry no claim-lane row: the digest of the served
+        // summary stands in for both content hashes, and the sentinel claim
+        // id marks the absence of a local rowid.
+        const digest = createHash("sha256").update(decision.payload.summary, "utf8").digest("hex");
+        return {
+            source: "anti_memory",
+            score,
+            publicClaimId: row.object.object_id,
+            revisionLocator,
+            contentDigest: digest,
+            claimId: -1,
+            normalizedHash: digest,
+            trigger: payload.trigger,
+            rejectedStrategy: payload.rejectedStrategy,
+            rejectionReason: payload.rejectionReason,
+            saferAlternative: payload.saferAlternative ?? null,
+            matchType: "exact",
+            ...(row.labeled ? { policyLabel: "labeled" } : {}),
+        };
+    }
     return {
         source: "memory",
-        content: row.decision?.payload.summary ?? "",
+        content: decision?.payload.summary ?? "",
         score,
         publicClaimId: row.object.object_id,
-        revisionLocator: `${row.object.object_id}@${row.object.created_commit_seq}`,
-        category: row.decision?.decision_kind ?? row.object.object_kind,
+        revisionLocator,
+        category: decision?.decision_kind ?? row.object.object_kind,
         matchType: "exact",
         ...(row.labeled ? { policyLabel: "labeled" } : {}),
     };
@@ -63,7 +116,9 @@ export interface KernelMemorySearchArgs {
  * newest first. Either path returns `null` when nothing matches so the caller
  * can fall through to the other sources.
  */
-export function searchKernelMemoryRows(args: KernelMemorySearchArgs): MemorySearchResult[] | null {
+export function searchKernelMemoryRows(
+    args: KernelMemorySearchArgs,
+): KernelMemorySearchResult[] | null {
     const candidates = args.rows.filter(
         (row) => row.decision !== undefined && !args.excludeObjectIds?.has(row.object.object_id),
     );
@@ -90,7 +145,7 @@ export function searchKernelMemoryRows(args: KernelMemorySearchArgs): MemorySear
             (left, right) =>
                 right.score - left.score ||
                 right.row.object.created_commit_seq - left.row.object.created_commit_seq ||
-                (left.row.object.object_id < right.row.object.object_id ? -1 : 1),
+                left.row.object.object_id.localeCompare(right.row.object.object_id),
         )
         .slice(0, args.limit)
         .map((entry) => memoryResultFromRow(entry.row, entry.score));

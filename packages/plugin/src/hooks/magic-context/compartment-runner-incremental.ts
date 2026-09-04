@@ -642,6 +642,8 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                     sessionId,
                     projectRoot: resolveProjectRootDirectory(sessionDirectory ?? directory),
                 }),
+                db,
+                projectPath: promotionProjectIdentity,
                 sessionId,
                 refs: promotedRefs,
                 identity: promotionIdentity,

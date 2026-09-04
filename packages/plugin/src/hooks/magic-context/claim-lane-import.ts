@@ -1,6 +1,9 @@
 /** One-time bridge from the claim-lane SQLite tables to the kernel store, run once per project. commentlint: allow(JUDGE) */
 
-import { WRITABLE_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
+import {
+    ANTI_MEMORY_CATEGORY,
+    PROMOTABLE_CATEGORIES,
+} from "../../features/magic-context/memory/constants";
 import {
     hasClaimMemoryFragment,
     type ProjectMemoryClaimSnapshot,
@@ -21,9 +24,13 @@ import { MEMORY_READ_SURFACE } from "./kernel-memory-render";
 
 export const CLAIM_LANE_IMPORT_SOURCE_ID = "claim-lane-import";
 export const CLAIM_LANE_IMPORT_ACTOR = "agent:claim-lane-import";
-const MARKER_PREFIX = "kernel_claim_lane_import:";
+/** The `_v2` suffix distinguishes markers for imports that include legacy categories; a project marked done under the old key imports its legacy-category claims once more. commentlint: allow(JUDGE) */
+const MARKER_PREFIX = "kernel_claim_lane_import_v2:";
 export const CLAIM_LANE_IMPORT_BATCH = 50;
 const RETRY_AFTER_MS = 5 * 60_000;
+
+/** Persisted categories are used verbatim as `decision_kind`. */
+const IMPORTED_CATEGORIES: readonly string[] = [...PROMOTABLE_CATEGORIES, ANTI_MEMORY_CATEGORY];
 
 export type ClaimLaneImportOutcome = "skipped" | "done" | "deferred";
 
@@ -56,6 +63,13 @@ function markDone(db: Database, projectPath: string, detail: Record<string, unkn
     ).run(markerKey(projectPath), JSON.stringify({ importedAt: Date.now(), ...detail }));
 }
 
+/** Clearing the schedule entry drops the in-process done-pin so the next `scheduleClaimLaneImport` call re-runs the importer. commentlint: allow(JUDGE) */
+export function resetClaimLaneImportMarker(db: Database, projectPath: string): void {
+    attemptedAt.delete(projectPath);
+    if (!hasMetaTable(db)) return;
+    db.prepare("DELETE FROM context_store_meta WHERE key = ?").run(markerKey(projectPath));
+}
+
 export function listClaimLaneMemories(
     db: Database,
     projectPath: string,
@@ -76,7 +90,7 @@ export function listClaimLaneMemories(
             (item) =>
                 own.has(item.projectId) &&
                 item.lifecycleState === "active" &&
-                (WRITABLE_MEMORY_CATEGORIES as readonly string[]).includes(item.category) &&
+                IMPORTED_CATEGORIES.includes(item.category) &&
                 item.content.trim().length > 0,
         )
         .sort((left, right) => left.publicClaimId.localeCompare(right.publicClaimId));
@@ -122,7 +136,19 @@ export async function importClaimLaneMemories(args: {
         return "deferred";
     }
     const present = new Set(existing.rows.map((row) => row.object.object_id));
-    const pending = claims.filter((claim) => !present.has(importedObjectId(claim.publicClaimId)));
+    // A marker reset replays the whole lane, so claims the historian already
+    // promoted under its own derived ids dedupe by (kind, summary) instead of
+    // duplicating as import-id rows.
+    const presentContent = new Set(
+        existing.rows
+            .filter((row) => row.object.domain_id === CTX_MEMORY_DOMAIN_ID && row.decision)
+            .map((row) => `${row.decision?.decision_kind}\u001f${row.decision?.payload.summary}`),
+    );
+    const pending = claims.filter(
+        (claim) =>
+            !present.has(importedObjectId(claim.publicClaimId)) &&
+            !presentContent.has(`${claim.category}\u001f${claim.content.trim()}`),
+    );
     let imported = 0;
     for (let start = 0; start < pending.length; start += CLAIM_LANE_IMPORT_BATCH) {
         const batch = pending.slice(start, start + CLAIM_LANE_IMPORT_BATCH);

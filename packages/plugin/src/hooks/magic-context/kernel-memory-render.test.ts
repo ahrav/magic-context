@@ -1,0 +1,108 @@
+import { describe, expect, test } from "bun:test";
+import {
+    BUDGET_OMITTED_MARKER,
+    EMPTY_PROJECT_MARKER,
+    KernelClient,
+    type KernelClientResolver,
+} from "../../shared/kernel-client";
+import { FakeKernel, FakeKernelTransport } from "../../shared/kernel-client-testing/fake-kernel";
+import {
+    memoryRows,
+    readHistorianMemoryBlock,
+    readInjectionMemorySnapshot,
+    renderKernelMemoryBlock,
+    trimKernelRowsToBudget,
+    withoutSensitiveRows,
+} from "./kernel-memory-render";
+
+const SESSION = "ses-kernel-render";
+const PROJECT = "git:kernel-render";
+
+/** A kernel client over an in-memory fake; the resolver shape matches the transform's. */
+function kernelHarness(kernel = new FakeKernel()): {
+    kernel: FakeKernel;
+    client: KernelClient;
+    kernelClient: KernelClientResolver;
+} {
+    const transport = new FakeKernelTransport(kernel);
+    const kernelClient: KernelClientResolver = ({ sessionId, projectRoot }) =>
+        new KernelClient({ transport, enabled: true, sessionId, projectRoot });
+    return {
+        kernel,
+        client: kernelClient({ sessionId: SESSION, projectRoot: PROJECT }),
+        kernelClient,
+    };
+}
+
+function seededKernel(
+    rows: { id: string; summary: string; sensitivity?: "normal" | "sensitive" | "secret" }[],
+): FakeKernel {
+    const kernel = new FakeKernel();
+    for (const row of rows) {
+        kernel.seedDecision({
+            object_id: `mem_${row.id.repeat(32).slice(0, 32)}`,
+            decision_kind: "PROJECT_RULES",
+            summary: row.summary,
+            sensitivity: row.sensitivity,
+        });
+    }
+    return kernel;
+}
+
+describe("renderKernelMemoryBlock markers", () => {
+    test("rows all trimmed by the budget render the budget-omitted marker, not empty-project", () => {
+        const kernel = seededKernel([{ id: "a", summary: "always run focused tests" }]);
+        const snapshot = kernel.snapshot();
+        const rows = memoryRows(snapshot);
+        const trimmed = trimKernelRowsToBudget(rows, 0);
+        expect(trimmed).toEqual([]);
+
+        const block = renderKernelMemoryBlock(trimmed, snapshot.state, rows.length);
+        expect(block).toContain(BUDGET_OMITTED_MARKER);
+        expect(block).not.toContain(EMPTY_PROJECT_MARKER);
+    });
+
+    test("a truly empty available snapshot still renders the empty-project marker", () => {
+        const snapshot = new FakeKernel().snapshot();
+        const rows = memoryRows(snapshot);
+        const block = renderKernelMemoryBlock(rows, snapshot.state, rows.length);
+        expect(block).toContain(EMPTY_PROJECT_MARKER);
+        expect(block).not.toContain(BUDGET_OMITTED_MARKER);
+    });
+});
+
+describe("sensitivity filtering on automatic surfaces", () => {
+    const seeds = [
+        { id: "a", summary: "a normal memory", sensitivity: "normal" as const },
+        { id: "b", summary: "a sensitive memory", sensitivity: "sensitive" as const },
+    ];
+
+    test("withoutSensitiveRows drops sensitive rows and keeps the rest", () => {
+        const snapshot = seededKernel(seeds).snapshot();
+        expect(snapshot.rows).toHaveLength(2);
+        const filtered = withoutSensitiveRows(snapshot);
+        expect(filtered.rows.map((row) => row.object.sensitivity)).toEqual(["normal"]);
+        expect(filtered.state).toEqual(snapshot.state);
+    });
+
+    test("the injection snapshot excludes sensitive rows while normal rows pass", async () => {
+        const { kernelClient } = kernelHarness(seededKernel(seeds));
+        const snapshot = await readInjectionMemorySnapshot({
+            kernelClient,
+            memoryEnabled: true,
+            projectIdentity: PROJECT,
+            sessionId: SESSION,
+            projectRoot: PROJECT,
+        });
+        expect(snapshot.state.kind).toBe("available");
+        const summaries = memoryRows(snapshot).map((row) => row.decision?.payload.summary);
+        expect(summaries).toEqual(["a normal memory"]);
+    });
+
+    test("the historian baseline excludes sensitive rows while normal rows pass", async () => {
+        const { client } = kernelHarness(seededKernel(seeds));
+        const block = await readHistorianMemoryBlock({ client, sessionId: SESSION });
+        expect(block).toContain("a normal memory");
+        expect(block).not.toContain("a sensitive memory");
+    });
+});

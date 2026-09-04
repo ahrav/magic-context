@@ -32,6 +32,7 @@ export interface KernelTransportCall {
 
 /** The transport surface the client depends on; `McHostModuleTransport` is adapted onto it. */
 export interface KernelTransport {
+    /** False marks the daemon unreachable; a transport that starts the daemon during `call` answers true with no connection file. commentlint: allow(JUDGE) */
     connectionFileExists(): boolean;
     call(args: KernelTransportCall): Promise<unknown>;
     /** Rebinds the session route after the daemon reports `route_unbound`. */

@@ -28,14 +28,11 @@ function isKernelMethod(method: string): method is KernelMethod {
     return KERNEL_METHODS.has(method);
 }
 
-/**
- * `connectionFileExists` is a synchronous stat so the client can answer
- * `daemon_absent` before any dial; `ensureRoute` forgets the cached route and
- * lets the next call reopen it.
- */
+/** A demand-start-capable transport is reachable with no connection file because `call` starts its daemon; every other origin keeps the synchronous stat that answers `daemon_absent` before any dial. `ensureRoute` forgets the cached route and lets the next call reopen it. commentlint: allow(JUDGE) */
 export function createKernelTransport(transport: McHostModuleTransport): KernelTransport {
     return {
-        connectionFileExists: () => existsSync(transport.connectionFilePath),
+        connectionFileExists: () =>
+            transport.canDemandStart() || existsSync(transport.connectionFilePath),
         call(args: KernelTransportCall): Promise<unknown> {
             if (!isKernelMethod(args.method)) {
                 return Promise.reject(

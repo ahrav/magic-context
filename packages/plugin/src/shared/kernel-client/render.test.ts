@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { EMPTY_PROJECT_MARKER, renderMemoryStateMarker, renderToolStateText } from "./render";
+import {
+    BUDGET_OMITTED_MARKER,
+    EMPTY_PROJECT_MARKER,
+    renderMemoryStateMarker,
+    renderToolStateText,
+} from "./render";
 
 describe("render", () => {
     test("available with zero rows renders the empty-project marker", () => {
@@ -8,6 +13,15 @@ describe("render", () => {
 
     test("available with rows renders nothing; the rows are the marker", () => {
         expect(renderMemoryStateMarker({ kind: "available" }, 3)).toBe("");
+    });
+
+    test("available trimmed to zero rows renders the budget-omitted marker, not empty-project", () => {
+        expect(renderMemoryStateMarker({ kind: "available" }, 0, 3)).toBe(BUDGET_OMITTED_MARKER);
+        expect(renderMemoryStateMarker({ kind: "available" }, 0, 3)).not.toBe(EMPTY_PROJECT_MARKER);
+    });
+
+    test("available with rendered rows ignores the pre-trim count", () => {
+        expect(renderMemoryStateMarker({ kind: "available" }, 2, 5)).toBe("");
     });
 
     test("lagging states carry their lag facts", () => {

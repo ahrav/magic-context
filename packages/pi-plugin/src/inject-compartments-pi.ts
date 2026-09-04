@@ -999,6 +999,7 @@ export function renderM0Pi(
 		? renderKernelMemoryBlock(
 				rowsOverride ?? renderedMemoryRows(state),
 				state.memory.state,
+				memoryRows(state.memory).length,
 			)
 		: "";
 	// Facts render through <project-memory>, not through decayed compartments.

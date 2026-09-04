@@ -26,7 +26,12 @@ export {
     type Surface,
     sha256Hex,
 } from "./client";
-export { EMPTY_PROJECT_MARKER, renderMemoryStateMarker, renderToolStateText } from "./render";
+export {
+    BUDGET_OMITTED_MARKER,
+    EMPTY_PROJECT_MARKER,
+    renderMemoryStateMarker,
+    renderToolStateText,
+} from "./render";
 export {
     ALL_STATE_KEYS,
     abstained,

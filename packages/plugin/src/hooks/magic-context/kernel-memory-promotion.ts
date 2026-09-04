@@ -12,7 +12,9 @@ import {
     stateKey,
 } from "../../shared/kernel-client";
 import { sessionLog } from "../../shared/logger";
+import type { Database } from "../../shared/sqlite";
 import { CTX_MEMORY_DOMAIN_ID } from "../../tools/ctx-memory/execute";
+import { resetClaimLaneImportMarker } from "./claim-lane-import";
 
 export const HISTORIAN_SOURCE_ID = "historian";
 
@@ -50,9 +52,11 @@ export function promotedFactSpecs(
         }));
 }
 
-/** A non-`available` answer is logged and dropped: the facts are already durable in the claim lane. */
+/** A non-`available` answer resets the claim-lane import marker: the facts are durable in the claim lane, and reopening the importer replays them into the kernel later. commentlint: allow(JUDGE) */
 export async function commitPromotedFactsToKernel(args: {
     client: KernelClient | undefined;
+    db: Database;
+    projectPath: string;
     sessionId: string;
     refs: readonly PromotedMemoryRef[];
     identity: HistorianPromotionIdentity;
@@ -67,9 +71,12 @@ export async function commitPromotedFactsToKernel(args: {
         operations: specs.map((spec) => ({ op: "insert_decision" as const, spec })),
     });
     if (!isAvailable(result)) {
+        if (args.projectPath.length > 0) {
+            resetClaimLaneImportMarker(args.db, args.projectPath);
+        }
         sessionLog(
             args.sessionId,
-            `historian kernel promotion answered ${stateKey(result.state)}; ${specs.length} fact(s) stay in the claim lane only`,
+            `historian kernel promotion answered ${stateKey(result.state)}; ${specs.length} fact(s) stay in the claim lane; import marker reset for replay`,
         );
         return;
     }

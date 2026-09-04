@@ -71,14 +71,17 @@ export class FakeKernel {
         labeled?: boolean;
         sensitivity?: FakeObject["sensitivity"];
         source_revision?: number;
+        domain_id?: string;
+        source_kind?: string;
+        source_id?: string;
     }): FakeObject {
         const seq = this.nextSeq();
         const object: FakeObject = {
             object_id: input.object_id,
             object_kind: "decision",
-            domain_id: "memory",
-            source_kind: "assistant",
-            source_id: "ctx_memory",
+            domain_id: input.domain_id ?? "memory",
+            source_kind: input.source_kind ?? "assistant",
+            source_id: input.source_id ?? "ctx_memory",
             source_revision: input.source_revision ?? 1,
             created_commit_seq: seq,
             invalidated_commit_seq: null,
@@ -251,6 +254,16 @@ export class FakeKernel {
                     return { state: { kind: "invalid", reason: "internal" } };
                 }
                 const spec = operation.spec as Record<string, unknown>;
+                if (
+                    replaced.domain_id !== spec.domain_id ||
+                    replaced.source_id !== spec.source_id ||
+                    replaced.source_kind !== sourceKind
+                ) {
+                    return { state: { kind: "invalid", reason: "invalid_input" } };
+                }
+                if ((spec.source_revision as number) <= replaced.source_revision) {
+                    return { state: { kind: "conflict", reason: "known_as_of_advanced" } };
+                }
                 insert(spec);
                 replaced.invalidated_commit_seq = seq;
                 replaced.superseded_by = spec.object_id as string;

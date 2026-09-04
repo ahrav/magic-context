@@ -11,10 +11,7 @@ import {
     renderAntiMemoryContent,
 } from "../../features/magic-context/memory/anti-memory-content";
 import { ClaimOperationInputError } from "../../features/magic-context/memory/claim-operation-contract";
-import {
-    ANTI_MEMORY_CATEGORY,
-    WRITABLE_MEMORY_CATEGORIES,
-} from "../../features/magic-context/memory/constants";
+import { ANTI_MEMORY_CATEGORY } from "../../features/magic-context/memory/constants";
 import {
     type CommitResult,
     type DecisionSpecInput,
@@ -24,6 +21,7 @@ import {
     type MutationArgs,
     type ReadRow,
     renderToolStateText,
+    type SourceKind,
     sha256Hex,
 } from "../../shared/kernel-client";
 import { DEFAULT_SEARCH_LIMIT, GET_MAX_CLAIMS } from "./constants";
@@ -47,10 +45,7 @@ function uniqueIds(ids: readonly string[] | undefined): string[] {
 }
 
 function isMemoryRow(row: ReadRow): boolean {
-    return (
-        row.decision !== undefined &&
-        (WRITABLE_MEMORY_CATEGORIES as readonly string[]).includes(row.decision.decision_kind)
-    );
+    return row.decision !== undefined && row.object.domain_id === CTX_MEMORY_DOMAIN_ID;
 }
 
 function memoryView(row: ReadRow): Record<string, unknown> {
@@ -112,7 +107,7 @@ function decisionSpec(
     args: CtxMemoryArgs,
     category: string,
     identity: CtxMemoryWriteIdentity,
-    sourceRevision: number,
+    lineage: { sourceId: string; sourceRevision: number },
 ): DecisionSpecInput {
     return {
         decision_id: derivedId("dec", identity, 0),
@@ -120,8 +115,34 @@ function decisionSpec(
         domain_id: CTX_MEMORY_DOMAIN_ID,
         decision_kind: category,
         payload: { summary: contentOf(args), rationale: args.reason?.trim() ?? "" },
-        source_id: CTX_MEMORY_SOURCE_ID,
-        source_revision: sourceRevision,
+        source_id: lineage.sourceId,
+        source_revision: lineage.sourceRevision,
+    };
+}
+
+/**
+ * All predecessors must share source_id and source_kind because a successor
+ * has one source lineage.
+ */
+function successorLineage(predecessors: readonly ReadRow[]): {
+    sourceId: string;
+    sourceKind: SourceKind;
+} {
+    const first = predecessors[0] as ReadRow;
+    for (const row of predecessors) {
+        if (
+            row.object.source_id !== first.object.source_id ||
+            row.object.source_kind !== first.object.source_kind
+        ) {
+            throw new ClaimOperationInputError(
+                "merge targets have different lineages (source_id/source_kind); one survivor cannot supersede them all. Merge same-lineage memories only.",
+            );
+        }
+    }
+    return {
+        sourceId: first.object.source_id,
+        // The store holds only source kinds the daemon admitted.
+        sourceKind: first.object.source_kind as SourceKind,
     };
 }
 
@@ -169,6 +190,8 @@ export interface ExecuteCtxMemoryArgs {
     action: CtxMemoryAction;
     identity: CtxMemoryWriteIdentity;
     actor: string;
+    /** The source kind `create` commits under; replacements inherit the predecessor's kind. */
+    sourceKind?: SourceKind;
 }
 
 async function readMemoryRows(
@@ -201,7 +224,7 @@ function nextSourceRevision(predecessors: readonly ReadRow[]): number {
 }
 
 export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<string> {
-    const { client, args, action, identity, actor } = input;
+    const { client, args, action, identity, actor, sourceKind } = input;
     const mutation: MutationArgs = { actor, cause: identity.toolCallId };
 
     if (action === "get" || action === "list") {
@@ -235,8 +258,12 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
 
     if (action === "create") {
         const category = args.category?.trim() ?? "";
-        const spec = decisionSpec(args, category, identity, 1);
-        return renderCommit(action, await client.create(spec, mutation), []);
+        const spec = decisionSpec(args, category, identity, {
+            sourceId: CTX_MEMORY_SOURCE_ID,
+            sourceRevision: 1,
+        });
+        const createMutation = sourceKind === undefined ? mutation : { ...mutation, sourceKind };
+        return renderCommit(action, await client.create(spec, createMutation), []);
     }
 
     if (action === "archive") {
@@ -258,8 +285,16 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         if (!category) {
             throw new ClaimOperationInputError(`revise requires a category for ${target}`);
         }
-        const spec = decisionSpec(merged, category, identity, nextSourceRevision(predecessors));
-        return renderCommit(action, await client.revise(target, spec, mutation), [target]);
+        const lineage = successorLineage(predecessors);
+        const spec = decisionSpec(merged, category, identity, {
+            sourceId: lineage.sourceId,
+            sourceRevision: nextSourceRevision(predecessors),
+        });
+        return renderCommit(
+            action,
+            await client.revise(target, spec, { ...mutation, sourceKind: lineage.sourceKind }),
+            [target],
+        );
     }
 
     const targets = uniqueIds(args.objectIds);
@@ -273,6 +308,14 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
     assertCtxMemoryWriteShape({ ...merged, action: "revise" });
     const category = merged.category?.trim();
     if (!category) throw new ClaimOperationInputError("merge requires a category");
-    const spec = decisionSpec(merged, category, identity, nextSourceRevision(predecessors));
-    return renderCommit(action, await client.merge(targets, spec, mutation), targets);
+    const lineage = successorLineage(predecessors);
+    const spec = decisionSpec(merged, category, identity, {
+        sourceId: lineage.sourceId,
+        sourceRevision: nextSourceRevision(predecessors),
+    });
+    return renderCommit(
+        action,
+        await client.merge(targets, spec, { ...mutation, sourceKind: lineage.sourceKind }),
+        targets,
+    );
 }

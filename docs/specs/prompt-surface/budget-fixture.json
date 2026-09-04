@@ -1,6 +1,6 @@
 {
   "artifactId": "prompt-surface-budget",
-  "revision": "s2-r3",
+  "revision": "s2-r4",
   "status": "PENDING-RATIFICATION",
   "policy": {
     "expression": "floor(0.50 * mutableProseBaseline)",
@@ -88,8 +88,8 @@
         "tokens": 391
       },
       "ctx_memory": {
-        "chars": 755,
-        "tokens": 181
+        "chars": 781,
+        "tokens": 179
       },
       "ctx_search": {
         "chars": 1373,
@@ -119,9 +119,9 @@
       },
       "totalTokens": 1108
     },
-    "builtInProviderVisibleTotal": 4727
+    "builtInProviderVisibleTotal": 4725
   },
-  "mutableProseBaseline": 3619,
+  "mutableProseBaseline": 3617,
   "integerLightCeiling": 1825,
   "includedSurfaces": [
     "The primary built-in full guidance section for the exact feature variant above.",

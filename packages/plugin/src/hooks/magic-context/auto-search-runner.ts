@@ -15,6 +15,7 @@ import {
 } from "../../features/magic-context/memory/embedding";
 import { resolveProjectRootDirectory } from "../../features/magic-context/memory/project-identity";
 import type {
+    SearchSource,
     UnifiedSearchOptions,
     UnifiedSearchResult,
 } from "../../features/magic-context/search";
@@ -33,7 +34,7 @@ import {
 import { log, sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { searchKernelMemoryRows } from "../../tools/ctx-search/kernel-memory-search";
-import { packAutoSearchHint } from "./auto-search-hint";
+import { collectAntiMemoryWarningFragments, packAutoSearchHint } from "./auto-search-hint";
 import {
     AUTO_SEARCH_RESULT_LIMIT,
     AUTO_SEARCH_SOURCES,
@@ -112,10 +113,8 @@ function emptyDelivery(
  * Persistence and message mutation stay with the transform caller.
  */
 /** The `memory` source is served by the kernel; every other source still reads the local database. */
-function localSources(sources: readonly string[] | undefined): UnifiedSearchOptions["sources"] {
-    return (sources ?? [])
-        .filter((source) => source !== "memory")
-        .map((source) => source as NonNullable<UnifiedSearchOptions["sources"]>[number]);
+function localSources(sources: readonly SearchSource[]): SearchSource[] {
+    return sources.filter((source) => source !== "memory");
 }
 
 /** The no-hint reason an empty turn records, given how the kernel answered. */
@@ -141,7 +140,10 @@ export async function executeAutoSearchDelivery(args: {
      * */
     packNowMs?: number;
 }): Promise<AutoSearchDelivery> {
-    const memoryRequested = (args.searchOptions.sources ?? []).includes("memory");
+    // An undefined source list takes the auto-search defaults; `unifiedSearch` gives an
+    // empty list the "no sources" meaning, not the default set. commentlint: allow(JUDGE)
+    const sources: readonly SearchSource[] = args.searchOptions.sources ?? AUTO_SEARCH_SOURCES;
+    const memoryRequested = sources.includes("memory");
     const kernelClient = memoryRequested ? args.kernelClient : undefined;
     const limit = args.searchOptions.limit ?? AUTO_SEARCH_RESULT_LIMIT;
     let timed: { results: UnifiedSearchResult[]; memory: KernelMemorySnapshot | null } | null;
@@ -151,11 +153,11 @@ export async function executeAutoSearchDelivery(args: {
             args.sessionId,
             args.projectPath,
             args.prompt,
-            { ...args.searchOptions, sources: localSources(args.searchOptions.sources) },
+            { ...args.searchOptions, sources: localSources(sources) },
             args.timeoutMs ?? AUTO_SEARCH_TIMEOUT_MS,
             kernelClient
-                ? async (signal, deadlineMs) =>
-                      withholdLaggingMemory(
+                ? async (signal, deadlineMs) => {
+                      const snapshot = withholdLaggingMemory(
                           kernelMemorySnapshotFrom(
                               await kernelClient.read({
                                   surface: MEMORY_READ_SURFACE,
@@ -164,7 +166,17 @@ export async function executeAutoSearchDelivery(args: {
                                   deadlineMs,
                               }),
                           ),
-                      )
+                      );
+                      // The `explicit_search` surface serves `sensitive` rows; this
+                      // automatic consumer re-imposes the daemon's auto-surface
+                      // sensitivity rule before any row is scored. commentlint: allow(JUDGE)
+                      return {
+                          ...snapshot,
+                          rows: snapshot.rows.filter(
+                              (row) => row.object.sensitivity !== "sensitive",
+                          ),
+                      };
+                  }
                 : undefined,
         );
     } catch (error) {
@@ -416,18 +428,27 @@ export async function runAutoSearchHint(args: {
     const hintText = delivery.hintText;
 
     const payload = `\n\n${hintText}`;
-    // Kernel memory hits carry no claim fragments, so the persisted hint replays on later passes.
+    // Any anti-memory fragment marks the persisted decision as non-replayable;
+    // ordinary kernel hits persist an empty fragment list and replay.
+    const { warningResults, memoryFragments } = collectAntiMemoryWarningFragments(
+        delivery.delivered,
+    );
     const outcome = appendAutoSearchHintDecision(db, sessionId, {
         messageId: userMsgId,
         decision: "hint",
         text: payload,
-        memoryFragments: [],
+        memoryFragments,
     });
     if (!outcome.ok) {
         sessionLog(sessionId, `auto-search: CAS exhausted for ${userMsgId}; skipping wire append`);
         return { ok: false, kind: "cas-exhaustion" };
     }
-    replayHintIfEligible(outcome.decision);
+    if (outcome.kind === "appended" && warningResults.length > 0) {
+        // A freshly delivered warning bypasses replay; later passes cannot re-serve it.
+        appendReminderToUserMessageById(messages, userMsgId, payload);
+    } else {
+        replayHintIfEligible(outcome.decision);
+    }
     sessionLog(
         sessionId,
         `auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,

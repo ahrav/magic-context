@@ -52,13 +52,23 @@ export async function readInjectionMemorySnapshot(args: {
     if (!args.memoryEnabled || !args.projectIdentity) return disabledSnapshot();
     if (!args.kernelClient) return daemonAbsentSnapshot();
     const client = args.kernelClient({ sessionId: args.sessionId, projectRoot: args.projectRoot });
-    return kernelMemorySnapshotFrom(
-        await client.read({
-            surface: MEMORY_READ_SURFACE,
-            gated: false,
-            deadlineMs: INJECTION_READ_DEADLINE_MS,
-        }),
+    return withoutSensitiveRows(
+        kernelMemorySnapshotFrom(
+            await client.read({
+                surface: MEMORY_READ_SURFACE,
+                gated: false,
+                deadlineMs: INJECTION_READ_DEADLINE_MS,
+            }),
+        ),
     );
+}
+
+/** The daemon hides `sensitive` rows on its automatic surfaces; `explicit_search` serves them, so automatic consumers re-impose that rule client-side. commentlint: allow(JUDGE) */
+export function withoutSensitiveRows(snapshot: KernelMemorySnapshot): KernelMemorySnapshot {
+    return {
+        ...snapshot,
+        rows: snapshot.rows.filter((row) => row.object.sensitivity !== "sensitive"),
+    };
 }
 
 /** Automatic consumers treat a `stale` read as `abstained` and surface none of its rows. */
@@ -90,7 +100,8 @@ export async function readHistorianMemoryBlock(args: {
         );
         return "";
     }
-    return renderKernelMemoryBlock(memoryRows(kernelMemorySnapshotFrom(read)), read.state);
+    const snapshot = withoutSensitiveRows(kernelMemorySnapshotFrom(read));
+    return renderKernelMemoryBlock(memoryRows(snapshot), read.state);
 }
 
 /** Excludes the store-wide `known_as_of`, which every commit to any project advances; a changed key rematerializes m[0] and the prompt prefix. commentlint: allow(JUDGE) */
@@ -176,13 +187,16 @@ export function trimKernelRowsToBudget(rows: readonly ReadRow[], budgetTokens: n
  * clean `available` with rows, the state marker line. An `available` snapshot
  * with zero rows renders the empty-project marker so the model learns the
  * project has no memories rather than inferring the block was cut.
+ * `totalRowCount` records the row count before budget trimming so the marker
+ * can report when trimming removes every row.
  */
 export function renderKernelMemoryBlock(
     rows: readonly ReadRow[],
     state: MemoryState,
+    totalRowCount: number = rows.length,
     wrapper = PROJECT_MEMORY_WRAPPER,
 ): string {
-    const marker = renderMemoryStateMarker(state, rows.length);
+    const marker = renderMemoryStateMarker(state, rows.length, totalRowCount);
     if (rows.length === 0 && marker.length === 0) return "";
     const lines = [`<${wrapper}>`];
     if (marker.length > 0) lines.push(escapeXmlContent(marker));

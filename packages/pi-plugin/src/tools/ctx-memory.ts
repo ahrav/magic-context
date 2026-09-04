@@ -202,6 +202,7 @@ export function createCtxMemoryTool(
 					actor: dreamerAllowed
 						? CTX_MEMORY_PI_DREAMER_ACTOR
 						: CTX_MEMORY_PI_ACTOR,
+					...(dreamerAllowed ? { sourceKind: "dreamer" as const } : {}),
 				});
 				return text.startsWith("Error:") ? err(text) : ok(text);
 			} catch (error) {

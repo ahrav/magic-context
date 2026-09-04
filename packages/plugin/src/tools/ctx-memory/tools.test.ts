@@ -38,7 +38,7 @@ function harness(kernel = new FakeKernel(), enabled = true) {
         kernelClient: ({ sessionId, projectRoot }) =>
             new KernelClient({ transport, enabled, sessionId, projectRoot, tokens }),
         resolveProjectPath: () => PROJECT,
-        allowedActions: ["create", "get", "revise", "archive", "restore", "merge"],
+        allowedActions: ["create", "get", "revise", "archive", "merge"],
     }).ctx_memory;
     const execute = async (
         args: Record<string, unknown>,
@@ -280,6 +280,118 @@ describe("ctx_memory lifecycle and merge", () => {
         ).toBe(refused);
         expect(tool.transport.methods()).not.toContain("kernel.commit");
         expect(kernel.objects.get("mem_secret")?.invalidated_commit_seq).toBeNull();
+    });
+});
+
+describe("ctx_memory domain fence and lineage", () => {
+    test("a decision outside the memory domain is invisible and cannot be archived", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: "mem_notes",
+            decision_kind: "ARCHITECTURE",
+            summary: "Notes.",
+            domain_id: "notes",
+        });
+        const tool = harness(kernel);
+        const got = parseJson<ReadJson>(
+            await tool.execute({ action: "get", objectIds: ["mem_notes"] }, "call-get-domain"),
+        );
+        expect(got.memories).toEqual([]);
+        expect(got.missingObjectIds).toEqual(["mem_notes"]);
+        expect(
+            await tool.execute({ action: "archive", objectId: "mem_notes" }, "call-archive-domain"),
+        ).toBe("Error: memory not found or not visible from this project: mem_notes");
+        expect(tool.transport.methods()).not.toContain("kernel.commit");
+        expect(kernel.objects.get("mem_notes")?.invalidated_commit_seq).toBeNull();
+    });
+
+    test("a memory-domain row with a legacy category reads and archives", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: "mem_legacy",
+            decision_kind: "USER_DIRECTIVES",
+            summary: "Legacy.",
+            source_id: "claim-lane-import",
+            source_kind: "model",
+        });
+        const tool = harness(kernel);
+        const got = parseJson<ReadJson>(
+            await tool.execute({ action: "get", objectIds: ["mem_legacy"] }, "call-get-legacy"),
+        );
+        expect(got.memories).toEqual([
+            expect.objectContaining({ objectId: "mem_legacy", category: "USER_DIRECTIVES" }),
+        ]);
+        const archived = parseJson<CommitJson>(
+            await tool.execute(
+                { action: "archive", objectId: "mem_legacy" },
+                "call-archive-legacy",
+            ),
+        );
+        expect(archived.outcome).toBe("applied");
+        expect(kernel.objects.get("mem_legacy")?.invalidated_commit_seq).not.toBeNull();
+    });
+
+    test("revise of a historian-promoted memory sends the predecessor's lineage", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: "mem_hist",
+            decision_kind: "ARCHITECTURE",
+            summary: "H.",
+            source_id: "historian",
+            source_kind: "model",
+        });
+        const tool = harness(kernel);
+        const revised = parseJson<CommitJson>(
+            await tool.execute(
+                { action: "revise", objectId: "mem_hist", content: "H2." },
+                "call-revise-hist",
+            ),
+        );
+        expect(revised.outcome).toBe("applied");
+        const survivor = revised.objects.find((id) => id !== "mem_hist") as string;
+        const commit = tool.transport.calls.find((call) => call.method === "kernel.commit")
+            ?.body as { source_kind?: string };
+        expect(commit.source_kind).toBe("model");
+        expect(kernel.objects.get(survivor)).toMatchObject({
+            source_id: "historian",
+            source_kind: "model",
+            source_revision: 2,
+        });
+    });
+
+    test("merge across differing lineages is refused before any commit", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: "mem_own",
+            decision_kind: "ARCHITECTURE",
+            summary: "O.",
+        });
+        kernel.seedDecision({
+            object_id: "mem_hist",
+            decision_kind: "ARCHITECTURE",
+            summary: "H.",
+            source_id: "historian",
+            source_kind: "model",
+        });
+        const tool = harness(kernel);
+        const text = await tool.execute(
+            { action: "merge", objectIds: ["mem_own", "mem_hist"], content: "OH." },
+            "call-merge-mixed",
+        );
+        expect(text).toContain("Merge same-lineage memories only");
+        expect(tool.transport.methods()).not.toContain("kernel.commit");
+        expect(kernel.liveRows()).toHaveLength(2);
+    });
+
+    test("a dreamer create commits under source kind dreamer", async () => {
+        const tool = harness();
+        const created = parseJson<CommitJson>(
+            await tool.execute(createArgs("Dreamed."), "call-dreamer-create", DREAMER_AGENT),
+        );
+        const objectId = created.objects[0] as string;
+        const commit = tool.transport.calls[0]?.body as { source_kind?: string };
+        expect(commit.source_kind).toBe("dreamer");
+        expect(tool.kernel.objects.get(objectId)?.source_kind).toBe("dreamer");
     });
 });
 

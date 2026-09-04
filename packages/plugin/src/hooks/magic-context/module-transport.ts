@@ -1206,6 +1206,10 @@ export class McHostModuleTransport {
         return this.connectionFile;
     }
 
+    canDemandStart(): boolean {
+        return this.connectionOrigin === "managed-default" && this.demandStart !== undefined;
+    }
+
     /**
      * Evicts the cached route for one `(session, root)` so the next call opens
      * a fresh one. Used after the daemon reports the route unbound: the cached

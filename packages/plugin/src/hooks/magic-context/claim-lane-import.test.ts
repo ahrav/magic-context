@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createProjectMemoryClaim } from "../../features/magic-context/memory/storage-claim-operations";
 import { ensureProject } from "../../features/magic-context/memory/storage-claims";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
-import { KernelClient } from "../../shared/kernel-client";
+import { KernelClient, sha256Hex } from "../../shared/kernel-client";
 import { FakeKernel, FakeKernelTransport } from "../../shared/kernel-client-testing/fake-kernel";
 import type { Database } from "../../shared/sqlite";
 import {
@@ -11,12 +11,21 @@ import {
     importClaimLaneMemories,
     importedObjectId,
     listClaimLaneMemories,
+    resetClaimLaneImportMarker,
+    resetClaimLaneImportScheduleForTest,
+    scheduleClaimLaneImport,
 } from "./claim-lane-import";
 
 const PROJECT = "git:import-project";
 const OTHER_PROJECT = "git:other-project";
 
-function seedClaim(db: Database, project: string, key: string, content: string): string {
+function seedClaim(
+    db: Database,
+    project: string,
+    key: string,
+    content: string,
+    category = "ARCHITECTURE",
+): string {
     const projectId = ensureProject(db, project);
     const result = createProjectMemoryClaim(
         db,
@@ -24,7 +33,7 @@ function seedClaim(db: Database, project: string, key: string, content: string):
         {
             projectId,
             content,
-            category: "ARCHITECTURE",
+            category,
             provenance: {
                 sourceLocator: "transcript://seed",
                 sourceContent: content,
@@ -121,5 +130,76 @@ describe("claim-lane import", () => {
         ).toBe("done");
         expect(transport.calls).toHaveLength(0);
         expect(claimLaneImportDone(db, PROJECT)).toBe(true);
+    });
+
+    test("a legacy-category active claim imports with its category as the decision kind", async () => {
+        const { db, kernel, client } = harness();
+        seedClaim(db, PROJECT, "a", "Prefers tabs over spaces.", "USER_PREFERENCES");
+        seedClaim(db, PROJECT, "b", "CI requires two approvals.", "WORKFLOW_RULES");
+        expect(
+            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+        ).toBe("done");
+        const kinds = kernel
+            .liveRows()
+            .map((row) => row.decision?.decision_kind)
+            .sort();
+        expect(kinds).toEqual(["USER_PREFERENCES", "WORKFLOW_RULES"]);
+    });
+
+    test("a project marked done under the pre-widening marker key re-imports once", async () => {
+        const { db, kernel, transport, client } = harness();
+        db.prepare("INSERT INTO context_store_meta(key, value) VALUES (?, ?)").run(
+            `kernel_claim_lane_import:${sha256Hex(PROJECT).slice(0, 32)}`,
+            JSON.stringify({ importedAt: 1, imported: 1 }),
+        );
+        const imported = seedClaim(db, PROJECT, "a", "Own claim A.");
+        seedClaim(db, PROJECT, "b", "Legacy directive.", "USER_DIRECTIVES");
+        kernel.seedDecision({
+            object_id: importedObjectId(imported),
+            decision_kind: "ARCHITECTURE",
+            summary: "Own claim A.",
+            domain_id: "memory",
+            source_kind: "model",
+            source_id: CLAIM_LANE_IMPORT_SOURCE_ID,
+        });
+
+        expect(claimLaneImportDone(db, PROJECT)).toBe(false);
+        expect(
+            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+        ).toBe("done");
+        expect(kernel.liveRows()).toHaveLength(2);
+        expect(kernel.liveRows().map((row) => row.decision?.payload.summary)).toContain(
+            "Legacy directive.",
+        );
+
+        const commitsBefore = transport.methods().filter((m) => m === "kernel.commit").length;
+        expect(
+            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+        ).toBe("skipped");
+        expect(transport.methods().filter((m) => m === "kernel.commit").length).toBe(commitsBefore);
+        expect(kernel.liveRows()).toHaveLength(2);
+    });
+
+    test("a marker reset clears the schedule done-pin so the next schedule re-runs", async () => {
+        const { db, kernel, client } = harness();
+        resetClaimLaneImportScheduleForTest();
+        expect(
+            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+        ).toBe("done");
+        scheduleClaimLaneImport({ db, client, projectPath: PROJECT, sessionId: "s1" });
+
+        seedClaim(db, PROJECT, "a", "Fact from a failed promotion.");
+        resetClaimLaneImportMarker(db, PROJECT);
+        expect(claimLaneImportDone(db, PROJECT)).toBe(false);
+
+        scheduleClaimLaneImport({ db, client, projectPath: PROJECT, sessionId: "s1" });
+        for (let waited = 0; waited < 200 && kernel.liveRows().length === 0; waited++) {
+            await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+        expect(kernel.liveRows()).toHaveLength(1);
+        expect(kernel.liveRows()[0]?.decision?.payload.summary).toBe(
+            "Fact from a failed promotion.",
+        );
+        resetClaimLaneImportScheduleForTest();
     });
 });

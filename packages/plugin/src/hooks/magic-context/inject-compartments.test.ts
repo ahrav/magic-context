@@ -16,7 +16,11 @@ import {
     setProjectState,
 } from "../../features/magic-context/storage";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
-import { type KernelMemorySnapshot, unavailable } from "../../shared/kernel-client";
+import {
+    BUDGET_OMITTED_MARKER,
+    type KernelMemorySnapshot,
+    unavailable,
+} from "../../shared/kernel-client";
 import { FakeKernel } from "../../shared/kernel-client-testing/fake-kernel";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -298,6 +302,26 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
             "<project-memory>\nmemory: no memories recorded for this project yet\n</project-memory>",
         );
         expect(messages.length).toBe(1);
+    });
+
+    it("renders the budget-omitted marker when the budget trims every memory row", () => {
+        db = makeDb();
+        insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "PROJECT_RULES",
+            content: "always run the focused test suite before handing off",
+        });
+        const result = prepareCompartmentInjection({
+            db,
+            sessionId: SESSION_ID,
+            messages: [userMessage("m1", "hi")],
+            isCacheBusting: true,
+            memory: memoryFor(db),
+            projectPath: PROJECT_PATH,
+            injectionBudgetTokens: 0,
+        });
+        expect(result?.memoryCount).toBe(0);
+        expect(result?.block).toBe(`<project-memory>\n${BUDGET_OMITTED_MARKER}\n</project-memory>`);
     });
 
     it("returns null when the session has no project to bind memory to", () => {

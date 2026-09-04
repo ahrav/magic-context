@@ -351,7 +351,11 @@ export function prepareCompartmentInjection(
     // The memory block is the rows plus the state marker; a project-less session renders
     // no memory at all because the kernel scope filter has nothing to bind to.
     const memoryBlock = projectPath
-        ? renderKernelMemoryBlock(renderedRows, args.memory.state) || undefined
+        ? renderKernelMemoryBlock(
+              renderedRows,
+              args.memory.state,
+              memoryRows(args.memory).length,
+          ) || undefined
         : undefined;
     const memoryCount = renderedRows.length;
 
@@ -1584,7 +1588,11 @@ export function renderM0(args: {
     );
 
     const memoriesBlock = args.memory
-        ? renderKernelMemoryBlock(args.memoryRows ?? [], args.memory.state)
+        ? renderKernelMemoryBlock(
+              args.memoryRows ?? [],
+              args.memory.state,
+              memoryRows(args.memory).length,
+          )
         : "";
     if (memoriesBlock) sections.push(memoriesBlock);
     if (args.mural?.enabled && args.mural.supportsVision && args.mural.dataUrl) {

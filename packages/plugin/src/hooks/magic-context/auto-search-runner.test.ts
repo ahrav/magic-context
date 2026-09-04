@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { renderAntiMemoryContent } from "../../features/magic-context/memory/anti-memory-content";
+import { ANTI_MEMORY_CATEGORY } from "../../features/magic-context/memory/constants";
 import * as searchModule from "../../features/magic-context/search";
 import { getAutoSearchHintDecisions } from "../../features/magic-context/storage-meta-persisted";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
@@ -7,10 +9,15 @@ import { FakeKernel, FakeKernelTransport } from "../../shared/kernel-client-test
 import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { extractBoundedAutoSearchQuery } from "./auto-search-prompt";
-import { executeAutoSearchDelivery, runAutoSearchHint } from "./auto-search-runner";
+import {
+    autoSearchHintReplayable,
+    executeAutoSearchDelivery,
+    runAutoSearchHint,
+} from "./auto-search-runner";
 import type { MessageLike } from "./transform-operations";
 
 const OBJECT_A = `mem_${"a".repeat(32)}`;
+const OBJECT_B = `mem_${"b".repeat(32)}`;
 
 /** A kernel client over an in-memory fake; `transport.calls` records every daemon round trip. */
 function kernelHarness(kernel = new FakeKernel()): {
@@ -941,6 +948,169 @@ describe("executeAutoSearchDelivery", () => {
             });
             expect(outcome).toEqual({ ok: false, kind: "search-failure" });
             expect(findUserPromptText(messages[0])).not.toContain("<ctx-search-hint>");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("undefined sources forward the auto-search defaults minus the kernel-served memory source", async () => {
+        let captured: string[] | undefined;
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+            async (_db, _sessionId, _projectPath, _query, options) => {
+                captured = options?.sources;
+                return [];
+            },
+        );
+        try {
+            const delivery = await executeAutoSearchDelivery(deliveryArgs());
+            expect(delivery.status).toBe("complete");
+            expect(captured).toEqual(["message", "git_commit"]);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("sensitive kernel rows are dropped before scoring", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const kernel = new FakeKernel();
+        const prompt = "please explain how the historian decides when to run";
+        kernel.seedDecision({
+            object_id: OBJECT_A,
+            decision_kind: "PROJECT_RULES",
+            summary: "the historian runs on a lease",
+            rationale: prompt,
+        });
+        kernel.seedDecision({
+            object_id: OBJECT_B,
+            decision_kind: "PROJECT_RULES",
+            summary: "internal credentials rotate weekly",
+            rationale: prompt,
+            sensitivity: "sensitive",
+        });
+        const client = new KernelClient({
+            transport: new FakeKernelTransport(kernel),
+            enabled: true,
+            sessionId: "s-delivery",
+            projectRoot: "/tmp/auto-search",
+        });
+        try {
+            const delivery = await executeAutoSearchDelivery(
+                deliveryArgs({ kernelClient: client }),
+            );
+            expect(delivery.status).toBe("complete");
+            if (delivery.status !== "complete") return;
+            expect(delivery.reason).toBe("delivered");
+            expect(
+                delivery.prePack.map((result) =>
+                    result.source === "memory" ? result.publicClaimId : result.source,
+                ),
+            ).toEqual([OBJECT_A]);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("a kernel anti-memory row takes the reserved first slot with warning fields", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const kernel = new FakeKernel();
+        const prompt = "please explain how the historian decides when to run";
+        kernel.seedDecision({
+            object_id: OBJECT_B,
+            decision_kind: ANTI_MEMORY_CATEGORY,
+            summary: renderAntiMemoryContent({
+                trigger: "historian scheduling",
+                rejectedStrategy: "polling the session table",
+                rejectionReason: "it starves the transform hot path",
+                saferAlternative: "use the lease",
+            }),
+            rationale: prompt,
+        });
+        kernel.seedDecision({
+            object_id: OBJECT_A,
+            decision_kind: "PROJECT_RULES",
+            summary: "the historian runs on a lease",
+            rationale: prompt,
+        });
+        const client = new KernelClient({
+            transport: new FakeKernelTransport(kernel),
+            enabled: true,
+            sessionId: "s-delivery",
+            projectRoot: "/tmp/auto-search",
+        });
+        try {
+            const delivery = await executeAutoSearchDelivery(
+                deliveryArgs({ kernelClient: client }),
+            );
+            expect(delivery.status).toBe("complete");
+            if (delivery.status !== "complete") return;
+            expect(delivery.reason).toBe("delivered");
+            // Pre-pack ranking places the later-seeded plain row first; the packer promotes the warning.
+            expect(delivery.prePack[0]?.source).toBe("memory");
+            expect(delivery.delivered[0]).toMatchObject({
+                source: "anti_memory",
+                publicClaimId: OBJECT_B,
+                trigger: "historian scheduling",
+                rejectedStrategy: "polling the session table",
+                rejectionReason: "it starves the transform hot path",
+                saferAlternative: "use the lease",
+            });
+            expect(delivery.hintText).toContain("Previously rejected");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("a delivered kernel anti-memory warning appends once and never replays", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const kernel = new FakeKernel();
+        const prompt = "please explain how the historian decides when to run";
+        kernel.seedDecision({
+            object_id: OBJECT_B,
+            decision_kind: ANTI_MEMORY_CATEGORY,
+            summary: renderAntiMemoryContent({
+                trigger: "historian scheduling",
+                rejectedStrategy: "polling the session table",
+                rejectionReason: "it starves the transform hot path",
+            }),
+            rationale: prompt,
+        });
+        const transport = new FakeKernelTransport(kernel);
+        const kernelClient: KernelClientResolver = ({ sessionId, projectRoot }) =>
+            new KernelClient({ transport, enabled: true, sessionId, projectRoot });
+        const options = {
+            enabled: true,
+            scoreThreshold: 0.6,
+            minPromptChars: 20,
+            projectPath: "git:test",
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            gitCommitsEnabled: true,
+            directory: "/tmp/auto-search",
+            kernelClient,
+        };
+        try {
+            const messages = [makeUserMsg("u-warn", prompt)];
+            expect(await runAutoSearchHint({ sessionId: "s-warn", db, messages, options })).toEqual(
+                { ok: true },
+            );
+            expect(findUserPromptText(messages[0])).toContain("Previously rejected");
+
+            const decision = getAutoSearchHintDecisions(db, "s-warn")[0];
+            expect(decision?.decision).toBe("hint");
+            if (decision?.decision !== "hint") return;
+            expect(decision.memoryFragments?.length).toBe(1);
+            expect(autoSearchHintReplayable(decision)).toBe(false);
+
+            const replayMessages = [makeUserMsg("u-warn", prompt)];
+            expect(
+                await runAutoSearchHint({
+                    sessionId: "s-warn",
+                    db,
+                    messages: replayMessages,
+                    options,
+                }),
+            ).toEqual({ ok: true });
+            expect(findUserPromptText(replayMessages[0])).not.toContain("<ctx-search-hint>");
         } finally {
             spy.mockRestore();
         }
