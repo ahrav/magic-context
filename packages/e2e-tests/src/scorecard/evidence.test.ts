@@ -11,6 +11,7 @@ import {
     H2,
     HISTORIAN_SYSTEM,
     PAIRED_DELTA_POLICY,
+    PAIRED_DELTA_POLICY_FP,
     dreamerReportFixture,
     historianReportFixture,
     incidentReportFixture,
@@ -157,6 +158,15 @@ describe("loadEvidenceBundle", () => {
         expect(laneEvidence(noiseSource, "paired-delta").status).toBe("incomplete");
         const missingSecondary = loadEvidenceBundle(tree({ policy: policyFixture({ secondaryMetricSlots: ["final-attempt-tokens-mc-on", "invalid-success-rate-mc-off"] }) }));
         expect(laneEvidence(missingSecondary, "paired-delta").status).toBe("present");
+        // The report stamps the pinned policy fingerprint but declares a looser minimum than the loaded policy pre-registered.
+        const looserMinimum = { ...pairedDeltaReportFixture({
+            policyDocument: pairedDeltaPolicyDocumentFixture({ ...PAIRED_DELTA_POLICY, minimumAnalyzableFamilyCount: 1 }),
+            minimumAnalyzableFamilyCount: 1,
+        }) };
+        looserMinimum.body = { ...looserMinimum.body, policyFingerprint: PAIRED_DELTA_POLICY_FP, analysis: { ...looserMinimum.body.analysis, policyFingerprint: PAIRED_DELTA_POLICY_FP } };
+        looserMinimum.reportFingerprint = canonicalFingerprint(looserMinimum.body);
+        const restamped = loadEvidenceBundle(tree({ lanes: { "paired-delta": looserMinimum } }));
+        expect(laneEvidence(restamped, "paired-delta")).toMatchObject({ status: "incomplete", diagnostics: ["pre-registration-mismatch"] });
     });
 
     it("verifies projected build identity and records identityless lanes as limitations", () => {

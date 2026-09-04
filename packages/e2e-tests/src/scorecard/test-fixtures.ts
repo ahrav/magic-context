@@ -147,6 +147,8 @@ export const PAIRED_FACTS: PairedCaseFact[] = [pairedFact(9), pairedFact(7)];
 export interface PairedDeltaFixtureOptions {
     policyDocument?: PolicyOwnerDocument;
     poolManifestFingerprint?: string;
+    /** Declared alongside a policy document whose own minimum matches it, or the builder refuses the report. */
+    minimumAnalyzableFamilyCount?: number;
     /** Per-family valid-success deltas applied at both primary endpoints. */
     familyDeltas?: Readonly<Record<string, number>>;
     noiseFloors?: readonly FamilyNoiseFloor[];
@@ -167,7 +169,7 @@ export function pairedDeltaReportFixture(options: PairedDeltaFixtureOptions = {}
             { coordinateId: `${familyId}:1`, familyId, endpoint: "mc-on-vs-compaction" as const, delta: delta - 0.05, runHealth: "completed" as const },
             { coordinateId: `${familyId}:0`, familyId, endpoint: "retrieval" as const, delta: 0.1, runHealth: "completed" as const },
         ]),
-        minimumAnalyzableFamilyCount: 2,
+        minimumAnalyzableFamilyCount: options.minimumAnalyzableFamilyCount ?? 2,
         bootstrapSeed: 17,
         bootstrapResamples: options.bootstrapResamples ?? 2000,
         lane: {
