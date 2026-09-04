@@ -6,8 +6,9 @@
 //! Storage-integrity failures latch CAS ingestion closed.
 
 use std::fs::File;
+use std::sync::atomic::Ordering;
 
-use mc_core::redaction::Detection;
+use mc_core::redaction::{Detection, RedactionError, RedactionErrorKind};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use rustix::fs::{self as rfs, AtFlags, OFlags};
 use serde::Serialize;
@@ -27,7 +28,10 @@ use crate::durable_fs::{
     sync_publish_directories_with, temp_name, write_and_sync, PublishOutcome, StorageError,
 };
 use crate::envelope::{check_fence, commit_with_writer, ObjectRow, PendingChange};
-use crate::redaction::{identity, record, redact_lossy, redact_payload, RedactedField};
+use crate::object_write::map_write_error;
+use crate::redaction::{
+    identity, payload_has_secret, record, redact_lossy, redact_payload, RedactedField,
+};
 use crate::{KernelError, KernelStore, Sensitivity};
 
 const RESERVATION_MS: i64 = 60 * 60 * 1_000;
@@ -127,29 +131,24 @@ impl PreparedArtifact {
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
 
-        // The windowed scan fails closed only on scanner construction or budget
-        // failure, replacing the whole payload with one placeholder. Measuring the
-        // raw payload first keeps that placeholder's length from standing in for
-        // the artifact's when the cap is checked.
-        if request.payload.len() > MAX_PAYLOAD_BYTES {
-            return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
-        }
-
         let (payload_redaction, bytes, inspected) = match std::str::from_utf8(&request.payload) {
             Ok(text) => {
-                let redaction = redact_payload(text);
-                let bytes = redaction.text.as_bytes().to_vec();
+                let mut redaction = redact_payload(text, MAX_PAYLOAD_DETECTIONS)
+                    .map_err(|error| ArtifactError::new(scan_failure(error)))?;
+                // The redacted text becomes the stored bytes without a copy;
+                // only its detections are needed afterwards.
+                let bytes = std::mem::take(&mut redaction.text).into_bytes();
                 (redaction, bytes, true)
             }
             Err(_) => {
-                {
-                    // Invalid bytes widen to three-byte replacement characters under the
-                    // lossy conversion; the windowed scan has no input limit, so the
-                    // widened text is inspected whole rather than rejected.
-                    let inspected_text = String::from_utf8_lossy(&request.payload);
-                    if !redact_payload(&inspected_text).detections.is_empty() {
+                // Lossy decoding expands invalid bytes to three-byte U+FFFD sequences;
+                // payload_has_secret scans bounded windows to avoid materializing a lossy-decoded payload.
+                match payload_has_secret(&request.payload) {
+                    Ok(false) => {}
+                    Ok(true) => {
                         return Err(ArtifactError::new(ArtifactErrorKind::UnredactableSecret));
                     }
+                    Err(error) => return Err(ArtifactError::new(scan_failure(error))),
                 }
                 (
                     RedactedField {
@@ -164,11 +163,9 @@ impl PreparedArtifact {
         let affirmative_provenance = request.provenance.as_ref().is_some_and(|provenance| {
             !provenance.repository_id.trim().is_empty() && !provenance.revision.trim().is_empty()
         });
+        // A placeholder can be wider than the secret it replaces, so redaction can push the payload past the cap.
         if bytes.len() > MAX_PAYLOAD_BYTES {
             return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
-        }
-        if payload_redaction.detections.len() > MAX_PAYLOAD_DETECTIONS {
-            return Err(ArtifactError::new(ArtifactErrorKind::DetectionLimit));
         }
         // A recognized secret anywhere that is stored verbatim-after-redaction must
         // raise the class, not only one in the payload; otherwise a clean payload
@@ -190,7 +187,9 @@ impl PreparedArtifact {
         let digest = format!("{:x}", Sha256::digest(&bytes));
         let artifact_reference = format!("objects/{}/{}", &digest[..2], &digest[2..]);
         let redaction_metadata = detection_metadata(&payload_redaction.detections)?;
-        request.payload.clear();
+        // `clear` would keep the allocation; the payload's bytes now live in
+        // `bytes` and the original buffer is released.
+        request.payload = Vec::new();
 
         Ok(Self {
             request,
@@ -201,6 +200,24 @@ impl PreparedArtifact {
             artifact_reference,
             redaction_metadata,
         })
+    }
+}
+
+/// A payload is refused when its scan cannot vouch for it. Only a match the
+/// scanner saw but could not describe counts as a secret; every other failure
+/// means the scan did not cover the payload, which is reported as such so an
+/// operator is not told a secret was found when the scan merely stopped.
+fn scan_failure(error: RedactionError) -> ArtifactErrorKind {
+    match error.kind() {
+        RedactionErrorKind::DetectionLimit => ArtifactErrorKind::DetectionLimit,
+        RedactionErrorKind::MatchLimit => ArtifactErrorKind::UnredactableSecret,
+        RedactionErrorKind::Construction
+        | RedactionErrorKind::InputLimit
+        | RedactionErrorKind::CandidateLimit
+        | RedactionErrorKind::WorkLimit
+        | RedactionErrorKind::InvalidSpan
+        | RedactionErrorKind::UnknownRule
+        | RedactionErrorKind::SecretDetected => ArtifactErrorKind::ScanIncomplete,
     }
 }
 
@@ -479,11 +496,20 @@ impl KernelStore {
             return Err(ArtifactError::new(ArtifactErrorKind::IngestionFailClosed));
         }
 
+        // The receipt lookup runs before the operation, so a `Conflict` raised
+        // without entering it is a reused `operation_key`, not a constraint.
+        let mut entered = false;
+        // Names the reason behind a `Conflict` the operation raises itself,
+        // since a storage constraint surfaces as the same error.
+        let mut refusal = None;
         let commit_result = commit_with_writer(
             &mut writer,
             self.lease_epoch(),
             prepared.request.intent.clone(),
-            |envelope| insert_reference(envelope, &prepared, &reservation_id),
+            |envelope| {
+                entered = true;
+                insert_reference(envelope, &prepared, &reservation_id, &mut refusal)
+            },
             || {
                 if faults.after_events {
                     Err(KernelError::Fault)
@@ -547,6 +573,10 @@ impl KernelStore {
                 );
                 Err(ArtifactError::new(match error {
                     KernelError::InvalidInput => ArtifactErrorKind::InvalidInput,
+                    KernelError::Conflict if !entered => ArtifactErrorKind::OperationKeyReused,
+                    KernelError::Conflict => {
+                        refusal.unwrap_or(ArtifactErrorKind::StorageConstraint)
+                    }
                     _ => ArtifactErrorKind::ReferenceCommit,
                 }))
             }
@@ -559,9 +589,11 @@ impl KernelStore {
         digest: &str,
         byte_length: u64,
     ) -> Result<(), ArtifactError> {
-        let usage = regular_file_bytes(objects).map_err(|error| {
-            self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
-        })?;
+        let usage = regular_file_bytes(objects, &|| false)
+            .map_err(|error| {
+                self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
+            })?
+            .expect("an uncancellable walk completes");
         let already_present = object_is_present(objects, digest);
         let projected = usage.saturating_add(if already_present { 0 } else { byte_length });
         if projected > self.artifact_cap {
@@ -570,7 +602,24 @@ impl KernelStore {
         Ok(())
     }
 
+    /// The classification generation is odd for the duration of the merge and
+    /// even again afterwards, whether or not the commit succeeded, so a reader
+    /// that saw the same even value on both sides of its snapshot knows the
+    /// facts it read were not changing underneath it.
     fn merge_replayed_classification(
+        &self,
+        writer: &mut Connection,
+        prepared: &PreparedArtifact,
+    ) -> Result<(), ArtifactError> {
+        self.classification_generation
+            .fetch_add(1, Ordering::SeqCst);
+        let merged = self.merge_replayed_classification_inner(writer, prepared);
+        self.classification_generation
+            .fetch_add(1, Ordering::SeqCst);
+        merged
+    }
+
+    fn merge_replayed_classification_inner(
         &self,
         writer: &mut Connection,
         prepared: &PreparedArtifact,
@@ -588,8 +637,7 @@ impl KernelStore {
         )
         .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
         tx.commit()
-            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
-        Ok(())
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))
     }
 
     fn release_reservation(&self, writer: &mut Connection, reservation_id: &str) {
@@ -667,8 +715,10 @@ fn insert_reference(
     envelope: &mut crate::Envelope<'_>,
     prepared: &PreparedArtifact,
     reservation_id: &str,
+    refusal: &mut Option<ArtifactErrorKind>,
 ) -> Result<String, KernelError> {
     if artifact_is_blocked(envelope.tx, &prepared.digest)? {
+        *refusal = Some(ArtifactErrorKind::ReAdmissionBlocked);
         return Err(KernelError::Conflict);
     }
     let reservation_state: Option<String> = envelope
@@ -681,6 +731,7 @@ fn insert_reference(
         .optional()
         .map_err(|_| KernelError::Io)?;
     if reservation_state.as_deref() != Some("Live") {
+        *refusal = Some(ArtifactErrorKind::ReferenceCommit);
         return Err(KernelError::Conflict);
     }
     let reclaiming: i64 = envelope
@@ -692,6 +743,7 @@ fn insert_reference(
         )
         .map_err(|_| KernelError::Io)?;
     if reclaiming != 0 {
+        *refusal = Some(ArtifactErrorKind::ReclaimInProgress);
         return Err(KernelError::Conflict);
     }
 
@@ -731,7 +783,7 @@ fn insert_reference(
                 sensitivity.as_str(),
             ],
         )
-        .map_err(|_| KernelError::Io)?;
+        .map_err(map_write_error)?;
     let first_detection = prepared.payload_redaction.detections.first();
     envelope
         .tx
@@ -770,7 +822,7 @@ fn insert_reference(
                 sensitivity.as_str(),
             ],
         )
-        .map_err(|_| KernelError::Io)?;
+        .map_err(map_write_error)?;
     record(
         envelope.tx,
         "evidence",
@@ -940,10 +992,17 @@ fn open_shard_nofollow(objects: &File, name: impl rustix::path::Arg) -> Result<F
 /// Sums regular-file sizes directly below `objects` and its shard directories.
 ///
 /// Symlinks and other file types do not contribute. Entries removed during the
-/// walk are skipped. The sum saturates at [`u64::MAX`].
-pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
+/// walk are skipped. The sum saturates at [`u64::MAX`]. `cancelled` is polled
+/// before every entry at both levels; a true result returns `None`.
+pub(super) fn regular_file_bytes(
+    objects: &File,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<u64>, StorageError> {
     let mut bytes = 0_u64;
     for entry in rfs::Dir::read_from(objects).map_err(classify_errno)? {
+        if cancelled() {
+            return Ok(None);
+        }
         let entry = entry.map_err(classify_errno)?;
         let name = entry.file_name();
         if is_dot_entry(name) {
@@ -971,6 +1030,9 @@ pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
             Err(error) => return Err(error),
         };
         for shard_entry in rfs::Dir::read_from(&shard).map_err(classify_errno)? {
+            if cancelled() {
+                return Ok(None);
+            }
             let shard_entry = shard_entry.map_err(classify_errno)?;
             let shard_name = shard_entry.file_name();
             if is_dot_entry(shard_name) {
@@ -986,7 +1048,7 @@ pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
             }
         }
     }
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 fn object_is_present(objects: &File, digest: &str) -> bool {

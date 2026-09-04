@@ -1,10 +1,9 @@
-//! Daemon-side kernel route proofs. The proof registry in
-//! `crates/mc-kernel/tests/kernel_proofs/registry.rs` names tests in this file.
+//! Daemon-side kernel route proofs.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cortexkit_store_types::{StorageBackend, StorageDescriptor};
 use mc_host::{
@@ -33,6 +32,14 @@ fn init(descriptor: &StorageDescriptor) -> HostInit {
     }
 }
 
+/// Wall-clock milliseconds, so manual samples carry realistic timestamps.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_millis() as i64
+}
+
 fn kernel_root(descriptor: &StorageDescriptor) -> PathBuf {
     let StorageBackend::Sqlite { path } = &descriptor.backend else {
         panic!("test descriptor is SQLite");
@@ -54,6 +61,8 @@ impl Daemon {
         let data = tempfile::tempdir().unwrap();
         let descriptor = dev_descriptor_at(data.path().to_str().unwrap());
         let handler = McHandler::new();
+        // Disable kernel sampling so assertions observe the controlled timestamp.
+        handler.disable_kernel_sampler_for_test();
         PrimaryComponent::initialize(&handler, init(&descriptor))
             .await
             .unwrap();
@@ -218,12 +227,16 @@ fn insert_domains(store: &mc_kernel::KernelStore, first: i64, count: i64) -> i64
 #[tokio::test]
 async fn health_reads_the_sampled_kernel_block_without_touching_the_store() {
     let daemon = Daemon::start().await;
-    daemon.handler.sample_kernel_health_for_test(1_000).await;
+    let sampled_at = now_ms();
+    daemon
+        .handler
+        .sample_kernel_health_for_test(sampled_at)
+        .await;
     let health = daemon.handler.health().await;
     assert_eq!(health.status, mc_host::HealthStatus::Ok);
     let kernel = kernel_block(&health);
     assert_eq!(kernel["kernel_state"], "ready");
-    assert_eq!(kernel["sampled_at_ms"], 1_000);
+    assert_eq!(kernel["sampled_at_ms"], sampled_at);
     assert_eq!(kernel["core_file_warn"], false);
     assert_eq!(kernel["artifact_warn"], false);
     assert!(kernel["artifact_cap_bytes"].as_u64().unwrap() > 0);
@@ -252,7 +265,7 @@ async fn an_empty_required_consumer_set_raises_a_daemon_health_warning() {
     let store = daemon.handler.kernel_store_for_test().unwrap();
     insert_domains(&store, 1, 3);
     store.mark_outbox_published_through(3, 1).unwrap();
-    daemon.handler.sample_kernel_health_for_test(1_000).await;
+    daemon.handler.sample_kernel_health_for_test(now_ms()).await;
 
     // No consumer: lag is unknown, the block says so, and the daemon stays Ok.
     // The readiness surface renders this as `warn (no_required_consumer)`.
@@ -351,7 +364,7 @@ async fn crossing_the_lag_threshold_raises_a_daemon_health_warning() {
     assert_eq!(kernel["lag_threshold_tripped"], true);
     assert_eq!(health.status, mc_host::HealthStatus::Degraded);
 
-    // The routed status method reports the same block from live facts.
+    // The routed status method reports the same sampled block.
     let status = daemon
         .handler
         .dispatch_value_for_test(
@@ -365,6 +378,100 @@ async fn crossing_the_lag_threshold_raises_a_daemon_health_warning() {
     let value = response_json(&output);
     assert_eq!(value["kernel"]["kernel_state"], "ready");
     assert_eq!(value["kernel"]["required_consumer_count"], 1);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_background_sampler_publishes_facts_on_its_own() {
+    let data = tempfile::tempdir().unwrap();
+    let descriptor = dev_descriptor_at(data.path().to_str().unwrap());
+    let handler = McHandler::new();
+    PrimaryComponent::initialize(&handler, init(&descriptor))
+        .await
+        .unwrap();
+    PrimaryComponent::activate(&handler).await.unwrap();
+    wait_for_state(&handler, KernelState::Ready).await;
+
+    // `Ready` reaches the health block only once the sampler has facts.
+    let started = Instant::now();
+    let kernel = loop {
+        let kernel = kernel_block(&handler.health().await);
+        if kernel["kernel_state"] == "ready" {
+            break kernel;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "sampler never published: {kernel}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(kernel["sampled_at_ms"].as_i64().unwrap() > 0);
+    assert_eq!(kernel["retained_outbox_rows"], 0);
+    assert_eq!(kernel["required_consumer_count"], 0);
+    handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_facts_sample_reports_the_kernel_unavailable_until_one_succeeds() {
+    let daemon = Daemon::start().await;
+    daemon.handler.sample_kernel_health_for_test(now_ms()).await;
+    assert_eq!(
+        daemon.handler.health().await.status,
+        mc_host::HealthStatus::Ok
+    );
+
+    // The store only opens owner-only artifact directories.
+    let objects = kernel_root(&daemon.descriptor).join("artifacts/objects");
+    fs::set_permissions(&objects, fs::Permissions::from_mode(0o755)).unwrap();
+    let failed_at = now_ms();
+    daemon
+        .handler
+        .sample_kernel_health_for_test(failed_at)
+        .await;
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Degraded, "{health:?}");
+    assert!(health
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.ends_with("kernel store is unavailable")));
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["kernel_state"], "unavailable");
+    assert_eq!(kernel["unavailable_reason"], "store_unavailable");
+    assert_eq!(kernel["sampled_at_ms"], failed_at);
+    assert!(kernel.get("core_file_bytes").is_none());
+    assert!(kernel.get("lag_threshold_tripped").is_none());
+    // Routes are not fenced by the health projection.
+    assert_eq!(daemon.handler.kernel_state(), KernelState::Ready);
+    assert!(daemon.handler.kernel_store_for_test().is_some());
+
+    // The routed status method reports the same failed sample.
+    let status = daemon
+        .handler
+        .dispatch_value_for_test(
+            daemon.route,
+            serde_json::json!({"method": "status", "session_id": "session-a"}),
+        )
+        .await;
+    let mc_module::dispatch::PreparedOutcome::Response(output) = status else {
+        panic!("status responded with {status:?}");
+    };
+    let value = response_json(&output);
+    assert_eq!(value["kernel"]["kernel_state"], "unavailable");
+    assert_eq!(value["kernel"]["unavailable_reason"], "store_unavailable");
+
+    fs::set_permissions(&objects, fs::Permissions::from_mode(0o700)).unwrap();
+    let recovered_at = now_ms();
+    daemon
+        .handler
+        .sample_kernel_health_for_test(recovered_at)
+        .await;
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Ok, "{health:?}");
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["kernel_state"], "ready");
+    assert_eq!(kernel["sampled_at_ms"], recovered_at);
+    assert!(kernel.get("unavailable_reason").is_none());
+    assert_eq!(kernel["retained_outbox_rows"], 0);
     daemon.handler.shutdown().await.unwrap();
 }
 
@@ -666,6 +773,7 @@ async fn replayed_intents_return_one_receipt_and_projects_never_collide() {
         first["tokens"],
         json!([{"object_id": "decision-object-1", "known_as_of": commit_seq}])
     );
+    assert_eq!(first["merged"], json!([]));
     let tip = daemon.tip();
 
     let again = daemon
@@ -760,6 +868,8 @@ async fn a_token_conflicts_when_its_object_advanced_was_retracted_or_was_superse
         )
         .await;
     assert_state(&superseded, "conflict", Some("superseded"));
+    // A token naming an object the store never held is answered like one
+    // naming another project's object, so neither is enumerable.
     let missing = daemon
         .commit(
             "mutate-missing",
@@ -767,7 +877,20 @@ async fn a_token_conflicts_when_its_object_advanced_was_retracted_or_was_superse
             vec![token("never-written", n)],
         )
         .await;
-    assert_state(&missing, "conflict", Some("retracted"));
+    assert_state(&missing, "invalid", Some("not_found"));
+    // A token from a snapshot no reader has seen is not "unchanged": it is
+    // refused before any object is consulted, so a malformed `known_as_of`
+    // cannot defeat the check on an object that did advance.
+    for future in [tip + 1, i64::MAX] {
+        let future_token = daemon
+            .commit(
+                "mutate-future",
+                vec![json!({"op": "retire_decision", "object_id": "decision-object-4"})],
+                vec![token("decision-object-4", future)],
+            )
+            .await;
+        assert_state(&future_token, "unavailable", Some("snapshot_diverged"));
+    }
     assert_eq!(daemon.tip(), tip, "a conflicting commit writes nothing");
 
     // A token at the current tip on an untouched object lets the mutation land.
@@ -828,6 +951,21 @@ async fn a_merge_folds_every_predecessor_into_one_survivor_in_one_commit() {
             "decision-object-3"
         ]
     );
+    // The survivor's spec content was discarded, and the response says so.
+    assert_eq!(merged["merged"], json!(["decision-object-3"]));
+    let replayed = daemon
+        .commit(
+            "merge",
+            vec![
+                json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": decision_spec(3)}),
+                json!({"op": "supersede_decision", "replaced_object_id": "decision-object-2", "spec": decision_spec(3)}),
+            ],
+            vec![],
+        )
+        .await;
+    assert_eq!(replayed["receipt"]["replayed"], true);
+    assert_eq!(replayed["merged"], merged["merged"]);
+    assert_eq!(replayed["tokens"], merged["tokens"]);
     let after = daemon.read("explicit_search", None).await;
     assert_eq!(object_ids(&after), ["decision-object-3"]);
     let history = daemon
@@ -930,6 +1068,96 @@ async fn a_request_naming_another_project_root_is_refused_before_any_work() {
 }
 
 #[tokio::test]
+async fn a_project_path_shaped_like_a_secret_still_serves_its_own_rows() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    let root = daemon._data.path().join(SECRET);
+    fs::create_dir_all(&root).unwrap();
+    let route = RouteHandle {
+        channel: 13,
+        epoch: 1,
+    };
+    assert!(matches!(
+        daemon
+            .handler
+            .bind(route, identity(&root, "session-s"))
+            .await,
+        BindOutcome::Accept
+    ));
+    let mut write = commit_request(&root, "secret-root", vec![insert_decision(1)], vec![]);
+    write["session_id"] = json!("session-s");
+    let written = daemon.call(route, write).await;
+    assert_state(&written, "available", None);
+    let known_as_of = written["known_as_of"].as_i64().unwrap();
+
+    // The scope term carries the digest, so the redactor left it alone and
+    // the route matches its own rows.
+    let mut read = read_request(&root, "explicit_search", None);
+    read["session_id"] = json!("session-s");
+    let read = daemon.call(route, read).await;
+    assert_eq!(object_ids(&read), ["decision-object-1"]);
+    let terms = store
+        .scope_terms(read["rows"][0]["scope_id"].as_str().unwrap())
+        .unwrap();
+    assert!(!terms[0].exact_value.as_deref().unwrap().contains(SECRET));
+    let mut retire = commit_request(
+        &root,
+        "retire-secret-root",
+        vec![json!({"op": "retire_decision", "object_id": "decision-object-1"})],
+        vec![token("decision-object-1", known_as_of)],
+    );
+    retire["session_id"] = json!("session-s");
+    assert_state(&daemon.call(route, retire).await, "available", None);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_route_bound_through_a_symlink_stays_on_the_project_it_was_bound_to() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let link = daemon._data.path().join("link");
+    std::os::unix::fs::symlink(&daemon.project, &link).unwrap();
+    let route = RouteHandle {
+        channel: 12,
+        epoch: 1,
+    };
+    assert!(matches!(
+        daemon
+            .handler
+            .bind(route, identity(&link, "session-c"))
+            .await,
+        BindOutcome::Accept
+    ));
+    let mut through_link = commit_request(&link, "via-link", vec![insert_decision(1)], vec![]);
+    through_link["session_id"] = json!("session-c");
+    assert_state(&daemon.call(route, through_link).await, "available", None);
+    let bound_scope = daemon.project_scope_id().await;
+
+    // Retargeting the link moves the spelling, not the binding: requests
+    // through the link now name another project, and the bound project's
+    // spelling still passes.
+    let other = daemon._data.path().join("other");
+    fs::create_dir_all(&other).unwrap();
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&other, &link).unwrap();
+    let mut retargeted = commit_request(&link, "after-retarget", vec![insert_decision(2)], vec![]);
+    retargeted["session_id"] = json!("session-c");
+    assert_state(
+        &daemon.call(route, retargeted).await,
+        "invalid",
+        Some("project_mismatch"),
+    );
+    let mut direct = read_request(&daemon.project, "explicit_search", None);
+    direct["session_id"] = json!("session-c");
+    let read = daemon.call(route, direct).await;
+    assert_state(&read, "available", None);
+    assert_eq!(object_ids(&read), ["decision-object-1"]);
+    assert_eq!(read["rows"][0]["scope_id"], bound_scope);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn rows_serve_only_to_the_project_their_scope_names() {
     let daemon = Daemon::start().await;
     let store = daemon.store();
@@ -945,6 +1173,7 @@ async fn rows_serve_only_to_the_project_their_scope_names() {
     assert_state(&daemon.call(route_b, write_b).await, "available", None);
 
     // A row whose project term was redacted names no resolvable project.
+    // An empty scope has no project constraint.
     store
         .commit(intent("redacted-scope"), |envelope| {
             envelope.insert_scope(ScopeSpec {
@@ -969,6 +1198,27 @@ async fn rows_serve_only_to_the_project_their_scope_names() {
                 None,
                 (SourceClass::ModelInference, TaintClass::AssistantInference),
             ))?;
+            envelope.insert_scope(ScopeSpec {
+                scope_id: "scope-unconstrained".to_string(),
+                object_id: "scope-unconstrained".to_string(),
+                domain_id: DOMAIN.to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "scope-unconstrained".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+                terms: Vec::new(),
+            })?;
+            envelope.insert_decision(store_decision(
+                10,
+                "scope-unconstrained",
+                "unconstrained-lineage",
+            ))?;
+            envelope.record_admission(admission(
+                "store-decision-object-10",
+                EventKind::Other,
+                None,
+                (SourceClass::ModelInference, TaintClass::AssistantInference),
+            ))?;
             Ok(String::new())
         })
         .unwrap();
@@ -981,12 +1231,12 @@ async fn rows_serve_only_to_the_project_their_scope_names() {
     request_b["session_id"] = json!("session-b");
     let read_b = daemon.call(route_b, request_b).await;
     assert_eq!(object_ids(&read_b), ["decision-object-2"]);
-    // The unfiltered kernel view still holds all three, so the filter is what
+    // The unfiltered kernel view still holds all four, so the filter is what
     // hid them.
     let all = store
         .visible_as_of(mc_kernel::Surface::ExplicitSearch, daemon.tip())
         .unwrap();
-    assert_eq!(all.rows.len(), 3);
+    assert_eq!(all.rows.len(), 4);
     daemon.handler.shutdown().await.unwrap();
 }
 
@@ -1097,6 +1347,10 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
     let daemon = Daemon::start().await;
     let store = daemon.store();
     seed_domain(&store);
+    let mut secret_decision = decision_spec(8);
+    secret_decision["sensitivity"] = json!("secret");
+    let mut sensitive_decision = decision_spec(9);
+    sensitive_decision["sensitivity"] = json!("sensitive");
     daemon
         .commit(
             "create",
@@ -1106,6 +1360,8 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
                 insert_decision(3),
                 insert_decision(4),
                 insert_decision(6),
+                json!({"op": "insert_decision", "spec": secret_decision}),
+                json!({"op": "insert_decision", "spec": sensitive_decision}),
             ],
             vec![],
         )
@@ -1124,6 +1380,35 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
     let mut write_b = commit_request(&project_b, "b", vec![insert_decision(7)], vec![]);
     write_b["session_id"] = json!("session-b");
     daemon.call(route_b, write_b).await;
+    // Written `normal`, but admitted under a `personal` taint whose floor the
+    // serving view folds onto the object as `sensitive`.
+    let mut personal = commit_request(
+        &daemon.project,
+        "personal",
+        vec![insert_decision(10)],
+        vec![],
+    );
+    personal["asserted_taint_class"] = json!("personal");
+    assert_state(
+        &daemon.call(daemon.route, personal).await,
+        "available",
+        None,
+    );
+    // A contradicted decision stays live and normal, but `kernel.read` hides it.
+    daemon
+        .commit("create-11", vec![insert_decision(11)], vec![])
+        .await;
+    store
+        .commit(intent("contradict-11"), |envelope| {
+            envelope.record_admission(admission(
+                "decision-object-11",
+                EventKind::Contradict,
+                None,
+                (SourceClass::ModelInference, TaintClass::AssistantInference),
+            ))?;
+            Ok(String::new())
+        })
+        .unwrap();
     let sensitive = store
         .ingest_artifact(ingest(
             "sensitive",
@@ -1140,6 +1425,11 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
         json!({"object_id": "decision-object-7", "source_revision": 7}),
         json!({"object_id": "decision-object-6", "source_revision": 6, "artifact_digest": sensitive.digest}),
         json!({"object_id": "never-written", "source_revision": 1}),
+        // Eligibility checks an object's class even when the object cites no artifact.
+        json!({"object_id": "decision-object-8", "source_revision": 8}),
+        json!({"object_id": "decision-object-9", "source_revision": 9}),
+        json!({"object_id": "decision-object-10", "source_revision": 10}),
+        json!({"object_id": "decision-object-11", "source_revision": 11}),
     ];
     let request = eligibility_request(&daemon.project, "remote", candidates.clone());
     let first = daemon.call(daemon.route, request.clone()).await;
@@ -1156,15 +1446,37 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
             ("decision-object-7", "wrong_scope"),
             ("decision-object-6", "provider_sensitive"),
             ("never-written", "retracted"),
+            ("decision-object-8", "provider_sensitive"),
+            ("decision-object-9", "provider_sensitive"),
+            ("decision-object-10", "provider_sensitive"),
+            ("decision-object-11", "hidden"),
         ]
         .map(|(id, verdict)| (id.to_string(), verdict.to_string()))
     );
-    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 7);
+    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 11);
 
     // Same tip, same candidates: every verdict comes from the cache.
     let second = daemon.call(daemon.route, request.clone()).await;
-    assert_eq!(second["cache_hits"], 7);
+    assert_eq!(second["cache_hits"], 11);
     assert_eq!(verdicts(&second), verdicts(&first));
+    // An oversized id or a malformed digest never reaches the cache.
+    for candidate in [
+        json!({"object_id": "x".repeat(mc_module::kernel_routes::eligibility::MAX_OBJECT_ID_BYTES + 1), "source_revision": 1}),
+        json!({"object_id": "", "source_revision": 1}),
+        json!({"object_id": "decision-object-1", "source_revision": 1, "artifact_digest": sensitive.digest.to_uppercase()}),
+    ] {
+        assert!(matches!(
+            daemon
+                .handler
+                .dispatch_value_for_test(
+                    daemon.route,
+                    eligibility_request(&daemon.project, "remote", vec![candidate]),
+                )
+                .await,
+            PreparedOutcome::Error { code, .. } if code == "invalid_params"
+        ));
+    }
+    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 11);
     // A different declared revision is a different key and a different verdict.
     let revised = daemon
         .call(
@@ -1187,6 +1499,12 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
         .await;
     assert_eq!(local["cache_hits"], 0);
     assert_eq!(verdicts(&local)[5].1, "ok");
+    // A secret object is refused locally too; a sensitive one is eligible.
+    assert_eq!(verdicts(&local)[7].1, "provider_sensitive");
+    assert_eq!(verdicts(&local)[8].1, "ok");
+    assert_eq!(verdicts(&local)[9].1, "ok");
+    // A hidden object is refused locally as well.
+    assert_eq!(verdicts(&local)[10].1, "hidden");
 
     // Retiring the `ok` candidate moves the tip, so the old entries stop matching.
     daemon
@@ -1204,6 +1522,91 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
     assert!(daemon.handler.eligibility_cache_len_for_test() > 0);
     daemon.handler.shutdown().await.unwrap();
     assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 0);
+}
+
+#[tokio::test]
+async fn an_unadmitted_object_is_hidden_and_an_unadmitted_secret_is_provider_sensitive() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    daemon
+        .commit("create", vec![insert_decision(1)], vec![])
+        .await;
+    let scope_id = daemon.project_scope_id().await;
+    // Written under the project's scope with no admission decision: no read
+    // serves either, and one carries a secret class in the registry.
+    store
+        .commit(intent("unadmitted"), |envelope| {
+            envelope.insert_decision(store_decision(1, &scope_id, "unadmitted-lineage"))?;
+            let mut secret = store_decision(2, &scope_id, "unadmitted-lineage");
+            secret.sensitivity = Sensitivity::Secret;
+            envelope.insert_decision(secret)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    for destination in ["local", "remote"] {
+        let response = daemon
+            .call(
+                daemon.route,
+                eligibility_request(
+                    &daemon.project,
+                    destination,
+                    vec![
+                        json!({"object_id": "store-decision-object-1", "source_revision": 1}),
+                        json!({"object_id": "store-decision-object-2", "source_revision": 1}),
+                    ],
+                ),
+            )
+            .await;
+        assert_eq!(
+            verdicts(&response),
+            [
+                ("store-decision-object-1", "hidden"),
+                ("store-decision-object-2", "provider_sensitive"),
+            ]
+            .map(|(id, verdict)| (id.to_string(), verdict.to_string())),
+            "destination {destination}"
+        );
+    }
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_replayed_ingest_that_tightens_classification_is_not_served_from_the_cache() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    daemon
+        .commit("create", vec![insert_decision(1)], vec![])
+        .await;
+    let payload = b"replayable bytes";
+    let handle = store
+        .ingest_artifact(ingest("replay", payload, Sensitivity::Normal))
+        .unwrap();
+    let request = eligibility_request(
+        &daemon.project,
+        "remote",
+        vec![
+            json!({"object_id": "decision-object-1", "source_revision": 1, "artifact_digest": handle.digest}),
+        ],
+    );
+    let first = daemon.call(daemon.route, request.clone()).await;
+    assert_eq!(verdicts(&first)[0].1, "ok");
+    let tip = daemon.tip();
+
+    // The same intent with a stronger policy replays the receipt and merges the
+    // classification in place, without a commit-log row.
+    let mut stronger = ingest("replay", payload, Sensitivity::Sensitive);
+    stronger.provider_egress = ProviderEgress::LocalOnly;
+    let replayed = store.ingest_artifact(stronger).unwrap();
+    assert_eq!(replayed.digest, handle.digest);
+    assert_eq!(daemon.tip(), tip);
+
+    let second = daemon.call(daemon.route, request).await;
+    assert_eq!(second["known_as_of"], tip);
+    assert_eq!(second["cache_hits"], 0);
+    assert_eq!(verdicts(&second)[0].1, "provider_sensitive");
+    daemon.handler.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1557,18 +1960,15 @@ fn refused(reason: &str) -> Value {
     json!({"refused": reason})
 }
 
-/// Artifacts of every class plus an owning object in the bound project and
-/// one in another project.
+fn citing_decision(index: i64, evidence_id: &str) -> Value {
+    let mut spec = decision_spec(index);
+    spec["evidence_id"] = json!(evidence_id);
+    json!({"op": "insert_decision", "spec": spec})
+}
+
 async fn egress_fixture(daemon: &Daemon) -> [String; 3] {
     let store = daemon.store();
     seed_domain(&store);
-    daemon
-        .commit("create-1", vec![insert_decision(1)], vec![])
-        .await;
-    let (route_b, project_b) = daemon.bind_project("project-b").await;
-    let mut write_b = commit_request(&project_b, "b", vec![insert_decision(2)], vec![]);
-    write_b["session_id"] = json!("session-b");
-    assert_state(&daemon.call(route_b, write_b).await, "available", None);
     let normal = store
         .ingest_artifact(ingest("normal", b"public bytes", Sensitivity::Normal))
         .unwrap();
@@ -1582,6 +1982,26 @@ async fn egress_fixture(daemon: &Daemon) -> [String; 3] {
     let secret = store
         .ingest_artifact(ingest("secret", b"classified bytes", Sensitivity::Secret))
         .unwrap();
+    let owners = daemon
+        .commit(
+            "create-owners",
+            vec![
+                citing_decision(1, "evidence-normal"),
+                citing_decision(3, "evidence-sensitive"),
+            ],
+            vec![],
+        )
+        .await;
+    assert_state(&owners, "available", None);
+    let (route_b, project_b) = daemon.bind_project("project-b").await;
+    let mut write_b = commit_request(
+        &project_b,
+        "b",
+        vec![citing_decision(2, "evidence-normal")],
+        vec![],
+    );
+    write_b["session_id"] = json!("session-b");
+    assert_state(&daemon.call(route_b, write_b).await, "available", None);
     [normal.digest, sensitive.digest, secret.digest]
 }
 
@@ -1645,7 +2065,13 @@ async fn egress_gate_rejects_sensitive_remote_and_all_secret_without_a_request()
     // Local egress of a sensitive artifact is eligible when declared honestly.
     assert_eq!(
         daemon
-            .egress(&recorder, &sensitive, "local", "sensitive", owner)
+            .egress(
+                &recorder,
+                &sensitive,
+                "local",
+                "sensitive",
+                "decision-object-3"
+            )
             .await,
         json!("allowed")
     );
@@ -1686,6 +2112,606 @@ async fn egress_gate_rejects_an_under_declared_normal_request_without_a_request(
         refused("sensitive_remote")
     );
     assert_eq!(recorder.requests(), 0);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn egress_gate_requires_the_owning_object_to_cite_the_artifact() {
+    let daemon = Daemon::start().await;
+    let [normal, sensitive, _] = egress_fixture(&daemon).await;
+    let recorder = Recorder(std::sync::atomic::AtomicUsize::new(0));
+
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-3")
+            .await,
+        refused("wrong_scope")
+    );
+    assert_eq!(
+        daemon
+            .egress(
+                &recorder,
+                &sensitive,
+                "local",
+                "sensitive",
+                "decision-object-1"
+            )
+            .await,
+        refused("wrong_scope")
+    );
+    assert_eq!(recorder.requests(), 0);
+
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-1")
+            .await,
+        json!("allowed")
+    );
+    assert_eq!(
+        daemon
+            .egress(
+                &recorder,
+                &sensitive,
+                "local",
+                "sensitive",
+                "decision-object-3"
+            )
+            .await,
+        json!("allowed")
+    );
+    assert_eq!(recorder.requests(), 2);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn egress_gate_requires_the_owning_object_to_be_live_and_unsuperseded() {
+    let daemon = Daemon::start().await;
+    let [normal, sensitive, _] = egress_fixture(&daemon).await;
+    let recorder = Recorder(std::sync::atomic::AtomicUsize::new(0));
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-1")
+            .await,
+        json!("allowed")
+    );
+    assert_eq!(recorder.requests(), 1);
+
+    // Owner 1 is retired and owner 3 superseded; both registry rows still
+    // carry their scope and citation, so only liveness separates them from a
+    // vouching owner.
+    let mut successor = decision_spec(4);
+    successor["evidence_id"] = json!("evidence-sensitive");
+    let changed = daemon
+        .commit(
+            "retract-owners",
+            vec![
+                json!({"op": "retire_decision", "object_id": "decision-object-1"}),
+                json!({"op": "supersede_decision", "replaced_object_id": "decision-object-3", "spec": successor}),
+            ],
+            vec![],
+        )
+        .await;
+    assert_state(&changed, "available", None);
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-1")
+            .await,
+        refused("wrong_scope")
+    );
+    assert_eq!(
+        daemon
+            .egress(
+                &recorder,
+                &sensitive,
+                "local",
+                "sensitive",
+                "decision-object-3"
+            )
+            .await,
+        refused("wrong_scope")
+    );
+    // The live successor vouches for the same artifact.
+    assert_eq!(
+        daemon
+            .egress(
+                &recorder,
+                &sensitive,
+                "local",
+                "sensitive",
+                "decision-object-4"
+            )
+            .await,
+        json!("allowed")
+    );
+    assert_eq!(recorder.requests(), 2);
+
+    // Retiring the cited evidence withdraws the citation even though the
+    // owner stays live; without live metadata the local verdict alone would
+    // still be `allowed`.
+    daemon
+        .store()
+        .delete_artifact(ArtifactDeletionRequest {
+            intent: intent("retire-evidence"),
+            identity: ArtifactDeletionIdentity::EvidenceId("evidence-sensitive".to_string()),
+            kind: ArtifactDeletionKind::Delete,
+            operator_id: None,
+            target_locator: None,
+            reason: None,
+            deleted_at: 43,
+        })
+        .unwrap();
+    assert!(is_live(&daemon.store(), "decision-object-4"));
+    assert_eq!(
+        daemon
+            .egress(
+                &recorder,
+                &sensitive,
+                "local",
+                "sensitive",
+                "decision-object-4"
+            )
+            .await,
+        refused("wrong_scope")
+    );
+    assert_eq!(recorder.requests(), 2);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn egress_gate_requires_the_owning_object_to_be_served() {
+    let daemon = Daemon::start().await;
+    let [normal, _, _] = egress_fixture(&daemon).await;
+    let recorder = Recorder(std::sync::atomic::AtomicUsize::new(0));
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-1")
+            .await,
+        json!("allowed")
+    );
+    assert_eq!(recorder.requests(), 1);
+
+    // A contradicted owner stays live and unsuperseded but no read serves it.
+    daemon
+        .store()
+        .commit(intent("contradict-owner"), |envelope| {
+            envelope.record_admission(admission(
+                "decision-object-1",
+                EventKind::Contradict,
+                None,
+                (SourceClass::ModelInference, TaintClass::AssistantInference),
+            ))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert!(is_live(&daemon.store(), "decision-object-1"));
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-1")
+            .await,
+        refused("wrong_scope")
+    );
+    assert_eq!(recorder.requests(), 1);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn egress_gate_judges_the_owner_by_its_served_class() {
+    let daemon = Daemon::start().await;
+    let [normal, _, _] = egress_fixture(&daemon).await;
+    let recorder = Recorder(std::sync::atomic::AtomicUsize::new(0));
+    // Written `normal`, admitted under a `personal` taint: the serving view
+    // classes the owner `sensitive` even though the artifact it cites is normal.
+    let mut personal = commit_request(
+        &daemon.project,
+        "personal-owner",
+        vec![citing_decision(5, "evidence-normal")],
+        vec![],
+    );
+    personal["asserted_taint_class"] = json!("personal");
+    assert_state(
+        &daemon.call(daemon.route, personal).await,
+        "available",
+        None,
+    );
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-5")
+            .await,
+        refused("owner_sensitive")
+    );
+    assert_eq!(recorder.requests(), 0);
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "local", "normal", "decision-object-5")
+            .await,
+        json!("allowed")
+    );
+    assert_eq!(recorder.requests(), 1);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+async fn commit_b(
+    daemon: &Daemon,
+    route_b: RouteHandle,
+    project_b: &Path,
+    key: &str,
+    operations: Vec<Value>,
+) -> Value {
+    let mut request = commit_request(project_b, key, operations, vec![]);
+    request["session_id"] = json!("session-b");
+    daemon.call(route_b, request).await
+}
+
+fn is_live(store: &mc_kernel::KernelStore, object_id: &str) -> bool {
+    let (_, states) = store.object_states(&[object_id.to_string()]).unwrap();
+    states[0]
+        .as_ref()
+        .is_some_and(|state| state.object.invalidated_commit_seq.is_none())
+}
+
+#[tokio::test]
+async fn another_projects_objects_are_not_found_through_commit_targets_or_tokens() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    assert_state(
+        &daemon.commit("a", vec![insert_decision(1)], vec![]).await,
+        "available",
+        None,
+    );
+    let (route_b, project_b) = daemon.bind_project("project-b").await;
+    assert_state(
+        &commit_b(&daemon, route_b, &project_b, "b", vec![insert_decision(2)]).await,
+        "available",
+        None,
+    );
+
+    let retired = daemon
+        .commit(
+            "retire-foreign",
+            vec![json!({"op": "retire_decision", "object_id": "decision-object-2"})],
+            vec![],
+        )
+        .await;
+    assert_state(&retired, "invalid", Some("not_found"));
+    assert!(is_live(&store, "decision-object-2"));
+
+    let superseded = daemon
+        .commit(
+            "supersede-foreign",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-2", "spec": decision_spec(3)})],
+            vec![],
+        )
+        .await;
+    assert_state(&superseded, "invalid", Some("not_found"));
+    assert!(is_live(&store, "decision-object-2"));
+
+    let folded = daemon
+        .commit(
+            "fold-into-foreign",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": decision_spec(2)})],
+            vec![],
+        )
+        .await;
+    assert_state(&folded, "invalid", Some("not_found"));
+    assert!(is_live(&store, "decision-object-1"));
+
+    // A retired foreign id answers the same as a live one, not `already_exists`.
+    assert_state(
+        &commit_b(
+            &daemon,
+            route_b,
+            &project_b,
+            "retire-b",
+            vec![json!({"op": "retire_decision", "object_id": "decision-object-2"})],
+        )
+        .await,
+        "available",
+        None,
+    );
+    let tip = daemon.tip();
+    let folded_into_retired = daemon
+        .commit(
+            "fold-into-retired-foreign",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": decision_spec(2)})],
+            vec![],
+        )
+        .await;
+    assert_state(&folded_into_retired, "invalid", Some("not_found"));
+    assert!(is_live(&store, "decision-object-1"));
+
+    let probed = daemon
+        .commit(
+            "probe-foreign",
+            vec![json!({"op": "retire_decision", "object_id": "decision-object-1"})],
+            vec![token("decision-object-2", tip)],
+        )
+        .await;
+    assert_state(&probed, "invalid", Some("not_found"));
+    assert!(is_live(&store, "decision-object-1"));
+
+    let missing = daemon
+        .commit(
+            "retire-missing",
+            vec![json!({"op": "retire_decision", "object_id": "never-written"})],
+            vec![],
+        )
+        .await;
+    assert_state(&missing, "invalid", Some("not_found"));
+
+    // A dependency target is refused like a mutation target.
+    let implements = daemon
+        .commit(
+            "implement-foreign",
+            vec![observation_implementing(1, "decision-object-2")],
+            vec![],
+        )
+        .await;
+    assert_state(&implements, "invalid", Some("not_found"));
+    // The applicability reducer reads `applicability_target` the same way.
+    let targets = daemon
+        .commit(
+            "target-foreign",
+            vec![observation_depending(
+                4,
+                "decision-object-2",
+                "applicability_target",
+            )],
+            vec![],
+        )
+        .await;
+    assert_state(&targets, "invalid", Some("not_found"));
+    assert_eq!(daemon.tip(), tip, "a refused commit writes nothing");
+
+    let own = daemon
+        .commit(
+            "implement-own",
+            vec![observation_implementing(2, "decision-object-1")],
+            vec![],
+        )
+        .await;
+    assert_state(&own, "available", None);
+    // Only `implements` feeds the alignment projection; any other dependency
+    // kind may cite a live object that carries no scope, such as the domain.
+    let cites_domain = daemon
+        .commit(
+            "cite-domain",
+            vec![observation_depending(3, "domain-object", "about")],
+            vec![],
+        )
+        .await;
+    assert_state(&cites_domain, "available", None);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+fn observation_implementing(index: i64, decision_object_id: &str) -> Value {
+    observation_depending(index, decision_object_id, "implements")
+}
+
+fn observation_depending(index: i64, dependency_object_id: &str, kind: &str) -> Value {
+    json!({
+        "op": "insert_observation",
+        "spec": {
+            "observation_id": format!("observation-{index}"),
+            "object_id": format!("observation-object-{index}"),
+            "domain_id": DOMAIN,
+            "observation_kind": "code_present",
+            "payload": {"summary": "code present", "classification": "code_present"},
+            "observed_at": index,
+            "dependencies": [
+                {"dependency_object_id": dependency_object_id, "dependency_kind": kind}
+            ],
+            "source_id": "memory-lineage",
+            "source_revision": index,
+        },
+    })
+}
+
+#[tokio::test]
+async fn a_row_under_any_scope_naming_the_project_is_readable_and_mutable() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    assert_state(
+        &daemon
+            .commit("seed", vec![insert_decision(1)], vec![])
+            .await,
+        "available",
+        None,
+    );
+    // Another producer's scope, under its own id, names this route's root by
+    // the digest of its canonical path.
+    let root = daemon.project.canonicalize().unwrap();
+    store
+        .commit(intent("alias-scope"), |envelope| {
+            envelope.insert_scope(ScopeSpec {
+                scope_id: "scope-alias".to_string(),
+                object_id: "scope-alias".to_string(),
+                domain_id: DOMAIN.to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "scope-alias".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+                terms: vec![ScopeTermSpec {
+                    dimension: "project".to_string(),
+                    operator: "exact".to_string(),
+                    exact_value: Some(digest(&root.to_string_lossy())),
+                    ..ScopeTermSpec::default()
+                }],
+            })?;
+            envelope.insert_decision(store_decision(1, "scope-alias", "alias-lineage"))?;
+            envelope.record_admission(admission(
+                "store-decision-object-1",
+                EventKind::Other,
+                None,
+                (SourceClass::ModelInference, TaintClass::AssistantInference),
+            ))?;
+            // A set term that lists this project's digest among others names
+            // it just as well.
+            envelope.insert_scope(ScopeSpec {
+                scope_id: "scope-set".to_string(),
+                object_id: "scope-set".to_string(),
+                domain_id: DOMAIN.to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "scope-set".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+                terms: vec![ScopeTermSpec {
+                    dimension: "project".to_string(),
+                    operator: "set".to_string(),
+                    set_values: Some(vec![
+                        digest("another-project"),
+                        digest(&root.to_string_lossy()),
+                    ]),
+                    ..ScopeTermSpec::default()
+                }],
+            })?;
+            envelope.insert_decision(store_decision(2, "scope-set", "set-lineage"))?;
+            envelope.record_admission(admission(
+                "store-decision-object-2",
+                EventKind::Other,
+                None,
+                (SourceClass::ModelInference, TaintClass::AssistantInference),
+            ))?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let read = daemon.read("explicit_search", None).await;
+    assert_eq!(
+        object_ids(&read),
+        [
+            "decision-object-1",
+            "store-decision-object-1",
+            "store-decision-object-2"
+        ]
+    );
+    let known_as_of = read["known_as_of"].as_i64().unwrap();
+    // The write path honours the token the read handed out.
+    let retired = daemon
+        .commit(
+            "retire-alias",
+            vec![json!({"op": "retire_decision", "object_id": "store-decision-object-1"})],
+            vec![token("store-decision-object-1", known_as_of)],
+        )
+        .await;
+    assert_state(&retired, "available", None);
+    assert!(!is_live(&store, "store-decision-object-1"));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_write_naming_an_existing_id_is_already_exists_not_a_retryable_conflict() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    assert_state(
+        &daemon
+            .commit("first", vec![insert_decision(1)], vec![])
+            .await,
+        "available",
+        None,
+    );
+    let tip = daemon.tip();
+    let duplicate = daemon
+        .commit("second", vec![insert_decision(1)], vec![])
+        .await;
+    assert_state(&duplicate, "invalid", Some("already_exists"));
+    assert_eq!(daemon.tip(), tip);
+    let retried = daemon
+        .commit(
+            "third",
+            vec![insert_decision(1)],
+            vec![token("decision-object-1", tip)],
+        )
+        .await;
+    assert_state(&retried, "invalid", Some("already_exists"));
+    assert_eq!(daemon.tip(), tip);
+
+    // A successor whose revision does not advance is not a storage constraint:
+    // every id is fresh, and a higher revision lands.
+    let mut stalled = decision_spec(2);
+    stalled["source_revision"] = json!(1);
+    let stalled = daemon
+        .commit(
+            "stalled",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": stalled})],
+            vec![],
+        )
+        .await;
+    assert_state(&stalled, "invalid", Some("revision_not_advanced"));
+    assert_eq!(daemon.tip(), tip);
+    let advanced = daemon
+        .commit(
+            "advanced",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": decision_spec(2)})],
+            vec![],
+        )
+        .await;
+    assert_state(&advanced, "available", None);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_foreign_scope_holding_the_reserved_project_id_refuses_every_write() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    let root = daemon.project.canonicalize().unwrap();
+    let reserved = format!("project:{}", digest(&root.to_string_lossy()));
+    store
+        .commit(intent("squat"), |envelope| {
+            envelope.insert_scope(ScopeSpec {
+                scope_id: reserved.clone(),
+                object_id: reserved.clone(),
+                domain_id: DOMAIN.to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "squat".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+                terms: vec![ScopeTermSpec {
+                    dimension: "project".to_string(),
+                    operator: "exact".to_string(),
+                    exact_value: Some(digest("another-project")),
+                    ..ScopeTermSpec::default()
+                }],
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let tip = daemon.tip();
+    let refused = daemon
+        .commit("write", vec![insert_decision(1)], vec![])
+        .await;
+    assert_state(&refused, "invalid", Some("scope_reserved"));
+    assert_eq!(daemon.tip(), tip);
+    assert!(!is_live(&store, "decision-object-1"));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_request_over_the_dependency_cap_is_refused_before_the_writer() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let dependency =
+        json!({"dependency_object_id": "decision-object-1", "dependency_kind": "relates_to"});
+    let mut observation = observation_depending(1, "decision-object-1", "relates_to");
+    observation["spec"]["dependencies"] = json!(vec![
+        dependency;
+        mc_module::kernel_routes::commit::MAX_DEPENDENCIES
+            + 1
+    ]);
+    let tip = daemon.tip();
+    assert!(matches!(
+        daemon
+            .handler
+            .dispatch_value_for_test(
+                daemon.route,
+                commit_request(&daemon.project, "too-many", vec![observation], vec![]),
+            )
+            .await,
+        PreparedOutcome::Error { code, .. } if code == "invalid_params"
+    ));
+    assert_eq!(daemon.tip(), tip);
     daemon.handler.shutdown().await.unwrap();
 }
 
@@ -1917,6 +2943,40 @@ async fn ingest_route_accepts_a_payload_at_the_artifact_cap() {
 }
 
 #[tokio::test]
+async fn an_ingestion_key_reused_with_another_payload_is_a_permanent_refusal() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let finished = daemon
+        .ingest_paged(daemon.route, "reused", b"first payload", 8)
+        .await;
+    assert_state(&finished, "available", None);
+    // The same intent key now carries a different request digest.
+    let reused = daemon
+        .ingest_paged(daemon.route, "reused", b"second payload", 8)
+        .await;
+    assert_state(&reused, "invalid", Some("operation_key_reused"));
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+
+    // A fresh key whose request names an evidence id the registry already
+    // holds is a storage constraint, refused for good rather than as a
+    // store outage.
+    let mut taken = ingest_begin_request(&daemon.project, "taken", b"third payload", 1);
+    taken["request"]["evidence_id"] = json!("evidence-reused");
+    assert_state(&daemon.call(daemon.route, taken).await, "available", None);
+    assert_state(
+        &daemon
+            .ingest_page(daemon.route, "taken", 0, b"third payload")
+            .await,
+        "available",
+        None,
+    );
+    let finished = daemon.ingest_finish(daemon.route, "taken").await;
+    assert_state(&finished, "invalid", Some("already_exists"));
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn ingest_route_redacts_a_secret_before_every_durable_surface() {
     let daemon = Daemon::start().await;
     seed_domain(&daemon.store());
@@ -2103,10 +3163,11 @@ async fn route_teardown_releases_the_staged_upload_while_the_session_stays_bound
 }
 
 #[tokio::test]
-async fn a_second_upload_on_a_busy_route_or_past_the_pending_cap_is_queue_full() {
+async fn a_second_begin_replaces_or_resumes_and_only_the_pending_cap_is_queue_full() {
     let daemon = Daemon::start().await;
     seed_domain(&daemon.store());
     let payload = vec![b'y'; 100];
+    let replacement = vec![b'z'; 200];
 
     assert_state(
         &daemon
@@ -2115,13 +3176,59 @@ async fn a_second_upload_on_a_busy_route_or_past_the_pending_cap_is_queue_full()
         "available",
         None,
     );
+    assert_eq!(daemon.handler.staging_budget_for_test(), (100, 1));
+
+    let replaced = daemon
+        .ingest_begin(daemon.route, "second", &replacement, 1)
+        .await;
+    assert_state(&replaced, "available", None);
+    assert_eq!(replaced["upload_id"], "second");
+    assert_eq!(daemon.handler.staging_budget_for_test(), (200, 1));
+    assert_state(
+        &daemon.ingest_page(daemon.route, "first", 0, &payload).await,
+        "invalid",
+        Some("upload_not_found"),
+    );
+
+    daemon
+        .ingest_page(daemon.route, "second", 0, &replacement)
+        .await;
+    let resumed = daemon
+        .ingest_begin(daemon.route, "second", &replacement, 1)
+        .await;
+    assert_state(&resumed, "available", None);
+    assert_eq!(resumed["upload_id"], "second");
+    assert_eq!(resumed["received_pages"], 1);
+    assert_eq!(resumed["received_bytes"], 200);
+    assert!(resumed["page_bytes_max"].as_u64().unwrap() >= 16 * MIB as u64);
+    assert_eq!(daemon.handler.staging_budget_for_test(), (200, 1));
+
+    // The same id with another declaration is a new upload, not a resume:
+    // the retained page would otherwise be ingested under the new request.
+    let mut redeclared = ingest_begin_request(&daemon.project, "second", &replacement, 1);
+    redeclared["request"]["asserted_sensitivity"] = json!("sensitive");
+    let redeclared = daemon.call(daemon.route, redeclared).await;
+    assert_state(&redeclared, "available", None);
+    assert_eq!(redeclared["upload_id"], "second");
+    assert!(redeclared.get("received_pages").is_none(), "{redeclared}");
+    assert_eq!(daemon.handler.staging_budget_for_test(), (200, 1));
+    assert_state(
+        &daemon.ingest_finish(daemon.route, "second").await,
+        "invalid",
+        Some("page_index"),
+    );
+    // Re-beginning `second` starts a fresh upload, so resend page 0 before finishing.
     assert_state(
         &daemon
-            .ingest_begin(daemon.route, "second", &payload, 1)
+            .ingest_begin(daemon.route, "second", &replacement, 1)
             .await,
-        "unavailable",
-        Some("queue_full"),
+        "available",
+        None,
     );
+    daemon
+        .ingest_page(daemon.route, "second", 0, &replacement)
+        .await;
+    assert_eq!(daemon.handler.staging_budget_for_test(), (200, 1));
 
     // Three more routes fill the handler-wide pending cap of four.
     let mut routes = Vec::new();
@@ -2134,7 +3241,7 @@ async fn a_second_upload_on_a_busy_route_or_past_the_pending_cap_is_queue_full()
         );
         routes.push(route);
     }
-    assert_eq!(daemon.handler.staging_budget_for_test(), (400, 4));
+    assert_eq!(daemon.handler.staging_budget_for_test(), (500, 4));
     let overflow = daemon.bind_sibling(30).await;
     assert_state(
         &daemon.ingest_begin(overflow, "overflow", &payload, 1).await,
@@ -2143,12 +3250,12 @@ async fn a_second_upload_on_a_busy_route_or_past_the_pending_cap_is_queue_full()
     );
 
     // Finishing one upload frees a slot for the waiting route.
-    daemon.ingest_page(daemon.route, "first", 0, &payload).await;
     assert_state(
-        &daemon.ingest_finish(daemon.route, "first").await,
+        &daemon.ingest_finish(daemon.route, "second").await,
         "available",
         None,
     );
+    assert_eq!(daemon.handler.staging_budget_for_test(), (300, 3));
     assert_state(
         &daemon.ingest_begin(overflow, "overflow", &payload, 1).await,
         "available",
@@ -2175,5 +3282,195 @@ async fn a_second_upload_on_a_busy_route_or_past_the_pending_cap_is_queue_full()
         Some("payload_too_large"),
     );
     assert_eq!(daemon.handler.staging_budget_for_test(), (400, 4));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn begin_refuses_layouts_and_digests_the_kernel_could_never_accept() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let project = daemon.project.clone();
+
+    let mut one_page = ingest_begin_request(&project, "one-page", b"", 1);
+    one_page["total_bytes"] = json!(mc_kernel::MAX_PAYLOAD_BYTES);
+    assert!(matches!(
+        daemon.handler.dispatch_value_for_test(daemon.route, one_page).await,
+        PreparedOutcome::Error { code, .. } if code == "invalid_params"
+    ));
+
+    let sliced = vec![b's'; mc_module::kernel_routes::ingest::PAGE_COUNT_MAX as usize + 1];
+    let too_many_pages = ingest_begin_request(&project, "sliced", &sliced, sliced.len() as u32);
+    assert!(matches!(
+        daemon.handler.dispatch_value_for_test(daemon.route, too_many_pages).await,
+        PreparedOutcome::Error { code, .. } if code == "invalid_params"
+    ));
+
+    let payload = vec![b'q'; 64];
+    let mut upper = ingest_begin_request(&project, "upper", &payload, 1);
+    upper["payload_digest"] = json!(sha256_hex(&payload).to_uppercase());
+    assert!(matches!(
+        daemon.handler.dispatch_value_for_test(daemon.route, upper).await,
+        PreparedOutcome::Error { code, .. } if code == "invalid_params"
+    ));
+
+    let mut upper_intent = ingest_begin_request(&project, "upper-intent", &payload, 1);
+    upper_intent["intent"]["request_digest"] = json!(sha256_hex(&payload).to_uppercase());
+    assert!(matches!(
+        daemon
+            .handler
+            .dispatch_value_for_test(daemon.route, upper_intent)
+            .await,
+        PreparedOutcome::Error { code, .. } if code == "invalid_params"
+    ));
+
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+
+    let finished = daemon
+        .ingest_paged(daemon.route, "lower", &payload, 64)
+        .await;
+    assert_state(&finished, "available", None);
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+
+    // An empty artifact is zero bytes in zero pages and finishes at once.
+    assert_state(
+        &daemon.ingest_begin(daemon.route, "empty", b"", 0).await,
+        "available",
+        None,
+    );
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 1));
+    let empty = daemon.ingest_finish(daemon.route, "empty").await;
+    assert_state(&empty, "available", None);
+    assert_eq!(empty["handle"]["digest"], sha256_hex(b""));
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_receipt_is_keyed_by_route_family_and_a_blank_key_is_refused() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let payload = vec![b'r'; 64];
+
+    // One caller-supplied key, one project, two route families: ingestion
+    // first, then a commit under the same key. Sharing a receipt would hand
+    // the commit the evidence id as its result and write none of its rows.
+    let ingested = daemon
+        .ingest_paged(daemon.route, "shared-key", &payload, 64)
+        .await;
+    assert_state(&ingested, "available", None);
+    let tip = daemon.tip();
+    let committed = daemon
+        .commit("shared-key", vec![insert_decision(1)], vec![])
+        .await;
+    assert_state(&committed, "available", None);
+    assert_eq!(committed["receipt"]["replayed"], false);
+    assert_eq!(daemon.tip(), tip + 1);
+    assert_eq!(
+        committed["tokens"],
+        json!([{"object_id": "decision-object-1", "known_as_of": tip + 1}])
+    );
+    let read = daemon.read("explicit_search", None).await;
+    assert_eq!(object_ids(&read), ["decision-object-1"]);
+
+    // A blank key would be hidden from the kernel's own check by the prefix.
+    for blank in ["", "   "] {
+        let mut commit = commit_request(&daemon.project, blank, vec![insert_decision(2)], vec![]);
+        commit["intent"] = wire_intent(blank, "blank");
+        assert!(matches!(
+            daemon.handler.dispatch_value_for_test(daemon.route, commit).await,
+            PreparedOutcome::Error { code, .. } if code == "invalid_params"
+        ));
+        let mut begin = ingest_begin_request(&daemon.project, "blank", &payload, 1);
+        begin["intent"]["operation_key"] = json!(blank);
+        assert!(matches!(
+            daemon.handler.dispatch_value_for_test(daemon.route, begin).await,
+            PreparedOutcome::Error { code, .. } if code == "invalid_params"
+        ));
+    }
+    assert_eq!(daemon.tip(), tip + 1);
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_page_for_an_unknown_upload_or_an_oversized_frame_is_refused_before_decoding() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let payload = vec![b'p'; 300];
+
+    let mut orphan = ingest_page_request(&daemon.project, "nobody", 0, &payload[..100]);
+    orphan["bytes_base64"] = json!("not base64 at all!");
+    assert_state(
+        &daemon.call(daemon.route, orphan).await,
+        "invalid",
+        Some("upload_not_found"),
+    );
+
+    assert_state(
+        &daemon
+            .ingest_begin(daemon.route, "framed", &payload, 3)
+            .await,
+        "available",
+        None,
+    );
+    assert_state(
+        &daemon
+            .ingest_page(daemon.route, "framed", 3, &payload[..100])
+            .await,
+        "invalid",
+        Some("page_index"),
+    );
+    let mut too_long = ingest_page_request(&daemon.project, "framed", 0, &payload[..100]);
+    too_long["bytes_base64"] =
+        json!("A".repeat(mc_module::kernel_routes::ingest::PAGE_BASE64_BYTES_MAX + 4));
+    assert_state(
+        &daemon.call(daemon.route, too_long).await,
+        "invalid",
+        Some("page_too_large"),
+    );
+    assert_eq!(daemon.handler.staging_budget_for_test(), (300, 1));
+
+    let finished = daemon
+        .ingest_paged(daemon.route, "framed", &payload, 100)
+        .await;
+    assert_state(&finished, "available", None);
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stale_ready_sample_reads_as_unavailable_until_a_fresh_one_lands() {
+    let daemon = Daemon::start().await;
+    let stale_at = now_ms();
+    daemon.handler.sample_kernel_health_for_test(stale_at).await;
+    assert_eq!(
+        daemon.handler.health().await.status,
+        mc_host::HealthStatus::Ok
+    );
+    // Staleness is measured on the monotonic clock from the publish, not from
+    // `sampled_at_ms`, so the block is aged rather than backdated.
+    daemon.handler.expire_kernel_health_for_test();
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Degraded, "{health:?}");
+    assert!(health
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.ends_with("kernel health sample is stale")));
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["kernel_state"], "unavailable");
+    assert_eq!(kernel["unavailable_reason"], "store_unavailable");
+    // The stale sample time stays visible so the age can be read off the block.
+    assert_eq!(kernel["sampled_at_ms"], stale_at);
+    assert!(kernel.get("retained_outbox_rows").is_none());
+    // The projection is read-side only: the store is still reachable and a fresh
+    // sample restores the ready block.
+    assert_eq!(daemon.handler.kernel_state(), KernelState::Ready);
+    let fresh_at = now_ms();
+    daemon.handler.sample_kernel_health_for_test(fresh_at).await;
+    let health = daemon.handler.health().await;
+    assert_eq!(health.status, mc_host::HealthStatus::Ok, "{health:?}");
+    let kernel = kernel_block(&health);
+    assert_eq!(kernel["kernel_state"], "ready");
+    assert_eq!(kernel["sampled_at_ms"], fresh_at);
     daemon.handler.shutdown().await.unwrap();
 }

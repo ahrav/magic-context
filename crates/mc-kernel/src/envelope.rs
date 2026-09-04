@@ -112,6 +112,9 @@ pub struct KnownAsOf {
 pub struct ObjectState {
     pub object: ObjectRow,
     pub scope_id: Option<String>,
+    /// The digest of the artifact the row's `evidence_id` cites; `None` when
+    /// the row cites no evidence or the evidence row is gone or invalidated.
+    pub artifact_digest: Option<String>,
     pub latest_change_commit_seq: Option<i64>,
 }
 
@@ -391,11 +394,18 @@ impl Envelope<'_> {
     /// Succession is judged before invalidation because a superseded object is
     /// also invalidated, and advancement last because both of the others also
     /// leave a later change event.
+    ///
+    /// `known_as_of >= self.commit_seq` names a snapshot no reader has seen,
+    /// and `Advanced` would compare against it as if it were real, so
+    /// `check_token` returns `FutureSnapshot` before consulting any object.
     pub fn check_token(
         &self,
         object_id: &str,
         known_as_of: i64,
     ) -> Result<TokenCheck, KernelError> {
+        if known_as_of >= self.commit_seq {
+            return Err(KernelError::FutureSnapshot);
+        }
         Ok(match self.object_state(object_id)? {
             None => TokenCheck::Conflict(TokenConflict::Retracted),
             Some(state) => token_check(&state, known_as_of),
@@ -1360,8 +1370,8 @@ fn token_check(state: &ObjectState, known_as_of: i64) -> TokenCheck {
     TokenCheck::Unchanged
 }
 
-/// Decisions and observations are the object kinds that carry a scope; every
-/// other kind reads `None`.
+/// Decisions and observations are the object kinds that carry a scope and an
+/// evidence citation; every other kind reads `None` for both.
 pub(super) fn load_object_state(
     tx: &Transaction<'_>,
     object_id: &str,
@@ -1370,10 +1380,14 @@ pub(super) fn load_object_state(
         &format!(
             "SELECT {OBJECT_ROW_COLUMNS},
                     COALESCE(dec.scope_id,obs.scope_id),
-                    (SELECT MAX(commit_seq) FROM change_event c WHERE c.object_id=o.object_id)
+                    (SELECT MAX(commit_seq) FROM change_event c WHERE c.object_id=o.object_id),
+                    em.artifact_digest
              FROM object_registry o
              LEFT JOIN decisions dec ON dec.object_id=o.object_id
              LEFT JOIN observations obs ON obs.object_id=o.object_id
+             LEFT JOIN evidence_meta em
+                    ON em.evidence_id=COALESCE(dec.evidence_id,obs.evidence_id)
+                   AND em.invalidated_commit_seq IS NULL
              WHERE o.object_id=?1"
         ),
         [object_id],
@@ -1382,6 +1396,7 @@ pub(super) fn load_object_state(
                 object: object_row_from(row)?,
                 scope_id: row.get(10)?,
                 latest_change_commit_seq: row.get(11)?,
+                artifact_digest: row.get(12)?,
             })
         },
     )

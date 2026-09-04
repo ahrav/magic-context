@@ -354,6 +354,7 @@ const CONTRACT = {
                 "already_running",
                 "already_stopped",
                 "healthy",
+                "kernel_capacity_warn",
                 "kernel_lagging",
                 "no_required_consumer",
                 "started",
@@ -364,6 +365,7 @@ const CONTRACT = {
             // Status and doctor stay `ok`, and the check carries this remediation.
             // A non-failing reason absent from this map has no remediation.
             warn_remediations: {
+                kernel_capacity_warn: "inspect_storage",
                 kernel_lagging: "inspect_kernel_projector",
             },
         },
@@ -1035,6 +1037,9 @@ export function validateContractSchema(contract: any): void {
     }
     if (cli.reasons.warn_remediations.kernel_lagging !== "inspect_kernel_projector") {
         fail("kernel_lagging remediation is fixed to inspect_kernel_projector");
+    }
+    if (cli.reasons.warn_remediations.kernel_capacity_warn !== "inspect_storage") {
+        fail("kernel_capacity_warn remediation is fixed to inspect_storage");
     }
     if (
         JSON.stringify(cli.readiness_states.transport) !==

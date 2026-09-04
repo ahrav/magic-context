@@ -522,6 +522,12 @@ describe("native invocation mapping", () => {
                 remediation: "inspect_kernel_projector",
             },
             {
+                kernel: { state: "ready", reason: "kernel_capacity_warn" },
+                status: "warn",
+                ok: true,
+                remediation: "inspect_storage",
+            },
+            {
                 kernel: { state: "ready", reason: "no_required_consumer" },
                 status: "warn",
                 ok: true,

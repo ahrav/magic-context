@@ -709,6 +709,27 @@ describe("gold and probe freeze guards", () => {
         expect(() => parseScenario(raw)).toThrow(/choice-separator/);
     });
 
+    test("rejects an exact gold answer containing the claim-id separator", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // An archived verdict does not record its answer type, so an exact answer must not read as an id list.
+        probes[0].goldAnswer = "cats | dogs";
+        expect(() => parseScenario(raw)).toThrow(/goldAnswer: choice-separator/);
+    });
+
+    test("rejects an authored answer equal to the no-injected-gold-claim marker", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        probes[0].goldAnswer = "<no injected gold claim>";
+        expect(() => parseScenario(raw)).toThrow(/goldAnswer: reserved-marker/);
+        const choices = validScenarioRaw();
+        const choiceProbes = choices.probes as Record<string, unknown>[];
+        const multipleChoice = choiceProbes.find((probe) => probe.answerType === "multiple-choice");
+        expect(multipleChoice).toBeDefined();
+        (multipleChoice!.choices as string[])[0] = "<no injected gold claim>";
+        expect(() => parseScenario(choices)).toThrow(/choices\[0\]: reserved-marker/);
+    });
+
     test("rejects a delimiter-bearing multiple-choice option, not only the gold one", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];

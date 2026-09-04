@@ -4,14 +4,16 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use mc_core::claim_operation::is_lower_hex;
 use mc_host::RouteHandle;
 use mc_kernel::{
-    ArtifactDestination, ArtifactEligibility, ArtifactHandle, KernelError, KernelStore, ObjectState,
+    ArtifactDestination, ArtifactEligibility, EgressCandidate, KernelError, KernelStore,
+    Sensitivity, SurfaceVisibility,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::project::{ProjectBinding, ScopeFilter};
+use super::project::{stored_terms, ProjectBinding, ScopeFilter};
 use super::{blocking, kernel_response, state_only, KernelOpenCoordinator, KernelOutcome};
 use crate::dispatch::PreparedOutcome;
 use crate::McHandler;
@@ -19,6 +21,18 @@ use crate::McHandler;
 const OPERATION: &str = "kernel.eligibility.batch";
 /// Entries held before the oldest is evicted.
 const CACHE_CAPACITY: usize = 4096;
+/// Longest `object_id` a candidate may carry. Every candidate becomes a
+/// cache key whether or not the object exists, so the id length is what
+/// bounds the bytes an entry retains.
+pub const MAX_OBJECT_ID_BYTES: usize = 512;
+/// Bytes one entry may retain: the key's strings, held once in the map and
+/// once in the eviction order, plus the fixed-size fields and node overhead.
+const ENTRY_BYTES_MAX: u64 = 2 * (MAX_OBJECT_ID_BYTES as u64 + 64 + 128) + 256;
+/// Resident bytes the verdict cache may hold at capacity.
+pub const CACHE_BUDGET_BYTES: u64 = CACHE_CAPACITY as u64 * ENTRY_BYTES_MAX;
+/// One batch is one registry read plus one `judge` per miss on the blocking
+/// pool, so the candidate count bounds the work a single request can queue.
+const MAX_CANDIDATES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +42,8 @@ pub enum Verdict {
     Superseded,
     Stale,
     WrongScope,
+    /// The object is live but `kernel.read` hides it on every surface.
+    Hidden,
     ProviderSensitive,
 }
 
@@ -51,6 +67,7 @@ struct Candidate {
 struct CacheKey {
     lease_epoch: u64,
     tip: i64,
+    classification_generation: u64,
     object_id: String,
     source_revision: i64,
     artifact_digest: Option<String>,
@@ -86,6 +103,7 @@ impl VerdictCache {
         self.order.clear();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -101,14 +119,22 @@ fn parse_destination(value: &str) -> Option<ArtifactDestination> {
 
 /// Verdict order is fixed: an object that is gone or replaced is reported as
 /// such before its revision, scope, or sensitivity is considered.
+///
+/// The sensitivity judged is the one the serving view folds onto the object
+/// from its admission history, since that is the class a read handed the
+/// caller; the registry class stands in when no admission decision serves the
+/// object. A secret object is refused for every destination and a non-normal
+/// object for a remote one, whether or not the candidate cites an artifact.
+/// An object no read serves, hidden by admission or never admitted, is
+/// refused as `Hidden`.
 fn judge(
     store: &KernelStore,
-    filter: &mut ScopeFilter<'_>,
+    filter: &mut ScopeFilter,
     candidate: &Candidate,
-    state: Option<&ObjectState>,
+    facts: &EgressCandidate,
     destination: ArtifactDestination,
 ) -> Result<Verdict, KernelError> {
-    let Some(state) = state else {
+    let Some(state) = &facts.state else {
         return Ok(Verdict::Retracted);
     };
     if state.object.superseded_by.is_some() {
@@ -120,38 +146,29 @@ fn judge(
     if state.object.source_revision != candidate.source_revision {
         return Ok(Verdict::Stale);
     }
-    if !filter.matches(state.scope_id.as_deref())? {
+    if !filter.matches(state.scope_id.as_deref(), &mut stored_terms(store))? {
         return Ok(Verdict::WrongScope);
     }
-    if let Some(digest) = &candidate.artifact_digest {
-        let handle = ArtifactHandle {
-            digest: digest.clone(),
-            evidence_id: String::new(),
-        };
-        match store.artifact_eligibility(&handle, destination) {
-            Ok(ArtifactEligibility::Allowed) => {}
-            Ok(ArtifactEligibility::Denied(_)) => return Ok(Verdict::ProviderSensitive),
-            Err(error) => return Err(artifact_error(error)),
+    let sensitivity = facts
+        .served
+        .map_or(state.object.sensitivity, |served| served.sensitivity);
+    if sensitivity == Sensitivity::Secret
+        || (destination == ArtifactDestination::Remote && sensitivity != Sensitivity::Normal)
+    {
+        return Ok(Verdict::ProviderSensitive);
+    }
+    if facts
+        .served
+        .is_none_or(|served| served.visibility == SurfaceVisibility::Hidden)
+    {
+        return Ok(Verdict::Hidden);
+    }
+    if let Some(artifact) = &facts.artifact {
+        if artifact.eligibility != ArtifactEligibility::Allowed {
+            return Ok(Verdict::ProviderSensitive);
         }
     }
     Ok(Verdict::Ok)
-}
-
-/// Artifact errors reach the route through their kind; the outcome mapping
-/// classifies the kind, so the kernel error chosen here only has to preserve
-/// the busy-versus-invalid distinction that mapping needs.
-fn artifact_error(error: mc_kernel::ArtifactError) -> KernelError {
-    match KernelOutcome::from(error.kind()) {
-        KernelOutcome::Unavailable {
-            reason: super::UnavailableReason::StoreBusy,
-        } => KernelError::Busy,
-        KernelOutcome::Invalid { .. } => KernelError::InvalidInput,
-        KernelOutcome::Available
-        | KernelOutcome::Stale { .. }
-        | KernelOutcome::Abstained { .. }
-        | KernelOutcome::Unavailable { .. }
-        | KernelOutcome::Conflict { .. } => KernelError::Io,
-    }
 }
 
 struct BatchResponse {
@@ -167,42 +184,71 @@ fn evaluate(
     destination: ArtifactDestination,
     candidates: &[Candidate],
 ) -> Result<BatchResponse, KernelError> {
-    let object_ids: Vec<String> = candidates
+    let named: Vec<(String, Option<String>)> = candidates
         .iter()
-        .map(|candidate| candidate.object_id.clone())
+        .map(|candidate| {
+            (
+                candidate.object_id.clone(),
+                candidate.artifact_digest.clone(),
+            )
+        })
         .collect();
-    let (tip, states) = store.object_states(&object_ids)?;
-    let lease_epoch = store.lease_epoch();
-    let project_scope_id = project.scope_id();
-    let mut filter = ScopeFilter::new(project, store);
+    let (snapshot, facts) = store.egress_candidates(&named, destination)?;
+    // Without a classification generation the snapshot has no cache identity:
+    // nothing is looked up and nothing is stored.
+    let keys: Option<Vec<CacheKey>> = snapshot.classification_generation.map(|generation| {
+        let lease_epoch = store.lease_epoch();
+        let project_scope_id = project.scope_id();
+        candidates
+            .iter()
+            .map(|candidate| CacheKey {
+                lease_epoch,
+                tip: snapshot.tip,
+                classification_generation: generation,
+                object_id: candidate.object_id.clone(),
+                source_revision: candidate.source_revision,
+                artifact_digest: candidate.artifact_digest.clone(),
+                destination,
+                project_scope_id: project_scope_id.clone(),
+            })
+            .collect()
+    });
+    // `judge` reads SQLite, so the cache guard is held only for the lookups
+    // and then again for the inserts, never across a judgement.
+    let cached: Vec<Option<Verdict>> = match &keys {
+        Some(keys) => {
+            let cache = coordinator.eligibility_cache();
+            keys.iter().map(|key| cache.get(key)).collect()
+        }
+        None => vec![None; candidates.len()],
+    };
+    let cache_hits = cached.iter().filter(|hit| hit.is_some()).count();
+    let mut filter = ScopeFilter::new(project);
     let mut verdicts = Vec::with_capacity(candidates.len());
-    let mut cache_hits = 0;
-    for (candidate, state) in candidates.iter().zip(&states) {
-        let key = CacheKey {
-            lease_epoch,
-            tip,
-            object_id: candidate.object_id.clone(),
-            source_revision: candidate.source_revision,
-            artifact_digest: candidate.artifact_digest.clone(),
-            destination,
-            project_scope_id: project_scope_id.clone(),
-        };
-        let cached = coordinator.eligibility_cache().get(&key);
+    let mut fresh: Vec<(CacheKey, Verdict)> = Vec::new();
+    let mut keys = keys.map(Vec::into_iter);
+    for ((candidate, facts), cached) in candidates.iter().zip(&facts).zip(cached) {
+        let key = keys.as_mut().and_then(Iterator::next);
         let verdict = match cached {
-            Some(verdict) => {
-                cache_hits += 1;
-                verdict
-            }
+            Some(verdict) => verdict,
             None => {
-                let verdict = judge(store, &mut filter, candidate, state.as_ref(), destination)?;
-                coordinator.eligibility_cache().insert(key, verdict);
+                let verdict = judge(store, &mut filter, candidate, facts, destination)?;
+                if let Some(key) = key {
+                    fresh.push((key, verdict));
+                }
                 verdict
             }
         };
         verdicts.push((candidate.object_id.clone(), verdict));
     }
+    if !fresh.is_empty() {
+        let mut cache = coordinator.eligibility_cache();
+        for (key, verdict) in fresh {
+            cache.insert(key, verdict);
+        }
+    }
     Ok(BatchResponse {
-        known_as_of: tip,
+        known_as_of: snapshot.tip,
         verdicts,
         cache_hits,
     })
@@ -229,6 +275,28 @@ impl McHandler {
                 "{OPERATION} destination must be local or remote"
             ));
         };
+        if parsed.candidates.len() > MAX_CANDIDATES {
+            return crate::invalid_params_error(format!(
+                "{OPERATION} carries at most {MAX_CANDIDATES} candidates"
+            ));
+        }
+        if parsed.candidates.iter().any(|candidate| {
+            candidate.object_id.is_empty() || candidate.object_id.len() > MAX_OBJECT_ID_BYTES
+        }) {
+            return crate::invalid_params_error(format!(
+                "{OPERATION} object_id must be 1..={MAX_OBJECT_ID_BYTES} bytes"
+            ));
+        }
+        if parsed.candidates.iter().any(|candidate| {
+            candidate
+                .artifact_digest
+                .as_deref()
+                .is_some_and(|digest| !is_lower_hex(digest, 64))
+        }) {
+            return crate::invalid_params_error(format!(
+                "{OPERATION} artifact_digest must be lowercase sha256 hex"
+            ));
+        }
         let store = scope.store;
         let project = scope.project;
         let coordinator = self.kernel.clone();
@@ -265,6 +333,7 @@ mod tests {
         CacheKey {
             lease_epoch: 1,
             tip: 1,
+            classification_generation: 0,
             object_id: format!("object-{index}"),
             source_revision: 1,
             artifact_digest: None,

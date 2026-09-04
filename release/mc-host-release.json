@@ -213,6 +213,7 @@
         "already_running",
         "already_stopped",
         "healthy",
+        "kernel_capacity_warn",
         "kernel_lagging",
         "no_required_consumer",
         "started",
@@ -220,6 +221,7 @@
         "synapse_unsupported"
       ],
       "warn_remediations": {
+        "kernel_capacity_warn": "inspect_storage",
         "kernel_lagging": "inspect_kernel_projector"
       }
     },

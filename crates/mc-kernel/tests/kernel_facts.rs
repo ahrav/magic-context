@@ -85,7 +85,7 @@ fn no_consumers_report_absent_lag_rather_than_zero() {
     let facts = store.facts(i64::MAX).unwrap();
     assert_eq!(facts.minimum_required_checkpoint, None);
     assert_eq!(facts.commit_lag, None);
-    assert_eq!(facts.oldest_unconsumed_age_ms, None);
+    assert_eq!(facts.outbox_lag.oldest_unconsumed_age_ms, None);
 }
 
 #[test]
@@ -111,7 +111,7 @@ fn lag_uses_slowest_consumer_and_oldest_age_grows_exactly() {
     let empty_commit_lag = store.facts(i64::MAX).unwrap();
     assert_eq!(empty_commit_lag.minimum_required_checkpoint, Some(2));
     assert_eq!(empty_commit_lag.commit_lag, Some(1));
-    assert_eq!(empty_commit_lag.oldest_unconsumed_age_ms, None);
+    assert_eq!(empty_commit_lag.outbox_lag.oldest_unconsumed_age_ms, None);
 
     store
         .commit(intent("register-fast"), |envelope| {
@@ -134,13 +134,13 @@ fn lag_uses_slowest_consumer_and_oldest_age_grows_exactly() {
     let second = store.facts(created_at + 42).unwrap();
     assert_eq!(first.minimum_required_checkpoint, Some(2));
     assert_eq!(first.commit_lag, Some(3));
-    assert_eq!(first.oldest_unconsumed_age_ms, Some(17));
-    assert_eq!(second.oldest_unconsumed_age_ms, Some(42));
+    assert_eq!(first.outbox_lag.oldest_unconsumed_age_ms, Some(17));
+    assert_eq!(second.outbox_lag.oldest_unconsumed_age_ms, Some(42));
 
     store.acknowledge_outbox("required", 5, 5).unwrap();
     let caught_up = store.facts(i64::MAX).unwrap();
     assert_eq!(caught_up.commit_lag, Some(0));
-    assert_eq!(caught_up.oldest_unconsumed_age_ms, None);
+    assert_eq!(caught_up.outbox_lag.oldest_unconsumed_age_ms, None);
 }
 
 /// One commit inserting `count` domains emits `count` outbox rows.
@@ -198,15 +198,15 @@ fn lag_uses_outbox_positions_and_the_required_consumer_minimum() {
     let facts = store.facts(1).unwrap();
     assert_eq!(facts.minimum_required_checkpoint, Some(1));
     assert_eq!(facts.commit_lag, Some(4));
-    assert_eq!(facts.outbox_position_lag, Some(5));
+    assert_eq!(facts.outbox_lag.position_lag, Some(5));
     assert_eq!(facts.retained_outbox_rows, 10);
     let lag = store.outbox_lag(1).unwrap();
     assert_eq!(lag.position_lag, Some(5));
     assert_eq!(lag.consumer_count, 2);
-    assert_eq!(lag.oldest_unconsumed_age_ms, facts.oldest_unconsumed_age_ms);
+    assert_eq!(facts.outbox_lag, lag);
 
     store.mark_outbox_published_through(8, 1).unwrap();
-    assert_eq!(store.facts(1).unwrap().outbox_position_lag, Some(6));
+    assert_eq!(store.facts(1).unwrap().outbox_lag.position_lag, Some(6));
 
     // The minimum governs: `a` catching up leaves `b` at commit 2, so position 8
     // (commit 3) is still unacknowledged.
@@ -214,8 +214,8 @@ fn lag_uses_outbox_positions_and_the_required_consumer_minimum() {
     assert_eq!(store.outbox_lag(1).unwrap().position_lag, Some(1));
     store.acknowledge_outbox("b", 5, 1).unwrap();
     let caught_up = store.facts(1).unwrap();
-    assert_eq!(caught_up.outbox_position_lag, Some(0));
-    assert_eq!(caught_up.oldest_unconsumed_age_ms, None);
+    assert_eq!(caught_up.outbox_lag.position_lag, Some(0));
+    assert_eq!(caught_up.outbox_lag.oldest_unconsumed_age_ms, None);
     assert_eq!(caught_up.retained_outbox_rows, 10);
 }
 
@@ -226,7 +226,7 @@ fn no_consumers_report_absent_position_lag_and_count_retained_rows() {
     insert_domains(&store, 1, 8);
     store.mark_outbox_published_through(8, 1).unwrap();
     let facts = store.facts(1).unwrap();
-    assert_eq!(facts.outbox_position_lag, None);
+    assert_eq!(facts.outbox_lag.position_lag, None);
     assert_eq!(facts.commit_lag, None);
     assert_eq!(facts.retained_outbox_rows, 8);
     let lag = store.outbox_lag(1).unwrap();

@@ -7,7 +7,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, PoisonError, TryLockError};
 use std::time::Instant;
 
@@ -117,6 +117,10 @@ pub struct KernelStore {
     pub(super) artifact_cap: u64,
     pub(super) artifacts_path: PathBuf,
     lease_epoch: u64,
+    /// Advances when an artifact's stored classification changes without a
+    /// commit-log row, so a reader keyed on the tip alone can still tell that
+    /// its egress facts are stale.
+    pub(super) classification_generation: AtomicU64,
     pub(super) db_path: PathBuf,
     _lease: HeldFileLease,
 }
@@ -237,6 +241,7 @@ impl KernelStore {
             artifact_cap,
             artifacts_path,
             lease_epoch,
+            classification_generation: AtomicU64::new(0),
             db_path,
             _lease: lease,
         };

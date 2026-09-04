@@ -668,6 +668,43 @@ fn correction_records_replaced_identifier_redactions_in_events_and_outbox() {
 }
 
 #[test]
+fn a_replacement_id_carrying_a_secret_is_refused_rather_than_aliased() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    seed_domain(&store);
+    // Two live decisions whose ids would redact to the same placeholder.
+    let mut first = decision(1);
+    first.object_id = format!("first-{SECRET}");
+    let mut second = decision(2);
+    second.object_id = format!("second-{SECRET}");
+    store
+        .commit(intent("secret-ids", '1'), |envelope| {
+            envelope.insert_decision(first)?;
+            envelope.insert_decision(second)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let mut replacement = decision(3);
+    replacement.object_id = format!("second-{SECRET}");
+    replacement.source_revision = 2;
+    let error = store
+        .commit(intent("alias-fold", '2'), |envelope| {
+            envelope.correct_decision(&format!("first-{SECRET}"), replacement)?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(error, KernelError::InvalidInput);
+    assert_eq!(
+        inspect_i64(
+            directory.path(),
+            "SELECT COUNT(*) FROM decisions WHERE invalidated_commit_seq IS NOT NULL"
+        ),
+        0,
+        "no decision was folded into a placeholder survivor"
+    );
+}
+
+#[test]
 fn corrections_reject_cross_domain_replacements() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();

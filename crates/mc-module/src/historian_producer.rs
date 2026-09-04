@@ -5,8 +5,6 @@
 
 use std::{
     collections::BTreeMap,
-    error::Error,
-    fmt,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},

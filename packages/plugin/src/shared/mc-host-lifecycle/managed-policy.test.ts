@@ -362,6 +362,35 @@ describe("kernel readiness from host.status metrics", () => {
         ).toEqual({ state: "ready", reason: "kernel_lagging" });
     });
 
+    test("either capacity flag warns as kernel_capacity_warn", () => {
+        expect(kernelReadiness(metricsWith({ ...readyBlock, core_file_warn: true }))).toEqual({
+            state: "ready",
+            reason: "kernel_capacity_warn",
+        });
+        expect(kernelReadiness(metricsWith({ ...readyBlock, artifact_warn: true }))).toEqual({
+            state: "ready",
+            reason: "kernel_capacity_warn",
+        });
+    });
+
+    test("warn reasons rank lagging over capacity over no required consumer", () => {
+        expect(
+            kernelReadiness(
+                metricsWith({
+                    ...readyBlock,
+                    artifact_warn: true,
+                    required_consumer_count: 0,
+                    lag_threshold_tripped: true,
+                }),
+            ),
+        ).toEqual({ state: "ready", reason: "kernel_lagging" });
+        expect(
+            kernelReadiness(
+                metricsWith({ ...readyBlock, artifact_warn: true, required_consumer_count: 0 }),
+            ),
+        ).toEqual({ state: "ready", reason: "kernel_capacity_warn" });
+    });
+
     test("a ready block with no required consumer warns as no_required_consumer", () => {
         expect(kernelReadiness(metricsWith({ ...readyBlock, required_consumer_count: 0 }))).toEqual(
             { state: "ready", reason: "no_required_consumer" },

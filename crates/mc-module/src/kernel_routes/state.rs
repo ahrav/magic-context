@@ -77,6 +77,18 @@ pub enum InvalidReason {
     /// Kernel input validation or admission policy rejected the request.
     InvalidInput,
     AdmissionPolicy,
+    /// The named object does not exist, is not live, or is not scoped to the
+    /// bound project.
+    NotFound,
+    /// A write named an id the registry already holds or otherwise violated a
+    /// storage constraint; retrying with fresh tokens cannot succeed.
+    AlreadyExists,
+    /// A successor's `source_revision` does not exceed its predecessor's.
+    /// Retrying with a higher revision can succeed.
+    RevisionNotAdvanced,
+    /// A foreign scope occupies the bound project's reserved scope id.
+    /// Retrying cannot succeed until that scope is removed.
+    ScopeReserved,
     PayloadTooLarge,
     /// A staged page's bytes do not match its declared digest, or a page index
     /// was resent with different bytes.
@@ -143,6 +155,10 @@ pub(crate) const ALL_INVALID: &[InvalidReason] = &[
     InvalidReason::ClassOverDeclared,
     InvalidReason::InvalidInput,
     InvalidReason::AdmissionPolicy,
+    InvalidReason::NotFound,
+    InvalidReason::AlreadyExists,
+    InvalidReason::RevisionNotAdvanced,
+    InvalidReason::ScopeReserved,
     InvalidReason::PayloadTooLarge,
     InvalidReason::PageDigest,
     InvalidReason::PageIndex,
@@ -183,20 +199,24 @@ const _: () = {
             InvalidReason::ClassOverDeclared => 2,
             InvalidReason::InvalidInput => 3,
             InvalidReason::AdmissionPolicy => 4,
-            InvalidReason::PayloadTooLarge => 5,
-            InvalidReason::PageDigest => 6,
-            InvalidReason::PageIndex => 7,
-            InvalidReason::PageTooLarge => 8,
-            InvalidReason::PayloadDigest => 9,
-            InvalidReason::UploadNotFound => 10,
-            InvalidReason::IngestionFailClosed => 11,
-            InvalidReason::ArtifactUnusable => 12,
-            InvalidReason::Internal => 13,
+            InvalidReason::NotFound => 5,
+            InvalidReason::AlreadyExists => 6,
+            InvalidReason::RevisionNotAdvanced => 7,
+            InvalidReason::ScopeReserved => 8,
+            InvalidReason::PayloadTooLarge => 9,
+            InvalidReason::PageDigest => 10,
+            InvalidReason::PageIndex => 11,
+            InvalidReason::PageTooLarge => 12,
+            InvalidReason::PayloadDigest => 13,
+            InvalidReason::UploadNotFound => 14,
+            InvalidReason::IngestionFailClosed => 15,
+            InvalidReason::ArtifactUnusable => 16,
+            InvalidReason::Internal => 17,
         }
     }
     assert!(ALL_UNAVAILABLE.len() == 7);
     assert!(ALL_CONFLICT.len() == 3);
-    assert!(ALL_INVALID.len() == 14);
+    assert!(ALL_INVALID.len() == 18);
     let mut index = 0;
     while index < ALL_UNAVAILABLE.len() {
         assert!(position_of_unavailable(ALL_UNAVAILABLE[index]) == index);
@@ -238,10 +258,10 @@ impl From<KernelError> for KernelOutcome {
             KernelError::Conflict => Self::conflict(ConflictReason::KnownAsOfAdvanced),
             KernelError::InvalidInput => Self::invalid(InvalidReason::InvalidInput),
             KernelError::AdmissionPolicy => Self::invalid(InvalidReason::AdmissionPolicy),
-            // Backup, restore, checkpoint, and lookup outcomes have no `kernel.*`
-            // route that can produce them.
-            KernelError::NotFound
-            | KernelError::InvalidCheckpoint
+            KernelError::NotFound => Self::invalid(InvalidReason::NotFound),
+            // Only the backup, restore, and checkpoint APIs raise these, and no
+            // `kernel.*` route calls those APIs.
+            KernelError::InvalidCheckpoint
             | KernelError::UnsafeDestination
             | KernelError::InvalidBackup
             | KernelError::InvalidRestore => Self::invalid(InvalidReason::Internal),
@@ -265,6 +285,10 @@ impl From<ArtifactErrorKind> for KernelOutcome {
                 Self::unavailable(UnavailableReason::StoreUnavailable)
             }
             ArtifactErrorKind::PayloadTooLarge => Self::invalid(InvalidReason::PayloadTooLarge),
+            ArtifactErrorKind::OperationKeyReused => {
+                Self::invalid(InvalidReason::OperationKeyReused)
+            }
+            ArtifactErrorKind::StorageConstraint => Self::invalid(InvalidReason::AlreadyExists),
             ArtifactErrorKind::InvalidInput
             | ArtifactErrorKind::TextFieldTooLong
             | ArtifactErrorKind::DetectionLimit => Self::invalid(InvalidReason::InvalidInput),
@@ -273,9 +297,8 @@ impl From<ArtifactErrorKind> for KernelOutcome {
             }
             ArtifactErrorKind::ReAdmissionBlocked
             | ArtifactErrorKind::ReferenceUnavailable
-            | ArtifactErrorKind::UnredactableSecret => {
-                Self::invalid(InvalidReason::ArtifactUnusable)
-            }
+            | ArtifactErrorKind::UnredactableSecret
+            | ArtifactErrorKind::ScanIncomplete => Self::invalid(InvalidReason::ArtifactUnusable),
         }
     }
 }
@@ -322,9 +345,12 @@ mod tests {
         ArtifactErrorKind::AlignmentRebuild,
         ArtifactErrorKind::ReclaimInProgress,
         ArtifactErrorKind::UnredactableSecret,
+        ArtifactErrorKind::ScanIncomplete,
         ArtifactErrorKind::DetectionLimit,
         ArtifactErrorKind::TextFieldTooLong,
         ArtifactErrorKind::InvalidInput,
+        ArtifactErrorKind::OperationKeyReused,
+        ArtifactErrorKind::StorageConstraint,
         ArtifactErrorKind::PurgeIntent,
         ArtifactErrorKind::PurgeUnlinkPending,
     ];

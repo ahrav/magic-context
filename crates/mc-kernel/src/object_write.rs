@@ -9,7 +9,7 @@ use super::envelope::ObjectRow;
 use super::redaction::{record, RedactedField};
 use super::KernelError;
 
-pub(super) fn map_write_error(error: rusqlite::Error) -> KernelError {
+pub(crate) fn map_write_error(error: rusqlite::Error) -> KernelError {
     super::map_sqlite(error)
 }
 

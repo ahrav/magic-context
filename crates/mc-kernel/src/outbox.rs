@@ -585,7 +585,8 @@ fn complete_satisfied_barriers(tx: &Transaction<'_>, completed_at: i64) -> Resul
     Ok(())
 }
 
-fn published_watermark(tx: &Transaction<'_>) -> Result<i64, KernelError> {
+/// Highest outbox position published to consumers; `0` before the first publication.
+pub(super) fn published_watermark(tx: &Transaction<'_>) -> Result<i64, KernelError> {
     tx.query_row(
         "SELECT published_through_position FROM outbox_publication WHERE id=0",
         [],

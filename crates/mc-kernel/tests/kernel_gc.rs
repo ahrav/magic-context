@@ -491,6 +491,43 @@ fn reclaim_frees_capacity_for_next_write() {
 }
 
 #[test]
+fn facts_unless_abandons_the_artifact_walk_once_cancelled() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    store.ingest_artifact(request("one", b"1234")).unwrap();
+    store.ingest_artifact(request("two", b"56")).unwrap();
+
+    let complete = store.facts_unless(1, &|| false).unwrap().unwrap();
+    assert_eq!(complete.artifact_budget.usage_bytes, 6);
+    assert_eq!(complete, store.facts(1).unwrap());
+
+    // The walk polls before every entry at both levels, so a cancellation
+    // raised after the first poll still ends the walk without a total.
+    let polls = std::cell::Cell::new(0_u32);
+    let cancelled = || {
+        polls.set(polls.get() + 1);
+        polls.get() > 1
+    };
+    assert_eq!(store.facts_unless(1, &cancelled).unwrap(), None);
+    assert_eq!(polls.get(), 2, "walk stopped at the first true poll");
+    // Two objects in distinct shards: a full walk polls the two shard entries,
+    // the `.`/`..` entries at each level, and every object.
+    let polls = std::cell::Cell::new(0_u32);
+    let counting = || {
+        polls.set(polls.get() + 1);
+        false
+    };
+    assert!(store.facts_unless(1, &counting).unwrap().is_some());
+    assert!(
+        polls.get() >= 4,
+        "only {} polls for two shards",
+        polls.get()
+    );
+    assert_eq!(store.facts_unless(1, &|| true).unwrap(), None);
+}
+
+#[test]
 fn orphan_mtime_grace_and_budget_facts_are_reconciled_from_objects() {
     let root = tempfile::tempdir().unwrap();
     let store = KernelStore::open_with_artifact_cap_for_test(root.path(), 10).unwrap();

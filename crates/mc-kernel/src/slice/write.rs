@@ -15,7 +15,7 @@ use crate::object_write::{
     insert_registry, invalidate, map_write_error, record_fields, record_registry_fields,
     set_successor,
 };
-use crate::redaction::{redact, redact_lossy, RedactedField};
+use crate::redaction::{identity, redact, redact_lossy, RedactedField};
 use crate::{KernelError, Sensitivity};
 
 struct RedactedDecision {
@@ -165,7 +165,7 @@ impl Envelope<'_> {
                 [&decision_id.text],
                 |row| row.get::<_, i64>(0),
             )
-            .map_err(|_| KernelError::Io)?;
+            .map_err(crate::map_sqlite)?;
         let payload = serde_json::to_vec(&StoredEventPayload {
             summary: &spec.summary.text,
         })
@@ -230,12 +230,16 @@ impl Envelope<'_> {
         let replaced_object_id = redact_lossy(replaced_object_id);
         let old = load_live_typed_object(self.tx, &replaced_object_id.text, "decision")?;
         let granted_before = self.subject_grants_authority(Some(&replaced_object_id.text))?;
+        // The replacement's id selects a survivor, so it is an identity: a
+        // detected secret is refused rather than redacted, since the shared
+        // placeholder would alias it onto whichever live decision holds it.
+        let replacement_object_id = identity(&replacement.object_id)?;
         let replacement = RedactedDecision::new(replacement)?;
         // A replacement naming a decision that is already live folds the
         // predecessor into that survivor: the survivor's stored row, not the
         // spec, is what the predecessor's lineage is checked against, and no
         // row is written for it.
-        let survivor = load_live_decision_by_object(self.tx, &replacement.object_id.text)?;
+        let survivor = load_live_decision_by_object(self.tx, &replacement_object_id)?;
         if let Some((survivor, _)) = &survivor {
             if survivor.object_id == old.object_id {
                 return Err(KernelError::InvalidInput);
@@ -811,7 +815,7 @@ fn require_live_decision_object(tx: &Transaction<'_>, object_id: &str) -> Result
         |_| Ok(()),
     )
     .optional()
-    .map_err(|_| KernelError::Io)?
+    .map_err(crate::map_sqlite)?
     .ok_or(KernelError::NotFound)
 }
 
@@ -824,7 +828,7 @@ fn require_live(
     let sql = format!("SELECT 1 FROM {table} WHERE {column}=?1 AND invalidated_commit_seq IS NULL");
     tx.query_row(&sql, [value], |_| Ok(()))
         .optional()
-        .map_err(|_| KernelError::Io)?
+        .map_err(crate::map_sqlite)?
         .ok_or(KernelError::NotFound)
 }
 
@@ -842,7 +846,7 @@ fn load_live_decision_object(
         row_to_object,
     )
     .optional()
-    .map_err(|_| KernelError::Io)?
+    .map_err(crate::map_sqlite)?
     .ok_or(KernelError::NotFound)
 }
 
@@ -861,7 +865,7 @@ fn load_live_decision_by_object(
         |row| Ok((row_to_object(row)?, row.get::<_, String>(8)?)),
     )
     .optional()
-    .map_err(|_| KernelError::Io)
+    .map_err(crate::map_sqlite)
 }
 
 fn load_live_typed_object(
@@ -878,7 +882,7 @@ fn load_live_typed_object(
         row_to_object,
     )
     .optional()
-    .map_err(|_| KernelError::Io)?
+    .map_err(crate::map_sqlite)?
     .ok_or(KernelError::NotFound)
 }
 

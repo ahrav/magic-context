@@ -1,15 +1,16 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { REPORT_SCHEMA_VERSION as RETRIEVAL_REPORT_SCHEMA, type BenchmarkReport } from "../../../plugin/scripts/retrieval-benchmark/report";
-import { REASON_CODE_RE, makeContractPrimitives } from "../contract-primitives";
+import { GATE_ID_RE, REASON_CODE_RE, makeContractPrimitives, vocabulary } from "../contract-primitives";
 import { DREAMER_EVAL_REPORT_SCHEMA } from "../dreamer-eval/contract";
 import { SCENARIO_ID_RE } from "../historian-eval/contract";
 import type { SystemVersionTuple } from "../historian-eval/runner";
 import { LANE_REPORT_SCHEMA as HISTORIAN_REPORT_SCHEMA } from "../historian-eval/scorer";
+import { parseSystemVersionTuple } from "../historian-eval/system-tuple";
 import { INCIDENT_REPORT_SCHEMA } from "../incident-pool/report";
 import { METAMORPHIC_REPORT_SCHEMA } from "../metamorphic-eval/report";
-import type { PairedDeltaPolicyModel } from "../paired-delta/contract";
+import { PRIMARY_ARM_IDS, type PairedDeltaPolicyModel } from "../paired-delta/contract";
 import { PRIMARY_ENDPOINTS, type PrimaryEndpoint } from "../paired-delta/estimator";
-import { PAIRED_DELTA_REPORT_SCHEMA } from "../paired-delta/report";
+import { PAIRED_DELTA_REPORT_SCHEMA, type SecondaryMetrics } from "../paired-delta/report";
 
 export const SCORECARD_POLICY_SCHEMA = "scorecard-policy/v1";
 export const SCORECARD_POLICY_OWNER = "magic-context-x4l.15";
@@ -34,8 +35,12 @@ export const {
     hex64,
     enumeration,
     array,
+    boolean,
+    nullable,
+    number,
     integer,
     unique,
+    sorted,
     idArray,
 } = p;
 
@@ -142,9 +147,92 @@ export type UtilitySlotId = (typeof UTILITY_SLOT_IDS)[number];
 export type MetricSlotId = (typeof SLOT_IDS_BY_FAMILY)[ScoreFamilyId][number];
 export const METRIC_SLOT_IDS: readonly MetricSlotId[] = SCORE_FAMILY_IDS.flatMap((family) => SLOT_IDS_BY_FAMILY[family]);
 
+export const METRIC_UNITS = ["ratio", "count", "tokens", "milliseconds", "delta"] as const;
+export type MetricUnit = (typeof METRIC_UNITS)[number];
+
+export interface SlotContract {
+    /** A `ratio` lies in [0, 1], a `delta` in [-1, 1], `count` and `tokens` are non-negative integers, and `milliseconds` is non-negative. */
+    unit: MetricUnit;
+    /** The one lane whose report the slot is read from; `null` when no lane produces the slot, so it cannot be measured. */
+    lane: LaneId | null;
+}
+
+export const SLOT_CONTRACTS: Readonly<Record<MetricSlotId, SlotContract>> = {
+    "valid-success-delta-mc-on-vs-mc-off": { unit: "delta", lane: "paired-delta" },
+    "valid-success-delta-mc-on-vs-compaction": { unit: "delta", lane: "paired-delta" },
+    "valid-failure-rate": { unit: "ratio", lane: "paired-delta" },
+    "invalid-failure-rate": { unit: "ratio", lane: "paired-delta" },
+    "invalid-success-rate-mc-on": { unit: "ratio", lane: "paired-delta" },
+    "invalid-success-rate-mc-off": { unit: "ratio", lane: "paired-delta" },
+    "invalid-success-rate-compaction": { unit: "ratio", lane: "paired-delta" },
+    "final-attempt-tokens-mc-on": { unit: "tokens", lane: "paired-delta" },
+    "final-attempt-tokens-mc-off": { unit: "tokens", lane: "paired-delta" },
+    "final-attempt-tokens-compaction": { unit: "tokens", lane: "paired-delta" },
+    "final-attempt-wall-clock-ms-mc-on": { unit: "milliseconds", lane: "paired-delta" },
+    "final-attempt-wall-clock-ms-mc-off": { unit: "milliseconds", lane: "paired-delta" },
+    "final-attempt-wall-clock-ms-compaction": { unit: "milliseconds", lane: "paired-delta" },
+    "final-attempt-turns-mc-on": { unit: "count", lane: "paired-delta" },
+    "final-attempt-turns-mc-off": { unit: "count", lane: "paired-delta" },
+    "final-attempt-turns-compaction": { unit: "count", lane: "paired-delta" },
+    "active-claim-precision": { unit: "ratio", lane: "historian" },
+    "active-claim-recall": { unit: "ratio", lane: "historian" },
+    "false-authoritative-scenario-rate": { unit: "ratio", lane: "historian" },
+    "false-authoritative-memory-rate": { unit: "ratio", lane: "historian" },
+    "supersession-latency": { unit: "milliseconds", lane: "historian" },
+    "pollution-duplication": { unit: "ratio", lane: "historian" },
+    "recall-at-10-explicit": { unit: "ratio", lane: "retrieval" },
+    "recall-at-50-explicit": { unit: "ratio", lane: "retrieval" },
+    "reciprocal-rank-explicit": { unit: "ratio", lane: "retrieval" },
+    "ndcg-at-10-explicit": { unit: "ratio", lane: "retrieval" },
+    "duplicate-rate-at-50-explicit": { unit: "ratio", lane: "retrieval" },
+    "recall-at-10-automatic": { unit: "ratio", lane: "retrieval" },
+    "recall-at-50-automatic": { unit: "ratio", lane: "retrieval" },
+    "reciprocal-rank-automatic": { unit: "ratio", lane: "retrieval" },
+    "ndcg-at-10-automatic": { unit: "ratio", lane: "retrieval" },
+    "duplicate-rate-at-50-automatic": { unit: "ratio", lane: "retrieval" },
+    currentness: { unit: "ratio", lane: "retrieval" },
+    "rejection-recall": { unit: "ratio", lane: "retrieval" },
+    "literal-recall": { unit: "ratio", lane: "retrieval" },
+    "abstention-accuracy": { unit: "ratio", lane: "retrieval" },
+    "post-compaction-probe-accuracy": { unit: "ratio", lane: null },
+    "ctx-expand-recovery": { unit: "ratio", lane: null },
+    "input-token-reduction": { unit: "ratio", lane: null },
+    "cache-write-preservation": { unit: "ratio", lane: null },
+    "paired-delta-planned-coordinates": { unit: "count", lane: "paired-delta" },
+    "paired-delta-healthy-coordinates": { unit: "count", lane: "paired-delta" },
+    "paired-delta-excluded-cells": { unit: "count", lane: "paired-delta" },
+    "incident-results-total": { unit: "count", lane: "incident" },
+    "incident-results-unhealthy": { unit: "count", lane: "incident" },
+    "incident-baseline-mismatches": { unit: "count", lane: "incident" },
+    "cross-harness-parity-pass-rate": { unit: "ratio", lane: "incident" },
+    "dreamer-runs-total": { unit: "count", lane: "dreamer" },
+    "dreamer-runs-not-passed": { unit: "count", lane: "dreamer" },
+    "restart-scenarios": { unit: "count", lane: null },
+    "contention-failures": { unit: "count", lane: null },
+};
+
 export const PRIMARY_ENDPOINT_SLOTS: Readonly<Record<PrimaryEndpoint, UtilitySlotId>> = {
     "mc-on-vs-mc-off": "valid-success-delta-mc-on-vs-mc-off",
     "mc-on-vs-compaction": "valid-success-delta-mc-on-vs-compaction",
+};
+
+export type PrimaryArmId = (typeof PRIMARY_ARM_IDS)[number];
+export type SecondaryMetricKey = keyof SecondaryMetrics;
+
+/** Which paired-delta arm metric each per-arm utility slot reads. */
+export const SECONDARY_SLOT_SOURCES: Readonly<Partial<Record<UtilitySlotId, { metric: SecondaryMetricKey; arm: PrimaryArmId }>>> = {
+    "invalid-success-rate-mc-on": { metric: "invalidSuccessRateByArm", arm: "mc-on" },
+    "invalid-success-rate-mc-off": { metric: "invalidSuccessRateByArm", arm: "mc-off" },
+    "invalid-success-rate-compaction": { metric: "invalidSuccessRateByArm", arm: "compaction" },
+    "final-attempt-tokens-mc-on": { metric: "finalAttemptTokensByArm", arm: "mc-on" },
+    "final-attempt-tokens-mc-off": { metric: "finalAttemptTokensByArm", arm: "mc-off" },
+    "final-attempt-tokens-compaction": { metric: "finalAttemptTokensByArm", arm: "compaction" },
+    "final-attempt-wall-clock-ms-mc-on": { metric: "finalAttemptWallClockMsByArm", arm: "mc-on" },
+    "final-attempt-wall-clock-ms-mc-off": { metric: "finalAttemptWallClockMsByArm", arm: "mc-off" },
+    "final-attempt-wall-clock-ms-compaction": { metric: "finalAttemptWallClockMsByArm", arm: "compaction" },
+    "final-attempt-turns-mc-on": { metric: "finalAttemptTurnsByArm", arm: "mc-on" },
+    "final-attempt-turns-mc-off": { metric: "finalAttemptTurnsByArm", arm: "mc-off" },
+    "final-attempt-turns-compaction": { metric: "finalAttemptTurnsByArm", arm: "compaction" },
 };
 
 export const NOISE_FLOOR_SOURCES = ["calibration", "none"] as const;
@@ -154,32 +242,14 @@ export type PolicyModel = PairedDeltaPolicyModel;
 
 export type SystemProjection = SystemVersionTuple;
 
-/** `_systemProjectionKeysComplete` fails to compile when a `SystemProjection` field is missing from this tuple. */
-const SYSTEM_PROJECTION_KEYS = [
-    "repoCommitSha",
-    "bunVersion",
-    "opencodeVersion",
-    "historianModelId",
-    "probeModelId",
-    "parserImpl",
-    "chunkTokenBudget",
-] as const satisfies readonly (keyof SystemProjection)[];
-type MissingSystemProjectionKey = Exclude<keyof SystemProjection, (typeof SYSTEM_PROJECTION_KEYS)[number]>;
-const _systemProjectionKeysComplete: MissingSystemProjectionKey extends never ? true : never = true;
-void _systemProjectionKeysComplete;
-
 export type ReleaseFingerprintsProjection = BenchmarkReport["semantic"]["releaseFingerprints"];
 
-/** `_releaseFingerprintsKeysComplete` fails to compile when a `ReleaseFingerprintsProjection` field is missing from this tuple. */
-const RELEASE_FINGERPRINTS_KEYS = [
-    "corpus",
-    "judgments",
-    "syntheticProfiles",
-    "manifest",
-] as const satisfies readonly (keyof ReleaseFingerprintsProjection)[];
-type MissingReleaseFingerprintsKey = Exclude<keyof ReleaseFingerprintsProjection, (typeof RELEASE_FINGERPRINTS_KEYS)[number]>;
-const _releaseFingerprintsKeysComplete: MissingReleaseFingerprintsKey extends never ? true : never = true;
-void _releaseFingerprintsKeysComplete;
+const RELEASE_FINGERPRINTS_KEYS = vocabulary<keyof ReleaseFingerprintsProjection>({
+    corpus: true,
+    judgments: true,
+    syntheticProfiles: true,
+    manifest: true,
+});
 
 export type LaneIdentity =
     | { kind: "identityless" }
@@ -232,10 +302,6 @@ function positiveNumber(value: unknown, label: string): number {
     return value as number;
 }
 
-function nullableHex64(value: unknown, label: string): string | null {
-    return value === null ? null : hex64(value, label);
-}
-
 function exactIdSequence<T extends string>(raw: unknown, expected: readonly T[], label: string, code: string): T[] {
     const values = array(raw, label).map((entry, index) => string(entry, `${label}[${index}]`));
     if (values.length !== expected.length || values.some((value, index) => value !== expected[index])) fail(`${label}: ${code}`);
@@ -243,21 +309,10 @@ function exactIdSequence<T extends string>(raw: unknown, expected: readonly T[],
 }
 
 function parseSystemProjection(raw: unknown, label: string): SystemProjection {
-    const value = record(raw, label);
-    exact(value, SYSTEM_PROJECTION_KEYS, label);
-    if (value.parserImpl !== "ts") fail(`${label}.parserImpl: enum-invalid`);
-    return {
-        repoCommitSha: string(value.repoCommitSha, `${label}.repoCommitSha`),
-        bunVersion: string(value.bunVersion, `${label}.bunVersion`),
-        opencodeVersion: string(value.opencodeVersion, `${label}.opencodeVersion`),
-        historianModelId: string(value.historianModelId, `${label}.historianModelId`),
-        probeModelId: string(value.probeModelId, `${label}.probeModelId`),
-        parserImpl: "ts",
-        chunkTokenBudget: value.chunkTokenBudget === null ? null : integer(value.chunkTokenBudget, `${label}.chunkTokenBudget`, 1),
-    };
+    return parseSystemVersionTuple(p, raw, label) ?? fail(`${label}: object-required`);
 }
 
-function parseIdentity(raw: unknown, lane: LaneId, label: string): LaneIdentity {
+export function parseLaneIdentity(raw: unknown, lane: LaneId, label: string): LaneIdentity {
     const value = record(raw, label);
     const kind = enumeration(value.kind, ["identityless", "projection"] as const, `${label}.kind`);
     if (kind === "identityless") {
@@ -303,7 +358,7 @@ function parseRequiredLanes(raw: unknown, label: string): RequiredLane[] {
         exact(value, ["lane", "schema", "identity"], rowLabel);
         const lane = enumeration(value.lane, LANE_IDS, `${rowLabel}.lane`);
         if (value.schema !== LANE_REPORT_SCHEMAS[lane]) fail(`${rowLabel}.schema: version-invalid`);
-        return { lane, schema: LANE_REPORT_SCHEMAS[lane], identity: parseIdentity(value.identity, lane, `${rowLabel}.identity`) };
+        return { lane, schema: LANE_REPORT_SCHEMAS[lane], identity: parseLaneIdentity(value.identity, lane, `${rowLabel}.identity`) };
     });
     if (rows.length !== LANE_IDS.length || rows.some((row, index) => row.lane !== LANE_IDS[index])) fail(`${label}: exact-lane-set-required`);
     return rows;
@@ -336,8 +391,11 @@ export function parseScorecardPolicy(raw: unknown): ScorecardPolicy {
     if (canaryIds.length === 0) fail("policy.injectionCanaryScenarioIds: empty");
     const secondaryMetricSlots = idArray(root.secondaryMetricSlots, "policy.secondaryMetricSlots", REASON_CODE_RE)
         .map((slot, index) => enumeration(slot, UTILITY_SLOT_IDS, `policy.secondaryMetricSlots[${index}]`));
+    if (secondaryMetricSlots.some((slot) => SECONDARY_SLOT_SOURCES[slot] === undefined)) fail("policy.secondaryMetricSlots: not-secondary");
     const requiredMetricSlots = idArray(root.requiredMetricSlots, "policy.requiredMetricSlots", REASON_CODE_RE)
         .map((slot, index) => enumeration(slot, METRIC_SLOT_IDS, `policy.requiredMetricSlots[${index}]`));
+    // A slot no lane produces can never be measured, so requiring it would deny mandatory evidence to every report.
+    if (requiredMetricSlots.some((slot) => SLOT_CONTRACTS[slot].lane === null)) fail("policy.requiredMetricSlots: slot-unproduced");
     const primaryEndpoint = enumeration(root.primaryEndpoint, PRIMARY_ENDPOINTS, "policy.primaryEndpoint");
     // Promotion reads the primary endpoint's delta, so a policy that does not require that slot
     // pre-registers a decision on a metric the evidence is allowed to omit.
@@ -361,7 +419,7 @@ export function parseScorecardPolicy(raw: unknown): ScorecardPolicy {
         requiredLanes: parseRequiredLanes(root.requiredLanes, "policy.requiredLanes"),
         requiredMetricSlots,
         pairedDeltaPolicyFingerprint: hex64(root.pairedDeltaPolicyFingerprint, "policy.pairedDeltaPolicyFingerprint"),
-        baselineScorecardReportFingerprint: nullableHex64(root.baselineScorecardReportFingerprint, "policy.baselineScorecardReportFingerprint"),
+        baselineScorecardReportFingerprint: nullable(root.baselineScorecardReportFingerprint, (fingerprint) => hex64(fingerprint, "policy.baselineScorecardReportFingerprint")),
     };
 }
 
@@ -369,4 +427,4 @@ export function scorecardPolicyFingerprint(policy: ScorecardPolicy): string {
     return canonicalFingerprint(policy);
 }
 
-export { REASON_CODE_RE };
+export { GATE_ID_RE, PRIMARY_ARM_IDS, REASON_CODE_RE };

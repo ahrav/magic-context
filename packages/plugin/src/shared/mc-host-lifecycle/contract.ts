@@ -209,7 +209,7 @@ function parseReadinessRecord(value: unknown, component: string): ReadinessRecor
             unsupported: ["synapse_unsupported"],
         },
         kernel: {
-            ready: ["healthy", "kernel_lagging", "no_required_consumer"],
+            ready: ["healthy", "kernel_lagging", "kernel_capacity_warn", "no_required_consumer"],
             starting: ["kernel_starting", "starting"],
             unavailable: ["kernel_unavailable"],
         },
@@ -315,6 +315,11 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         wedged: "wedged",
         shutdown_timeout: "stopping",
     };
+    // Non-failing top-level verdicts require a fixed daemon state; component-only
+    // reasons such as `kernel_lagging` are rejected here.
+    if (NON_FAILING_REASONS.has(reason) && fixedReasonStates[reason] === undefined) {
+        fail("a component-only reason is not a top-level verdict");
+    }
     const expectedState = fixedReasonStates[reason];
     if (expectedState !== undefined && state !== expectedState) {
         fail("state contradicts the selected reason");

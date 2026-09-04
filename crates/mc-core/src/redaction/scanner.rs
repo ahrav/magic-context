@@ -111,8 +111,36 @@ pub(super) fn render(
     input: &str,
     mut replacements: Vec<Replacement>,
 ) -> Result<Redaction, RedactionError> {
-    // Widest span first so a cluster's union is known from its first member, then
-    // most specific, so the cluster walk can pick a winner without rescanning.
+    sort_for_clustering(&mut replacements);
+    render_sorted(input, replacements)
+}
+
+/// Collapses every overlapping cluster into one replacement covering its union, labelled by its winner.
+///
+/// Rendering the result is identical to rendering the input, so a windowed scan can merge after every
+/// window and count detections rather than raw findings.
+pub(super) fn merge(mut replacements: Vec<Replacement>) -> Vec<Replacement> {
+    sort_for_clustering(&mut replacements);
+    let mut merged: Vec<Replacement> = Vec::with_capacity(replacements.len());
+    for replacement in replacements {
+        match merged.last_mut() {
+            Some(cluster) if replacement.start < cluster.end => {
+                cluster.end = cluster.end.max(replacement.end);
+                if replacement.specificity < cluster.specificity {
+                    cluster.specificity = replacement.specificity;
+                    cluster.secret_type = replacement.secret_type;
+                    cluster.replacement = replacement.replacement;
+                }
+            }
+            _ => merged.push(replacement),
+        }
+    }
+    merged
+}
+
+/// Widest span first so a cluster's union is known from its first member, then
+/// most specific, so the cluster walk can pick a winner without rescanning.
+fn sort_for_clustering(replacements: &mut [Replacement]) {
     replacements.sort_by(|left, right| {
         (left.start, Reverse(left.end), left.specificity).cmp(&(
             right.start,
@@ -120,7 +148,6 @@ pub(super) fn render(
             right.specificity,
         ))
     });
-    render_sorted(input, replacements)
 }
 
 fn describe(
@@ -171,7 +198,16 @@ fn render_sorted(
     input: &str,
     mut replacements: Vec<Replacement>,
 ) -> Result<Redaction, RedactionError> {
-    let mut text = String::with_capacity(input.len());
+    // Reserving the whole upper bound keeps the buffer from doubling on its
+    // first byte past `input.len()`, which for a payload near the cap would
+    // hold twice the payload while the input is still resident.
+    let bound = input.len()
+        + replacements
+            .iter()
+            .map(|replacement| replacement.replacement.len())
+            .sum::<usize>();
+    let mut text = String::with_capacity(bound);
+    let reserved = text.capacity();
     let mut detections = Vec::with_capacity(replacements.len());
     let mut cursor = 0;
     let mut index = 0;
@@ -205,6 +241,7 @@ fn render_sorted(
         index = next;
     }
     text.push_str(input.get(cursor..).ok_or_else(invalid_span)?);
+    debug_assert!(text.capacity() == reserved, "rendering must not reallocate");
     Ok(Redaction { text, detections })
 }
 
@@ -217,6 +254,28 @@ const fn invalid_span() -> RedactionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendering_reserves_its_bound_once_and_never_grows() {
+        // Every one-byte span becomes a 17-byte placeholder, so the output is
+        // far longer than the input.
+        let input = "x".repeat(64);
+        let replacements: Vec<Replacement> = (0..64)
+            .map(|start| Replacement {
+                start,
+                end: start + 1,
+                specificity: GENERIC_PRECEDENCE,
+                secret_type: "secret".to_owned(),
+                replacement: "<REDACTED:secret>".to_owned(),
+            })
+            .collect();
+        // The debug assertion inside `render_sorted` is what proves the buffer
+        // never reallocated; the output length shows the bound was needed.
+        let redaction = render(&input, replacements).unwrap();
+        assert_eq!(redaction.text.len(), 64 * "<REDACTED:secret>".len());
+        assert!(redaction.text.len() > input.len());
+        assert_eq!(redaction.detections.len(), 64);
+    }
 
     #[test]
     fn every_overlay_rule_is_classified() {

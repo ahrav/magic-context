@@ -1,3 +1,5 @@
+import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { compareCodeUnits } from "../code-unit-order";
 import type { InjectedClaimRecord } from "../historian-eval/claim-read";
 import { normalizeContent } from "../historian-eval/contract";
 import {
@@ -75,16 +77,31 @@ function canonicalizeInjectionSet(
         unique.set(claimKey(canonical), canonical);
     }
     return [...unique.entries()]
-        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .sort(([left], [right]) => compareCodeUnits(left, right))
         .map(([, claim]) => claim);
 }
 
-export function compareInvariants(
+/** Sorted unique false-authoritative matches, the form both comparison sets publish. */
+export function falseAuthoritativeMatchSet(score: { falseAuthoritativeMatches: readonly string[] }): string[] {
+    return [...new Set(score.falseAuthoritativeMatches)].sort(compareCodeUnits);
+}
+
+/** Fail reasons present on the derivative and absent from the baseline, in `FAIL_REASONS` order. */
+export function introducedFailReasons(
+    baselineScore: { failReasons: readonly FailReason[] },
+    derivativeScore: { failReasons: readonly FailReason[] },
+): FailReason[] {
+    const baselineReasons = new Set(baselineScore.failReasons);
+    return FAIL_REASONS.filter(
+        (reason) => derivativeScore.failReasons.includes(reason) && !baselineReasons.has(reason),
+    );
+}
+
+/** The one invariant both runners derive from the injected claim sets rather than from the scores. */
+export function injectionSetInvariant(
     baselineClaims: readonly InjectedClaimRecord[],
     derivativeClaims: readonly InjectedClaimRecord[],
-    baselineScore: ComparableScore,
-    derivativeScore: ComparableScore,
-): InvariantVerdict[] {
+): InjectionSetEqualityVerdict {
     const baseline = canonicalizeInjectionSet(baselineClaims);
     const derivative = canonicalizeInjectionSet(derivativeClaims);
     const baselineKeys = new Set(baseline.map(claimKey));
@@ -97,39 +114,27 @@ export function compareInvariants(
             .filter((claim) => !baselineKeys.has(claimKey(claim)))
             .map((claim): InjectionSetChange => ({ direction: "added-in-derivative", claim })),
     ];
-    const baselineMatches = [...new Set(baselineScore.falseAuthoritativeMatches)].sort();
-    const derivativeMatches = [...new Set(derivativeScore.falseAuthoritativeMatches)].sort();
+    return withHolds({ invariant: "injection-set-equality", changes });
+}
 
-    const baselineReasons = new Set(baselineScore.failReasons);
-    const introducedFailReasons = FAIL_REASONS.filter(
-        (reason) => derivativeScore.failReasons.includes(reason) && !baselineReasons.has(reason),
-    );
+export function compareInvariants(
+    baselineClaims: readonly InjectedClaimRecord[],
+    derivativeClaims: readonly InjectedClaimRecord[],
+    baselineScore: ComparableScore,
+    derivativeScore: ComparableScore,
+): InvariantVerdict[] {
+    const baselineMatches = falseAuthoritativeMatchSet(baselineScore);
+    const derivativeMatches = falseAuthoritativeMatchSet(derivativeScore);
 
     return [
-        {
-            invariant: "injection-set-equality",
-            holds: changes.length === 0,
-            changes,
-        },
-        {
-            invariant: "expected-absent-empty",
-            holds: baselineMatches.length === 0 && derivativeMatches.length === 0,
-            baselineMatches,
-            derivativeMatches,
-        },
-        {
+        injectionSetInvariant(baselineClaims, derivativeClaims),
+        withHolds({ invariant: "expected-absent-empty", baselineMatches, derivativeMatches }),
+        withHolds({
             invariant: "verdict-monotonicity",
-            // A derivative preserves the scenario's semantics, so a baseline that
-            // passed and a derivative that does not is the transform's doing.
-            // Only that direction is a violation: a derivative that passes where
-            // the baseline failed is not a regression to report here.
-            holds: !(
-                baselineScore.verdict === "PASS" && derivativeScore.verdict !== "PASS"
-            ),
             baselineVerdict: baselineScore.verdict,
             derivativeVerdict: derivativeScore.verdict,
-            introducedFailReasons,
-        },
+            introducedFailReasons: introducedFailReasons(baselineScore, derivativeScore),
+        }),
     ];
 }
 
@@ -146,25 +151,46 @@ export function compareScoreInvariants(
     const changedExpectationIds = expectationIds.filter(
         (id) => baselineExpectations[id] !== derivativeExpectations[id],
     );
-    const baselineMatches = [...new Set(baselineScore.falseAuthoritativeMatches)].sort();
-    const derivativeMatches = [...new Set(derivativeScore.falseAuthoritativeMatches)].sort();
+    const baselineMatches = falseAuthoritativeMatchSet(baselineScore);
+    const derivativeMatches = falseAuthoritativeMatchSet(derivativeScore);
     return [
-        {
-            invariant: "expectation-predicate-equality",
-            holds: changedExpectationIds.length === 0,
-            changedExpectationIds,
-        },
-        {
-            invariant: "false-authoritative-set-equality",
-            holds: JSON.stringify(baselineMatches) === JSON.stringify(derivativeMatches),
-            baselineMatches,
-            derivativeMatches,
-        },
-        {
+        withHolds({ invariant: "expectation-predicate-equality", changedExpectationIds }),
+        withHolds({ invariant: "false-authoritative-set-equality", baselineMatches, derivativeMatches }),
+        withHolds({
             invariant: "scenario-verdict-equality",
-            holds: baselineScore.verdict === derivativeScore.verdict,
             baselineVerdict: baselineScore.verdict,
             derivativeVerdict: derivativeScore.verdict,
-        },
+        }),
     ];
+}
+
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+/** An invariant verdict with `holds` removed; every `holds` is a function of the remaining evidence fields. */
+export type InvariantEvidence = DistributiveOmit<MetamorphicInvariantVerdict, "holds">;
+
+/** `holds` is recomputed when parsing archived reports to verify it matches the recorded evidence. */
+export function invariantHolds(evidence: InvariantEvidence): boolean {
+    switch (evidence.invariant) {
+        case "injection-set-equality":
+            return evidence.changes.length === 0;
+        case "expected-absent-empty":
+            return evidence.baselineMatches.length === 0 && evidence.derivativeMatches.length === 0;
+        case "verdict-monotonicity":
+            // A derivative preserves the scenario's semantics, so a baseline that
+            // passed and a derivative that does not is the transform's doing.
+            // Only that direction is a violation: a derivative that passes where
+            // the baseline failed is not a regression to report here.
+            return !(evidence.baselineVerdict === "PASS" && evidence.derivativeVerdict !== "PASS");
+        case "expectation-predicate-equality":
+            return evidence.changedExpectationIds.length === 0;
+        case "false-authoritative-set-equality":
+            return canonicalJson(evidence.baselineMatches) === canonicalJson(evidence.derivativeMatches);
+        case "scenario-verdict-equality":
+            return evidence.baselineVerdict === evidence.derivativeVerdict;
+    }
+}
+
+function withHolds<E extends InvariantEvidence>(evidence: E): E & { holds: boolean } {
+    return { ...evidence, holds: invariantHolds(evidence) };
 }

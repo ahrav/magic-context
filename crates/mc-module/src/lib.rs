@@ -220,6 +220,8 @@ struct ClaimMirrorReceiptRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionBinding {
     pub project_root: PathBuf,
+    /// The project the `kernel.*` routes work against, canonicalized at bind.
+    pub(crate) kernel_project: kernel_routes::ProjectBinding,
     pub harness: String,
     pub session: String,
     pub model_key: Option<String>,
@@ -383,6 +385,30 @@ struct StoreOpenWaiterGuard {
 impl Drop for StoreOpenWaiterGuard {
     fn drop(&mut self) {
         self.coordinator.finish_waiter();
+    }
+}
+
+/// `'static` lets running tasks own a `TaskAdmission` and admit follow-on tasks.
+#[derive(Clone)]
+struct TaskAdmission {
+    gate: Arc<Mutex<()>>,
+    cancel: CancellationToken,
+    tasks: TaskTracker,
+}
+
+impl TaskAdmission {
+    /// `None` once shutdown has closed admission; the gate keeps a spawn that
+    /// passed the cancellation check from landing after the tracker closes.
+    fn spawn<F, T>(&self, future: F) -> Option<tokio::task::JoinHandle<T>>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let _gate = self.gate.lock().expect("module spawn gate mutex");
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        Some(self.tasks.spawn(future))
     }
 }
 
@@ -2313,7 +2339,11 @@ pub const DECLARED_RETAINED_RESIDENT_BYTES: u64 = TRANSFORM_SERVE_CACHE_COMBINED
     + TRANSFORM_SNAPSHOT_BUDGET_BYTES as u64
     + BOUNDARY_TOKEN_CACHE_BUDGET_BYTES as u64
     + STATE_IMPORT_MAX_STAGED_BYTES as u64
-    + transform::TAG_CACHE_COMBINED_BUDGET_BYTES as u64;
+    + transform::TAG_CACHE_COMBINED_BUDGET_BYTES as u64
+    + kernel_routes::ingest::MAX_STAGED_BYTES
+    + kernel_routes::ingest::FINISH_WORKING_BYTES_MAX
+    + kernel_routes::ingest::PAGE_DECODE_BYTES_MAX
+    + kernel_routes::eligibility::CACHE_BUDGET_BYTES;
 
 #[derive(Debug, Clone)]
 struct NativeDeltaFrontier {
@@ -3438,34 +3468,20 @@ impl McHandler {
         self.store.lock().expect("store slot mutex").clone()
     }
 
+    fn admission(&self) -> TaskAdmission {
+        TaskAdmission {
+            gate: Arc::clone(&self.spawn_gate),
+            cancel: self.cancel.clone(),
+            tasks: self.tasks.clone(),
+        }
+    }
+
     fn spawn_tracked_task<F, T>(&self, future: F) -> Option<tokio::task::JoinHandle<T>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let _gate = self.spawn_gate.lock().expect("module spawn gate mutex");
-        if self.cancel.is_cancelled() {
-            return None;
-        }
-        Some(self.tasks.spawn(future))
-    }
-
-    /// A spawner a running task can use to admit a follow-on task under the
-    /// same gate and tracker, since it holds no `&self`.
-    fn tracked_spawner(
-        &self,
-    ) -> impl Fn(Arc<kernel_routes::KernelOpenCoordinator>, CancellationToken) + Send + 'static
-    {
-        let gate = Arc::clone(&self.spawn_gate);
-        let cancel = self.cancel.clone();
-        let tasks = self.tasks.clone();
-        move |kernel, task_cancel| {
-            let _gate = gate.lock().expect("module spawn gate mutex");
-            if cancel.is_cancelled() {
-                return;
-            }
-            tasks.spawn(kernel.run_sampler(task_cancel));
-        }
+        self.admission().spawn(future)
     }
 
     fn spawn_module_task<F, T>(&self, future: F) -> Option<tokio::task::JoinHandle<T>>
@@ -3503,12 +3519,13 @@ impl McHandler {
             .fetch_add(1, Ordering::Relaxed);
         let store = Arc::clone(&self.store);
         let kernel = Arc::clone(&self.kernel);
-        let sampler_spawn = self.tracked_spawner();
+        let admission = self.admission();
+        let task_admission = admission.clone();
         let coordinator = Arc::clone(&self.store_open);
         let task_coordinator = Arc::clone(&coordinator);
         let cancel = self.cancel.clone();
-        if self
-            .spawn_tracked_task(async move {
+        if admission
+            .spawn(async move {
                 let _guard = StoreOpenWaiterGuard {
                     coordinator: Arc::clone(&task_coordinator),
                 };
@@ -3516,28 +3533,25 @@ impl McHandler {
                     .policy
                     .lock()
                     .expect("store open policy mutex");
-                let opened = Self::run_store_open(
-                    store,
-                    task_coordinator,
-                    descriptor.clone(),
-                    cancel.clone(),
-                )
-                .await;
-                // The kernel store shares the managed directory, so it opens only once
-                // the cache store holds it; a cache store that never opened leaves the
-                // kernel unavailable rather than starting forever.
+                let opened =
+                    Self::run_store_open(store, task_coordinator, &descriptor, cancel.clone())
+                        .await;
+                // SQLite supplies the path that derives the kernel root.
                 match (opened, &descriptor.backend) {
                     (true, StorageBackend::Sqlite { path }) => {
                         kernel
                             .open(kernel_routes::kernel_root_for(path), policy, cancel.clone())
                             .await;
-                        if kernel.state() == kernel_routes::KernelState::Ready {
-                            sampler_spawn(Arc::clone(&kernel), cancel);
+                        if kernel.state() == kernel_routes::KernelState::Ready
+                            && kernel.background_sampler_enabled()
+                        {
+                            task_admission.spawn(kernel.run_sampler(cancel));
                         }
                     }
-                    (true, _) | (false, _) => {
-                        kernel.mark_unavailable(kernel_routes::UnavailableReason::StoreUnavailable)
+                    (true, StorageBackend::Postgres { .. }) => {
+                        kernel.mark_unavailable(kernel_routes::UnavailableKind::Unsupported)
                     }
+                    (false, _) => kernel.mark_unavailable(kernel_routes::UnavailableKind::Store),
                 }
             })
             .is_none()
@@ -3553,11 +3567,11 @@ impl McHandler {
     async fn run_store_open(
         store_slot: Arc<Mutex<Option<Arc<McStore>>>>,
         coordinator: Arc<StoreOpenCoordinator>,
-        descriptor: StorageDescriptor,
+        descriptor: &StorageDescriptor,
         cancel: CancellationToken,
     ) -> bool {
         let policy = *coordinator.policy.lock().expect("store open policy mutex");
-        let mut last_lease_error = match Self::open_store_once(&descriptor).await {
+        let mut last_lease_error = match Self::open_store_once(descriptor).await {
             Ok(opened) => {
                 if cancel.is_cancelled() {
                     coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
@@ -3633,7 +3647,7 @@ impl McHandler {
                 continue;
             }
 
-            match Self::open_store_once(&descriptor).await {
+            match Self::open_store_once(descriptor).await {
                 Ok(opened) => {
                     if cancel.is_cancelled() {
                         coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
@@ -7798,6 +7812,9 @@ impl McHandler {
             Some(store) => Arc::clone(&store),
             None => return store_unavailable_error(),
         };
+        // The same sampled snapshot `health()` reports; a status request never
+        // walks the artifact tree itself.
+        let kernel = self.kernel.health_block().reported().0.to_json();
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
             return match store.load("__health__") {
                 Ok(state) => respond(json!({
@@ -7815,7 +7832,7 @@ impl McHandler {
                     },
                     "storage_versions": storage_versions_block(&store),
                     "memory_holders": self.memory_holder_metrics(),
-                    "kernel": kernel_routes::health::live_block(&self.kernel, now_ms()).to_json(),
+                    "kernel": kernel,
                 })),
                 Err(e) => PreparedOutcome::Error {
                     code: "store_load_failed".to_string(),
@@ -7881,7 +7898,7 @@ impl McHandler {
                 "state_sync_epoch": STATE_SYNC_EPOCH,
             },
             "storage_versions": storage_versions_block(&store),
-            "kernel": kernel_routes::health::live_block(&self.kernel, now_ms()).to_json(),
+            "kernel": kernel,
         }))
     }
 
@@ -11696,6 +11713,7 @@ impl CompositeComponent for McHandler {
         self.bind_route(
             route,
             SessionBinding {
+                kernel_project: kernel_routes::ProjectBinding::new(&identity.project_root),
                 project_root: identity.project_root,
                 harness: identity.harness,
                 session: identity.session,
@@ -11777,10 +11795,13 @@ impl CompositeComponent for McHandler {
             serde_json::Value::String(storage_state.to_owned()),
         );
         // One atomic load; only the sampler task reads the store for this block.
-        let kernel = self.kernel.health_block();
+        // A sampler that stopped publishing must not leave its last `Ready`
+        // block standing, so an old sample reads as unavailable.
+        let (kernel, stale) = self.kernel.health_block().reported();
         if storage_state == "ready" && kernel.degrades_health() {
             report.status = HealthStatus::Degraded;
             let reason = match kernel.kernel_state {
+                _ if stale => "kernel health sample is stale",
                 kernel_routes::KernelState::Ready => "kernel outbox lag past threshold",
                 kernel_routes::KernelState::Starting => "kernel store is opening",
                 kernel_routes::KernelState::Unavailable => "kernel store is unavailable",
@@ -11871,7 +11892,7 @@ impl CompositeComponent for McHandler {
             .clear();
         *self.store.lock().expect("store slot mutex") = None;
         self.kernel
-            .mark_unavailable(kernel_routes::UnavailableReason::StoreUnavailable);
+            .mark_unavailable(kernel_routes::UnavailableKind::Store);
         Ok(())
     }
 }
@@ -12015,7 +12036,19 @@ impl McHandler {
     /// Runs one health sample at `now_ms` instead of waiting for the sampler tick.
     #[cfg(feature = "test-support")]
     pub async fn sample_kernel_health_for_test(&self, now_ms: i64) {
-        self.kernel.sample(now_ms).await;
+        self.kernel.sample(now_ms, &CancellationToken::new()).await;
+    }
+
+    /// Disabling the background sampler lets tests control published snapshots.
+    #[cfg(feature = "test-support")]
+    pub fn disable_kernel_sampler_for_test(&self) {
+        self.kernel.disable_background_sampler();
+    }
+
+    /// Ages the published kernel health block past `SAMPLE_STALE_AFTER`.
+    #[cfg(feature = "test-support")]
+    pub fn expire_kernel_health_for_test(&self) {
+        self.kernel.expire_health_for_test();
     }
 
     #[cfg(feature = "test-support")]
@@ -12120,7 +12153,7 @@ impl McHandler {
                     self.handle_kernel_ingest_begin(channel, &request).await
                 }
                 "kernel.artifact.ingest.page" => {
-                    self.handle_kernel_ingest_page(channel, &request).await
+                    self.handle_kernel_ingest_page(channel, request).await
                 }
                 "kernel.artifact.ingest.finish" => {
                     self.handle_kernel_ingest_finish(channel, &request).await
@@ -14015,20 +14048,28 @@ const MAX_TRANSFORM_FRAME_BYTES: usize = 32 * 1024 * 1024;
 /// Serde ignores the remaining fields, avoiding a full `Value` parse of a multi-MiB array.
 #[derive(Deserialize)]
 struct RequestMethodProbe {
+    /// Held as a `Value` so a non-string field does not fail the probe: dispatch
+    /// reads each field with `Value::as_str` and treats anything else as absent.
     #[serde(default)]
-    method: Option<String>,
+    method: Option<Value>,
     #[serde(default)]
-    kind: Option<String>,
+    kind: Option<Value>,
 }
 
 impl RequestMethodProbe {
     fn is_transform_class(&self) -> bool {
-        let named = |value: &Option<String>, name: &str| value.as_deref() == Some(name);
-        named(&self.kind, "transform")
+        // Dispatch reads `method` and falls back to `kind`, so the class is
+        // read the same way; a `kind` beside a `method` names nothing.
+        let route = self
+            .method
+            .as_ref()
+            .and_then(Value::as_str)
+            .or_else(|| self.kind.as_ref().and_then(Value::as_str));
+        route == Some("transform")
             // The state-sync path uses the transform-class ceiling because one row can exceed the facade cap.
-            || named(&self.method, "state_sync")
+            || route == Some("state_sync")
             // One base64 artifact page carries up to 16 MiB decoded.
-            || named(&self.method, kernel_routes::ingest::PAGE)
+            || route == Some(kernel_routes::ingest::PAGE)
     }
 }
 
@@ -16796,6 +16837,7 @@ mod tests {
     fn binding_with_harness(root: &str, harness: &str, session: &str) -> SessionBinding {
         SessionBinding {
             project_root: PathBuf::from(root),
+            kernel_project: kernel_routes::ProjectBinding::new(Path::new(root)),
             harness: harness.to_string(),
             session: session.to_string(),
             model_key: None,
@@ -17211,6 +17253,18 @@ mod tests {
             enforce_request_byte_cap(&pad("kernel.artifact.ingest.begin", "method", two_mib))
                 .is_err()
         );
+        // A `kind` beside a `method` does not widen the cap: dispatch ignores it.
+        let widened = format!(
+            "{{\"method\":\"kernel.artifact.ingest.begin\",\"kind\":\"transform\",\"pad\":\"{}\"}}",
+            "x".repeat(two_mib)
+        );
+        assert!(enforce_request_byte_cap(widened.as_bytes()).is_err());
+        // A non-string `method` is absent to dispatch, which then reads `kind`.
+        let fallback = format!(
+            "{{\"method\":0,\"kind\":\"kernel.artifact.ingest.page\",\"pad\":\"{}\"}}",
+            "x".repeat(two_mib)
+        );
+        assert!(enforce_request_byte_cap(fallback.as_bytes()).is_ok());
         // Oversized facade bodies reject at 1 MiB.
         assert!(enforce_request_byte_cap(&pad("ctx_memory", "method", two_mib)).is_err());
         // Unparseable oversized bodies reject conservatively.

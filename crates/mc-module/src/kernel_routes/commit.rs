@@ -3,7 +3,8 @@
 //! that applies it.
 //!
 //! Writes arriving here are classified server-side from `source_kind`; a
-//! caller may lower the derived class but never raise it. Every written row is
+//! caller may lower the derived class but never raise it, and the resulting
+//! pair must satisfy the kernel's admission rules. Every written row is
 //! stamped with the bound project's scope and admitted under the derived
 //! classes, so visibility follows the kernel's admission rules rather than
 //! anything the caller asserts.
@@ -14,23 +15,40 @@ use std::time::{Duration, Instant};
 use mc_host::RouteHandle;
 use mc_kernel::{
     AdmissionEvent, AdmissionRequest, CommitIntent, CommitReceipt, DecisionPayload, DecisionSpec,
-    DomainSpec, Envelope, EventKind, KernelError, KernelStore, ObservationDependencySpec,
-    ObservationPayload, ObservationSpec, Sensitivity, SourceClass, TaintClass, TokenCheck,
-    TokenConflict,
+    DomainSpec, Envelope, EventKind, KernelError, KernelStore, ObjectState,
+    ObservationDependencySpec, ObservationPayload, ObservationSpec, Sensitivity, SourceClass,
+    TaintClass, TokenCheck, TokenConflict, ALIGNMENT_DEPENDENCY_KIND,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::project::ProjectBinding;
+use super::project::{IntentRequest, ProjectBinding, ScopeFilter};
 use super::{blocking, kernel_response, state_only, ConflictReason, InvalidReason, KernelOutcome};
 use crate::dispatch::PreparedOutcome;
 use crate::McHandler;
 
 const OPERATION: &str = "kernel.commit";
+/// Namespace of this route's receipts within a project.
+const RECEIPT_FAMILY: &str = "commit";
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_DEADLINE: Duration = Duration::from_secs(30);
+/// The whole envelope runs inside one exclusive-writer transaction and
+/// `deadline_ms` bounds only writer acquisition, so the operation count is
+/// what bounds how long the writer is held.
+const MAX_OPERATIONS: usize = 256;
+/// Each token is one registry lookup inside the same writer transaction.
+const MAX_TOKENS: usize = 1024;
+/// Dependencies are summed across every observation in the request, since
+/// each one is validated and inserted inside the same writer transaction.
+pub const MAX_DEPENDENCIES: usize = 1024;
 /// Reason recorded on the admission decision of every route-written object.
 const ADMISSION_REASON: &str = "kernel.commit";
+/// Dependency kinds a kernel projection reads without comparing scopes, so
+/// their targets must belong to the bound project.
+const PROJECTED_DEPENDENCY_KINDS: [&str; 2] = [
+    ALIGNMENT_DEPENDENCY_KIND,
+    mc_kernel::applicability::DEPENDENCY_KIND_TARGET,
+];
 
 #[derive(Debug, Deserialize)]
 struct CommitRequest {
@@ -45,15 +63,6 @@ struct CommitRequest {
     asserted_taint_class: Option<String>,
     #[serde(default)]
     deadline_ms: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct IntentRequest {
-    producer: String,
-    operation_key: String,
-    request_digest: String,
-    actor: String,
-    cause: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,7 +231,8 @@ const fn taint_rank(class: TaintClass) -> u8 {
 /// The classes a write is admitted under: the derived pair, lowered to any
 /// asserted class that ranks at or below it. An assertion above the derived
 /// class is refused rather than clamped so the caller learns its claim was not
-/// honored.
+/// accepted. A pair forbidden by the kernel's admission table is malformed
+/// input.
 pub(crate) fn resolve_classes(
     source_kind: &str,
     asserted_source: Option<&str>,
@@ -252,6 +262,9 @@ pub(crate) fn resolve_classes(
             asserted
         }
     };
+    if !source.allows(taint) {
+        return Err(InvalidReason::InvalidInput);
+    }
     Ok((source, taint))
 }
 
@@ -269,6 +282,14 @@ enum CommitFailure {
     Kernel(KernelError),
     Token(TokenConflict),
     OperationKeyReused,
+    /// A storage constraint (a duplicate `object_id` or `decision_id`, a
+    /// broken reference) rejected a write inside the envelope.
+    StorageConstraint,
+    /// A successor's revision did not advance past its predecessor's.
+    RevisionNotAdvanced,
+    /// The store holds a scope under this project's reserved id whose terms
+    /// name a different project.
+    ScopeReserved,
 }
 
 impl From<CommitFailure> for KernelOutcome {
@@ -285,7 +306,30 @@ impl From<CommitFailure> for KernelOutcome {
                 Self::conflict(ConflictReason::Superseded)
             }
             CommitFailure::OperationKeyReused => Self::invalid(InvalidReason::OperationKeyReused),
+            CommitFailure::StorageConstraint => Self::invalid(InvalidReason::AlreadyExists),
+            CommitFailure::RevisionNotAdvanced => Self::invalid(InvalidReason::RevisionNotAdvanced),
+            CommitFailure::ScopeReserved => Self::invalid(InvalidReason::ScopeReserved),
         }
+    }
+}
+
+/// The receipt's result payload; a replay reads it back from the receipt.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct CommitResult {
+    /// Every object the envelope wrote or re-pointed; each becomes a token.
+    touched: Vec<String>,
+    /// Each id identifies a survivor whose replacement spec names an existing
+    /// live decision. The kernel discards that spec's content and only
+    /// re-points the predecessor, leaving the survivor's row unchanged.
+    merged: Vec<String>,
+}
+
+impl CommitResult {
+    fn normalize(&mut self) {
+        self.touched.sort();
+        self.touched.dedup();
+        self.merged.sort();
+        self.merged.dedup();
     }
 }
 
@@ -318,12 +362,21 @@ fn ensure_scope(
     project: &ProjectBinding,
     domain_id: &str,
     ready: &mut bool,
+    refused: &mut Option<CommitFailure>,
 ) -> Result<(), KernelError> {
     if *ready {
         return Ok(());
     }
-    if envelope.scope_terms(&project.scope_id())?.is_none() {
-        envelope.insert_scope(project.scope_spec(domain_id))?;
+    let expected = project.scope_spec(domain_id);
+    match envelope.scope_terms(&expected.scope_id)? {
+        None => {
+            envelope.insert_scope(expected)?;
+        }
+        Some(terms) if terms == expected.terms => {}
+        Some(_) => {
+            *refused = Some(CommitFailure::ScopeReserved);
+            return Err(KernelError::Conflict);
+        }
     }
     *ready = true;
     Ok(())
@@ -356,90 +409,166 @@ fn ensure_domain(
     Ok(())
 }
 
-fn is_live(envelope: &Envelope<'_>, object_id: &str) -> Result<bool, KernelError> {
-    Ok(envelope
+/// The object, when its scope names the bound project by the same algebra
+/// `kernel.read` serves rows with, so every row a read hands a token for is
+/// a row the same route may mutate. Returning `NotFound` for an out-of-scope
+/// object, the same answer a missing object gets, prevents cross-project
+/// object-id enumeration.
+fn scoped_object_state(
+    envelope: &Envelope<'_>,
+    filter: &mut ScopeFilter,
+    object_id: &str,
+) -> Result<ObjectState, KernelError> {
+    let state = envelope
         .object_state(object_id)?
-        .is_some_and(|state| state.object.invalidated_commit_seq.is_none()))
+        .ok_or(KernelError::NotFound)?;
+    if !filter.matches(state.scope_id.as_deref(), &mut |scope_id| {
+        envelope.scope_terms(scope_id)
+    })? {
+        return Err(KernelError::NotFound);
+    }
+    Ok(state)
 }
 
-/// The receipt's result payload is the sorted list of touched object ids, so a
-/// replayed commit hands back the same tokens the original did.
-fn apply(envelope: &mut Envelope<'_>, plan: &CommitPlan) -> Result<String, KernelError> {
+/// `refused` records why `apply` returns `KernelError::Conflict`, since the
+/// kernel raises that same error for storage constraints.
+fn apply(
+    envelope: &mut Envelope<'_>,
+    filter: &mut ScopeFilter,
+    plan: &CommitPlan,
+    refused: &mut Option<CommitFailure>,
+) -> Result<String, KernelError> {
     let scope_id = plan.project.scope_id();
     let mut scope_ready = false;
     let mut domains_ready: HashSet<String> = HashSet::new();
-    let mut touched: Vec<String> = Vec::new();
+    let mut result = CommitResult::default();
     for operation in &plan.operations {
         match operation {
             Operation::InsertDecision { spec } => {
                 ensure_domain(envelope, &spec.domain_id, &mut domains_ready)?;
-                ensure_scope(envelope, &plan.project, &spec.domain_id, &mut scope_ready)?;
+                ensure_scope(
+                    envelope,
+                    &plan.project,
+                    &spec.domain_id,
+                    &mut scope_ready,
+                    refused,
+                )?;
                 let spec = spec.clone().into_spec(&plan.source_kind, &scope_id);
                 let outcome = envelope.insert_decision(spec)?;
                 admit(envelope, &outcome.object_id, plan.classes)?;
-                touched.push(outcome.object_id);
+                result.touched.push(outcome.object_id);
             }
             Operation::SupersedeDecision {
                 replaced_object_id,
                 spec,
             } => {
                 ensure_domain(envelope, &spec.domain_id, &mut domains_ready)?;
-                ensure_scope(envelope, &plan.project, &spec.domain_id, &mut scope_ready)?;
-                let replacement_live = is_live(envelope, &spec.object_id)?;
+                ensure_scope(
+                    envelope,
+                    &plan.project,
+                    &spec.domain_id,
+                    &mut scope_ready,
+                    refused,
+                )?;
+                let predecessor = scoped_object_state(envelope, filter, replaced_object_id)?;
+                // An existing replacement must belong to the bound project
+                // whether or not it is live: a foreign retired id answering
+                // `already_exists` where a foreign live one answers
+                // `not_found` would reveal the foreign object's state. A live
+                // one's stored revision, not the spec's, is what the kernel
+                // compares.
+                let (replacement_live, successor_revision) =
+                    match envelope.object_state(&spec.object_id)? {
+                        Some(state) => {
+                            scoped_object_state(envelope, filter, &spec.object_id)?;
+                            if state.object.invalidated_commit_seq.is_none() {
+                                (true, state.object.source_revision)
+                            } else {
+                                (false, spec.source_revision)
+                            }
+                        }
+                        None => (false, spec.source_revision),
+                    };
+                if successor_revision <= predecessor.object.source_revision {
+                    *refused = Some(CommitFailure::RevisionNotAdvanced);
+                    return Err(KernelError::Conflict);
+                }
                 let spec = spec.clone().into_spec(&plan.source_kind, &scope_id);
                 let outcome = envelope.supersede_decision(replaced_object_id, spec)?;
-                if !replacement_live {
+                if replacement_live {
+                    result.merged.push(outcome.object_id.clone());
+                } else {
                     admit(envelope, &outcome.object_id, plan.classes)?;
                 }
-                touched.push(replaced_object_id.clone());
-                touched.push(outcome.object_id);
+                result.touched.push(replaced_object_id.clone());
+                result.touched.push(outcome.object_id);
             }
             Operation::RetireDecision { object_id } => {
+                scoped_object_state(envelope, filter, object_id)?;
                 envelope.retire_decision(object_id)?;
-                touched.push(object_id.clone());
+                result.touched.push(object_id.clone());
             }
             Operation::InsertObservation { spec } => {
                 ensure_domain(envelope, &spec.domain_id, &mut domains_ready)?;
-                ensure_scope(envelope, &plan.project, &spec.domain_id, &mut scope_ready)?;
+                ensure_scope(
+                    envelope,
+                    &plan.project,
+                    &spec.domain_id,
+                    &mut scope_ready,
+                    refused,
+                )?;
+                // The alignment projection pairs an observation with the
+                // decision its `implements` dependency names, and the
+                // applicability reducer with the object its
+                // `applicability_target` names, without comparing scopes, so
+                // a foreign target would let this project alter another
+                // project's derived results. Other dependency kinds may cite
+                // any live registry object, as the kernel allows.
+                for dependency in &spec.dependencies {
+                    if PROJECTED_DEPENDENCY_KINDS.contains(&dependency.dependency_kind.as_str()) {
+                        scoped_object_state(envelope, filter, &dependency.dependency_object_id)?;
+                    }
+                }
                 let spec = spec.clone().into_spec(&plan.source_kind, &scope_id);
                 let outcome = envelope.insert_observation(spec)?;
                 admit(envelope, &outcome.object_id, plan.classes)?;
-                touched.push(outcome.object_id);
+                result.touched.push(outcome.object_id);
             }
         }
     }
-    touched.sort();
-    touched.dedup();
-    serde_json::to_string(&touched).map_err(|_| KernelError::InvalidInput)
+    result.normalize();
+    serde_json::to_string(&result).map_err(|_| KernelError::InvalidInput)
 }
 
 fn run(store: &KernelStore, plan: CommitPlan) -> Result<CommitReceipt, CommitFailure> {
     let mut entered = false;
-    let mut token_conflict = None;
+    let mut refused = None;
+    let mut filter = ScopeFilter::new(&plan.project);
     let result = store.commit_before(
         Instant::now() + plan.deadline,
         plan.intent.clone(),
         |envelope| {
             entered = true;
             for token in &plan.tokens {
+                scoped_object_state(envelope, &mut filter, &token.object_id)?;
                 if let TokenCheck::Conflict(conflict) =
                     envelope.check_token(&token.object_id, token.known_as_of)?
                 {
-                    token_conflict = Some(conflict);
+                    refused = Some(CommitFailure::Token(conflict));
                     return Err(KernelError::Conflict);
                 }
             }
-            apply(envelope, &plan)
+            apply(envelope, &mut filter, &plan, &mut refused)
         },
     );
     match result {
         Ok(receipt) => Ok(receipt),
-        Err(KernelError::Conflict) => match token_conflict {
-            Some(conflict) => Err(CommitFailure::Token(conflict)),
+        Err(KernelError::Conflict) => match refused {
+            Some(failure) => Err(failure),
             // The receipt lookup runs before the operation, so a conflict
             // raised without entering it is a reused `operation_key`.
             None if !entered => Err(CommitFailure::OperationKeyReused),
-            None => Err(CommitFailure::Kernel(KernelError::Conflict)),
+            None => Err(CommitFailure::StorageConstraint),
         },
         Err(error) => Err(CommitFailure::Kernel(error)),
     }
@@ -461,6 +590,29 @@ impl McHandler {
                 return crate::invalid_params_error(format!("invalid {OPERATION}: {error}"))
             }
         };
+        if parsed.operations.len() > MAX_OPERATIONS {
+            return crate::invalid_params_error(format!(
+                "{OPERATION} carries at most {MAX_OPERATIONS} operations"
+            ));
+        }
+        if parsed.tokens.len() > MAX_TOKENS {
+            return crate::invalid_params_error(format!(
+                "{OPERATION} carries at most {MAX_TOKENS} tokens"
+            ));
+        }
+        let dependencies: usize = parsed
+            .operations
+            .iter()
+            .map(|operation| match operation {
+                Operation::InsertObservation { spec } => spec.dependencies.len(),
+                _ => 0,
+            })
+            .sum();
+        if dependencies > MAX_DEPENDENCIES {
+            return crate::invalid_params_error(format!(
+                "{OPERATION} carries at most {MAX_DEPENDENCIES} observation dependencies"
+            ));
+        }
         let classes = match resolve_classes(
             &parsed.source_kind,
             parsed.asserted_source_class.as_deref(),
@@ -469,18 +621,17 @@ impl McHandler {
             Ok(classes) => classes,
             Err(reason) => return state_only(KernelOutcome::invalid(reason)),
         };
+        let Some(intent) = parsed.intent.into_intent(&scope.project, RECEIPT_FAMILY) else {
+            return crate::invalid_params_error(format!(
+                "{OPERATION} intent.operation_key must not be blank"
+            ));
+        };
         let deadline = parsed
             .deadline_ms
             .map_or(DEFAULT_DEADLINE, Duration::from_millis)
             .min(MAX_DEADLINE);
         let plan = CommitPlan {
-            intent: CommitIntent {
-                producer: parsed.intent.producer,
-                operation_key: scope.project.operation_key(&parsed.intent.operation_key),
-                request_digest: parsed.intent.request_digest,
-                actor: parsed.intent.actor,
-                cause: parsed.intent.cause,
-            },
+            intent,
             tokens: parsed.tokens,
             operations: parsed.operations,
             source_kind: parsed.source_kind,
@@ -494,8 +645,10 @@ impl McHandler {
             Ok(Err(failure)) => return state_only(KernelOutcome::from(failure)),
             Err(outcome) => return state_only(outcome),
         };
-        let touched: Vec<String> = serde_json::from_str(&receipt.result).unwrap_or_default();
-        let tokens: Vec<Value> = touched
+        let result: CommitResult =
+            serde_json::from_str(&receipt.result).unwrap_or_else(|_| CommitResult::default());
+        let tokens: Vec<Value> = result
+            .touched
             .iter()
             .map(|object_id| json!({"object_id": object_id, "known_as_of": receipt.commit_seq}))
             .collect();
@@ -505,6 +658,7 @@ impl McHandler {
                 "receipt": {"commit_seq": receipt.commit_seq, "replayed": receipt.replayed},
                 "known_as_of": receipt.commit_seq,
                 "tokens": tokens,
+                "merged": result.merged,
             }),
         )
     }
@@ -556,5 +710,59 @@ mod tests {
         assert!(TaintClass::ALL
             .iter()
             .all(|class| taint_rank(*class) <= taint_rank(TaintClass::Personal)));
+    }
+
+    #[test]
+    fn a_pair_is_accepted_exactly_when_not_raised_and_legal_for_admission() {
+        for source_kind in ["assistant", "model", "dreamer", "user"] {
+            let (derived_source, derived_taint) = derive_classes(source_kind).unwrap();
+            for source in SourceClass::ALL {
+                for taint in TaintClass::ALL {
+                    let outcome =
+                        resolve_classes(source_kind, Some(source.as_str()), Some(taint.as_str()));
+                    let raised = source_rank(*source) < source_rank(derived_source)
+                        || taint_rank(*taint) < taint_rank(derived_taint);
+                    let expected = if raised {
+                        Err(InvalidReason::ClassOverDeclared)
+                    } else if source.allows(*taint) {
+                        Ok((*source, *taint))
+                    } else {
+                        Err(InvalidReason::InvalidInput)
+                    };
+                    assert_eq!(outcome, expected, "{source_kind} {source:?} {taint:?}");
+                }
+            }
+        }
+        // `user` derives a pair the table forbids only once lowered to a
+        // repo or tool taint.
+        assert!(resolve_classes("user", None, None).is_ok());
+        assert_eq!(
+            resolve_classes("user", None, Some("repo_untrusted_text")),
+            Err(InvalidReason::InvalidInput)
+        );
+        assert_eq!(
+            resolve_classes("user", None, Some("tool_untrusted_output")),
+            Err(InvalidReason::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn the_result_payload_round_trips_and_tolerates_an_unreadable_receipt() {
+        let mut result = CommitResult {
+            touched: vec!["b".to_string(), "a".to_string(), "b".to_string()],
+            merged: vec!["c".to_string(), "c".to_string()],
+        };
+        result.normalize();
+        assert_eq!(result.touched, ["a", "b"]);
+        assert_eq!(result.merged, ["c"]);
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CommitResult>(&encoded).unwrap(),
+            result
+        );
+        assert_eq!(
+            serde_json::from_str::<CommitResult>("[\"a\"]").unwrap_or_default(),
+            CommitResult::default()
+        );
     }
 }
