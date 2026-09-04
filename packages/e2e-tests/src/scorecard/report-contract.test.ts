@@ -154,6 +154,18 @@ describe("parseScorecardReport", () => {
             .toThrow(/deltas\[0\]: cross-field-invalid/);
     });
 
+    it("bounds every paired-delta estimate it carries to [-1, 1]", () => {
+        const rung = edited(missingLanes, (body) => {
+            body.regret = [{ coordinateId: "fam-a:0", familyId: "fam-a", retrieval: 5.7, formation: null, representation: null, label: "raw-non-inferential" }];
+        });
+        expect(() => parseScorecardReport(rung)).toThrow(/regret\[0\].retrieval: number-invalid/);
+        const wide = edited(missingLanes, (body) => {
+            body.utility.familyEstimates = [{ ...estimate("fam-a", 0.2), interval: { lower: -1.5, upper: 0.3 } }];
+            body.utility.deltas = [{ endpoint: "mc-on-vs-mc-off", familyId: "fam-a", status: "no-baseline", value: 0.2 }];
+        });
+        expect(() => parseScorecardReport(wide)).toThrow(/familyEstimates\[0\].interval.lower: number-invalid/);
+    });
+
     it("ties every compared delta and adverse row to a present baseline", () => {
         const current = [estimate("fam-a", 0.2)];
         const noBaseline: DeltaRow = { endpoint: "mc-on-vs-mc-off", familyId: "fam-a", status: "no-baseline", value: 0.2 };

@@ -218,6 +218,15 @@ describe("loadEvidenceBundle", () => {
         expect(laneEvidence(bundle, "historian").status).toBe("present");
     });
 
+    it("raises the scorecard error class when the paired-delta policy document does not parse", () => {
+        const emptyMatrix = pairedDeltaPolicyDocumentFixture({ ...PAIRED_DELTA_POLICY, modelMatrix: [] });
+        const bundle = tree({ pairedDeltaPolicyDocument: emptyMatrix, policy: policyFixture({ pairedDeltaPolicyFingerprint: emptyMatrix.policyFingerprint! }) });
+        expect(() => loadEvidenceBundle(bundle)).toThrow(ScorecardContractError);
+        expect(() => loadEvidenceBundle(bundle)).toThrow(/paired-delta-policy: parse-failed/);
+        const notOwner = { ...pairedDeltaPolicyDocumentFixture(), owner: "magic-context-x4l.99" } as unknown as PolicyOwnerDocument;
+        expect(() => loadEvidenceBundle(tree({ pairedDeltaPolicyDocument: notOwner }))).toThrow(ScorecardContractError);
+    });
+
     it("refuses a paired-delta policy document that carries sensitive content", () => {
         const leaked = { ...pairedDeltaPolicyDocumentFixture(), owner: "/home/operator/magic-context-x4l.14" } as unknown as PolicyOwnerDocument;
         expect(() => loadEvidenceBundle(tree({ pairedDeltaPolicyDocument: leaked }))).toThrow(/paired-delta-policy: privacy-rejected/);

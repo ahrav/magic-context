@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
     canonicalFingerprint,
@@ -14,7 +14,7 @@ import { parseRunReport as parseDreamerRunReport, type DreamerEvalRunReport } fr
 import { parseLaneReport as parseHistorianReport, type LaneReport as HistorianReport } from "../historian-eval/scorer";
 import { parseIncidentReport, type IncidentPoolReport } from "../incident-pool/report";
 import { parseMetamorphicReport, type MetamorphicReport } from "../metamorphic-eval/report";
-import { parsePairedDeltaPolicy } from "../paired-delta/contract";
+import { PairedDeltaContractError, parsePairedDeltaPolicy } from "../paired-delta/contract";
 import { parsePairedDeltaReport, type PairedDeltaReport } from "../paired-delta/report";
 import { HoldoutContractError, parsePolicyOwnerDocument } from "../prospective-holdout/contract";
 import { loadFreeze, loadPolicyDocuments } from "../prospective-holdout/freeze";
@@ -192,11 +192,19 @@ interface PairedDeltaPolicyView {
 function loadPairedDeltaPolicy(path: string, expectedFingerprint: string): PairedDeltaPolicyView {
     const raw = readCanonicalJsonFile(path, (code) => new ScorecardContractError([`paired-delta-policy: ${code}`]));
     if (scanForSensitiveContent(raw).length > 0) throw new ScorecardContractError(["paired-delta-policy: privacy-rejected"]);
-    const document = parsePolicyOwnerDocument(raw, "magic-context-x4l.14");
-    if (document.status !== "ready" || document.policyFingerprint !== expectedFingerprint) {
-        throw new ScorecardContractError(["scorecard: paired-delta-policy-binding-mismatch"]);
+    let policy: ReturnType<typeof parsePairedDeltaPolicy>;
+    try {
+        const document = parsePolicyOwnerDocument(raw, "magic-context-x4l.14");
+        if (document.status !== "ready" || document.policyFingerprint !== expectedFingerprint) {
+            throw new ScorecardContractError(["scorecard: paired-delta-policy-binding-mismatch"]);
+        }
+        policy = parsePairedDeltaPolicy(document.policy);
+    } catch (error) {
+        if (error instanceof HoldoutContractError || error instanceof PairedDeltaContractError) {
+            throw new ScorecardContractError(["paired-delta-policy: parse-failed", ...error.diagnostics]);
+        }
+        throw error;
     }
-    const policy = parsePairedDeltaPolicy(document.policy);
     return {
         poolManifestFingerprint: policy.poolManifestFingerprint,
         minimumAnalyzableFamilyCount: policy.minimumAnalyzableFamilyCount,
@@ -211,9 +219,15 @@ type JsonArtifact = { kind: "missing" } | { kind: "unparseable" } | { kind: "jso
 
 /** Published reports are read whitespace-insensitively; their fingerprint is of the parsed value, not the bytes. */
 function readJsonArtifact(path: string): JsonArtifact {
-    if (!existsSync(path)) return { kind: "missing" };
+    let text: string;
     try {
-        return { kind: "json", raw: JSON.parse(readFileSync(path, "utf8")) as unknown };
+        text = readFileSync(path, "utf8");
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
+        throw error;
+    }
+    try {
+        return { kind: "json", raw: JSON.parse(text) as unknown };
     } catch {
         return { kind: "unparseable" };
     }
