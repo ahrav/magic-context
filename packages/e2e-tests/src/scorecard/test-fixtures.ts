@@ -260,6 +260,8 @@ export function metamorphicReportFixture(options: {
     tierInvalidReason?: MetamorphicReport["tierInvalidReason"];
     /** The raw-output scoring seam publishes no system tuple, runs no control pair, and reports two extra invariants. */
     source?: ScenarioScore["source"];
+    /** Entries appended after the scored pairs, for runs that left a pair unscored. */
+    extraEntries?: readonly MetamorphicReport["entries"][number][];
 } = {}): MetamorphicReport {
     const covered = options.coveredScenarioIds ?? CANARY_SCENARIO_IDS;
     const source = options.source ?? "run-record";
@@ -277,8 +279,7 @@ export function metamorphicReportFixture(options: {
         { invariant: "false-authoritative-set-equality" as const, holds: true, baselineMatches: [], derivativeMatches: [] },
         { invariant: "scenario-verdict-equality" as const, holds: true, baselineVerdict: "PASS" as const, derivativeVerdict: "PASS" as const },
     ];
-    return buildMetamorphicReport({
-        entries: covered.flatMap((scenarioId, index) => {
+    const entries: MetamorphicReport["entries"] = covered.flatMap((scenarioId, index) => {
             const pair = { scenarioId, transformId: "reorder-independent-turns", transformVersion: 1, seed: 0 };
             const product = {
                 ...pair,
@@ -299,7 +300,9 @@ export function metamorphicReportFixture(options: {
                     invariants: invariants(),
                 }, product]
                 : [product];
-        }),
+        });
+    return buildMetamorphicReport({
+        entries: [...entries, ...(options.extraEntries ?? [])],
         coverage: covered.map((scenarioId) => ({ scenarioId, applied: 1, inapplicable: [], violations: [] })),
         injectionCanaryHits: options.injectionCanaryHits ?? [],
         tierInvalidReason: options.tierInvalidReason ?? null,

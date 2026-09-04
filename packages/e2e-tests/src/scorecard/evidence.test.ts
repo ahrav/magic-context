@@ -9,6 +9,7 @@ import type { PolicyOwnerDocument } from "../prospective-holdout/contract";
 import { laneEvidence, loadEvidenceBundle, type EvidenceSources } from "./evidence";
 import { LANE_IDS, ScorecardContractError } from "./policy";
 import {
+    CANARY_SCENARIO_IDS,
     H2,
     HISTORIAN_SYSTEM,
     PAIRED_DELTA_POLICY,
@@ -95,6 +96,12 @@ describe("loadEvidenceBundle", () => {
     it("lowers each lane to incomplete when its own run summary says the run did not finish", () => {
         expect(statuses(tree({ lanes: { "paired-delta": pairedDeltaReportFixture({ runSummary: { evidenceComplete: false } }) } }))["paired-delta"]).toBe("incomplete");
         expect(statuses(tree({ lanes: { metamorphic: metamorphicReportFixture({ tierInvalidReason: { kind: "incomplete" } }) } })).metamorphic).toBe("incomplete");
+        // A pair the live run never scored leaves `tierInvalidReason` null, and the lane's own exit code still calls the run a failure.
+        const unscored = metamorphicReportFixture({
+            extraEntries: [{ scenarioId: CANARY_SCENARIO_IDS[0]!, transformId: "reorder-independent-turns", transformVersion: 1, seed: 1, kind: "error", error: "role threw" }],
+        });
+        expect(unscored.tierInvalidReason).toBeNull();
+        expect(statuses(tree({ lanes: { metamorphic: unscored } })).metamorphic).toBe("incomplete");
         expect(statuses(tree({
             lanes: { historian: historianReportFixture([scenarioScoreFixture("hse-a", { verdict: "ERROR", errorReason: "run-never-fired", precision: null, recall: null })]) },
         })).historian).toBe("incomplete");

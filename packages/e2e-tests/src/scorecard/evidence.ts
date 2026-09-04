@@ -133,8 +133,12 @@ function runIncompleteReasons(parsed: ParsedLane): string[] {
         }
         case "historian":
             return parsed.report.aggregate.errors > 0 ? ["run-incomplete"] : [];
-        case "metamorphic":
-            return parsed.report.tierInvalidReason === null ? [] : ["run-incomplete"];
+        case "metamorphic": {
+            // A pair that threw, failed admission, or was never scored is one the run did not finish; a scored pair whose
+            // invariants failed is a result.
+            const { tierInvalidReason, entries } = parsed.report;
+            return tierInvalidReason === null && entries.length > 0 && entries.every((entry) => entry.kind === "scored") ? [] : ["run-incomplete"];
+        }
         case "dreamer":
             return parsed.report.length > 0 && parsed.report.every((run) => run.status !== "ERROR") ? [] : ["run-incomplete"];
         case "incident":
