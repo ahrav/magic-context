@@ -87,6 +87,33 @@ pub enum KernelError {
 }
 
 impl KernelError {
+    /// Lists every variant so tests can verify exhaustive error partitions.
+    #[cfg(any(test, feature = "test-support"))]
+    pub const ALL: &'static [KernelError] = &[
+        Self::Held,
+        Self::EngineUnsupported,
+        Self::Foreign,
+        Self::Inconclusive,
+        Self::Io,
+        Self::Busy,
+        Self::IdentityMismatch,
+        Self::FenceLost,
+        Self::Conflict,
+        Self::CorruptCanonicalRow,
+        Self::InvalidInput,
+        Self::AdmissionPolicy,
+        Self::FutureSnapshot,
+        Self::NotFound,
+        Self::InvalidCheckpoint,
+        Self::NoRequiredConsumers,
+        Self::ConsumerPending,
+        Self::Fault,
+        Self::Deadline,
+        Self::UnsafeDestination,
+        Self::InvalidBackup,
+        Self::InvalidRestore,
+    ];
+
     /// Returns true only when retrying the unchanged request is valid.
     pub fn is_retryable(self) -> bool {
         matches!(self, Self::Busy | Self::Held)
@@ -1008,6 +1035,42 @@ fn map_lease_error(error: LeaseError) -> KernelError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_lists_every_variant() {
+        // The exhaustive match stops compiling when a variant is added, which
+        // points at `ALL` as the list to extend.
+        for error in KernelError::ALL {
+            match error {
+                KernelError::Held
+                | KernelError::EngineUnsupported
+                | KernelError::Foreign
+                | KernelError::Inconclusive
+                | KernelError::Io
+                | KernelError::Busy
+                | KernelError::IdentityMismatch
+                | KernelError::FenceLost
+                | KernelError::Conflict
+                | KernelError::CorruptCanonicalRow
+                | KernelError::InvalidInput
+                | KernelError::AdmissionPolicy
+                | KernelError::FutureSnapshot
+                | KernelError::NotFound
+                | KernelError::InvalidCheckpoint
+                | KernelError::NoRequiredConsumers
+                | KernelError::ConsumerPending
+                | KernelError::Fault
+                | KernelError::Deadline
+                | KernelError::UnsafeDestination
+                | KernelError::InvalidBackup
+                | KernelError::InvalidRestore => {}
+            }
+        }
+        let mut names: Vec<_> = KernelError::ALL.iter().map(|e| e.to_string()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), KernelError::ALL.len(), "duplicate in ALL");
+    }
 
     #[test]
     fn owned_read_connections_are_query_only() {
