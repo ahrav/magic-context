@@ -558,7 +558,9 @@ export function parseScorecardReport(raw: unknown): ScorecardReport {
     const pinned = body.target.baselineScorecardReportFingerprint;
     const loaded = body.evidence.baseline;
     if ((loaded.status === "absent") !== (pinned === null)) fail("report.body.evidence.baseline.status: cross-field-invalid");
-    if ((loaded.status === "present") !== (loaded.reportFingerprint !== null && loaded.estimatesStatus !== null)) fail("report.body.evidence.baseline: shape-invalid");
+    if ((loaded.status === "present") !== (loaded.reportFingerprint !== null) || (loaded.status === "present") !== (loaded.estimatesStatus !== null)) {
+        fail("report.body.evidence.baseline: shape-invalid");
+    }
     if (loaded.status === "present" && loaded.reportFingerprint !== pinned) fail("report.body.evidence.baseline.reportFingerprint: cross-field-invalid");
     verifyEvidenceBindings(body);
     verifyComparison(body);

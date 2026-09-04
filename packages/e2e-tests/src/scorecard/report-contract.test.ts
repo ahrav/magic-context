@@ -201,6 +201,8 @@ describe("parseScorecardReport", () => {
         expect(parseScorecardReport(hollow).body.outcome).toMatchObject({ promotionAllowed: false, mandatoryEvidenceComplete: false });
         expect(() => parseScorecardReport(edited(hollow, (body) => { body.outcome.mandatoryEvidenceComplete = true; }))).toThrow(/outcome: cross-field-invalid/);
         expect(() => parseScorecardReport(edited(loaded, (body) => { body.evidence.baseline.estimatesStatus = null; }))).toThrow(/baseline: shape-invalid/);
+        expect(() => parseScorecardReport(edited(unloaded, (body) => { body.evidence.baseline.reportFingerprint = H2; }))).toThrow(/baseline: shape-invalid/);
+        expect(() => parseScorecardReport(edited(unloaded, (body) => { body.evidence.baseline.estimatesStatus = "present"; }))).toThrow(/baseline: shape-invalid/);
         expect(() => parseScorecardReport(edited(presentLanes, (body) => { body.evidence.baseline = { status: "present", reportFingerprint: H2, estimatesStatus: "present" }; })))
             .toThrow(/baseline.status: cross-field-invalid/);
     });

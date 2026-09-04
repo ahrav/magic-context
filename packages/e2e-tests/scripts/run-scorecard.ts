@@ -66,10 +66,19 @@ function overlapsInput(out: string, inputs: readonly string[]): boolean {
     });
 }
 
-/** The one tokenization both the parser and the pre-parse cleanup read: alternating flag and value slots. */
+/**
+ * The one tokenization both the parser and the pre-parse cleanup read. A flag takes the next token as
+ * its value only when that token is not itself a flag, so a lost value leaves its flag valueless
+ * instead of shifting every later pair.
+ */
 function flagPairs(argv: readonly string[]): { flag: string; value: string | undefined }[] {
     const pairs: { flag: string; value: string | undefined }[] = [];
-    for (let index = 0; index < argv.length; index += 2) pairs.push({ flag: argv[index]!, value: argv[index + 1] });
+    for (let index = 0; index < argv.length; index += 1) {
+        const next = argv[index + 1];
+        const value = next !== undefined && !next.startsWith("--") ? next : undefined;
+        pairs.push({ flag: argv[index]!, value });
+        if (value !== undefined) index += 1;
+    }
     return pairs;
 }
 
@@ -78,7 +87,7 @@ export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): Par
     const values = new Map<string, string>();
     for (const { flag, value } of flagPairs(argv)) {
         if (!KNOWN_FLAGS.includes(flag)) throw new Error(`unknown argument: ${flag}\n${USAGE}`);
-        if (value === undefined || value.startsWith("--")) throw new Error(`${flag} requires a value\n${USAGE}`);
+        if (value === undefined) throw new Error(`${flag} requires a value\n${USAGE}`);
         if (values.has(flag)) throw new Error(`${flag} given twice`);
         values.set(flag, value);
     }
@@ -118,11 +127,10 @@ export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): Par
  */
 export function removeNamedOutput(argv: readonly string[], root: string = E2E_ROOT): void {
     if (helpRequested(argv)) return;
-    // Only a flag slot names an output or an input; a misaligned invocation puts `--out` in a value slot and removes nothing.
     // Every value of a repeated flag counts: the parser refuses the duplicate, and the stale report may sit at the second.
     const values = new Map<string, string[]>();
     for (const { flag, value } of flagPairs(argv)) {
-        if (KNOWN_FLAGS.includes(flag) && value !== undefined && !value.startsWith("--")) values.set(flag, [...(values.get(flag) ?? []), value]);
+        if (KNOWN_FLAGS.includes(flag) && value !== undefined) values.set(flag, [...(values.get(flag) ?? []), value]);
     }
     const inputs = inputPaths(values, root);
     for (const value of values.get("--out") ?? []) {

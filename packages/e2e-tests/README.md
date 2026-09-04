@@ -342,8 +342,9 @@ fail-closed default, not a bug.
    # ... one rename per lane; pick one retrieval candidate report.
    # dreamer expects one JSON array of the nested `<group>/<run-id>.json` run reports.
    # -mindepth 2 skips the top-level coverage.json; the name filter skips variance.json.
+   # sort -z fixes the array order, so the same run reports always give the same lane fingerprint.
    find downloads/dreamer-eval-report -mindepth 2 -name '*.json' ! -name variance.json -print0 \
-     | xargs -0 jq -s '.' > artifacts/dreamer-report.json
+     | sort -z | xargs -0 jq -s '.' > artifacts/dreamer-report.json
    ```
 
 3. Score:

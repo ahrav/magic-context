@@ -89,10 +89,14 @@ describe("removeNamedOutput", () => {
         removeNamedOutput([]);
         removeNamedOutput(["--help", "--out", out]);
         removeNamedOutput(["--out", out, "-h"]);
-        // A lost value shifts `--out` into a value slot; the cleanup reads flag slots only, as the parser does.
-        removeNamedOutput(["--freeze", "--out", out]);
-        removeNamedOutput(["--freeze", "f", "--freeze-fingerprint", "--out", out, "--artifacts"]);
         expect(existsSync(out)).toBe(true);
+        // A lost value leaves its flag valueless instead of shifting the pairs, so the output is still recognized.
+        for (const argv of [["--freeze", "--out", out], ["--freeze", "f", "--freeze-fingerprint", "--out", out, "--artifacts"], ["stray", "--out", out]]) {
+            writeFileSync(out, "{\"stale\":true}\n");
+            expect(() => parseArgs(argv, "/root")).toThrow(/requires a value|unknown argument/);
+            removeNamedOutput(argv, "/root");
+            expect(existsSync(out)).toBe(false);
+        }
     });
 
     it("leaves an output that names or lies inside an input alone, and the parser refuses that invocation", () => {
