@@ -5,8 +5,8 @@
 
 use mc_host::RouteHandle;
 use mc_kernel::{
-    ArtifactDestination, ArtifactEgressFacts, ArtifactEligibility, ArtifactHandle,
-    EligibilityDeniedReason, KernelStore, Sensitivity,
+    ArtifactDestination, ArtifactEgressFacts, ArtifactEligibility, EligibilityDeniedReason,
+    KernelError, KernelStore, Sensitivity,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -91,8 +91,6 @@ pub fn decide_egress(
 #[derive(Debug, Deserialize)]
 struct EgressRequest {
     artifact_digest: String,
-    #[serde(default)]
-    evidence_id: Option<String>,
     destination: String,
     asserted_sensitivity: Sensitivity,
     owning_object_id: String,
@@ -112,20 +110,23 @@ fn evaluate(
     request: &EgressRequest,
     destination: ArtifactDestination,
 ) -> Result<EgressDecision, KernelOutcome> {
-    let handle = ArtifactHandle {
-        digest: request.artifact_digest.clone(),
-        evidence_id: request.evidence_id.clone().unwrap_or_default(),
-    };
-    let facts = store
-        .artifact_egress_facts(&handle, destination)
-        .map_err(|error| KernelOutcome::from(error.kind()))?;
-    let (_, states) = store
-        .object_states(std::slice::from_ref(&request.owning_object_id))
+    // The artifact's class and the owner's citation are read in one snapshot,
+    // so an ingest that reclassifies the digest cannot land between them.
+    let (_, mut candidates) = store
+        .egress_candidates(
+            &[(
+                request.owning_object_id.clone(),
+                Some(request.artifact_digest.clone()),
+            )],
+            destination,
+        )
         .map_err(KernelOutcome::from)?;
+    let candidate = candidates.pop().ok_or(KernelError::Io)?;
+    let facts = candidate.artifact.ok_or(KernelError::Io)?;
     // Only a live, unsuperseded owner vouches. A retired or replaced object's
     // registry row still carries its scope and citation, so a candidate
     // retracted after selection would otherwise still be dispatched.
-    let owner = states.first().and_then(Option::as_ref).filter(|state| {
+    let owner = candidate.state.as_ref().filter(|state| {
         state.object.invalidated_commit_seq.is_none() && state.object.superseded_by.is_none()
     });
     // Without the citation check any own-project object id would authorize

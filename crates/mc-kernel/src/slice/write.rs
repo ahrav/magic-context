@@ -15,7 +15,7 @@ use crate::object_write::{
     insert_registry, invalidate, map_write_error, record_fields, record_registry_fields,
     set_successor,
 };
-use crate::redaction::{redact, redact_lossy, RedactedField};
+use crate::redaction::{identity, redact, redact_lossy, RedactedField};
 use crate::{KernelError, Sensitivity};
 
 struct RedactedDecision {
@@ -230,12 +230,16 @@ impl Envelope<'_> {
         let replaced_object_id = redact_lossy(replaced_object_id);
         let old = load_live_typed_object(self.tx, &replaced_object_id.text, "decision")?;
         let granted_before = self.subject_grants_authority(Some(&replaced_object_id.text))?;
+        // The replacement's id selects a survivor, so it is an identity: a
+        // detected secret is refused rather than redacted, since the shared
+        // placeholder would alias it onto whichever live decision holds it.
+        let replacement_object_id = identity(&replacement.object_id)?;
         let replacement = RedactedDecision::new(replacement)?;
         // A replacement naming a decision that is already live folds the
         // predecessor into that survivor: the survivor's stored row, not the
         // spec, is what the predecessor's lineage is checked against, and no
         // row is written for it.
-        let survivor = load_live_decision_by_object(self.tx, &replacement.object_id.text)?;
+        let survivor = load_live_decision_by_object(self.tx, &replacement_object_id)?;
         if let Some((survivor, _)) = &survivor {
             if survivor.object_id == old.object_id {
                 return Err(KernelError::InvalidInput);

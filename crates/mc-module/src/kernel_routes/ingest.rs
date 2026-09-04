@@ -199,6 +199,9 @@ struct Page {
 /// far by index, and the request the assembled bytes will be ingested under.
 struct Upload {
     upload_id: String,
+    /// Assigned by the coordinator at `begin`; a page decoded against one
+    /// upload is staged only into that same upload.
+    generation: u64,
     total_bytes: u64,
     page_count: u32,
     payload_digest: String,
@@ -238,6 +241,7 @@ pub(crate) struct UploadCoordinator {
     budget: StagingBudget,
     uploads: HashMap<RouteHandle, Upload>,
     stale_after: Duration,
+    next_generation: u64,
 }
 
 impl Default for UploadCoordinator {
@@ -246,6 +250,7 @@ impl Default for UploadCoordinator {
             budget: StagingBudget::default(),
             uploads: HashMap::new(),
             stale_after: UPLOAD_STALE_AFTER,
+            next_generation: 1,
         }
     }
 }
@@ -269,7 +274,7 @@ impl UploadCoordinator {
     fn begin(
         &mut self,
         route: RouteHandle,
-        upload: Upload,
+        mut upload: Upload,
         now: Instant,
     ) -> Result<BeginOutcome, BeginRejection> {
         self.evict_stale(now);
@@ -285,6 +290,8 @@ impl UploadCoordinator {
         if !self.budget.try_reserve(upload.total_bytes) {
             return Err(BeginRejection::QueueFull);
         }
+        upload.generation = self.next_generation;
+        self.next_generation += 1;
         self.uploads.insert(route, upload);
         Ok(BeginOutcome::Started)
     }
@@ -309,12 +316,16 @@ impl UploadCoordinator {
             .filter(|upload| upload.upload_id == upload_id)
     }
 
+    /// Whether a page at `index` may be staged, answering the generation of
+    /// the upload it would join. Decoding happens between this check and
+    /// `stage`, and a `begin` in that gap may replace the upload under the
+    /// same id; the generation is what `stage` compares to refuse the page.
     fn accepts_page(
         &self,
         route: RouteHandle,
         upload_id: &str,
         index: u32,
-    ) -> Result<(), InvalidReason> {
+    ) -> Result<u64, InvalidReason> {
         let upload = self
             .uploads
             .get(&route)
@@ -323,7 +334,7 @@ impl UploadCoordinator {
         if index >= upload.page_count {
             return Err(InvalidReason::PageIndex);
         }
-        Ok(())
+        Ok(upload.generation)
     }
 
     /// Removes the route's upload and returns its declared size to the budget.
@@ -358,12 +369,14 @@ impl UploadCoordinator {
         &mut self,
         route: RouteHandle,
         upload_id: &str,
+        generation: u64,
         index: u32,
         page: Page,
         now: Instant,
     ) -> Result<Value, InvalidReason> {
         let upload = self
             .upload_mut(route, upload_id)
+            .filter(|upload| upload.generation == generation)
             .ok_or(InvalidReason::UploadNotFound)?;
         if index >= upload.page_count {
             return Err(InvalidReason::PageIndex);
@@ -426,19 +439,23 @@ impl UploadCoordinator {
 /// worker, and a handler cancelled mid-finish would otherwise never release.
 struct StagingReservation {
     kernel: Arc<KernelOpenCoordinator>,
-    bytes: u64,
+    /// `None` once the charge has been handed back to an upload the
+    /// coordinator holds again; `release` counts a pending slot as well as
+    /// bytes, so the guard must then release nothing at all.
+    bytes: Option<u64>,
 }
 
 impl StagingReservation {
-    /// Hands the charge back to an upload the coordinator holds again.
     fn keep(mut self) {
-        self.bytes = 0;
+        self.bytes = None;
     }
 }
 
 impl Drop for StagingReservation {
     fn drop(&mut self) {
-        self.kernel.uploads().release(self.bytes);
+        if let Some(bytes) = self.bytes {
+            self.kernel.uploads().release(bytes);
+        }
     }
 }
 
@@ -525,6 +542,7 @@ impl McHandler {
         let artifact = parsed.request;
         let upload = Upload {
             upload_id: parsed.upload_id.clone(),
+            generation: 0,
             total_bytes: parsed.total_bytes,
             page_count: parsed.page_count,
             payload_digest: parsed.payload_digest,
@@ -583,13 +601,15 @@ impl McHandler {
         if parsed.bytes_base64.len() > PAGE_BASE64_BYTES_MAX {
             return state_only(KernelOutcome::invalid(InvalidReason::PageTooLarge));
         }
-        if let Err(reason) =
-            self.kernel
+        let generation =
+            match self
+                .kernel
                 .uploads()
                 .accepts_page(channel, &parsed.upload_id, parsed.index)
-        {
-            return state_only(KernelOutcome::invalid(reason));
-        }
+            {
+                Ok(generation) => generation,
+                Err(reason) => return state_only(KernelOutcome::invalid(reason)),
+            };
         // Decoding and hashing a page is CPU work proportional to the frame,
         // so it runs off the async workers and before the coordinator lock.
         let decoded = blocking(move || {
@@ -615,11 +635,14 @@ impl McHandler {
             Ok(_) => return state_only(KernelOutcome::invalid(InvalidReason::PageDigest)),
             Err(outcome) => return state_only(outcome),
         };
-        match self
-            .kernel
-            .uploads()
-            .stage(channel, &upload_id, index, page, Instant::now())
-        {
+        match self.kernel.uploads().stage(
+            channel,
+            &upload_id,
+            generation,
+            index,
+            page,
+            Instant::now(),
+        ) {
             Ok(progress) => kernel_response(&KernelOutcome::Available, progress),
             Err(reason) => state_only(KernelOutcome::invalid(reason)),
         }
@@ -648,7 +671,7 @@ impl McHandler {
         };
         let reservation = StagingReservation {
             kernel: Arc::clone(&self.kernel),
-            bytes: upload.total_bytes,
+            bytes: Some(upload.total_bytes),
         };
         let store = scope.store;
         // The reservation rides in the worker's result: a handler cancelled
@@ -701,6 +724,7 @@ mod tests {
     ) -> Upload {
         Upload {
             upload_id: id.to_string(),
+            generation: 0,
             total_bytes,
             page_count,
             payload_digest: sha256_hex(payload),
@@ -742,6 +766,11 @@ mod tests {
 
     fn started(outcome: Result<BeginOutcome, BeginRejection>) {
         assert!(matches!(outcome, Ok(BeginOutcome::Started)));
+    }
+
+    /// The live generation of the route's upload, as a page handler learns it.
+    fn generation(uploads: &UploadCoordinator, route: RouteHandle, upload_id: &str) -> u64 {
+        uploads.accepts_page(route, upload_id, 0).unwrap()
     }
 
     #[test]
@@ -819,22 +848,75 @@ mod tests {
             uploads.accepts_page(route(1), "u", 3),
             Err(InvalidReason::PageIndex)
         );
-        assert_eq!(uploads.accepts_page(route(1), "u", 2), Ok(()));
+        assert!(uploads.accepts_page(route(1), "u", 2).is_ok());
         assert_eq!(
-            uploads.stage(route(1), "other", 0, page(b"ab"), now),
+            uploads.stage(route(1), "other", 1, 0, page(b"ab"), now),
+            Err(InvalidReason::UploadNotFound)
+        );
+        // A page decoded against an earlier generation of this id is refused.
+        assert_eq!(
+            uploads.stage(
+                route(1),
+                "u",
+                generation(&uploads, route(1), "u") + 1,
+                0,
+                page(b"ab"),
+                now
+            ),
             Err(InvalidReason::UploadNotFound)
         );
         assert_eq!(
-            uploads.stage(route(1), "u", 3, page(b"ab"), now),
+            uploads.stage(
+                route(1),
+                "u",
+                generation(&uploads, route(1), "u"),
+                3,
+                page(b"ab"),
+                now
+            ),
             Err(InvalidReason::PageIndex)
         );
-        let progress = uploads.stage(route(1), "u", 2, page(b"ef"), now).unwrap();
+        let progress = uploads
+            .stage(
+                route(1),
+                "u",
+                generation(&uploads, route(1), "u"),
+                2,
+                page(b"ef"),
+                now,
+            )
+            .unwrap();
         assert_eq!(progress["received_bytes"], 2);
-        uploads.stage(route(1), "u", 0, page(b"ab"), now).unwrap();
-        let repeat = uploads.stage(route(1), "u", 0, page(b"ab"), now).unwrap();
+        uploads
+            .stage(
+                route(1),
+                "u",
+                generation(&uploads, route(1), "u"),
+                0,
+                page(b"ab"),
+                now,
+            )
+            .unwrap();
+        let repeat = uploads
+            .stage(
+                route(1),
+                "u",
+                generation(&uploads, route(1), "u"),
+                0,
+                page(b"ab"),
+                now,
+            )
+            .unwrap();
         assert_eq!(repeat["received_bytes"], 4);
         assert_eq!(
-            uploads.stage(route(1), "u", 0, page(b"xx"), now),
+            uploads.stage(
+                route(1),
+                "u",
+                generation(&uploads, route(1), "u"),
+                0,
+                page(b"xx"),
+                now
+            ),
             Err(InvalidReason::PageDigest)
         );
         assert_eq!(
@@ -842,10 +924,26 @@ mod tests {
             Err(InvalidReason::PageIndex)
         );
         assert_eq!(
-            uploads.stage(route(1), "u", 1, page(b"cde"), now),
+            uploads.stage(
+                route(1),
+                "u",
+                generation(&uploads, route(1), "u"),
+                1,
+                page(b"cde"),
+                now
+            ),
             Err(InvalidReason::PageIndex)
         );
-        uploads.stage(route(1), "u", 1, page(b"cd"), now).unwrap();
+        uploads
+            .stage(
+                route(1),
+                "u",
+                generation(&uploads, route(1), "u"),
+                1,
+                page(b"cd"),
+                now,
+            )
+            .unwrap();
         let complete = uploads.take_complete(route(1), "u").unwrap();
         assert_eq!(
             complete.pages.keys().copied().collect::<Vec<_>>(),
@@ -869,11 +967,47 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_reservation_releases_neither_bytes_nor_the_pending_slot() {
+        let kernel = Arc::new(KernelOpenCoordinator::new());
+        let now = Instant::now();
+        started(
+            kernel
+                .uploads()
+                .begin(route(1), upload("u", 2, 1, b"ab"), now),
+        );
+        let charged = |kernel: &KernelOpenCoordinator| {
+            let budget = kernel.uploads().budget();
+            (budget.total_bytes, budget.pending)
+        };
+        let guard = StagingReservation {
+            kernel: Arc::clone(&kernel),
+            bytes: Some(2),
+        };
+        guard.keep();
+        assert_eq!(charged(&kernel), (2, 1));
+        let guard = StagingReservation {
+            kernel: Arc::clone(&kernel),
+            bytes: Some(2),
+        };
+        drop(guard);
+        assert_eq!(charged(&kernel), (0, 0));
+    }
+
+    #[test]
     fn a_restored_upload_keeps_its_pages_and_yields_to_a_newer_begin() {
         let mut uploads = UploadCoordinator::default();
         let now = Instant::now();
         started(uploads.begin(route(1), upload("u", 2, 1, b"ab"), now));
-        uploads.stage(route(1), "u", 0, page(b"ab"), now).unwrap();
+        uploads
+            .stage(
+                route(1),
+                "u",
+                generation(&uploads, route(1), "u"),
+                0,
+                page(b"ab"),
+                now,
+            )
+            .unwrap();
         let complete = uploads.take_complete(route(1), "u").unwrap();
         assert!(uploads.restore(route(1), complete, now).is_none());
         assert_eq!(
@@ -904,7 +1038,16 @@ mod tests {
         let mut uploads = UploadCoordinator::default();
         let now = Instant::now();
         started(uploads.begin(route(1), upload("u", 6, 3, b"abcdef"), now));
-        uploads.stage(route(1), "u", 0, page(b"ab"), now).unwrap();
+        uploads
+            .stage(
+                route(1),
+                "u",
+                generation(&uploads, route(1), "u"),
+                0,
+                page(b"ab"),
+                now,
+            )
+            .unwrap();
 
         let resumed = uploads.begin(route(1), upload("u", 6, 3, b"abcdef"), now);
         let Ok(BeginOutcome::Resumed(progress)) = resumed else {
@@ -919,7 +1062,16 @@ mod tests {
         // The same id declaring other bytes is a replacement, not a resume.
         started(uploads.begin(route(1), upload("u", 6, 3, b"abcxyz"), now));
         assert_eq!(
-            uploads.stage(route(1), "u", 0, page(b"ax"), now).unwrap()["received_pages"],
+            uploads
+                .stage(
+                    route(1),
+                    "u",
+                    generation(&uploads, route(1), "u"),
+                    0,
+                    page(b"ax"),
+                    now
+                )
+                .unwrap()["received_pages"],
             1,
             "a retained page would have refused a different digest at index 0"
         );
@@ -933,7 +1085,7 @@ mod tests {
             uploads.accepts_page(route(1), "u", 0),
             Err(InvalidReason::UploadNotFound)
         );
-        assert_eq!(uploads.accepts_page(route(1), "v", 0), Ok(()));
+        assert!(uploads.accepts_page(route(1), "v", 0).is_ok());
     }
 
     #[test]
@@ -997,7 +1149,16 @@ mod tests {
         let began = Instant::now();
         started(uploads.begin(route(1), upload_at("u", 6, 3, b"abcdef", began), began));
         let later = began + Duration::from_secs(45);
-        uploads.stage(route(1), "u", 0, page(b"ab"), later).unwrap();
+        uploads
+            .stage(
+                route(1),
+                "u",
+                generation(&uploads, route(1), "u"),
+                0,
+                page(b"ab"),
+                later,
+            )
+            .unwrap();
         let second = began + Duration::from_secs(70);
         started(uploads.begin(route(2), upload_at("v", 4, 1, b"", second), second));
         assert_eq!(uploads.budget().pending, 2);

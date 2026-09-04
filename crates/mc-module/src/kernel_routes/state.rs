@@ -86,6 +86,9 @@ pub enum InvalidReason {
     /// A successor's `source_revision` does not exceed its predecessor's.
     /// Retrying with a higher revision can succeed.
     RevisionNotAdvanced,
+    /// A foreign scope occupies the bound project's reserved scope id.
+    /// Retrying cannot succeed until that scope is removed.
+    ScopeReserved,
     PayloadTooLarge,
     /// A staged page's bytes do not match its declared digest, or a page index
     /// was resent with different bytes.

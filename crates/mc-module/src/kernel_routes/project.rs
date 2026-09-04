@@ -5,7 +5,7 @@
 //! bound root. A row serves to a route only when its scope names that digest.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mc_kernel::{
     scope_matches, CanonicalScope, CommitIntent, Dimension, KernelError, KernelStore, MatchOutcome,
@@ -20,8 +20,10 @@ const PROJECT_SCOPE_SOURCE_KIND: &str = "kernel_route";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectBinding {
-    /// The bound root after canonicalization.
-    root: String,
+    /// The bound root after canonicalization, compared and hashed as the raw
+    /// path bytes so two roots that differ only in bytes a lossy string would
+    /// fold together stay distinct.
+    root: PathBuf,
     /// `sha256(root)`: the scope term's exact value, and the handle the scope
     /// id and the per-project operation-key prefix are built from. A path can
     /// match a secret detector and be stored as a placeholder, which would
@@ -31,15 +33,15 @@ pub struct ProjectBinding {
 
 impl ProjectBinding {
     pub(crate) fn new(root: &Path) -> Self {
-        let root = canonical_root(root).to_string_lossy().into_owned();
-        let digest = format!("{:x}", Sha256::digest(root.as_bytes()));
+        let root = canonical_root(root);
+        let digest = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
         Self { root, digest }
     }
 
     /// A request's `project_root` is compared after the same canonicalization
     /// the binding went through, so a symlinked spelling of the bound root passes.
     pub(crate) fn accepts(&self, requested: &Path) -> bool {
-        canonical_root(requested).to_string_lossy() == self.root
+        canonical_root(requested) == self.root
     }
 
     pub(crate) fn scope_id(&self) -> String {

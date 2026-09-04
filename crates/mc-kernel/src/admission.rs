@@ -2189,17 +2189,29 @@ impl KernelStore {
                     |row| row.get::<_, i64>(0),
                 )
                 .map_err(map_sqlite)?;
-            let served: HashMap<String, Sensitivity> =
+            // Hidden at `ExplicitSearch`, the widest surface, means hidden everywhere.
+            let served: HashMap<String, ServedClass> =
                 served_rows(tx, Surface::ExplicitSearch, tip, Some(&ids))?
                     .into_iter()
-                    .map(|(object, _, _)| (object.object_id, object.sensitivity))
+                    .map(|(object, visibility, _)| {
+                        (
+                            object.object_id,
+                            ServedClass {
+                                sensitivity: object.sensitivity,
+                                visibility,
+                            },
+                        )
+                    })
                     .collect();
             candidates
                 .iter()
                 .map(|(object_id, digest)| {
                     let state = load_object_state(tx, object_id)?;
-                    let served_sensitivity = served.get(object_id).copied();
+                    let served = served.get(object_id).copied();
                     let artifact = match digest {
+                        Some(digest) if !crate::cas::is_artifact_digest(digest) => {
+                            return Err(KernelError::InvalidInput);
+                        }
                         Some(digest) => Some(
                             crate::cas::egress_facts_tx(tx, digest, destination)
                                 .map_err(map_sqlite)?,
@@ -2208,7 +2220,7 @@ impl KernelStore {
                     };
                     Ok(EgressCandidate {
                         state,
-                        served_sensitivity,
+                        served,
                         artifact,
                     })
                 })
@@ -2222,12 +2234,22 @@ impl KernelStore {
 pub struct EgressCandidate {
     /// `None` when the registry has never seen the object.
     pub state: Option<ObjectState>,
-    /// The object's sensitivity as the serving view folds it from its
-    /// admission history; `None` when no admission decision serves the object,
-    /// so its class is unknown.
-    pub served_sensitivity: Option<Sensitivity>,
+    /// The serving view derives this class from the object's admission
+    /// history; `None` when no admission decision serves the object, so its
+    /// class is unknown.
+    pub served: Option<ServedClass>,
     /// Facts for the artifact the candidate named, when it named one.
     pub artifact: Option<ArtifactEgressFacts>,
+}
+
+/// The serving view's verdict on one admitted object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServedClass {
+    /// The strictest sensitivity in the object's admission history.
+    pub sensitivity: Sensitivity,
+    /// `Hidden` when no surface serves the object: admission rejected,
+    /// contradicted, or quarantined it, or its class bars every surface.
+    pub visibility: SurfaceVisibility,
 }
 
 /// Every object admitted at `requested` with its served sensitivity and the

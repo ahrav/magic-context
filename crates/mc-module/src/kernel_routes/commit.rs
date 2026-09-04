@@ -37,6 +37,9 @@ const MAX_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_OPERATIONS: usize = 256;
 /// Each token is one registry lookup inside the same writer transaction.
 const MAX_TOKENS: usize = 1024;
+/// Dependencies are summed across every observation in the request, since
+/// each one is validated and inserted inside the same writer transaction.
+pub const MAX_DEPENDENCIES: usize = 1024;
 /// Reason recorded on the admission decision of every route-written object.
 const ADMISSION_REASON: &str = "kernel.commit";
 
@@ -277,6 +280,9 @@ enum CommitFailure {
     StorageConstraint,
     /// A successor's revision did not advance past its predecessor's.
     RevisionNotAdvanced,
+    /// The store holds a scope under this project's reserved id whose terms
+    /// name a different project.
+    ScopeReserved,
 }
 
 impl From<CommitFailure> for KernelOutcome {
@@ -295,6 +301,7 @@ impl From<CommitFailure> for KernelOutcome {
             CommitFailure::OperationKeyReused => Self::invalid(InvalidReason::OperationKeyReused),
             CommitFailure::StorageConstraint => Self::invalid(InvalidReason::AlreadyExists),
             CommitFailure::RevisionNotAdvanced => Self::invalid(InvalidReason::RevisionNotAdvanced),
+            CommitFailure::ScopeReserved => Self::invalid(InvalidReason::ScopeReserved),
         }
     }
 }
@@ -348,12 +355,21 @@ fn ensure_scope(
     project: &ProjectBinding,
     domain_id: &str,
     ready: &mut bool,
+    refused: &mut Option<CommitFailure>,
 ) -> Result<(), KernelError> {
     if *ready {
         return Ok(());
     }
-    if envelope.scope_terms(&project.scope_id())?.is_none() {
-        envelope.insert_scope(project.scope_spec(domain_id))?;
+    let expected = project.scope_spec(domain_id);
+    match envelope.scope_terms(&expected.scope_id)? {
+        None => {
+            envelope.insert_scope(expected)?;
+        }
+        Some(terms) if terms == expected.terms => {}
+        Some(_) => {
+            *refused = Some(CommitFailure::ScopeReserved);
+            return Err(KernelError::Conflict);
+        }
     }
     *ready = true;
     Ok(())
@@ -380,11 +396,13 @@ fn scoped_object_state(
     Ok(state)
 }
 
+/// `refused` records why `apply` returns `KernelError::Conflict`, since the
+/// kernel raises that same error for storage constraints.
 fn apply(
     envelope: &mut Envelope<'_>,
     filter: &mut ScopeFilter,
     plan: &CommitPlan,
-    revision_stalled: &mut bool,
+    refused: &mut Option<CommitFailure>,
 ) -> Result<String, KernelError> {
     let scope_id = plan.project.scope_id();
     let mut scope_ready = false;
@@ -392,7 +410,13 @@ fn apply(
     for operation in &plan.operations {
         match operation {
             Operation::InsertDecision { spec } => {
-                ensure_scope(envelope, &plan.project, &spec.domain_id, &mut scope_ready)?;
+                ensure_scope(
+                    envelope,
+                    &plan.project,
+                    &spec.domain_id,
+                    &mut scope_ready,
+                    refused,
+                )?;
                 let spec = spec.clone().into_spec(&plan.source_kind, &scope_id);
                 let outcome = envelope.insert_decision(spec)?;
                 admit(envelope, &outcome.object_id, plan.classes)?;
@@ -402,7 +426,13 @@ fn apply(
                 replaced_object_id,
                 spec,
             } => {
-                ensure_scope(envelope, &plan.project, &spec.domain_id, &mut scope_ready)?;
+                ensure_scope(
+                    envelope,
+                    &plan.project,
+                    &spec.domain_id,
+                    &mut scope_ready,
+                    refused,
+                )?;
                 let predecessor = scoped_object_state(envelope, filter, replaced_object_id)?;
                 // A live replacement must belong to the bound project too. Its
                 // stored revision, not the spec's, is what the kernel compares.
@@ -414,10 +444,8 @@ fn apply(
                         }
                         _ => (false, spec.source_revision),
                     };
-                // The kernel refuses this as `Conflict`, the same error a storage
-                // constraint raises, so the route names the reason first.
                 if successor_revision <= predecessor.object.source_revision {
-                    *revision_stalled = true;
+                    *refused = Some(CommitFailure::RevisionNotAdvanced);
                     return Err(KernelError::Conflict);
                 }
                 let spec = spec.clone().into_spec(&plan.source_kind, &scope_id);
@@ -436,7 +464,13 @@ fn apply(
                 result.touched.push(object_id.clone());
             }
             Operation::InsertObservation { spec } => {
-                ensure_scope(envelope, &plan.project, &spec.domain_id, &mut scope_ready)?;
+                ensure_scope(
+                    envelope,
+                    &plan.project,
+                    &spec.domain_id,
+                    &mut scope_ready,
+                    refused,
+                )?;
                 // The alignment projection pairs an observation with the
                 // decision its `implements` dependency names without comparing
                 // scopes, so a foreign target would let this project alter
@@ -460,8 +494,7 @@ fn apply(
 
 fn run(store: &KernelStore, plan: CommitPlan) -> Result<CommitReceipt, CommitFailure> {
     let mut entered = false;
-    let mut token_conflict = None;
-    let mut revision_stalled = false;
+    let mut refused = None;
     let mut filter = ScopeFilter::new(&plan.project);
     let result = store.commit_before(
         Instant::now() + plan.deadline,
@@ -473,21 +506,20 @@ fn run(store: &KernelStore, plan: CommitPlan) -> Result<CommitReceipt, CommitFai
                 if let TokenCheck::Conflict(conflict) =
                     envelope.check_token(&token.object_id, token.known_as_of)?
                 {
-                    token_conflict = Some(conflict);
+                    refused = Some(CommitFailure::Token(conflict));
                     return Err(KernelError::Conflict);
                 }
             }
-            apply(envelope, &mut filter, &plan, &mut revision_stalled)
+            apply(envelope, &mut filter, &plan, &mut refused)
         },
     );
     match result {
         Ok(receipt) => Ok(receipt),
-        Err(KernelError::Conflict) => match token_conflict {
-            Some(conflict) => Err(CommitFailure::Token(conflict)),
+        Err(KernelError::Conflict) => match refused {
+            Some(failure) => Err(failure),
             // The receipt lookup runs before the operation, so a conflict
             // raised without entering it is a reused `operation_key`.
             None if !entered => Err(CommitFailure::OperationKeyReused),
-            None if revision_stalled => Err(CommitFailure::RevisionNotAdvanced),
             None => Err(CommitFailure::StorageConstraint),
         },
         Err(error) => Err(CommitFailure::Kernel(error)),
@@ -518,6 +550,19 @@ impl McHandler {
         if parsed.tokens.len() > MAX_TOKENS {
             return crate::invalid_params_error(format!(
                 "{OPERATION} carries at most {MAX_TOKENS} tokens"
+            ));
+        }
+        let dependencies: usize = parsed
+            .operations
+            .iter()
+            .map(|operation| match operation {
+                Operation::InsertObservation { spec } => spec.dependencies.len(),
+                _ => 0,
+            })
+            .sum();
+        if dependencies > MAX_DEPENDENCIES {
+            return crate::invalid_params_error(format!(
+                "{OPERATION} carries at most {MAX_DEPENDENCIES} observation dependencies"
             ));
         }
         let classes = match resolve_classes(

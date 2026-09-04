@@ -8,7 +8,7 @@ use mc_core::claim_operation::is_lower_hex;
 use mc_host::RouteHandle;
 use mc_kernel::{
     ArtifactDestination, ArtifactEligibility, EgressCandidate, KernelError, KernelStore,
-    Sensitivity,
+    Sensitivity, SurfaceVisibility,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -42,6 +42,8 @@ pub enum Verdict {
     Superseded,
     Stale,
     WrongScope,
+    /// The object is live but `kernel.read` hides it on every surface.
+    Hidden,
     ProviderSensitive,
 }
 
@@ -145,7 +147,7 @@ fn judge(
     if !filter.matches(state.scope_id.as_deref(), &mut stored_terms(store))? {
         return Ok(Verdict::WrongScope);
     }
-    let sensitive = match facts.served_sensitivity {
+    let sensitive = match facts.served.map(|served| served.sensitivity) {
         Some(Sensitivity::Secret) => true,
         Some(sensitivity) => {
             destination == ArtifactDestination::Remote && sensitivity != Sensitivity::Normal
@@ -154,6 +156,13 @@ fn judge(
     };
     if sensitive {
         return Ok(Verdict::ProviderSensitive);
+    }
+    // `kernel.read` no longer serves a hidden object; dispatch must not either.
+    if facts
+        .served
+        .is_some_and(|served| served.visibility == SurfaceVisibility::Hidden)
+    {
+        return Ok(Verdict::Hidden);
     }
     if let Some(artifact) = &facts.artifact {
         if artifact.eligibility != ArtifactEligibility::Allowed {

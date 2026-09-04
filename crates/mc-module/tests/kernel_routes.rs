@@ -1366,6 +1366,21 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
         "available",
         None,
     );
+    // A contradicted decision stays live and normal, but `kernel.read` hides it.
+    daemon
+        .commit("create-11", vec![insert_decision(11)], vec![])
+        .await;
+    store
+        .commit(intent("contradict-11"), |envelope| {
+            envelope.record_admission(admission(
+                "decision-object-11",
+                EventKind::Contradict,
+                None,
+                (SourceClass::ModelInference, TaintClass::AssistantInference),
+            ))?;
+            Ok(String::new())
+        })
+        .unwrap();
     let sensitive = store
         .ingest_artifact(ingest(
             "sensitive",
@@ -1386,6 +1401,7 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
         json!({"object_id": "decision-object-8", "source_revision": 8}),
         json!({"object_id": "decision-object-9", "source_revision": 9}),
         json!({"object_id": "decision-object-10", "source_revision": 10}),
+        json!({"object_id": "decision-object-11", "source_revision": 11}),
     ];
     let request = eligibility_request(&daemon.project, "remote", candidates.clone());
     let first = daemon.call(daemon.route, request.clone()).await;
@@ -1405,14 +1421,15 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
             ("decision-object-8", "provider_sensitive"),
             ("decision-object-9", "provider_sensitive"),
             ("decision-object-10", "provider_sensitive"),
+            ("decision-object-11", "hidden"),
         ]
         .map(|(id, verdict)| (id.to_string(), verdict.to_string()))
     );
-    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 10);
+    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 11);
 
     // Same tip, same candidates: every verdict comes from the cache.
     let second = daemon.call(daemon.route, request.clone()).await;
-    assert_eq!(second["cache_hits"], 10);
+    assert_eq!(second["cache_hits"], 11);
     assert_eq!(verdicts(&second), verdicts(&first));
     // An oversized id or a malformed digest never reaches the cache.
     for candidate in [
@@ -1431,7 +1448,7 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
             PreparedOutcome::Error { code, .. } if code == "invalid_params"
         ));
     }
-    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 10);
+    assert_eq!(daemon.handler.eligibility_cache_len_for_test(), 11);
     // A different declared revision is a different key and a different verdict.
     let revised = daemon
         .call(
@@ -1458,6 +1475,8 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
     assert_eq!(verdicts(&local)[7].1, "provider_sensitive");
     assert_eq!(verdicts(&local)[8].1, "ok");
     assert_eq!(verdicts(&local)[9].1, "ok");
+    // A hidden object is refused locally as well.
+    assert_eq!(verdicts(&local)[10].1, "hidden");
 
     // Retiring the `ok` candidate moves the tip, so the old entries stop matching.
     daemon
@@ -2376,6 +2395,70 @@ async fn a_write_naming_an_existing_id_is_already_exists_not_a_retryable_conflic
         )
         .await;
     assert_state(&advanced, "available", None);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_foreign_scope_holding_the_reserved_project_id_refuses_every_write() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    let root = daemon.project.canonicalize().unwrap();
+    let reserved = format!("project:{}", digest(&root.to_string_lossy()));
+    store
+        .commit(intent("squat"), |envelope| {
+            envelope.insert_scope(ScopeSpec {
+                scope_id: reserved.clone(),
+                object_id: reserved.clone(),
+                domain_id: DOMAIN.to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "squat".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+                terms: vec![ScopeTermSpec {
+                    dimension: "project".to_string(),
+                    operator: "exact".to_string(),
+                    exact_value: Some(digest("another-project")),
+                    ..ScopeTermSpec::default()
+                }],
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let tip = daemon.tip();
+    let refused = daemon
+        .commit("write", vec![insert_decision(1)], vec![])
+        .await;
+    assert_state(&refused, "invalid", Some("scope_reserved"));
+    assert_eq!(daemon.tip(), tip);
+    assert!(!is_live(&store, "decision-object-1"));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_request_over_the_dependency_cap_is_refused_before_the_writer() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let dependency =
+        json!({"dependency_object_id": "decision-object-1", "dependency_kind": "relates_to"});
+    let mut observation = observation_depending(1, "decision-object-1", "relates_to");
+    observation["spec"]["dependencies"] = json!(vec![
+        dependency;
+        mc_module::kernel_routes::commit::MAX_DEPENDENCIES
+            + 1
+    ]);
+    let tip = daemon.tip();
+    assert!(matches!(
+        daemon
+            .handler
+            .dispatch_value_for_test(
+                daemon.route,
+                commit_request(&daemon.project, "too-many", vec![observation], vec![]),
+            )
+            .await,
+        PreparedOutcome::Error { code, .. } if code == "invalid_params"
+    ));
+    assert_eq!(daemon.tip(), tip);
     daemon.handler.shutdown().await.unwrap();
 }
 

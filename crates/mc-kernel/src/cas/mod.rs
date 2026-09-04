@@ -454,7 +454,7 @@ pub(super) fn read_capped(source: impl std::io::Read) -> std::io::Result<Option<
     Ok(Some(bytes))
 }
 
-pub(super) fn is_artifact_digest(value: &str) -> bool {
+pub(crate) fn is_artifact_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
