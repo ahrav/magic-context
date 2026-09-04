@@ -57,8 +57,10 @@ impl KernelStore {
     ///
     /// Returns [`KernelError::InvalidInput`] for a negative sequence,
     /// [`KernelError::FutureSnapshot`] when `requested` exceeds the transaction's current tip,
-    /// [`KernelError::CorruptCanonicalRow`] for invalid stored JSON payloads, and
-    /// [`KernelError::Io`] for lock, SQLite, conversion, or commit failures.
+    /// [`KernelError::CorruptCanonicalRow`] for invalid stored JSON payloads,
+    /// the SQLite classification (`Busy`, `Conflict`, `Io`) for a row that
+    /// fails while being read, and [`KernelError::Io`] for lock, statement, or
+    /// commit failures.
     pub fn slice_as_of(&self, requested: i64) -> Result<SliceSnapshot, KernelError> {
         let mut reader = self.lock_reader()?;
         let tx = reader
@@ -78,8 +80,10 @@ impl KernelStore {
     ///
     /// Returns [`KernelError::InvalidInput`] for a negative sequence,
     /// [`KernelError::FutureSnapshot`] when `requested` exceeds the transaction's current tip,
-    /// [`KernelError::CorruptCanonicalRow`] for invalid stored JSON payloads, and
-    /// [`KernelError::Io`] for lock, SQLite, conversion, or commit failures.
+    /// [`KernelError::CorruptCanonicalRow`] for invalid stored JSON payloads,
+    /// the SQLite classification (`Busy`, `Conflict`, `Io`) for a row that
+    /// fails while being read, and [`KernelError::Io`] for lock, statement, or
+    /// commit failures.
     pub fn decisions_for_objects_as_of(
         &self,
         object_ids: &[String],
@@ -335,6 +339,6 @@ fn classify_row_error(error: rusqlite::Error) -> KernelError {
         {
             KernelError::CorruptCanonicalRow
         }
-        _ => KernelError::Io,
+        _ => crate::map_sqlite(error),
     }
 }

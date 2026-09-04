@@ -972,3 +972,53 @@ fn supersede_decision_refuses_a_quarantined_predecessor() {
         .unwrap_err();
     assert_eq!(missing, KernelError::NotFound);
 }
+
+/// A supersession whose replacement is already live folds the predecessor
+/// into that survivor, so the survivor's lineage is judged as well.
+#[test]
+fn a_fold_refuses_a_quarantined_survivor() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    seed_domain(&store);
+    store
+        .commit(intent("seed", '1'), |envelope| {
+            envelope.insert_decision(decision(1))?;
+            envelope.insert_decision(decision(2))?;
+            envelope.insert_decision(decision(3))?;
+            envelope
+                .record_admission(subject_request("decision-object-3", EventKind::Quarantine))?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    // The survivor's revision advances past the predecessor's, so only the
+    // lineage guard stands between this fold and the write.
+    let barred_survivor = store
+        .commit(intent("fold-into-quarantined", '2'), |envelope| {
+            envelope.supersede_decision("decision-object-2", decision(3))?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(barred_survivor, KernelError::AdmissionPolicy);
+    assert_eq!(
+        inspect_i64(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE invalidated_commit_seq IS NOT NULL OR superseded_by IS NOT NULL"
+        ),
+        0
+    );
+
+    store
+        .commit(intent("fold", '3'), |envelope| {
+            envelope.supersede_decision("decision-object-1", decision(2))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_i64(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE object_id = 'decision-object-1' AND superseded_by = 'decision-object-2'"
+        ),
+        1
+    );
+}

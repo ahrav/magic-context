@@ -206,6 +206,35 @@ pub enum ArtifactErrorKind {
     PurgeUnlinkPending,
 }
 
+impl ArtifactErrorKind {
+    /// Every variant, in declaration order, so consumers can prove they map
+    /// each one. Adding a variant fails `all_names_every_variant_once` to
+    /// compile until its match is extended, which is where this list is
+    /// revisited.
+    pub const ALL: &'static [Self] = &[
+        Self::PayloadTooLarge,
+        Self::Capacity,
+        Self::StorageExhausted,
+        Self::IngestionFailClosed,
+        Self::ReAdmissionBlocked,
+        Self::MissingObject,
+        Self::CorruptObject,
+        Self::ReferenceUnavailable,
+        Self::ReferenceCommit,
+        Self::AlignmentRebuild,
+        Self::ReclaimInProgress,
+        Self::UnredactableSecret,
+        Self::ScanIncomplete,
+        Self::DetectionLimit,
+        Self::TextFieldTooLong,
+        Self::InvalidInput,
+        Self::OperationKeyReused,
+        Self::StorageConstraint,
+        Self::PurgeIntent,
+        Self::PurgeUnlinkPending,
+    ];
+}
+
 /// Bounded artifact failure with optional capacity or digest context.
 ///
 /// Display and debug output expose no payload bytes.
@@ -472,6 +501,44 @@ pub(crate) fn is_artifact_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod error_kind_tests {
+    use super::ArtifactErrorKind;
+
+    #[test]
+    fn all_names_every_variant_once() {
+        for kind in ArtifactErrorKind::ALL {
+            // The wildcard-free match forces a new arm, and with it a review
+            // of `ALL`, whenever a variant is added.
+            match kind {
+                ArtifactErrorKind::PayloadTooLarge
+                | ArtifactErrorKind::Capacity
+                | ArtifactErrorKind::StorageExhausted
+                | ArtifactErrorKind::IngestionFailClosed
+                | ArtifactErrorKind::ReAdmissionBlocked
+                | ArtifactErrorKind::MissingObject
+                | ArtifactErrorKind::CorruptObject
+                | ArtifactErrorKind::ReferenceUnavailable
+                | ArtifactErrorKind::ReferenceCommit
+                | ArtifactErrorKind::AlignmentRebuild
+                | ArtifactErrorKind::ReclaimInProgress
+                | ArtifactErrorKind::UnredactableSecret
+                | ArtifactErrorKind::ScanIncomplete
+                | ArtifactErrorKind::DetectionLimit
+                | ArtifactErrorKind::TextFieldTooLong
+                | ArtifactErrorKind::InvalidInput
+                | ArtifactErrorKind::OperationKeyReused
+                | ArtifactErrorKind::StorageConstraint
+                | ArtifactErrorKind::PurgeIntent
+                | ArtifactErrorKind::PurgeUnlinkPending => {}
+            }
+        }
+        for (index, kind) in ArtifactErrorKind::ALL.iter().enumerate() {
+            assert!(!ArtifactErrorKind::ALL[..index].contains(kind));
+        }
+    }
 }
 
 #[cfg(test)]

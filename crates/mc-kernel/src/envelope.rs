@@ -49,7 +49,9 @@ impl Sensitivity {
         }
     }
 
-    pub(super) fn restrictive(self, other: Self) -> Self {
+    /// The stricter of two labels; a successor never relabels its
+    /// predecessor's content below the label it was admitted under.
+    pub fn restrictive(self, other: Self) -> Self {
         match (self, other) {
             (Self::Secret, _) | (_, Self::Secret) => Self::Secret,
             (Self::Sensitive, _) | (_, Self::Sensitive) => Self::Sensitive,

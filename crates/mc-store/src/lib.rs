@@ -7436,8 +7436,7 @@ impl McStore {
         session_id: &str,
         after_state_read: impl FnOnce(),
     ) -> Result<TransformSnapshot, McStoreError> {
-        let snapshot = self.inner.with_conn(|conn| {
-            let transaction = conn;
+        let snapshot = self.inner.with_conn(|transaction| {
             let cache_state_started_at = Instant::now();
             let state = transaction
                 .query_row(CACHE_STATE_FULL_SELECT, params![session_id], |row| {
@@ -7563,8 +7562,7 @@ impl McStore {
         session_id: &str,
         compartment_page: Option<(i64, usize)>,
     ) -> Result<SessionStatusSnapshot, McStoreError> {
-        let snapshot = self.inner.with_conn(|conn| {
-            let transaction = conn;
+        let snapshot = self.inner.with_conn(|transaction| {
             let state = transaction
                 .query_row(CACHE_STATE_FULL_SELECT, params![session_id], |row| {
                     Ok((
@@ -11366,8 +11364,7 @@ impl McStore {
         session_id: &str,
     ) -> Result<M1RevisionSnapshot, McStoreError> {
         self.inner
-            .with_conn(|conn| {
-                let transaction = conn;
+            .with_conn(|transaction| {
                 let max_compartment_seq = transaction.query_row(
                     "SELECT COALESCE(MAX(sequence), 0) FROM mc_compartments WHERE session_id = ?1",
                     params![session_id],
@@ -17544,6 +17541,37 @@ mod tests {
             prepare_json_content_preserving_identities(r#"{"block_ids":["password=legacy-id"]}"#)
                 .unwrap();
         assert_eq!(inherited, r#"{"block_ids":["password=legacy-id"]}"#);
+    }
+
+    /// Session teardown deletes from every non-backend table that carries a
+    /// `session_id` column; the backend's `cortexkit_%` tables are skipped by
+    /// name, which is sound only while none of them holds session rows.
+    #[test]
+    fn backend_tables_carry_no_session_id_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        drop(McStore::open(&descriptor(dir.path())).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let backend_tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'cortexkit_%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!backend_tables.is_empty());
+        for table in backend_tables {
+            let has_session_id: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'session_id')",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!has_session_id, "{table} carries a session_id column");
+        }
     }
 
     /// The transaction, not an earlier read, decides whether `session_id` is a new identity.

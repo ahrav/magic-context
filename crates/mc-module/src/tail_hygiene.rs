@@ -6,6 +6,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+use base64::Engine;
 use mc_core::CoreState;
 use mc_store::{
     CkOutputKind, McTagRow, MediaBlock, MediaKind, ResultBlockKind, TailHygieneBaseline,
@@ -101,36 +103,21 @@ fn media_content(media: &MediaBlock) -> String {
         .unwrap_or_else(|| serde_json::to_string(&media.source).unwrap_or_default())
 }
 
+/// Standard alphabet, indifferent to padding and to non-zero trailing bits:
+/// the TypeScript reference decodes the same prefix through `atob`, which
+/// accepts both, and the two estimators agree on whitespace-free payloads.
+const PREVIEW_BASE64: GeneralPurpose = GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    GeneralPurposeConfig::new()
+        .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+        .with_decode_allow_trailing_bits(true),
+);
+
+/// Decodes the first 512 base64 characters, enough to hold every image
+/// header the dimension parsers read.
 fn decode_base64_preview(payload: &str) -> Option<Vec<u8>> {
-    let mut output = Vec::with_capacity(payload.len() * 3 / 4);
-    let mut quartet = [0u8; 4];
-    let mut filled = 0usize;
-    for byte in payload.bytes().take(512) {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => break,
-            _ => return None,
-        };
-        quartet[filled] = value;
-        filled += 1;
-        if filled == 4 {
-            output.push((quartet[0] << 2) | (quartet[1] >> 4));
-            output.push((quartet[1] << 4) | (quartet[2] >> 2));
-            output.push((quartet[2] << 6) | quartet[3]);
-            filled = 0;
-        }
-    }
-    if filled >= 2 {
-        output.push((quartet[0] << 2) | (quartet[1] >> 4));
-    }
-    if filled >= 3 {
-        output.push((quartet[1] << 4) | (quartet[2] >> 2));
-    }
-    Some(output)
+    let bytes = payload.as_bytes();
+    PREVIEW_BASE64.decode(&bytes[..bytes.len().min(512)]).ok()
 }
 
 fn image_dimensions(header: &str, bytes: &[u8]) -> Option<(u64, u64)> {

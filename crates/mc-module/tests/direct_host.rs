@@ -7,6 +7,7 @@ use std::fs;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use mc_host::TargetKind;
 use mc_store::{McStore, StoredCompartment};
 use serde_json::{json, Value};
@@ -16,26 +17,7 @@ use support::direct_host::{
 };
 
 fn base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let value = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        encoded.push(TABLE[((value >> 18) & 0x3f) as usize] as char);
-        encoded.push(TABLE[((value >> 12) & 0x3f) as usize] as char);
-        encoded.push(if chunk.len() > 1 {
-            TABLE[((value >> 6) & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-        encoded.push(if chunk.len() > 2 {
-            TABLE[(value & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-    }
-    encoded
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 fn redaction_forms(publication: &str) -> Vec<String> {
