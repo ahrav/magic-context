@@ -109,8 +109,9 @@ describe("removeNamedOutput", () => {
             [...common, "--out", artifacts],
             [...common, "--out", join(root, "freeze", "manifest.json")],
             [...common, "--policies", root, "--out", join(root, "anything.json")],
+            [...common, "--baseline", join(root, "safe.json"), "--baseline", baseline, "--out", baseline],
         ]) {
-            expect(() => parseArgs(argv, "/root")).toThrow(/--out must not name an input/);
+            expect(() => parseArgs(argv, "/root")).toThrow(/--out must not name an input|given twice/);
             removeNamedOutput(argv, "/root");
         }
         expect(existsSync(baseline)).toBe(true);

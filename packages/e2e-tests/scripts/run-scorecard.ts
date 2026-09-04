@@ -28,15 +28,16 @@ function helpRequested(argv: readonly string[]): boolean {
     return argv.includes("--help") || argv.includes("-h");
 }
 
-/** The files and directories a run reads, resolved from whichever flags are present plus the defaults. */
-function inputPaths(values: ReadonlyMap<string, string>, root: string): string[] {
-    return [
-        values.get("--freeze"),
-        values.get("--artifacts"),
-        values.get("--baseline"),
-        values.get("--policies") ?? join(root, "prospective-holdout", "policies"),
-        values.get("--paired-delta-policy") ?? join(root, "pools", "paired-delta-policy.json"),
-    ].filter((path): path is string => path !== undefined).map((path) => resolve(path));
+const INPUT_FLAGS = ["--freeze", "--artifacts", "--baseline", "--policies", "--paired-delta-policy"] as const;
+const INPUT_DEFAULTS = (root: string): Record<string, string> => ({
+    "--policies": join(root, "prospective-holdout", "policies"),
+    "--paired-delta-policy": join(root, "pools", "paired-delta-policy.json"),
+});
+
+/** The files and directories a run reads: every value given for an input flag, plus the defaults for flags not given. */
+function inputPaths(values: ReadonlyMap<string, readonly string[]>, root: string): string[] {
+    const defaults = INPUT_DEFAULTS(root);
+    return INPUT_FLAGS.flatMap((flag) => values.get(flag) ?? (defaults[flag] === undefined ? [] : [defaults[flag]])).map((path) => resolve(path));
 }
 
 /** Whether `out` names an input or lies inside an input directory; the run deletes `out` before reading. */
@@ -66,7 +67,9 @@ export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): Par
     const freezeFingerprint = required("--freeze-fingerprint");
     if (!HEX64_RE.test(freezeFingerprint)) throw new Error("--freeze-fingerprint must be the lowercase hex64 fingerprint recorded in the trusted manifest registry");
     const out = resolve(required("--out"));
-    if (overlapsInput(out, inputPaths(values, root))) throw new Error("--out must not name an input or lie inside an input directory");
+    if (overlapsInput(out, inputPaths(new Map([...values].map(([flag, value]) => [flag, [value]])), root))) {
+        throw new Error("--out must not name an input or lie inside an input directory");
+    }
     const policiesDir = resolve(values.get("--policies") ?? join(root, "prospective-holdout", "policies"));
     const baseline = values.get("--baseline");
     return {
@@ -92,10 +95,11 @@ export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): Par
  */
 export function removeNamedOutput(argv: readonly string[], root: string = E2E_ROOT): void {
     if (helpRequested(argv)) return;
-    const values = new Map<string, string>();
+    // Every value of a repeated input flag is protected: the parser refuses the duplicate, and the stale report may be the second.
+    const values = new Map<string, string[]>();
     for (const [index, flag] of argv.entries()) {
         const value = argv[index + 1];
-        if (flag.startsWith("--") && value !== undefined && !value.startsWith("--") && !values.has(flag)) values.set(flag, value);
+        if (flag.startsWith("--") && value !== undefined && !value.startsWith("--")) values.set(flag, [...(values.get(flag) ?? []), value]);
     }
     const inputs = inputPaths(values, root);
     // Every value, not the first: a duplicate flag is refused by the parser, and the stale report may sit at the second.
