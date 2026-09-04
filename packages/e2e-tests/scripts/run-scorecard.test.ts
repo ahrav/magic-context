@@ -89,6 +89,9 @@ describe("removeNamedOutput", () => {
         removeNamedOutput([]);
         removeNamedOutput(["--help", "--out", out]);
         removeNamedOutput(["--out", out, "-h"]);
+        // A lost value shifts `--out` into a value slot; the cleanup reads flag slots only, as the parser does.
+        removeNamedOutput(["--freeze", "--out", out]);
+        removeNamedOutput(["--freeze", "f", "--freeze-fingerprint", "--out", out, "--artifacts"]);
         expect(existsSync(out)).toBe(true);
     });
 

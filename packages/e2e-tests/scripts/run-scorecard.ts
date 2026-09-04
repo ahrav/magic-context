@@ -48,12 +48,17 @@ function overlapsInput(out: string, inputs: readonly string[]): boolean {
     });
 }
 
+/** The one tokenization both the parser and the pre-parse cleanup read: alternating flag and value slots. */
+function flagPairs(argv: readonly string[]): { flag: string; value: string | undefined }[] {
+    const pairs: { flag: string; value: string | undefined }[] = [];
+    for (let index = 0; index < argv.length; index += 2) pairs.push({ flag: argv[index]!, value: argv[index + 1] });
+    return pairs;
+}
+
 export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): ParsedArgs {
     if (helpRequested(argv)) return HELP_REQUESTED;
     const values = new Map<string, string>();
-    for (let index = 0; index < argv.length; index += 2) {
-        const flag = argv[index]!;
-        const value = argv[index + 1];
+    for (const { flag, value } of flagPairs(argv)) {
         if (!KNOWN_FLAGS.includes(flag)) throw new Error(`unknown argument: ${flag}\n${USAGE}`);
         if (value === undefined || value.startsWith("--")) throw new Error(`${flag} requires a value\n${USAGE}`);
         if (values.has(flag)) throw new Error(`${flag} given twice`);
@@ -95,17 +100,14 @@ export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): Par
  */
 export function removeNamedOutput(argv: readonly string[], root: string = E2E_ROOT): void {
     if (helpRequested(argv)) return;
-    // Every value of a repeated input flag is protected: the parser refuses the duplicate, and the stale report may be the second.
+    // Only a flag slot names an output or an input; a misaligned invocation puts `--out` in a value slot and removes nothing.
+    // Every value of a repeated flag counts: the parser refuses the duplicate, and the stale report may sit at the second.
     const values = new Map<string, string[]>();
-    for (const [index, flag] of argv.entries()) {
-        const value = argv[index + 1];
-        if (flag.startsWith("--") && value !== undefined && !value.startsWith("--")) values.set(flag, [...(values.get(flag) ?? []), value]);
+    for (const { flag, value } of flagPairs(argv)) {
+        if (KNOWN_FLAGS.includes(flag) && value !== undefined && !value.startsWith("--")) values.set(flag, [...(values.get(flag) ?? []), value]);
     }
     const inputs = inputPaths(values, root);
-    // Every value, not the first: a duplicate flag is refused by the parser, and the stale report may sit at the second.
-    for (const [index, flag] of argv.entries()) {
-        const value = argv[index + 1];
-        if (flag !== "--out" || value === undefined || value.startsWith("--")) continue;
+    for (const value of values.get("--out") ?? []) {
         const out = resolve(value);
         if (!overlapsInput(out, inputs)) rmSync(out, { force: true });
     }

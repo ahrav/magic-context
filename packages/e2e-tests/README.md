@@ -302,7 +302,9 @@ is parsed, so an archived report that embeds an absolute path or an XML manifest
 lowers its lane to `schema-mismatch` with `privacy-rejected`.
 
 **Exit codes.** `2` when any gate is non-passing, the run was refused
-(`policy-not-frozen`, `privacy-rejected`), or usage was requested or malformed;
+(`policy-not-frozen`, `privacy-rejected`), or usage was requested or malformed
+(`--help` shares this code so a stray help flag in CI can never read as a
+promotion);
 `1` when `outcome.promotionAllowed` is false for any other reason: evidence is
 incomplete, the policy pins a baseline the run cannot compare against
 (`baseline-not-comparable`), or blocking regressions exceed the tolerance; `0`
