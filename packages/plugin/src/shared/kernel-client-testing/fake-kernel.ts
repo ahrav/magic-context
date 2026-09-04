@@ -235,7 +235,8 @@ export class FakeKernel {
                     created_commit_seq: seq,
                     invalidated_commit_seq: null,
                     superseded_by: null,
-                    sensitivity: "normal",
+                    // The daemon defaults an omitted spec sensitivity to `normal`.
+                    sensitivity: (spec.sensitivity as FakeObject["sensitivity"]) ?? "normal",
                     labeled: true,
                     decision: { decision_kind: spec.decision_kind as string, payload },
                 });

@@ -4,7 +4,13 @@ import { ANTI_MEMORY_CATEGORY } from "../../features/magic-context/memory/consta
 import * as searchModule from "../../features/magic-context/search";
 import { getAutoSearchHintDecisions } from "../../features/magic-context/storage-meta-persisted";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
-import { KernelClient, type KernelClientResolver, unavailable } from "../../shared/kernel-client";
+import {
+    cancelled,
+    invalid,
+    KernelClient,
+    type KernelClientResolver,
+    unavailable,
+} from "../../shared/kernel-client";
 import { FakeKernel, FakeKernelTransport } from "../../shared/kernel-client-testing/fake-kernel";
 import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -144,6 +150,8 @@ describe("auto-search-runner", () => {
             "memory-abstained",
         ],
         ["unavailable", unavailable("store_busy"), "memory-unavailable"],
+        ["invalid", invalid("unrecognized_state"), "memory-unavailable"],
+        ["cancelled", cancelled(), "memory-unavailable"],
     ] as const)("a %s kernel persists a typed no-hint reason and appends nothing", async (_label, state, reason) => {
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
         const { kernel, kernelClient } = kernelHarness();

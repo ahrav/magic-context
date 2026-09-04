@@ -351,6 +351,120 @@ describe("ctx_memory lifecycle and merge", () => {
     });
 });
 
+describe("ctx_memory merge category and sensitivity fences", () => {
+    test("merge refuses predecessors from different categories before any commit", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        kernel.seedDecision({ object_id: "mem_b", decision_kind: "CONSTRAINTS", summary: "B." });
+        const tool = harness(kernel);
+        expect(
+            await tool.execute(
+                { action: "merge", objectIds: ["mem_a", "mem_b"], content: "AB." },
+                "call-merge-cross-category",
+            ),
+        ).toBe(
+            "Error: merge targets span categories (ARCHITECTURE, CONSTRAINTS); one survivor cannot replace facts from different categories. Merge same-category memories only.",
+        );
+        expect(tool.transport.methods()).not.toContain("kernel.commit");
+        expect(kernel.objects.get("mem_a")?.invalidated_commit_seq).toBeNull();
+        expect(kernel.objects.get("mem_b")?.invalidated_commit_seq).toBeNull();
+    });
+
+    test("merge refuses folding anti-memories into a positive survivor", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: "mem_r1",
+            decision_kind: "REJECTED_APPROACH",
+            summary: "Trigger: retries. Rejected strategy: unbounded retry loop.",
+        });
+        kernel.seedDecision({
+            object_id: "mem_r2",
+            decision_kind: "REJECTED_APPROACH",
+            summary: "Trigger: caching. Rejected strategy: cache without invalidation.",
+        });
+        const tool = harness(kernel);
+        expect(
+            await tool.execute(
+                {
+                    action: "merge",
+                    objectIds: ["mem_r1", "mem_r2"],
+                    category: "ARCHITECTURE",
+                    content: "Do retries and caching.",
+                },
+                "call-merge-anti-to-positive",
+            ),
+        ).toBe(
+            "Error: merge cannot fold REJECTED_APPROACH memories into a positive survivor; the negation would be lost",
+        );
+        expect(tool.transport.methods()).not.toContain("kernel.commit");
+    });
+
+    test("merge refuses folding positive memories into an anti-memory survivor", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        kernel.seedDecision({ object_id: "mem_b", decision_kind: "ARCHITECTURE", summary: "B." });
+        const tool = harness(kernel);
+        expect(
+            await tool.execute(
+                {
+                    action: "merge",
+                    objectIds: ["mem_a", "mem_b"],
+                    category: "REJECTED_APPROACH",
+                    antiMemory: {
+                        trigger: "merging",
+                        rejectedStrategy: "merging positives",
+                        rejectionReason: "positives are not rejections",
+                    },
+                },
+                "call-merge-positive-to-anti",
+            ),
+        ).toBe("Error: merge cannot fold positive memories into an anti-memory survivor");
+        expect(tool.transport.methods()).not.toContain("kernel.commit");
+    });
+
+    test("the merge survivor carries the strictest predecessor sensitivity", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        kernel.seedDecision({
+            object_id: "mem_b",
+            decision_kind: "ARCHITECTURE",
+            summary: "B.",
+            sensitivity: "sensitive",
+        });
+        const tool = harness(kernel);
+        const merged = parseJson<CommitJson>(
+            await tool.execute(
+                { action: "merge", objectIds: ["mem_a", "mem_b"], content: "A and B." },
+                "call-merge-sensitive",
+            ),
+        );
+        expect(merged.outcome).toBe("applied");
+        expect(kernel.objects.get(merged.objectId as string)?.sensitivity).toBe("sensitive");
+        const commit = tool.transport.calls.find((call) => call.method === "kernel.commit")
+            ?.body as { operations: Array<{ spec: { sensitivity?: string } }> };
+        expect(commit.operations.every((op) => op.spec.sensitivity === "sensitive")).toBeTrue();
+    });
+
+    test("revise inherits the predecessor's sensitivity instead of resetting to normal", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: "mem_s",
+            decision_kind: "ARCHITECTURE",
+            summary: "S.",
+            sensitivity: "sensitive",
+        });
+        const tool = harness(kernel);
+        const revised = parseJson<CommitJson>(
+            await tool.execute(
+                { action: "revise", objectId: "mem_s", content: "S2." },
+                "call-revise-sensitive",
+            ),
+        );
+        expect(revised.outcome).toBe("applied");
+        expect(kernel.objects.get(revised.objectId as string)?.sensitivity).toBe("sensitive");
+    });
+});
+
 describe("ctx_memory domain fence and lineage", () => {
     test("a decision outside the memory domain is invisible and cannot be archived", async () => {
         const kernel = new FakeKernel();
@@ -557,7 +671,7 @@ describe("ctx_memory anti-memory", () => {
         });
         kernel.seedDecision({
             object_id: "mem_second_in_store",
-            decision_kind: "CONSTRAINTS",
+            decision_kind: "ARCHITECTURE",
             summary: "Stored later.",
             rationale: "why",
         });
@@ -569,7 +683,7 @@ describe("ctx_memory anti-memory", () => {
             ),
         );
         const survivor = kernel.objects.get(merged.objectId as string);
-        expect(survivor?.decision?.decision_kind).toBe("CONSTRAINTS");
+        expect(survivor?.decision?.decision_kind).toBe("ARCHITECTURE");
         expect(survivor?.decision?.payload.summary).toBe("Stored later.");
         expect(survivor?.decision?.payload.rationale).toBe("why");
     });

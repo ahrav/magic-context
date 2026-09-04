@@ -8,6 +8,7 @@ import type { Database } from "../../shared/sqlite";
 import {
     CLAIM_LANE_IMPORT_SOURCE_ID,
     claimLaneImportDone,
+    claimLaneImportGeneration,
     importClaimLaneMemories,
     importedObjectId,
     listClaimLaneMemories,
@@ -268,6 +269,52 @@ describe("claim-lane import", () => {
             "Fact from a failed promotion.",
         );
         resetClaimLaneImportScheduleForTest();
+    });
+
+    test("a marker reset during an in-flight import fences the stale done write", async () => {
+        const { db, kernel, client } = harness();
+        seedClaim(db, PROJECT, "a", "Own claim A.");
+        // The reset lands while the importer awaits its commit: after the
+        // claims snapshot, before the done write.
+        kernel.beforeCommit = () => {
+            resetClaimLaneImportMarker(db, PROJECT, ROOT);
+            kernel.beforeCommit = null;
+        };
+        expect(
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
+        ).toBe("deferred");
+        // The stale run committed its batch but must not mark the replay done.
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(false);
+        expect(kernel.liveRows()).toHaveLength(1);
+
+        // A claim that arrives after the reset migrates on the next run.
+        seedClaim(db, PROJECT, "b", "Fact from a failed promotion.");
+        expect(
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
+        ).toBe("done");
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
+        expect(kernel.liveRows()).toHaveLength(2);
+    });
+
+    test("a reset between runs bumps the generation so an old-generation done write is ignored", () => {
+        const { db } = harness();
+        expect(claimLaneImportGeneration(db, PROJECT, ROOT)).toBe(0);
+        resetClaimLaneImportMarker(db, PROJECT, ROOT);
+        expect(claimLaneImportGeneration(db, PROJECT, ROOT)).toBe(1);
+        resetClaimLaneImportMarker(db, PROJECT, ROOT);
+        expect(claimLaneImportGeneration(db, PROJECT, ROOT)).toBe(2);
     });
 
     test("two checkouts sharing a root-commit identity each import into their own kernel scope", async () => {

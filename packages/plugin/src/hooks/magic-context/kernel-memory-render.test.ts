@@ -192,3 +192,40 @@ describe("serving-policy gating on automatic reads", () => {
         expect(block).toBe("");
     });
 });
+
+describe("category tag safety", () => {
+    test("a taxonomy category renders as its own element", () => {
+        const kernel = seededKernel([{ id: "a", summary: "always run focused tests" }]);
+        const snapshot = kernel.snapshot();
+        const block = renderKernelMemoryBlock(memoryRows(snapshot), snapshot.state);
+        expect(block).toContain("<PROJECT_RULES>");
+        expect(block).toContain("</PROJECT_RULES>");
+    });
+
+    test("a decision kind that is not a legal XML name rides as an escaped attribute", () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: `mem_${"e".repeat(32)}`,
+            decision_kind: 'build rules/<"legacy">',
+            summary: "a legacy-kind memory",
+        });
+        const snapshot = kernel.snapshot();
+        const block = renderKernelMemoryBlock(memoryRows(snapshot), snapshot.state);
+        expect(block).toContain('<memory-category name="build rules/&lt;&quot;legacy&quot;&gt;">');
+        expect(block).toContain("</memory-category>");
+        expect(block).not.toContain("<build rules");
+        expect(block).toContain("a legacy-kind memory");
+    });
+
+    test("trimming budgets the safe tag form for an illegal-name category", () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: `mem_${"f".repeat(32)}`,
+            decision_kind: "build rules",
+            summary: "a legacy-kind memory",
+        });
+        const rows = memoryRows(kernel.snapshot());
+        expect(trimKernelRowsToBudget(rows, 0)).toEqual([]);
+        expect(trimKernelRowsToBudget(rows, 10_000)).toEqual(rows);
+    });
+});

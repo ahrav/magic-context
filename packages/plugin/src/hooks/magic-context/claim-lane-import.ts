@@ -40,6 +40,26 @@ function markerKey(projectPath: string, projectRoot: string): string {
     return `${MARKER_PREFIX}${sha256Hex(`${projectPath}\u001f${projectRoot}`).slice(0, 32)}`;
 }
 
+/** The reset counter the done marker is fenced by; `resetClaimLaneImportMarker` bumps it so an importer that started before the reset cannot mark the replay done. commentlint: allow(JUDGE) */
+const GENERATION_PREFIX = "kernel_claim_lane_import_gen:";
+
+function generationKey(projectPath: string, projectRoot: string): string {
+    return `${GENERATION_PREFIX}${sha256Hex(`${projectPath}\u001f${projectRoot}`).slice(0, 32)}`;
+}
+
+export function claimLaneImportGeneration(
+    db: Database,
+    projectPath: string,
+    projectRoot: string,
+): number {
+    if (!hasMetaTable(db)) return 0;
+    const row = db
+        .prepare("SELECT value FROM context_store_meta WHERE key = ?")
+        .get(generationKey(projectPath, projectRoot)) as { value?: string } | undefined;
+    const parsed = Number.parseInt(row?.value ?? "0", 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function hasMetaTable(db: Database): boolean {
     return (
         db
@@ -63,22 +83,32 @@ export function claimLaneImportDone(
     );
 }
 
+/** Writes the done marker only while the generation still equals `generation`, in one statement, so a reset that lands mid-import wins over the stale importer's completion. Answers whether the marker was written. commentlint: allow(JUDGE) */
 function markDone(
     db: Database,
     projectPath: string,
     projectRoot: string,
+    generation: number,
     detail: Record<string, unknown>,
-): void {
-    if (!hasMetaTable(db)) return;
-    db.prepare(
-        "INSERT INTO context_store_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    ).run(
-        markerKey(projectPath, projectRoot),
-        JSON.stringify({ importedAt: Date.now(), ...detail }),
-    );
+): boolean {
+    if (!hasMetaTable(db)) return false;
+    const changes = db
+        .prepare(
+            `INSERT INTO context_store_meta(key, value)
+             SELECT ?, ?
+             WHERE COALESCE((SELECT CAST(value AS INTEGER) FROM context_store_meta WHERE key = ?), 0) = ?
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        )
+        .run(
+            markerKey(projectPath, projectRoot),
+            JSON.stringify({ importedAt: Date.now(), ...detail }),
+            generationKey(projectPath, projectRoot),
+            generation,
+        ).changes;
+    return changes > 0;
 }
 
-/** Clearing the schedule entry drops the in-process done-pin so the next `scheduleClaimLaneImport` call re-runs the importer. commentlint: allow(JUDGE) */
+/** Clearing the schedule entry drops the in-process done-pin so the next `scheduleClaimLaneImport` call re-runs the importer; the generation bump invalidates any importer already in flight. commentlint: allow(JUDGE) */
 export function resetClaimLaneImportMarker(
     db: Database,
     projectPath: string,
@@ -86,6 +116,9 @@ export function resetClaimLaneImportMarker(
 ): void {
     attemptedAt.delete(scheduleKey(projectPath, projectRoot));
     if (!hasMetaTable(db)) return;
+    db.prepare(
+        "INSERT INTO context_store_meta(key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+    ).run(generationKey(projectPath, projectRoot));
     db.prepare("DELETE FROM context_store_meta WHERE key = ?").run(
         markerKey(projectPath, projectRoot),
     );
@@ -146,7 +179,7 @@ export function liveMemoryContentKeys(rows: readonly ReadRow[]): Set<string> {
     );
 }
 
-/** The marker is written only after every batch is `available`; a partial run resumes from the kernel's live rows. commentlint: allow(JUDGE) */
+/** The marker is written only after every batch is `available` and only under the generation the run started at; a partial or fenced run resumes from the kernel's live rows. commentlint: allow(JUDGE) */
 export async function importClaimLaneMemories(args: {
     db: Database;
     client: KernelClient;
@@ -157,10 +190,12 @@ export async function importClaimLaneMemories(args: {
 }): Promise<ClaimLaneImportOutcome> {
     const { db, client, projectPath, projectRoot, sessionId } = args;
     if (claimLaneImportDone(db, projectPath, projectRoot)) return "skipped";
+    const generation = claimLaneImportGeneration(db, projectPath, projectRoot);
     const claims = listClaimLaneMemories(db, projectPath);
     if (claims.length === 0) {
-        markDone(db, projectPath, projectRoot, { imported: 0 });
-        return "done";
+        return markDone(db, projectPath, projectRoot, generation, { imported: 0 })
+            ? "done"
+            : "deferred";
     }
     const existing = await client.read({ surface: MEMORY_READ_SURFACE, gated: false });
     if (!isAvailable(existing)) {
@@ -201,10 +236,18 @@ export async function importClaimLaneMemories(args: {
         }
         imported += batch.length;
     }
-    markDone(db, projectPath, projectRoot, {
-        imported,
-        alreadyPresent: claims.length - pending.length,
-    });
+    if (
+        !markDone(db, projectPath, projectRoot, generation, {
+            imported,
+            alreadyPresent: claims.length - pending.length,
+        })
+    ) {
+        sessionLog(
+            sessionId,
+            `claim-lane import fenced: a marker reset landed during the run; ${imported} committed memories stay live and the next schedule replays the lane`,
+        );
+        return "deferred";
+    }
     sessionLog(
         sessionId,
         `claim-lane import complete: ${imported} memories committed to the kernel, ${claims.length - pending.length} already present`,

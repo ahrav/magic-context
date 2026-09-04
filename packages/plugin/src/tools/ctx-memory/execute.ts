@@ -24,6 +24,8 @@ import {
     OPERATION_KEY_SEPARATOR,
     type ReadRow,
     renderToolStateText,
+    SENSITIVITIES,
+    type Sensitivity,
     type SourceKind,
     sha256Hex,
 } from "../../shared/kernel-client";
@@ -143,6 +145,43 @@ function successorLineage(predecessors: readonly ReadRow[]): {
         // The store holds only source kinds the daemon admitted.
         sourceKind: first.object.source_kind as SourceKind,
     };
+}
+
+function rowCategory(row: ReadRow): string {
+    return row.decision?.decision_kind ?? row.object.object_kind;
+}
+
+/** One survivor cannot replace facts from different categories, so every merge predecessor must carry the same `decision_kind`. commentlint: allow(JUDGE) */
+function requireMergeableCategory(predecessors: readonly ReadRow[]): string {
+    const categories = [...new Set(predecessors.map(rowCategory))].sort();
+    if (categories.length > 1) {
+        throw new ClaimOperationInputError(
+            `merge targets span categories (${categories.join(", ")}); one survivor cannot replace facts from different categories. Merge same-category memories only.`,
+        );
+    }
+    return categories[0] as string;
+}
+
+/** An anti-memory records a rejected strategy; a survivor on the other arm would flip the negation, so the survivor's anti-memory arm must match the predecessors'. commentlint: allow(JUDGE) */
+function requireMatchingAntiArm(survivorCategory: string, predecessorCategory: string): void {
+    const survivorAnti = survivorCategory === ANTI_MEMORY_CATEGORY;
+    if (survivorAnti !== (predecessorCategory === ANTI_MEMORY_CATEGORY)) {
+        throw new ClaimOperationInputError(
+            survivorAnti
+                ? "merge cannot fold positive memories into an anti-memory survivor"
+                : `merge cannot fold ${ANTI_MEMORY_CATEGORY} memories into a positive survivor; the negation would be lost`,
+        );
+    }
+}
+
+/** The kernel admits only the envelope's first supersede of a survivor and folds later targets in without re-admission, and an omitted sensitivity defaults to `normal`; the successor therefore asserts the strictest sensitivity any predecessor holds so a sensitive predecessor's content never reaches automatic surfaces. commentlint: allow(JUDGE) */
+function strictestSensitivity(predecessors: readonly ReadRow[]): Sensitivity {
+    // `SENSITIVITIES` is ordered least to most strict.
+    const rank = predecessors.reduce(
+        (max, row) => Math.max(max, SENSITIVITIES.indexOf(row.object.sensitivity)),
+        0,
+    );
+    return SENSITIVITIES[rank] as Sensitivity;
 }
 
 /**
@@ -313,10 +352,13 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
             throw new ClaimOperationInputError(`revise requires a category for ${target}`);
         }
         const lineage = successorLineage(predecessors);
-        const spec = decisionSpec(merged, category, identity, {
-            sourceId: lineage.sourceId,
-            sourceRevision: nextSourceRevision(predecessors),
-        });
+        const spec: DecisionSpecInput = {
+            ...decisionSpec(merged, category, identity, {
+                sourceId: lineage.sourceId,
+                sourceRevision: nextSourceRevision(predecessors),
+            }),
+            sensitivity: strictestSensitivity(predecessors),
+        };
         return renderCommit(
             action,
             await client.revise(target, spec, { ...mutation, sourceKind: lineage.sourceKind }),
@@ -332,15 +374,20 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
     const read = await readMemoryRows(client);
     if (!read.ok) return renderCtxMemoryStateText(read.state, targets);
     const predecessors = requireVisible(read.rows, targets);
+    const predecessorCategory = requireMergeableCategory(predecessors);
     const merged = revisionArgs(args, predecessors);
     assertCtxMemoryWriteShape({ ...merged, action: "revise" });
     const category = merged.category?.trim();
     if (!category) throw new ClaimOperationInputError("merge requires a category");
+    requireMatchingAntiArm(category, predecessorCategory);
     const lineage = successorLineage(predecessors);
-    const spec = decisionSpec(merged, category, identity, {
-        sourceId: lineage.sourceId,
-        sourceRevision: nextSourceRevision(predecessors),
-    });
+    const spec: DecisionSpecInput = {
+        ...decisionSpec(merged, category, identity, {
+            sourceId: lineage.sourceId,
+            sourceRevision: nextSourceRevision(predecessors),
+        }),
+        sensitivity: strictestSensitivity(predecessors),
+    };
     return renderCommit(
         action,
         await client.merge(targets, spec, { ...mutation, sourceKind: lineage.sourceKind }),

@@ -140,6 +140,20 @@ export function memoryRowCategory(row: ReadRow): string {
     return row.decision?.decision_kind ?? row.object.object_kind;
 }
 
+/** The taxonomy categories all match; the store also holds free-form kinds from other producers. commentlint: allow(JUDGE) */
+const XML_ELEMENT_NAME = /^[A-Za-z_][A-Za-z0-9._-]*$/;
+
+/** A category that is a legal XML element name opens as itself; any other value rides as an escaped attribute on a fixed element so it cannot corrupt the block's markup. commentlint: allow(JUDGE) */
+export function memoryCategoryOpenTag(category: string): string {
+    return XML_ELEMENT_NAME.test(category)
+        ? `<${category}>`
+        : `<memory-category name="${escapeXmlAttr(category)}">`;
+}
+
+export function memoryCategoryCloseTag(category: string): string {
+    return XML_ELEMENT_NAME.test(category) ? `</${category}>` : "</memory-category>";
+}
+
 export function renderKernelMemoryLine(row: ReadRow): string {
     const summary = row.decision?.payload.summary ?? "";
     const label = row.labeled ? " [labeled]" : "";
@@ -183,7 +197,9 @@ export function trimKernelRowsToBudget(rows: readonly ReadRow[], budgetTokens: n
         const category = memoryRowCategory(row);
         let cost = estimateTokens(`${renderKernelMemoryLine(row)}\n`);
         if (!seenCategories.has(category)) {
-            cost += estimateTokens(`<${escapeXmlAttr(category)}>\n</${escapeXmlAttr(category)}>\n`);
+            cost += estimateTokens(
+                `${memoryCategoryOpenTag(category)}\n${memoryCategoryCloseTag(category)}\n`,
+            );
         }
         if (usedTokens + cost > budgetTokens) continue;
         usedTokens += cost;
@@ -215,13 +231,13 @@ export function renderKernelMemoryBlock(
     for (const row of [...rows].sort(renderOrder)) {
         const category = memoryRowCategory(row);
         if (category !== openCategory) {
-            if (openCategory !== undefined) lines.push(`</${escapeXmlAttr(openCategory)}>`);
+            if (openCategory !== undefined) lines.push(memoryCategoryCloseTag(openCategory));
             openCategory = category;
-            lines.push(`<${escapeXmlAttr(openCategory)}>`);
+            lines.push(memoryCategoryOpenTag(openCategory));
         }
         lines.push(renderKernelMemoryLine(row));
     }
-    if (openCategory !== undefined) lines.push(`</${escapeXmlAttr(openCategory)}>`);
+    if (openCategory !== undefined) lines.push(memoryCategoryCloseTag(openCategory));
     lines.push(`</${wrapper}>`);
     return lines.join("\n");
 }

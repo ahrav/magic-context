@@ -117,13 +117,13 @@ function localSources(sources: readonly SearchSource[]): SearchSource[] {
     return sources.filter((source) => source !== "memory");
 }
 
-/** The no-hint reason an empty turn records, given how the kernel answered. */
+/** The no-hint reason an empty turn records, given how the kernel answered. Every non-`available` state is withheld memory — `invalid` and `cancelled` reads served no rows just as `unavailable` does — so only a served-and-empty read records the project as having nothing relevant. commentlint: allow(JUDGE) */
 function emptyReason(
     memory: KernelMemorySnapshot | null,
 ): "empty" | "memory-abstained" | "memory-unavailable" {
-    if (memory?.state.kind === "abstained") return "memory-abstained";
-    if (memory?.state.kind === "unavailable") return "memory-unavailable";
-    return "empty";
+    if (memory === null || memory.state.kind === "available") return "empty";
+    if (memory.state.kind === "abstained") return "memory-abstained";
+    return "memory-unavailable";
 }
 
 export async function executeAutoSearchDelivery(args: {
