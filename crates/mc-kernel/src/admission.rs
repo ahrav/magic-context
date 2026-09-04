@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 use super::cas::{ArtifactDestination, ArtifactEgressFacts};
 use super::envelope::{
@@ -2178,10 +2179,11 @@ impl KernelStore {
         &self,
         candidates: &[(String, Option<String>)],
         destination: ArtifactDestination,
-    ) -> Result<(i64, Vec<EgressCandidate>), KernelError> {
+    ) -> Result<(EgressSnapshot, Vec<EgressCandidate>), KernelError> {
         let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
         let ids = serde_json::to_string(&ids).map_err(|_| KernelError::InvalidInput)?;
-        self.read_snapshot(0, |tx| {
+        let generation_before = self.classification_generation.load(Ordering::SeqCst);
+        let (tip, candidates) = self.read_snapshot(0, |tx| {
             let tip = tx
                 .query_row(
                     "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
@@ -2224,9 +2226,34 @@ impl KernelStore {
                         artifact,
                     })
                 })
-                .collect()
-        })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        let generation_after = self.classification_generation.load(Ordering::SeqCst);
+        // A seqlock read: an even, unchanged generation proves no classification
+        // merge ran during the snapshot.
+        let classification_generation = (generation_before == generation_after
+            && generation_before.is_multiple_of(2))
+        .then_some(generation_before);
+        Ok((
+            EgressSnapshot {
+                tip,
+                classification_generation,
+            },
+            candidates,
+        ))
     }
+}
+
+/// Identifies the state [`KernelStore::egress_candidates`] read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EgressSnapshot {
+    /// The commit-log tip the snapshot observed.
+    pub tip: i64,
+    /// Artifact classification can change through an idempotent ingest replay
+    /// without a commit-log row, so the tip alone does not identify the egress
+    /// facts. `None` when such a change overlapped the read; a caller must then
+    /// not cache what it judged.
+    pub classification_generation: Option<u64>,
 }
 
 /// One candidate of [`KernelStore::egress_candidates`].

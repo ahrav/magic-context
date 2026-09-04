@@ -1497,6 +1497,44 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
 }
 
 #[tokio::test]
+async fn a_replayed_ingest_that_tightens_classification_is_not_served_from_the_cache() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    daemon
+        .commit("create", vec![insert_decision(1)], vec![])
+        .await;
+    let payload = b"replayable bytes";
+    let handle = store
+        .ingest_artifact(ingest("replay", payload, Sensitivity::Normal))
+        .unwrap();
+    let request = eligibility_request(
+        &daemon.project,
+        "remote",
+        vec![
+            json!({"object_id": "decision-object-1", "source_revision": 1, "artifact_digest": handle.digest}),
+        ],
+    );
+    let first = daemon.call(daemon.route, request.clone()).await;
+    assert_eq!(verdicts(&first)[0].1, "ok");
+    let tip = daemon.tip();
+
+    // The same intent with a stronger policy replays the receipt and merges the
+    // classification in place, without a commit-log row.
+    let mut stronger = ingest("replay", payload, Sensitivity::Sensitive);
+    stronger.provider_egress = ProviderEgress::LocalOnly;
+    let replayed = store.ingest_artifact(stronger).unwrap();
+    assert_eq!(replayed.digest, handle.digest);
+    assert_eq!(daemon.tip(), tip);
+
+    let second = daemon.call(daemon.route, request).await;
+    assert_eq!(second["known_as_of"], tip);
+    assert_eq!(second["cache_hits"], 0);
+    assert_eq!(verdicts(&second)[0].1, "provider_sensitive");
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn an_artifact_purge_advances_the_commit_sequence() {
     let daemon = Daemon::start().await;
     let store = daemon.store();

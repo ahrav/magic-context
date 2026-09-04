@@ -67,6 +67,7 @@ struct Candidate {
 struct CacheKey {
     lease_epoch: u64,
     tip: i64,
+    classification_generation: u64,
     object_id: String,
     source_revision: i64,
     artifact_digest: Option<String>,
@@ -194,41 +195,49 @@ fn evaluate(
             )
         })
         .collect();
-    let (tip, facts) = store.egress_candidates(&named, destination)?;
-    let lease_epoch = store.lease_epoch();
-    let project_scope_id = project.scope_id();
-    let keys: Vec<CacheKey> = candidates
-        .iter()
-        .map(|candidate| CacheKey {
-            lease_epoch,
-            tip,
-            object_id: candidate.object_id.clone(),
-            source_revision: candidate.source_revision,
-            artifact_digest: candidate.artifact_digest.clone(),
-            destination,
-            project_scope_id: project_scope_id.clone(),
-        })
-        .collect();
+    let (snapshot, facts) = store.egress_candidates(&named, destination)?;
+    // Without a classification generation the snapshot has no cache identity:
+    // nothing is looked up and nothing is stored.
+    let keys: Option<Vec<CacheKey>> = snapshot.classification_generation.map(|generation| {
+        let lease_epoch = store.lease_epoch();
+        let project_scope_id = project.scope_id();
+        candidates
+            .iter()
+            .map(|candidate| CacheKey {
+                lease_epoch,
+                tip: snapshot.tip,
+                classification_generation: generation,
+                object_id: candidate.object_id.clone(),
+                source_revision: candidate.source_revision,
+                artifact_digest: candidate.artifact_digest.clone(),
+                destination,
+                project_scope_id: project_scope_id.clone(),
+            })
+            .collect()
+    });
     // `judge` reads SQLite, so the cache guard is held only for the lookups
     // and then again for the inserts, never across a judgement.
-    let cached: Vec<Option<Verdict>> = {
-        let cache = coordinator.eligibility_cache();
-        keys.iter().map(|key| cache.get(key)).collect()
+    let cached: Vec<Option<Verdict>> = match &keys {
+        Some(keys) => {
+            let cache = coordinator.eligibility_cache();
+            keys.iter().map(|key| cache.get(key)).collect()
+        }
+        None => vec![None; candidates.len()],
     };
     let cache_hits = cached.iter().filter(|hit| hit.is_some()).count();
     let mut filter = ScopeFilter::new(project);
     let mut verdicts = Vec::with_capacity(candidates.len());
     let mut fresh: Vec<(CacheKey, Verdict)> = Vec::new();
-    for ((candidate, facts), (key, cached)) in candidates
-        .iter()
-        .zip(&facts)
-        .zip(keys.into_iter().zip(cached))
-    {
+    let mut keys = keys.map(Vec::into_iter);
+    for ((candidate, facts), cached) in candidates.iter().zip(&facts).zip(cached) {
+        let key = keys.as_mut().and_then(Iterator::next);
         let verdict = match cached {
             Some(verdict) => verdict,
             None => {
                 let verdict = judge(store, &mut filter, candidate, facts, destination)?;
-                fresh.push((key, verdict));
+                if let Some(key) = key {
+                    fresh.push((key, verdict));
+                }
                 verdict
             }
         };
@@ -241,7 +250,7 @@ fn evaluate(
         }
     }
     Ok(BatchResponse {
-        known_as_of: tip,
+        known_as_of: snapshot.tip,
         verdicts,
         cache_hits,
     })
@@ -326,6 +335,7 @@ mod tests {
         CacheKey {
             lease_epoch: 1,
             tip: 1,
+            classification_generation: 0,
             object_id: format!("object-{index}"),
             source_revision: 1,
             artifact_digest: None,

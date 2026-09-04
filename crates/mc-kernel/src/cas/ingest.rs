@@ -6,6 +6,7 @@
 //! Storage-integrity failures latch CAS ingestion closed.
 
 use std::fs::File;
+use std::sync::atomic::Ordering;
 
 use mc_core::redaction::{Detection, RedactionError, RedactionErrorKind};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -583,7 +584,24 @@ impl KernelStore {
         Ok(())
     }
 
+    /// The classification generation is odd for the duration of the merge and
+    /// even again afterwards, whether or not the commit succeeded, so a reader
+    /// that saw the same even value on both sides of its snapshot knows the
+    /// facts it read were not changing underneath it.
     fn merge_replayed_classification(
+        &self,
+        writer: &mut Connection,
+        prepared: &PreparedArtifact,
+    ) -> Result<(), ArtifactError> {
+        self.classification_generation
+            .fetch_add(1, Ordering::SeqCst);
+        let merged = self.merge_replayed_classification_inner(writer, prepared);
+        self.classification_generation
+            .fetch_add(1, Ordering::SeqCst);
+        merged
+    }
+
+    fn merge_replayed_classification_inner(
         &self,
         writer: &mut Connection,
         prepared: &PreparedArtifact,
@@ -601,8 +619,7 @@ impl KernelStore {
         )
         .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
         tx.commit()
-            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
-        Ok(())
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))
     }
 
     fn release_reservation(&self, writer: &mut Connection, reservation_id: &str) {
