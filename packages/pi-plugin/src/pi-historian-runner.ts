@@ -74,6 +74,7 @@ import {
 	validateHistorianOutput,
 	validateStoredCompartments,
 } from "@magic-context/core/hooks/magic-context/compartment-runner-validation";
+import { deriveHistorianMemoryTokens } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import {
 	getHistorianRetryBackoffMs,
 	isTransientHistorianPromptError,
@@ -633,6 +634,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 								projectRoot: resolveProjectRootDirectory(directory),
 							}),
 							sessionId,
+							budgetTokens: deriveHistorianMemoryTokens(historianChunkTokens),
 						})
 					: "";
 

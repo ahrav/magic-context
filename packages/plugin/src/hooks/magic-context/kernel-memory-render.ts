@@ -5,7 +5,6 @@
  * surface words a state the same way.
  */
 
-import { MAX_MEMORY_INJECTION_BUDGET_TOKENS } from "../../config/schema/magic-context";
 import { escapeXmlAttr, escapeXmlContent } from "../../features/magic-context/compartment-storage";
 import {
     ANTI_MEMORY_CATEGORY,
@@ -95,10 +94,14 @@ export function withholdLaggingMemory(snapshot: KernelMemorySnapshot): KernelMem
 /**
  * The historian deduplicates against the block the model saw; a non-`available`
  * read — including a gated read's `stale` answer — yields no baseline.
+ *
+ * `budgetTokens` bounds the rendered rows; the caller derives it from the
+ * historian model's window so the baseline and the raw chunk fit together.
  */
 export async function readHistorianMemoryBlock(args: {
     client: KernelClient | undefined;
     sessionId: string;
+    budgetTokens: number;
 }): Promise<string> {
     if (!args.client) return "";
     const read = await args.client.read({
@@ -114,11 +117,8 @@ export async function readHistorianMemoryBlock(args: {
         return "";
     }
     const snapshot = withoutSensitiveRows(kernelMemorySnapshotFrom(read));
-    // The historian does not know the session's configured budget, so the
-    // baseline is trimmed to the largest budget any session can configure:
-    // it covers every row an injector could have shown while staying bounded.
     return renderKernelMemoryBlock(
-        budgetedMemoryRows(snapshot, MAX_MEMORY_INJECTION_BUDGET_TOKENS),
+        budgetedMemoryRows(snapshot, args.budgetTokens),
         read.state,
         memoryRows(snapshot).length,
         snapshot.truncated === true,

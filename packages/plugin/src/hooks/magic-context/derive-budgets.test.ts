@@ -1,8 +1,10 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
+import { MAX_MEMORY_INJECTION_BUDGET_TOKENS } from "../../config/schema/magic-context";
 import {
     deriveHistorianChunkTokens,
+    deriveHistorianMemoryTokens,
     deriveTriggerBudget,
     resolveHistorianContextLimit,
 } from "./derive-budgets";
@@ -97,5 +99,24 @@ describe("resolveHistorianContextLimit", () => {
         } finally {
             console.warn = originalWarn;
         }
+    });
+});
+
+describe("deriveHistorianMemoryTokens", () => {
+    it("gives the baseline half the chunk so both fit a small window", () => {
+        // A 16k historian gets an 8k chunk; chunk plus baseline stay at 12k.
+        expect(deriveHistorianMemoryTokens(deriveHistorianChunkTokens(16_000))).toBe(4_000);
+        expect(deriveHistorianMemoryTokens(deriveHistorianChunkTokens(128_000))).toBe(16_000);
+    });
+
+    it("never exceeds the largest configurable injection budget", () => {
+        expect(deriveHistorianMemoryTokens(deriveHistorianChunkTokens(400_000))).toBe(
+            MAX_MEMORY_INJECTION_BUDGET_TOKENS,
+        );
+    });
+
+    it("handles invalid inputs defensively", () => {
+        expect(deriveHistorianMemoryTokens(0)).toBe(0);
+        expect(deriveHistorianMemoryTokens(Number.NaN)).toBe(0);
     });
 });
