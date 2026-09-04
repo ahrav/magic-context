@@ -70,6 +70,8 @@ export interface ReadPayload {
     known_as_of: number;
     tip: number;
     gated: boolean;
+    /** Whether the daemon dropped rows to fit its per-read row and byte bounds; dropped rows are the oldest, and objects they name still mutate through commit-side token checks. commentlint: allow(JUDGE) */
+    truncated: boolean;
     rows: ReadRow[];
 }
 
@@ -244,6 +246,11 @@ export function parseReadResponse(raw: unknown): Parsed<ReadPayload> {
         return failed();
     }
     if (typeof payload.gated !== "boolean" || !Array.isArray(payload.rows)) return failed();
+    // A daemon that predates the flag omits it. commentlint: allow(JUDGE)
+    if (payload.truncated !== undefined && typeof payload.truncated !== "boolean") {
+        return failed();
+    }
+    const truncated = payload.truncated === true;
     const rows: ReadRow[] = [];
     for (const item of payload.rows) {
         const row = parseReadRow(item);
@@ -252,7 +259,13 @@ export function parseReadResponse(raw: unknown): Parsed<ReadPayload> {
     }
     return {
         state,
-        payload: { known_as_of: payload.known_as_of, tip: payload.tip, gated: payload.gated, rows },
+        payload: {
+            known_as_of: payload.known_as_of,
+            tip: payload.tip,
+            gated: payload.gated,
+            truncated,
+            rows,
+        },
     };
 }
 

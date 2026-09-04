@@ -94,6 +94,15 @@ describe("parseReadResponse", () => {
         expect(parsed.payload?.rows[0]?.token).toEqual({ object_id: "o1", known_as_of: 7 });
     });
 
+    test("a read without the truncated field parses as not truncated", () => {
+        expect(parseReadResponse(good).payload?.truncated).toBe(false);
+    });
+
+    test("a truncated read carries the flag through", () => {
+        const parsed = parseReadResponse({ ...good, truncated: true });
+        expect(parsed.payload?.truncated).toBe(true);
+    });
+
     test("a decision row is typed and a non-decision object carries no decision", () => {
         const decision = {
             decision_kind: "memory",
@@ -126,6 +135,7 @@ describe("parseReadResponse", () => {
         ["known_as_of as string", { ...good, known_as_of: "7" }],
         ["negative tip", { ...good, tip: -1 }],
         ["rows not an array", { ...good, rows: {} }],
+        ["truncated as string", { ...good, truncated: "yes" }],
         ["row token disagrees with known_as_of", { ...good, rows: [readRow("o1", 6)] }],
         [
             "row with unknown sensitivity",

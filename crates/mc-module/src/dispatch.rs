@@ -289,7 +289,7 @@ fn checked_body_len(
 /// Measures a JSON value's exact encoded length without retaining the bytes.
 ///
 /// Serialization stops when encoded output exceeds `MAX_WIRE_BODY_BYTES`.
-fn measure_json(value: &Value) -> Result<usize, PreparedOutputError> {
+pub(crate) fn measure_json(value: &Value) -> Result<usize, PreparedOutputError> {
     let mut writer = CountingWriter::default();
     let result = serde_json::to_writer(&mut writer, value).map_err(PreparedOutputError::Serialize);
     let writer = finish_count(writer, result)?;

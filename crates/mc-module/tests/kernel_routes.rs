@@ -1317,6 +1317,101 @@ async fn reads_at_a_snapshot_return_what_was_visible_then() {
     daemon.handler.shutdown().await.unwrap();
 }
 
+fn insert_decision_with_summary(index: i64, summary: &str) -> Value {
+    let mut operation = insert_decision(index);
+    operation["spec"]["payload"]["summary"] = json!(summary);
+    operation
+}
+
+#[tokio::test]
+async fn a_read_over_the_row_cap_serves_the_newest_rows_and_flags_truncation() {
+    use mc_module::kernel_routes::read::MAX_READ_ROWS;
+
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    // Indices ascend with commit order, so higher indices are newer.
+    let total = MAX_READ_ROWS + 1;
+    let mut index = 0i64;
+    let mut batch = 0usize;
+    while (index as usize) < total {
+        let operations: Vec<Value> = (0..256.min(total - index as usize))
+            .map(|offset| insert_decision(index + offset as i64))
+            .collect();
+        index += operations.len() as i64;
+        let response = daemon
+            .commit(&format!("bulk-{batch}"), operations, vec![])
+            .await;
+        assert_state(&response, "available", None);
+        batch += 1;
+    }
+
+    let read = daemon.read("explicit_search", None).await;
+    assert_state(&read, "available", None);
+    assert_eq!(read["truncated"], true, "{}", read["truncated"]);
+    let rows = read["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), MAX_READ_ROWS);
+    assert_eq!(
+        rows[0]["object"]["object_id"],
+        format!("decision-object-{}", total - 1)
+    );
+    let served: std::collections::HashSet<String> = object_ids(&read).into_iter().collect();
+    let missing: Vec<i64> = (0..total as i64)
+        .filter(|index| !served.contains(&format!("decision-object-{index}")))
+        .collect();
+    // The dropped row comes from the oldest commit, the first batch of 256.
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert!(missing[0] < 256, "{missing:?}");
+    let sequences: Vec<i64> = rows
+        .iter()
+        .map(|row| row["object"]["created_commit_seq"].as_i64().unwrap())
+        .collect();
+    assert!(sequences.windows(2).all(|pair| pair[0] >= pair[1]));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_read_over_the_byte_budget_serves_the_newest_rows_that_fit() {
+    use mc_module::kernel_routes::read::MAX_READ_ROW_BYTES;
+
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let small = daemon
+        .commit("small", vec![insert_decision(0)], vec![])
+        .await;
+    assert_state(&small, "available", None);
+    let baseline = daemon.read("explicit_search", None).await;
+    assert_eq!(baseline["truncated"], false, "{}", baseline["truncated"]);
+
+    // Rows of ~480 KiB each, one commit apiece so each is strictly newer than the last; enough of them exceed the byte budget while every summary stays under the 512 KiB redaction limit. commentlint: allow(JUDGE)
+    let row_bytes = 480 * 1024;
+    let total = MAX_READ_ROW_BYTES / row_bytes + 3;
+    let summary = "s".repeat(row_bytes);
+    for index in 1..=total as i64 {
+        let response = daemon
+            .commit(
+                &format!("big-{index}"),
+                vec![insert_decision_with_summary(index, &summary)],
+                vec![],
+            )
+            .await;
+        assert_state(&response, "available", None);
+    }
+
+    let read = daemon.read("explicit_search", None).await;
+    assert_state(&read, "available", None);
+    assert_eq!(read["truncated"], true, "{}", read["truncated"]);
+    let served = object_ids(&read);
+    assert!(!served.is_empty());
+    assert!(served.len() < total + 1, "{}", served.len());
+    // The served set is a contiguous run of the newest commits; the small oldest row is past the stopping point even though it would fit. commentlint: allow(JUDGE)
+    let mut expected: Vec<String> = (0..served.len())
+        .map(|offset| format!("decision-object-{}", total - offset))
+        .collect();
+    expected.sort();
+    assert_eq!(served, expected);
+    daemon.handler.shutdown().await.unwrap();
+}
+
 fn eligibility_request(project: &Path, destination: &str, candidates: Vec<Value>) -> Value {
     json!({
         "method": "kernel.eligibility.batch",

@@ -30,6 +30,7 @@ interface ReadJson {
         labeled: boolean;
     }>;
     missingObjectIds?: string[];
+    truncated?: boolean;
 }
 
 function harness(kernel = new FakeKernel(), enabled = true) {
@@ -281,6 +282,21 @@ describe("ctx_memory reads", () => {
             await tool.execute({ action: "list", category: "NAMING" }, "call-list", DREAMER_AGENT),
         );
         expect(listed.memories.map((memory) => memory.objectId)).toEqual(["mem_b"]);
+    });
+
+    test("a truncated daemon read marks get and list responses", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        kernel.readTruncated = true;
+        const tool = harness(kernel);
+        const got = parseJson<ReadJson>(
+            await tool.execute({ action: "get", objectIds: ["mem_a"] }, "call-get-truncated"),
+        );
+        expect(got.truncated).toBe(true);
+        const listed = parseJson<ReadJson>(
+            await tool.execute({ action: "list" }, "call-list-truncated", DREAMER_AGENT),
+        );
+        expect(listed.truncated).toBe(true);
     });
 
     test("get with more than 20 unique ids is rejected naming the limit", async () => {
