@@ -7,7 +7,7 @@ import { baselineEstimates, compareWithBaseline, regretRows } from "./comparison
 import { laneEvidence, type ScorecardEvidenceBundle } from "./evidence";
 import { buildScoreFamilies } from "./families";
 import { evaluateGates } from "./gates";
-import { SCORECARD_POLICY_OWNER, SCORE_FAMILY_IDS, ScorecardContractError, reasonCode } from "./policy";
+import { SCORECARD_POLICY_OWNER, SCORE_FAMILY_IDS, ScorecardContractError, reasonCode, scorecardPolicyFingerprint } from "./policy";
 import {
     SCORECARD_REPORT_SCHEMA,
     baselineComparable,
@@ -22,6 +22,8 @@ export type ScorecardExitCode = 0 | 1 | 2;
 
 /** Every section is derived here from the bundle; nothing in the outcome is supplied by a caller. */
 export function buildScorecardReport(bundle: ScorecardEvidenceBundle): ScorecardReport {
+    // The fingerprint names the frozen policy; the terms below must be that policy's, not an edited copy's.
+    if (scorecardPolicyFingerprint(bundle.policy) !== bundle.policyFingerprint) throw new ScorecardContractError(["scorecard: policy-fingerprint-mismatch"]);
     const safetyGates = evaluateGates(bundle);
     const families = buildScoreFamilies(bundle);
     const comparison = compareWithBaseline(families.utility.familyEstimates, baselineEstimates(bundle.baseline));
@@ -38,6 +40,8 @@ export function buildScorecardReport(bundle: ScorecardEvidenceBundle): Scorecard
             policyFingerprint: bundle.policyFingerprint,
             pairedDeltaPolicyFingerprint: bundle.policy.pairedDeltaPolicyFingerprint,
             baselineScorecardReportFingerprint: bundle.policy.baselineScorecardReportFingerprint,
+            maxToleratedRegressions: bundle.policy.maxToleratedRegressions,
+            requiredMetricSlots: [...bundle.policy.requiredMetricSlots],
         },
         utility: { ...families.utility, deltas: comparison.deltas },
         formation: families.formation,
@@ -93,7 +97,8 @@ export function createScorecardAdapter(input: { bundle: ScorecardEvidenceBundle;
     if (derived.reportFingerprint !== input.report.reportFingerprint) {
         throw new ScorecardContractError(["adapter: report-bundle-mismatch"]);
     }
-    const pairedDelta = laneEvidence(input.bundle, "paired-delta").report;
+    // Cloned so the estimator the adapter recomputes cannot follow a later edit to the bundle's analysis.
+    const pairedDelta = structuredClone(laneEvidence(input.bundle, "paired-delta").report);
     // An estimator result from any other analysis of the same pairs must not pair with this promotion decision.
     const archivedEstimator = pairedDelta === null ? null : {
         pairedFactsFingerprint: pairedDelta.body.analysis.pairedFactsFingerprint,

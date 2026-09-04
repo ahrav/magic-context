@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { readCanonicalJsonFile } from "../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { parseScorecardReport } from "../src/scorecard/report-contract";
 import { policyFixture, scannableDreamerReportFixture, writeReleaseTree, type ReleaseTreeOptions } from "../src/scorecard/test-fixtures";
-import { HELP_REQUESTED, parseArgs, runScorecard, type ScorecardCliArgs } from "./run-scorecard";
+import { HELP_REQUESTED, parseArgs, removeNamedOutput, runScorecard, type ScorecardCliArgs } from "./run-scorecard";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -62,6 +62,24 @@ describe("run-scorecard", () => {
         expect(report.body.evidence.lanes.find((row) => row.lane === "retrieval")).toMatchObject({ status: "missing", reportFingerprint: null });
         expect(report.body.outcome.mandatoryEvidenceComplete).toBe(false);
         expect(readdirSync(join(args.out, "..")).sort()).toEqual(["scorecard-report.json"]);
+    });
+});
+
+describe("removeNamedOutput", () => {
+    it("clears the report an invocation names even when the rest of the invocation is malformed", () => {
+        const root = mkdtempSync(join(tmpdir(), "scorecard-stale-"));
+        roots.push(root);
+        const out = join(root, "scorecard-report.json");
+        writeFileSync(out, "{\"stale\":true}\n");
+        const argv = ["--freeze", "f", "--freeze-fingerprint", "nope", "--out", out];
+        expect(() => parseArgs(argv, "/root")).toThrow(/hex64/);
+        removeNamedOutput(argv);
+        expect(existsSync(out)).toBe(false);
+        writeFileSync(out, "{\"stale\":true}\n");
+        removeNamedOutput(["--out"]);
+        removeNamedOutput(["--out", "--freeze", out]);
+        removeNamedOutput([]);
+        expect(existsSync(out)).toBe(true);
     });
 });
 

@@ -5,6 +5,7 @@ import type { RawRegretLadder } from "../paired-delta/report";
 import {
     GATE_ID_RE,
     LANE_IDS,
+    METRIC_SLOT_IDS,
     REASON_CODE_RE,
     SCORECARD_GATE_IDS,
     SLOT_IDS_BY_FAMILY,
@@ -103,11 +104,14 @@ export interface EvidenceRow {
 }
 
 export interface ScorecardReportBody {
+    /** The pinned terms the outcome was judged against, so the parser can recompute the outcome from the report alone. */
     target: {
         freezeManifestFingerprint: string;
         policyFingerprint: string;
         pairedDeltaPolicyFingerprint: string;
         baselineScorecardReportFingerprint: string | null;
+        maxToleratedRegressions: number;
+        requiredMetricSlots: MetricSlotId[];
     };
     utility: UtilitySection;
     formation: ScoreFamilySection;
@@ -366,7 +370,11 @@ export function parseScorecardReport(raw: unknown): ScorecardReport {
     exact(value, REPORT_BODY_KEYS, "report.body");
     if (Object.keys(value).some((key, index) => key !== REPORT_BODY_KEYS[index])) fail("report.body: section-order-invalid");
     const target = record(value.target, "report.body.target");
-    exact(target, ["freezeManifestFingerprint", "policyFingerprint", "pairedDeltaPolicyFingerprint", "baselineScorecardReportFingerprint"], "report.body.target");
+    exact(
+        target,
+        ["freezeManifestFingerprint", "policyFingerprint", "pairedDeltaPolicyFingerprint", "baselineScorecardReportFingerprint", "maxToleratedRegressions", "requiredMetricSlots"],
+        "report.body.target",
+    );
     const evidence = record(value.evidence, "report.body.evidence");
     exact(evidence, ["lanes", "baseline"], "report.body.evidence");
     const baseline = record(evidence.baseline, "report.body.evidence.baseline");
@@ -384,6 +392,9 @@ export function parseScorecardReport(raw: unknown): ScorecardReport {
             pairedDeltaPolicyFingerprint: hex64(target.pairedDeltaPolicyFingerprint, "report.body.target.pairedDeltaPolicyFingerprint"),
             baselineScorecardReportFingerprint: nullable(target.baselineScorecardReportFingerprint, (fingerprint) =>
                 hex64(fingerprint, "report.body.target.baselineScorecardReportFingerprint")),
+            maxToleratedRegressions: integer(target.maxToleratedRegressions, "report.body.target.maxToleratedRegressions"),
+            requiredMetricSlots: idArray(target.requiredMetricSlots, "report.body.target.requiredMetricSlots", REASON_CODE_RE)
+                .map((slot, index) => enumeration(slot, METRIC_SLOT_IDS, `report.body.target.requiredMetricSlots[${index}]`)),
         },
         utility: parseUtilitySection(value.utility),
         formation: parseFamilySection(value.formation, "formation"),
@@ -411,17 +422,17 @@ export function parseScorecardReport(raw: unknown): ScorecardReport {
     };
     const reportFingerprint = hex64(root.reportFingerprint, "report.reportFingerprint");
     if (canonicalFingerprint(body) !== reportFingerprint) fail("report.reportFingerprint: mismatch");
-    const expectedFailures = body.safetyGates.filter((row) => row.status !== "passed").map((row) => row.gateId).sort();
-    if (JSON.stringify(body.outcome.hardGateFailures) !== JSON.stringify(expectedFailures)) fail("report.body.outcome.hardGateFailures: cross-field-invalid");
-    if (body.outcome.blockingRegressionCount !== body.adverseDeltas.filter((row) => row.blocking).length) {
-        fail("report.body.outcome.blockingRegressionCount: cross-field-invalid");
-    }
-    if (body.outcome.promotionAllowed
-        && (expectedFailures.length > 0 || !body.outcome.mandatoryEvidenceComplete || !baselineComparable(body.target, body.evidence.baseline))) {
-        fail("report.body.outcome.promotionAllowed: cross-field-invalid");
-    }
-    if (body.outcome.mandatoryEvidenceComplete && body.evidence.lanes.some((row) => row.status !== "present")) {
-        fail("report.body.outcome.mandatoryEvidenceComplete: cross-field-invalid");
+    const expected = deriveOutcome({
+        gates: body.safetyGates,
+        lanes: body.evidence.lanes,
+        families: [body.utility, body.formation, body.retrieval, body.context, body.reliability],
+        requiredMetricSlots: body.target.requiredMetricSlots,
+        adverseDeltas: body.adverseDeltas,
+        maxToleratedRegressions: body.target.maxToleratedRegressions,
+        baselineComparable: baselineComparable(body.target, body.evidence.baseline),
+    });
+    for (const field of ["hardGateFailures", "blockingRegressionCount", "mandatoryEvidenceComplete", "promotionAllowed"] as const) {
+        if (JSON.stringify(body.outcome[field]) !== JSON.stringify(expected[field])) fail(`report.body.outcome.${field}: cross-field-invalid`);
     }
     if ((body.evidence.baseline.status === "present") !== (body.evidence.baseline.reportFingerprint !== null)) {
         fail("report.body.evidence.baseline: shape-invalid");

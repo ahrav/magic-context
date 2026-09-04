@@ -153,6 +153,38 @@ describe("buildScorecardReport", () => {
             .toThrow(/outcome\.promotionAllowed: cross-field-invalid/);
     });
 
+    it("refuses a bundle whose policy terms do not match the fingerprint it names", () => {
+        const bundle = bundleFixture();
+        bundle.policy = { ...bundle.policy, maxToleratedRegressions: 99 };
+        expect(() => buildScorecardReport(bundle)).toThrow(/scorecard: policy-fingerprint-mismatch/);
+    });
+
+    it("rejects a forged promotion whose blocking rows exceed the tolerance the report itself records", () => {
+        const baseline = baselineReport({ lanes: { "paired-delta": pairedDeltaReportFixture({ familyDeltas: { "fam-a": 0.9, "fam-b": 0.9 } }) } });
+        const regressed = pairedDeltaReportFixture({
+            familyDeltas: { "fam-a": 0.1, "fam-b": 0.1 },
+            noiseFloors: [
+                { familyId: "fam-a", value: 0.01, interval: { lower: 0, upper: 0.01 } },
+                { familyId: "fam-b", value: 0.01, interval: { lower: 0, upper: 0.01 } },
+            ],
+        });
+        const policy = policyFixture({ baselineScorecardReportFingerprint: baseline.reportFingerprint });
+        const blocked = allGatesPassed(bundleFixture({ policy, baseline, lanes: { "paired-delta": regressed } }));
+        expect(blocked.body.target.maxToleratedRegressions).toBe(policy.maxToleratedRegressions);
+        expect(blocked.body.outcome.blockingRegressionCount).toBeGreaterThan(policy.maxToleratedRegressions);
+        const forged = structuredClone(blocked.body);
+        forged.outcome.promotionAllowed = true;
+        expect(() => parseScorecardReport({ schema: blocked.schema, body: forged, reportFingerprint: canonicalFingerprint(forged) }))
+            .toThrow(/outcome\.promotionAllowed: cross-field-invalid/);
+        expect(() => publishScorecardReport({ schema: blocked.schema, body: forged, reportFingerprint: canonicalFingerprint(forged) }, "/dev/null"))
+            .toThrow(/outcome\.promotionAllowed: cross-field-invalid/);
+        const unmeasured = allGatesPassed(bundleFixture({ policy: policyFixture({ requiredMetricSlots: ["ctx-expand-recovery"] }) }));
+        const forgedEvidence = structuredClone(unmeasured.body);
+        forgedEvidence.outcome.mandatoryEvidenceComplete = true;
+        expect(() => parseScorecardReport({ schema: unmeasured.schema, body: forgedEvidence, reportFingerprint: canonicalFingerprint(forgedEvidence) }))
+            .toThrow(/outcome\.mandatoryEvidenceComplete: cross-field-invalid/);
+    });
+
     it("reports four not-observed gates and one passed injection gate from lane-built fixtures", () => {
         const report = buildScorecardReport(bundleFixture({ lanes: { metamorphic: metamorphicReportFixture() } }));
         expect(report.body.safetyGates.filter((row) => row.status === "not-observed")).toHaveLength(4);
@@ -248,6 +280,13 @@ describe("createScorecardAdapter", () => {
         expect(() => adapter.evaluate({ ...holdout(bundle), estimator: holdout(otherAnalysis).estimator }, bundle.policyFingerprint))
             .toThrow(/adapter: estimator-result-mismatch/);
         expect(() => adapter.evaluate(holdout(bundle), H3)).toThrow(ScorecardContractError);
+        const mutable = bundleFixture();
+        const mutableAdapter = createScorecardAdapter({ bundle: mutable, report: buildScorecardReport(mutable) });
+        const lane = mutable.lanes.find((row) => row.lane === "paired-delta")!;
+        if (lane.lane !== "paired-delta" || lane.report === null) throw new Error("fixture lane absent");
+        lane.report.body.analysis.endpoints[0]!.families[0]!.pointEstimate += 1;
+        expect(() => mutableAdapter.evaluate(holdout(mutable), mutable.policyFingerprint)).toThrow(/adapter: estimator-result-mismatch/);
+        expect(() => mutableAdapter.evaluate(holdout(bundle), bundle.policyFingerprint)).not.toThrow();
     });
 
     it("attests the report's own denial when the paired-delta lane is absent instead of throwing", () => {

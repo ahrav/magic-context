@@ -60,6 +60,15 @@ export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): Par
     };
 }
 
+/**
+ * Argument parsing is fallible and runs before `runScorecard` can remove the previous report, so a
+ * malformed rerun clears the path it names first.
+ */
+export function removeNamedOutput(argv: readonly string[]): void {
+    const value = argv[argv.indexOf("--out") + 1];
+    if (argv.includes("--out") && value !== undefined && !value.startsWith("--")) rmSync(resolve(value), { force: true });
+}
+
 export function runScorecard(args: ScorecardCliArgs, log: (line: string) => void = console.log): ScorecardExitCode {
     // A refused run must not leave an earlier report, possibly promotion-allowed, at the documented output path.
     rmSync(args.out, { force: true });
@@ -81,6 +90,7 @@ export function runScorecard(args: ScorecardCliArgs, log: (line: string) => void
 if (import.meta.main) {
     let code: number;
     try {
+        removeNamedOutput(Bun.argv.slice(2));
         const parsed = parseArgs(Bun.argv.slice(2));
         if (parsed.kind === "help") {
             console.log(USAGE);
