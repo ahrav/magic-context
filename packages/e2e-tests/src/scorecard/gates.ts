@@ -65,7 +65,7 @@ export function evaluateGates(bundle: ScorecardEvidenceBundle): GateRow[] {
             return row(gateId, extractor(bundle));
         } catch {
             // Thrown error messages can contain lane content; rows admit only reason codes.
-            return { gateId, status: "errored", observedCount: null, evidenceFingerprint: null, sourceLane: null, diagnostic: "extractor-threw" };
+            return { gateId, status: "errored", observedCount: null, evidenceFingerprint: null, sourceLane: null, diagnostic: reasonCode("extractor-threw") };
         }
     });
 }
