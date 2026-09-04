@@ -14,6 +14,10 @@
 //! arrival model is not applicable: one caller, no concurrency, so the
 //! reported time is service time of one logical request.
 //!
+//! A refusal (`conflict`, `invalid`, `unavailable`) returns before the work a
+//! case names, so a timed refusal would read as a speedup. `Daemon::call`
+//! panics unless the encoded body contains `"state":{"kind":"available"}`.
+//!
 //! Warm state: the store is open, every SQLite page touched by the case is in
 //! the page cache, the secret scanner is constructed, and the tokio runtime
 //! and blocking pool are warm. Cold variants are named `cold` and clear the
@@ -22,12 +26,14 @@
 //!
 //! Input distributions:
 //! - `read/{n}-rows/{narrow,wide}-scope`: `n` live decisions, each admitted
-//!   for `explicit_search`. `narrow` gives every row the route's own project
-//!   scope so the filter visits one scope and every row serializes; `wide`
-//!   spreads rows over 64 distinct scopes, one of which is the project's, so
-//!   the filter loads 64 scopes and serializes `n/64` rows. `n` bounds the
-//!   registry the route reads; a plugin session reads a project's whole
-//!   surface at once, so the row count is the production knob.
+//!   for `explicit_search`. `narrow` puts every row on the project scope.
+//!   `wide` distributes rows across 64 scopes, including the route's project
+//!   scope, so the kernel's `scope_term` subquery narrows an `n`-row registry
+//!   to `n/64` rows before the route sees them. The route-local scope filter
+//!   resolves one scope in both shapes because the subquery excludes every
+//!   foreign row. `n` bounds the registry the route reads; a plugin session
+//!   reads a project's whole surface at once, so the row count is the
+//!   production knob.
 //! - `commit/{k}-ops`: one envelope of `k` operations, three quarters
 //!   `insert_decision`, one quarter `insert_observation`, with one token per
 //!   16 operations naming a pre-existing row. Each iteration uses a fresh
@@ -73,9 +79,10 @@ use mc_host::{
     BindOutcome, CompositeComponent, HostInit, PrimaryComponent, RouteHandle, RouteIdentity,
 };
 use mc_kernel::{
-    AdmissionEvent, AdmissionRequest, ArtifactIngestRequest, CommitIntent, DecisionPayload,
-    DecisionSpec, DomainSpec, EventKind, KernelStore, ProviderEgress, RepositoryProvenance,
-    ScopeSpec, ScopeTermSpec, Sensitivity, SourceClass, TaintClass,
+    AdmissionEvent, AdmissionRequest, ArtifactDeletionIdentity, ArtifactDeletionKind,
+    ArtifactDeletionRequest, ArtifactIngestRequest, CommitIntent, DecisionPayload, DecisionSpec,
+    DomainSpec, EventKind, KernelStore, ProviderEgress, RepositoryProvenance, ScopeSpec,
+    ScopeTermSpec, Sensitivity, SourceClass, TaintClass,
 };
 use mc_module::dispatch::PreparedOutcome;
 use mc_module::kernel_routes::KernelState;
@@ -88,6 +95,9 @@ const DOMAIN: &str = "domain";
 const SECRET_LINE: &str = "password=hunter-two-very-secret-value-0123456789\n";
 const FILLER_LINE: &str = "plain filler line without any credential words 0123\n";
 const PAGE_BYTES_MAX: usize = 16 * 1024 * 1024;
+/// Compact `serde_json` encoding of `KernelOutcome::Available` under the
+/// `state` key every kernel route emits.
+const AVAILABLE_STATE: &[u8] = br#""state":{"kind":"available"}"#;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(bytes))
@@ -187,6 +197,13 @@ impl Daemon {
                 encoded.clear();
                 let measured = output.measure().expect("response measures");
                 measured.write_to(&mut *encoded).expect("response encodes");
+                if memchr::memmem::rfind(&encoded, AVAILABLE_STATE).is_none() {
+                    let tail = encoded.len().saturating_sub(256);
+                    panic!(
+                        "kernel route did not answer available; body tail: {}",
+                        String::from_utf8_lossy(&encoded[tail..])
+                    );
+                }
                 encoded.len()
             }
             PreparedOutcome::Error { code, message } => {
@@ -787,6 +804,9 @@ fn bench_egress(c: &mut Criterion) {
         ingest_request("local-only", b"local bytes", "evidence-local-only");
     local_only_request.provider_egress = ProviderEgress::LocalOnly;
     let local_only = store.ingest_artifact(local_only_request).unwrap();
+    let purged = store
+        .ingest_artifact(ingest_request("purged", b"purged bytes", "evidence-purged"))
+        .unwrap();
     let foreign_scope = seed_foreign_scopes(&store, 1).remove(0);
     store
         .commit(intent("seed-owners"), |envelope| {
@@ -796,6 +816,7 @@ fn bench_egress(c: &mut Criterion) {
                 ("evidence-secret", &own_scope),
                 ("evidence-local-only", &own_scope),
                 ("evidence-normal", &foreign_scope),
+                ("evidence-normal", &own_scope),
             ]
             .into_iter()
             .enumerate()
@@ -804,9 +825,26 @@ fn bench_egress(c: &mut Criterion) {
                 spec.object_id = format!("owner-{n}");
                 spec.decision_id = format!("owner-decision-{n}");
                 envelope.insert_decision(spec)?;
-                envelope.record_admission(admission(&format!("owner-{n}")))?;
+                let mut admitted = admission(&format!("owner-{n}"));
+                // A personal taint classes the served owner `sensitive` while
+                // the artifact it cites stays `normal`.
+                if n == 5 {
+                    admitted.taint_class = Some(TaintClass::Personal);
+                }
+                envelope.record_admission(admitted)?;
             }
             Ok(String::new())
+        })
+        .unwrap();
+    store
+        .delete_artifact(ArtifactDeletionRequest {
+            intent: intent("purge"),
+            identity: ArtifactDeletionIdentity::Digest(purged.digest.clone()),
+            kind: ArtifactDeletionKind::Purge,
+            operator_id: Some("bench".to_string()),
+            target_locator: Some("bench://purge".to_string()),
+            reason: Some("bench".to_string()),
+            deleted_at: 1,
         })
         .unwrap();
     drop(store);
@@ -846,6 +884,16 @@ fn bench_egress(c: &mut Criterion) {
             "unknown_sensitive",
             egress_request(&daemon, &"0".repeat(64), "remote", "normal", "owner-0"),
             json!({"refused": "unknown_sensitive"}),
+        ),
+        (
+            "owner_sensitive",
+            egress_request(&daemon, &normal.digest, "remote", "normal", "owner-5"),
+            json!({"refused": "owner_sensitive"}),
+        ),
+        (
+            "tombstoned",
+            egress_request(&daemon, &purged.digest, "remote", "normal", "owner-0"),
+            json!({"refused": "tombstoned"}),
         ),
     ];
     group.sample_size(30);
