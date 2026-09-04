@@ -165,71 +165,6 @@ fn load_alignment_input(
     requested: i64,
 ) -> Result<AlignmentInput, KernelError> {
     let tip = snapshot_tip(tx, requested)?;
-    let decisions = {
-        let mut statement = tx
-            .prepare_cached(
-                "SELECT decision_id,object_id,
-                        CASE WHEN invalidated_commit_seq<=?1 THEN invalidated_commit_seq END,
-                        CASE WHEN invalidated_commit_seq<=?1 THEN superseded_by END,
-                        evidence_id IS NULL OR EXISTS(
-                            SELECT 1 FROM evidence_meta e
-                            WHERE e.evidence_id=d.evidence_id
-                              AND e.created_commit_seq<=?1
-                              AND (e.invalidated_commit_seq IS NULL OR ?1<e.invalidated_commit_seq)
-                        )
-                 FROM decisions d
-                 WHERE created_commit_seq<=?1",
-            )
-            .map_err(|_| KernelError::Io)?;
-        let rows = statement
-            .query_map([requested], |row| {
-                Ok((
-                    row.get::<_, String>(1)?,
-                    DecisionHistory {
-                        decision_id: row.get(0)?,
-                        invalidated_commit_seq: row.get(2)?,
-                        superseded_by: row.get(3)?,
-                        evidence_eligible: row.get(4)?,
-                    },
-                ))
-            })
-            .map_err(|_| KernelError::Io)?
-            .collect::<rusqlite::Result<HashMap<_, _>>>()
-            .map_err(|_| KernelError::Io)?;
-        rows
-    };
-    let observations = {
-        let mut statement = tx
-            .prepare_cached(
-                "SELECT observation_id,observation_payload
-                 FROM observations o
-                 WHERE created_commit_seq<=?1
-                   AND (invalidated_commit_seq IS NULL OR ?1<invalidated_commit_seq)
-                   AND (
-                       evidence_id IS NULL OR EXISTS(
-                           SELECT 1 FROM evidence_meta e
-                           WHERE e.evidence_id=o.evidence_id
-                             AND e.created_commit_seq<=?1
-                             AND (e.invalidated_commit_seq IS NULL OR ?1<e.invalidated_commit_seq)
-                       )
-                   )",
-            )
-            .map_err(|_| KernelError::Io)?;
-        let encoded = statement
-            .query_map([requested], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })
-            .map_err(|_| KernelError::Io)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|_| KernelError::Io)?;
-        let mut observations = HashMap::with_capacity(encoded.len());
-        for (observation_id, payload) in encoded {
-            let decoded: ObservationClassification =
-                serde_json::from_slice(&payload).map_err(|_| KernelError::CorruptCanonicalRow)?;
-            observations.insert(observation_id, decoded.classification);
-        }
-        observations
-    };
     let dependencies = {
         let mut statement = tx
             .prepare_cached(
@@ -249,6 +184,110 @@ fn load_alignment_input(
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| KernelError::Io)?;
         rows
+    };
+    // Only the decisions a dependency can reach through supersession and the
+    // observations a dependency names take part in the derivation, so those
+    // are the only rows loaded; a store with no alignment dependency loads no
+    // decision at all.
+    let mut decisions: HashMap<String, DecisionHistory> = HashMap::new();
+    let mut frontier: Vec<String> = dependencies
+        .iter()
+        .map(|dependency| dependency.decision_object_id.clone())
+        .collect();
+    frontier.sort_unstable();
+    frontier.dedup();
+    while !frontier.is_empty() {
+        let ids = serde_json::to_string(&frontier).map_err(|_| KernelError::Io)?;
+        let mut statement = tx
+            .prepare_cached(
+                "SELECT decision_id,object_id,
+                        CASE WHEN invalidated_commit_seq<=?1 THEN invalidated_commit_seq END,
+                        CASE WHEN invalidated_commit_seq<=?1 THEN superseded_by END,
+                        evidence_id IS NULL OR EXISTS(
+                            SELECT 1 FROM evidence_meta e
+                            WHERE e.evidence_id=d.evidence_id
+                              AND e.created_commit_seq<=?1
+                              AND (e.invalidated_commit_seq IS NULL OR ?1<e.invalidated_commit_seq)
+                        )
+                 FROM decisions d
+                 WHERE created_commit_seq<=?1
+                   AND object_id IN (SELECT value FROM json_each(?2))",
+            )
+            .map_err(|_| KernelError::Io)?;
+        let loaded = statement
+            .query_map(rusqlite::params![requested, ids], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    DecisionHistory {
+                        decision_id: row.get(0)?,
+                        invalidated_commit_seq: row.get(2)?,
+                        superseded_by: row.get(3)?,
+                        evidence_eligible: row.get(4)?,
+                    },
+                ))
+            })
+            .map_err(|_| KernelError::Io)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| KernelError::Io)?;
+        let mut next = Vec::new();
+        for (object_id, history) in loaded {
+            if let Some(successor) = history.superseded_by.as_deref() {
+                // Keep `frontier` sorted for `binary_search_by`.
+                let in_frontier = frontier
+                    .binary_search_by(|id| id.as_str().cmp(successor))
+                    .is_ok();
+                if !in_frontier && !decisions.contains_key(successor) {
+                    next.push(successor.to_string());
+                }
+            }
+            decisions.insert(object_id, history);
+        }
+        next.sort_unstable();
+        next.dedup();
+        next.retain(|id| !decisions.contains_key(id));
+        frontier = next;
+    }
+    let observations = if dependencies.is_empty() {
+        HashMap::new()
+    } else {
+        let mut ids: Vec<&str> = dependencies
+            .iter()
+            .map(|dependency| dependency.observation_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let ids = serde_json::to_string(&ids).map_err(|_| KernelError::Io)?;
+        let mut statement = tx
+            .prepare_cached(
+                "SELECT observation_id,observation_payload
+                 FROM observations o
+                 WHERE created_commit_seq<=?1
+                   AND (invalidated_commit_seq IS NULL OR ?1<invalidated_commit_seq)
+                   AND (
+                       evidence_id IS NULL OR EXISTS(
+                           SELECT 1 FROM evidence_meta e
+                           WHERE e.evidence_id=o.evidence_id
+                             AND e.created_commit_seq<=?1
+                             AND (e.invalidated_commit_seq IS NULL OR ?1<e.invalidated_commit_seq)
+                       )
+                   )
+                   AND observation_id IN (SELECT value FROM json_each(?2))",
+            )
+            .map_err(|_| KernelError::Io)?;
+        let encoded = statement
+            .query_map(rusqlite::params![requested, ids], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|_| KernelError::Io)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| KernelError::Io)?;
+        let mut observations = HashMap::with_capacity(encoded.len());
+        for (observation_id, payload) in encoded {
+            let decoded: ObservationClassification =
+                serde_json::from_slice(&payload).map_err(|_| KernelError::CorruptCanonicalRow)?;
+            observations.insert(observation_id, decoded.classification);
+        }
+        observations
     };
     Ok(AlignmentInput {
         known_as_of: requested,
