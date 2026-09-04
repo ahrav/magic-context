@@ -70,17 +70,18 @@ function harness() {
 }
 
 describe("historian kernel promotion", () => {
-    test("specs derive stable ids and skip refs without a category or content", () => {
+    test("specs derive claim-stable ids and skip refs without a category or content", () => {
         const refs = [ref("PROJECT_RULES", "a"), ref("", "b"), ref("CONFIG_VALUES", "")];
-        const first = promotedFactSpecs(refs, identity);
-        const second = promotedFactSpecs(refs, identity);
+        const first = promotedFactSpecs(refs, ROOT);
+        const second = promotedFactSpecs(refs, ROOT);
         expect(first).toHaveLength(1);
         expect(first).toEqual(second);
         expect(first[0]?.object_id).toMatch(/^mem_[0-9a-f]{32}$/);
         expect(first[0]?.source_id).toBe("historian");
+        expect(promotedFactSpecs(refs, "/other-root")[0]?.object_id).not.toBe(first[0]?.object_id);
     });
 
-    test("a rerun of the same batch replays instead of minting a second object", async () => {
+    test("a rerun of the same batch finds the object present and commits nothing new", async () => {
         const { db, kernel, transport, client } = harness();
         const refs = [ref("PROJECT_RULES", "the build runs in CI only")];
         const args = {
@@ -97,7 +98,51 @@ describe("historian kernel promotion", () => {
         expect(kernel.liveRows()).toHaveLength(1);
         expect(kernel.liveRows()[0]?.decision?.payload.summary).toBe("the build runs in CI only");
         expect(kernel.liveRows()[0]?.source_kind).toBe("model");
-        expect(transport.methods().filter((method) => method === "kernel.commit")).toHaveLength(2);
+        expect(transport.methods().filter((method) => method === "kernel.commit")).toHaveLength(1);
+    });
+
+    test("a later run re-emitting the same claim keeps one live object", async () => {
+        const { db, kernel, client } = harness();
+        const refs = [ref("PROJECT_RULES", "the build runs in CI only")];
+        await commitPromotedFactsToKernel({
+            client,
+            db,
+            projectPath: PROJECT,
+            projectRoot: ROOT,
+            sessionId: "s1",
+            refs,
+            identity,
+        });
+        await commitPromotedFactsToKernel({
+            client,
+            db,
+            projectPath: PROJECT,
+            projectRoot: ROOT,
+            sessionId: "s2",
+            refs,
+            identity: { ...identity, runId: "s2:0:9", batchId: "20-29" },
+        });
+        expect(kernel.liveRows()).toHaveLength(1);
+    });
+
+    test("a fact already live under another object id is not promoted again", async () => {
+        const { db, kernel, transport, client } = harness();
+        kernel.seedDecision({
+            object_id: "mem_run_keyed_row",
+            decision_kind: "PROJECT_RULES",
+            summary: "the build runs in CI only",
+        });
+        await commitPromotedFactsToKernel({
+            client,
+            db,
+            projectPath: PROJECT,
+            projectRoot: ROOT,
+            sessionId: "s1",
+            refs: [ref("PROJECT_RULES", "the build runs in CI only")],
+            identity,
+        });
+        expect(kernel.liveRows()).toHaveLength(1);
+        expect(transport.methods()).not.toContain("kernel.commit");
     });
 
     test("no client and no refs are both no-ops", async () => {

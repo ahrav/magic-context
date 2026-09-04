@@ -4,6 +4,6 @@ export const CTX_EXPAND_LIGHT_DESCRIPTION = `For ctx_expand users, recover compa
 
 export const CTX_NOTE_LIGHT_DESCRIPTION = `For ctx_note users, write saves, read lists, update changes, and dismiss retires future session notes; surface_condition creates a smart note. For smart notes, NEVER use a condition tied to this conversation or an unobservable future action because the background checker can inspect only external GitHub, disk, git, or web signals.`;
 
-export const CTX_MEMORY_LIGHT_DESCRIPTION = `For ctx_memory users, create one durable project claim with category and content; revise, archive, or merge claims by opaque public ID, or get up to twenty public IDs. Stale tokens make no change. list remains dreamer-only, so primary agents must NEVER assume bulk-list access.`;
+export const CTX_MEMORY_LIGHT_DESCRIPTION = `For ctx_memory users, create one durable project claim with category and content; revise, archive, or merge claims by opaque object id, or get up to twenty object ids. No token is passed; revise and merge return the survivor's id. list remains dreamer-only, so primary agents must NEVER assume bulk-list access.`;
 
 export const CTX_SEARCH_LIGHT_DESCRIPTION = `For ctx_search users, retrieve compacted messages, commits, and notes. Broad project-memory retrieval is disabled until the claim retrieval projection is active; exact public claim or revision locators resolve directly. Message hits continue through ctx_expand.`;

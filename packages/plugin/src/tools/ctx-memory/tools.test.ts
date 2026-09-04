@@ -167,10 +167,11 @@ describe("ctx_memory create and revise through the cached token", () => {
         expect(first.outcome).toBe("applied");
         expect(second).toMatchObject({ outcome: "already applied", objects: first.objects });
         expect(tool.kernel.liveRows()).toHaveLength(1);
-        // Changed arguments under the same tool call derive the same object id, which the
-        // store already holds, so the daemon refuses the insert instead of minting a twin.
+        // Changed arguments under the same tool call retain the operation key
+        // and change the request digest, so the daemon rejects the redelivery
+        // instead of committing a second operation.
         expect(await tool.execute(createArgs("Changed args."), "call-replay")).toBe(
-            "Error: The kernel rejected the request as invalid input.",
+            "Error: The operation key was reused with a different request digest.",
         );
         expect(tool.kernel.liveRows()).toHaveLength(1);
     });
@@ -302,6 +303,21 @@ describe("ctx_memory lifecycle and merge", () => {
         const bare = tool.transport.calls.filter((call) => call.method === "kernel.commit")[1]
             ?.body as { intent: { cause: string } };
         expect(bare.intent.cause).toBe("call-archive-bare");
+    });
+
+    test("an archive tool call redelivered against another target is rejected, not applied", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        kernel.seedDecision({ object_id: "mem_b", decision_kind: "ARCHITECTURE", summary: "B." });
+        const tool = harness(kernel);
+        const first = parseJson<CommitJson>(
+            await tool.execute({ action: "archive", objectId: "mem_a" }, "call-archive-redeliver"),
+        );
+        expect(first.outcome).toBe("applied");
+        expect(
+            await tool.execute({ action: "archive", objectId: "mem_b" }, "call-archive-redeliver"),
+        ).toBe("Error: The operation key was reused with a different request digest.");
+        expect(kernel.objects.get("mem_b")?.invalidated_commit_seq).toBeNull();
     });
 
     test("a target the project cannot read is refused before any commit", async () => {
@@ -481,6 +497,81 @@ describe("ctx_memory anti-memory", () => {
             expect(await tool.execute(args, callId)).toContain("Error:");
         }
         expect(tool.kernel.liveRows()).toHaveLength(1);
+    });
+
+    test("revise of an anti-memory without a replacement inherits the parsed payload", async () => {
+        const tool = harness();
+        const payload = {
+            trigger: "Choosing a cache backend",
+            rejectedStrategy: "Use Redis",
+            rejectionReason: "The project must work offline",
+        };
+        const created = parseJson<CommitJson>(
+            await tool.execute(
+                { action: "create", category: "REJECTED_APPROACH", antiMemory: payload },
+                "call-anti-create-revise",
+            ),
+        );
+        const objectId = created.objects[0] as string;
+        const revised = parseJson<CommitJson>(
+            await tool.execute(
+                { action: "revise", objectId, reason: "still true" },
+                "call-anti-revise",
+            ),
+        );
+        expect(revised.outcome).toBe("applied");
+        const survivor = revised.objectId as string;
+        const got = parseJson<ReadJson>(
+            await tool.execute({ action: "get", objectIds: [survivor] }, "call-anti-revise-get"),
+        );
+        expect(got.memories[0]).toMatchObject({
+            category: "REJECTED_APPROACH",
+            antiMemory: expect.objectContaining(payload),
+        });
+    });
+
+    test("revise of an anti-memory whose summary does not parse names the input error", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: "mem_anti_broken",
+            decision_kind: "REJECTED_APPROACH",
+            summary: "free prose that is not an anti-memory payload",
+        });
+        const tool = harness(kernel);
+        const text = await tool.execute(
+            { action: "revise", objectId: "mem_anti_broken" },
+            "call-anti-broken",
+        );
+        expect(text).toBe(
+            "Error: the anti-memory being replaced has an unparseable stored payload; pass a full antiMemory payload to replace it",
+        );
+        expect(kernel.objects.get("mem_anti_broken")?.invalidated_commit_seq).toBeNull();
+    });
+
+    test("merge inherits from the caller's first target, not store order", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: "mem_first_in_store",
+            decision_kind: "ARCHITECTURE",
+            summary: "Stored earlier.",
+        });
+        kernel.seedDecision({
+            object_id: "mem_second_in_store",
+            decision_kind: "CONSTRAINTS",
+            summary: "Stored later.",
+            rationale: "why",
+        });
+        const tool = harness(kernel);
+        const merged = parseJson<CommitJson>(
+            await tool.execute(
+                { action: "merge", objectIds: ["mem_second_in_store", "mem_first_in_store"] },
+                "call-merge-order",
+            ),
+        );
+        const survivor = kernel.objects.get(merged.objectId as string);
+        expect(survivor?.decision?.decision_kind).toBe("CONSTRAINTS");
+        expect(survivor?.decision?.payload.summary).toBe("Stored later.");
+        expect(survivor?.decision?.payload.rationale).toBe("why");
     });
 });
 

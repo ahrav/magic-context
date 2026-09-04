@@ -148,9 +148,7 @@ export interface KernelClientOptions {
 const DEFAULT_PRODUCER = "plugin";
 const DEFAULT_DEADLINE_MS = 10_000;
 /**
- * Fields of the operation key are joined with the ASCII unit separator, which
- * no path, producer, actor, cause, or hex digest contains, so distinct inputs
- * cannot collide by concatenation.
+ * Fields of the operation key are joined with the ASCII unit separator; callers strip it from free-text fields (see `archiveCause`), so distinct inputs cannot collide by concatenation. commentlint: allow(JUDGE)
  */
 export const OPERATION_KEY_SEPARATOR = "\u001f";
 
@@ -162,17 +160,15 @@ export function deriveRequestDigest(operations: readonly CommitOperation[]): str
     return sha256Hex(stableStringify(operations));
 }
 
+/** The key names only the stable call identity — never the body, which travels in `request_digest` — so a redelivered identity with different bytes hits the daemon's `operation_key_reused` rejection instead of committing as a second operation. commentlint: allow(JUDGE) */
 export function deriveOperationKey(parts: {
     projectRoot: string;
     producer: string;
     actor: string;
     cause: string;
-    requestDigest: string;
 }): string {
     return sha256Hex(
-        [parts.projectRoot, parts.producer, parts.actor, parts.cause, parts.requestDigest].join(
-            OPERATION_KEY_SEPARATOR,
-        ),
+        [parts.projectRoot, parts.producer, parts.actor, parts.cause].join(OPERATION_KEY_SEPARATOR),
     );
 }
 
@@ -380,7 +376,6 @@ export class KernelClient {
             producer,
             actor: args.actor,
             cause: args.cause,
-            requestDigest,
         });
         return this.wireBody("kernel.commit", {
             intent: {

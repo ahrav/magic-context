@@ -14,6 +14,7 @@ import {
     type DecisionSpecInput,
     isAvailable,
     type KernelClient,
+    type ReadRow,
     sha256Hex,
     stateKey,
 } from "../../shared/kernel-client";
@@ -136,6 +137,15 @@ export function claimLaneImportSpec(
     };
 }
 
+/** The (kind, summary) identity a memory-domain decision row deduplicates by when writers derive distinct object ids for the same fact. commentlint: allow(JUDGE) */
+export function liveMemoryContentKeys(rows: readonly ReadRow[]): Set<string> {
+    return new Set(
+        rows
+            .filter((row) => row.object.domain_id === CTX_MEMORY_DOMAIN_ID && row.decision)
+            .map((row) => `${row.decision?.decision_kind}\u001f${row.decision?.payload.summary}`),
+    );
+}
+
 /** The marker is written only after every batch is `available`; a partial run resumes from the kernel's live rows. commentlint: allow(JUDGE) */
 export async function importClaimLaneMemories(args: {
     db: Database;
@@ -164,11 +174,7 @@ export async function importClaimLaneMemories(args: {
     // A marker reset replays the whole lane, so claims the historian already
     // promoted under its own derived ids dedupe by (kind, summary) instead of
     // duplicating as import-id rows.
-    const presentContent = new Set(
-        existing.rows
-            .filter((row) => row.object.domain_id === CTX_MEMORY_DOMAIN_ID && row.decision)
-            .map((row) => `${row.decision?.decision_kind}\u001f${row.decision?.payload.summary}`),
-    );
+    const presentContent = liveMemoryContentKeys(existing.rows);
     const pending = claims.filter(
         (claim) =>
             !present.has(importedObjectId(claim.publicClaimId, projectRoot)) &&

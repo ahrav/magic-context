@@ -334,7 +334,6 @@ describe("KernelClient mutations", () => {
             producer: "plugin",
             actor: "a",
             cause: "c",
-            requestDigest: digest,
         });
         expect(key).toMatch(/^[0-9a-f]{64}$/);
         expect(
@@ -343,9 +342,31 @@ describe("KernelClient mutations", () => {
                 producer: "plugin",
                 actor: "a",
                 cause: "c",
-                requestDigest: digest,
             }),
         ).not.toBe(key);
+    });
+
+    test("the same call identity keeps its key while a changed body changes only the digest", () => {
+        const key = deriveOperationKey({
+            projectRoot: PROJECT,
+            producer: "plugin",
+            actor: "a",
+            cause: "call-1",
+        });
+        expect(
+            deriveOperationKey({
+                projectRoot: PROJECT,
+                producer: "plugin",
+                actor: "a",
+                cause: "call-1",
+            }),
+        ).toBe(key);
+        const digest = deriveRequestDigest([{ op: "insert_decision", spec }]);
+        const otherDigest = deriveRequestDigest([
+            { op: "retire_decision", object_id: "mem_other" },
+        ]);
+        expect(digest).toBe(deriveRequestDigest([{ op: "insert_decision", spec: { ...spec } }]));
+        expect(otherDigest).not.toBe(digest);
     });
 
     test("create sends one insert_decision under a derived intent", async () => {
@@ -359,13 +380,15 @@ describe("KernelClient mutations", () => {
         expect(body.source_kind).toBe("assistant");
         const wireIntent = body.intent as Record<string, string>;
         expect(wireIntent.producer).toBe("plugin");
+        expect(wireIntent.request_digest).toBe(
+            deriveRequestDigest([{ op: "insert_decision", spec }]),
+        );
         expect(wireIntent.operation_key).toBe(
             deriveOperationKey({
                 projectRoot: PROJECT,
                 producer: "plugin",
                 actor: intent.actor,
                 cause: intent.cause,
-                requestDigest: wireIntent.request_digest as string,
             }),
         );
         expect(c.tokens.get(PROJECT, spec.object_id)?.known_as_of).toBe(2);

@@ -148,18 +148,18 @@ function successorLineage(predecessors: readonly ReadRow[]): {
 /**
  * Every mutation target must be a memory this project can read: the daemon
  * resolves ids store-wide and checks only the tokens it is handed, so the
- * project-scoped read is the authorization boundary.
+ * project-scoped read is the authorization boundary. Rows follow `targets`
+ * order because `revisionArgs` inherits from the caller's first target. commentlint: allow(JUDGE)
  */
 function requireVisible(rows: readonly ReadRow[], targets: readonly string[]): ReadRow[] {
-    const visible = rows.filter((row) => targets.includes(row.object.object_id));
-    const seen = new Set(visible.map((row) => row.object.object_id));
-    const missing = targets.filter((id) => !seen.has(id));
+    const byId = new Map(rows.map((row) => [row.object.object_id, row]));
+    const missing = targets.filter((id) => !byId.has(id));
     if (missing.length > 0) {
         throw new ClaimOperationInputError(
             `memory not found or not visible from this project: ${missing.join(", ")}`,
         );
     }
-    return visible;
+    return targets.map((id) => byId.get(id) as ReadRow);
 }
 
 function requireTarget(args: CtxMemoryArgs): string {
@@ -208,21 +208,27 @@ async function readMemoryRows(
     return { ok: true, rows: read.rows.filter(isMemoryDecisionRow), knownAsOf: read.known_as_of };
 }
 
-/** The category a revision keeps unless the call names another; `rationale` follows the same rule. */
+/** An anti-memory predecessor's summary is parsed back into an `antiMemory` payload — never inherited as `content` — because `assertCtxMemoryWriteShape` requires the payload arm for the anti-memory category. commentlint: allow(JUDGE) */
 function revisionArgs(args: CtxMemoryArgs, predecessors: readonly ReadRow[]): CtxMemoryArgs {
-    const first = predecessors[0];
-    const inherited = {
-        ...(args.category === undefined && first?.decision
-            ? { category: first.decision.decision_kind }
-            : {}),
-        ...(args.content === undefined && args.antiMemory === undefined && first?.decision
-            ? { content: first.decision.payload.summary }
-            : {}),
-        ...(args.reason === undefined && first?.decision?.payload.rationale
-            ? { reason: first.decision.payload.rationale }
+    const decision = predecessors[0]?.decision;
+    const merged: CtxMemoryArgs = {
+        ...args,
+        ...(args.category === undefined && decision ? { category: decision.decision_kind } : {}),
+        ...(args.reason === undefined && decision?.payload.rationale
+            ? { reason: decision.payload.rationale }
             : {}),
     };
-    return { ...args, ...inherited };
+    if (args.content !== undefined || args.antiMemory !== undefined || !decision) return merged;
+    if (merged.category?.trim() !== ANTI_MEMORY_CATEGORY) {
+        return { ...merged, content: decision.payload.summary };
+    }
+    try {
+        return { ...merged, antiMemory: parseAntiMemoryContent(decision.payload.summary) };
+    } catch {
+        throw new ClaimOperationInputError(
+            "the anti-memory being replaced has an unparseable stored payload; pass a full antiMemory payload to replace it",
+        );
+    }
 }
 
 function nextSourceRevision(predecessors: readonly ReadRow[]): number {
