@@ -45,11 +45,12 @@ import {
 } from "./compartment-render-epoch";
 import { extractM0Block, renderCompartmentAtTier, renderDecayedCompartments } from "./decay-render";
 import {
+    budgetedMemoryRows,
+    DEFAULT_MEMORY_BUDGET_TOKENS,
     memoryRowLocator,
     memoryRows,
     memorySnapshotKey,
     renderKernelMemoryBlock,
-    trimKernelRowsToBudget,
     withheldMemoryRowCount,
 } from "./kernel-memory-render";
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
@@ -293,12 +294,11 @@ export function prepareCompartmentInjection(
     args: PrepareCompartmentInjectionArgs,
 ): PreparedCompartmentInjection | null {
     const { db, sessionId, messages, isCacheBusting, projectPath, temporalAwareness } = args;
-    const renderedRows = projectPath
-        ? trimKernelRowsToBudget(
-              memoryRows(args.memory),
-              args.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
-          )
-        : [];
+    const renderedRows = renderedMemoryRows(
+        args.memory,
+        projectPath,
+        args.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+    );
     const snapshotKey = memorySnapshotKey(args.memory);
     const renderedRevisionLocators = JSON.stringify(renderedRows.map(memoryRowLocator).sort());
 
@@ -809,7 +809,6 @@ function lastCompartmentBoundaryId(compartments: readonly M0Compartment[]): stri
 }
 
 const DEFAULT_HISTORY_BUDGET_TOKENS = 60_000;
-export const DEFAULT_MEMORY_BUDGET_TOKENS = 8_000;
 
 function renderBudgetIdentity(memoryBudget?: number, historyBudget?: number): string {
     return `m${memoryBudget ?? DEFAULT_MEMORY_BUDGET_TOKENS}-h${historyBudget ?? DEFAULT_HISTORY_BUDGET_TOKENS}`;
@@ -849,7 +848,7 @@ function renderedMemoryRows(
     projectPath: string | undefined,
     budgetTokens: number,
 ): ReadRow[] {
-    return projectPath ? trimKernelRowsToBudget(memoryRows(memory), budgetTokens) : [];
+    return projectPath ? budgetedMemoryRows(memory, budgetTokens) : [];
 }
 
 /** The digest `memory_block_hashes` tracks per rendered row: the summary bytes. */

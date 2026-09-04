@@ -7,11 +7,7 @@ import { getProjectEmbeddingSnapshot } from "../../features/magic-context/memory
 import { resolveProjectRootDirectory } from "../../features/magic-context/memory/project-identity";
 import { toolCallIdFromContext } from "../../plugin/rust-tool-backends";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
-import {
-    CTX_MEMORY_ANTI_MEMORY_RULE,
-    CTX_MEMORY_DESCRIPTION,
-    CTX_MEMORY_TOOL_NAME,
-} from "./constants";
+import { CTX_MEMORY_DESCRIPTION, CTX_MEMORY_TOOL_NAME, CTX_MEMORY_UNWRAP_RULES } from "./constants";
 import { CTX_MEMORY_ACTOR, CTX_MEMORY_DREAMER_ACTOR, executeCtxMemory } from "./execute";
 import {
     CTX_MEMORY_ACTIONS,
@@ -19,6 +15,7 @@ import {
     type CtxMemoryAction,
     type CtxMemoryArgs,
     type CtxMemoryToolDeps,
+    isCtxMemoryMutation,
 } from "./types";
 import { assertCtxMemoryWriteShape } from "./write-shape";
 
@@ -86,16 +83,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
             try {
                 const parsed = ctxMemoryArgsSchema.safeParse(rawArgs);
                 let args = (parsed.success ? parsed.data : rawArgs) as CtxMemoryArgs;
-                args = unwrapImitatedReducedArgs(args, ["action"], {
-                    action: { type: "enum", values: CTX_MEMORY_DREAMER_ACTIONS },
-                    content: "string",
-                    category: { type: "enum", values: WRITABLE_MEMORY_CATEGORIES },
-                    antiMemory: CTX_MEMORY_ANTI_MEMORY_RULE,
-                    objectId: "string",
-                    objectIds: { type: "array", items: "string", maxItems: 20 },
-                    limit: "number",
-                    reason: "string",
-                });
+                args = unwrapImitatedReducedArgs(args, ["action"], CTX_MEMORY_UNWRAP_RULES);
                 const rawAction = (args as { action?: unknown }).action;
                 if (rawAction === "approve" || rawAction === "enforce") {
                     return "Error: approve and enforce are human-host-owned commands, not agent actions.";
@@ -125,8 +113,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     return "Cross-session memory is disabled for this project.";
                 }
                 const toolCallId = toolCallIdFromContext(toolContext);
-                const mutation = !["get", "list"].includes(action);
-                if (!toolCallId && mutation) {
+                if (!toolCallId && isCtxMemoryMutation(action)) {
                     return "Error: ctx_memory mutation requires a stable tool-call identity.";
                 }
                 const client = deps.kernelClient({

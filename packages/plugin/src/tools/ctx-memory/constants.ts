@@ -1,4 +1,6 @@
-import type { ImitatedArgRule } from "../unwrap-imitated-reduced-args";
+import { WRITABLE_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
+import type { ImitatedArgRule, ImitatedArgsSchema } from "../unwrap-imitated-reduced-args";
+import { CTX_MEMORY_DREAMER_ACTIONS } from "./types";
 
 export const CTX_MEMORY_TOOL_NAME = "ctx_memory";
 export const CTX_MEMORY_DESCRIPTION = `Durable project memories shared across sessions, served by the memory daemon.
@@ -40,4 +42,16 @@ export const CTX_MEMORY_ANTI_MEMORY_RULE: ImitatedArgRule = {
         nonApplicableWhen: "string",
         expiresAt: "number",
     },
+};
+
+/** How each `ctx_memory` argument is recovered from a reduced-args wrapper; every host registers the tool against this one table. */
+export const CTX_MEMORY_UNWRAP_RULES: ImitatedArgsSchema = {
+    action: { type: "enum", values: CTX_MEMORY_DREAMER_ACTIONS },
+    content: "string",
+    category: { type: "enum", values: WRITABLE_MEMORY_CATEGORIES },
+    antiMemory: CTX_MEMORY_ANTI_MEMORY_RULE,
+    objectId: "string",
+    objectIds: { type: "array", items: "string", maxItems: 20 },
+    limit: "number",
+    reason: "string",
 };

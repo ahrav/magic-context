@@ -10,7 +10,7 @@ import type { ContextDatabase } from "@magic-context/core/features/magic-context
 import type { KernelClientResolver } from "@magic-context/core/shared/kernel-client";
 import { CTX_SEARCH_DESCRIPTION } from "@magic-context/core/tools/ctx-search/constants";
 import { executeCtxSearch } from "@magic-context/core/tools/ctx-search/execute";
-import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
+import { normalizeCtxSearchArgs } from "@magic-context/core/tools/ctx-search/query-input";
 import { type Static, Type } from "typebox";
 
 const ParamsSchema = Type.Object(
@@ -79,16 +79,7 @@ export function createCtxSearchTool(
 			_onUpdate,
 			ctx,
 		) {
-			params = unwrapImitatedReducedArgs(params, ["query"], {
-				query: "string",
-				limit: "number",
-				sources: {
-					type: "array",
-					items: "string",
-					maxItems: 5,
-					values: ["memory", "message", "git_commit", "primer", "note"],
-				},
-			});
+			params = normalizeCtxSearchArgs(params);
 			const execution = await executeCtxSearch(
 				{
 					db: deps.db,

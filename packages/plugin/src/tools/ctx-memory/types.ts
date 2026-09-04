@@ -10,6 +10,13 @@ export const CTX_MEMORY_DREAMER_ACTIONS = [...CTX_MEMORY_ACTIONS, "list"] as con
 
 export type CtxMemoryAction = (typeof CTX_MEMORY_DREAMER_ACTIONS)[number];
 
+const CTX_MEMORY_READ_ACTIONS: ReadonlySet<CtxMemoryAction> = new Set(["get", "list"]);
+
+/** Whether `action` commits through the kernel rather than reading from it. */
+export function isCtxMemoryMutation(action: CtxMemoryAction): boolean {
+    return !CTX_MEMORY_READ_ACTIONS.has(action);
+}
+
 export interface CtxMemoryArgs extends ImitatedReducedArgs {
     action?: CtxMemoryAction;
     content?: string;

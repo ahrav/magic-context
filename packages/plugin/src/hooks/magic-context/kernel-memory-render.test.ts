@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { MAX_MEMORY_INJECTION_BUDGET_TOKENS } from "../../config/schema/magic-context";
 import { ANTI_MEMORY_CATEGORY } from "../../features/magic-context/memory/constants";
 import {
     BUDGET_OMITTED_MARKER,
@@ -130,6 +131,29 @@ describe("sensitivity filtering on automatic surfaces", () => {
         const block = await readHistorianMemoryBlock({ client, sessionId: SESSION });
         expect(block).toContain("a normal memory");
         expect(block).not.toContain("a sensitive memory");
+    });
+});
+
+describe("historian baseline budget", () => {
+    test("the baseline is trimmed to the largest configurable injection budget", async () => {
+        // Each summary is ~600 tokens; 40 of them exceed the 20k configurable maximum.
+        const filler = "budget ".repeat(600);
+        const kernel = seededKernel(
+            Array.from({ length: 40 }, (_, index) => ({
+                id: String.fromCharCode(97 + (index % 26)) + String(index),
+                summary: `memory ${index} ${filler}`,
+            })),
+        );
+        const { client } = kernelHarness(kernel);
+        const block = await readHistorianMemoryBlock({ client, sessionId: SESSION });
+        const rendered = block.split("\n").filter((line) => line.startsWith("mem_")).length;
+        const expected = trimKernelRowsToBudget(
+            memoryRows(kernel.snapshot()),
+            MAX_MEMORY_INJECTION_BUDGET_TOKENS,
+        ).length;
+        expect(expected).toBeGreaterThan(0);
+        expect(expected).toBeLessThan(40);
+        expect(rendered).toBe(expected);
     });
 });
 

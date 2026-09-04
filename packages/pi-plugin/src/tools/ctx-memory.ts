@@ -9,24 +9,27 @@ import {
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import type { KernelClientResolver } from "@magic-context/core/shared/kernel-client";
 import {
-	CTX_MEMORY_ANTI_MEMORY_RULE,
 	CTX_MEMORY_DESCRIPTION,
+	CTX_MEMORY_UNWRAP_RULES,
 } from "@magic-context/core/tools/ctx-memory/constants";
 import { executeCtxMemory } from "@magic-context/core/tools/ctx-memory/execute";
-import type { CtxMemoryArgs } from "@magic-context/core/tools/ctx-memory/types";
+import {
+	CTX_MEMORY_ACTIONS,
+	CTX_MEMORY_DREAMER_ACTIONS,
+	type CtxMemoryAction,
+	type CtxMemoryArgs,
+	isCtxMemoryMutation,
+} from "@magic-context/core/tools/ctx-memory/types";
 import { assertCtxMemoryWriteShape } from "@magic-context/core/tools/ctx-memory/write-shape";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
-const ALL_ACTIONS = [
-	"create",
-	"get",
-	"list",
-	"revise",
-	"archive",
-	"merge",
-] as const;
-const DREAMER_ONLY_ACTIONS = new Set<string>(["list"]);
+const ALL_ACTIONS = CTX_MEMORY_DREAMER_ACTIONS;
+const DREAMER_ONLY_ACTIONS: ReadonlySet<CtxMemoryAction> = new Set(
+	ALL_ACTIONS.filter(
+		(action) => !(CTX_MEMORY_ACTIONS as readonly string[]).includes(action),
+	),
+);
 
 export const CTX_MEMORY_PI_ACTOR = "agent:pi";
 export const CTX_MEMORY_PI_DREAMER_ACTOR = "agent:pi:dreamer";
@@ -140,16 +143,11 @@ export function createCtxMemoryTool(
 		async execute(toolCallId, rawParams, signal, _onUpdate, ctx) {
 			try {
 				let params = rawParams as CtxMemoryParams & CtxMemoryArgs;
-				params = unwrapImitatedReducedArgs(params, ["action"], {
-					action: { type: "enum", values: ALL_ACTIONS },
-					content: "string",
-					category: { type: "enum", values: WRITABLE_MEMORY_CATEGORIES },
-					antiMemory: CTX_MEMORY_ANTI_MEMORY_RULE,
-					objectId: "string",
-					objectIds: { type: "array", items: "string", maxItems: 20 },
-					limit: "number",
-					reason: "string",
-				});
+				params = unwrapImitatedReducedArgs(
+					params,
+					["action"],
+					CTX_MEMORY_UNWRAP_RULES,
+				);
 				const rawAction = (params as { action?: unknown }).action;
 				if (rawAction === "approve" || rawAction === "enforce") {
 					return err(
@@ -158,13 +156,13 @@ export function createCtxMemoryTool(
 				}
 				if (
 					typeof rawAction !== "string" ||
-					!ALL_ACTIONS.includes(rawAction as (typeof ALL_ACTIONS)[number])
+					!ALL_ACTIONS.includes(rawAction as CtxMemoryAction)
 				) {
 					return err(
 						`Error: Action '${String(rawAction)}' is not allowed in this context.`,
 					);
 				}
-				const action = rawAction as (typeof ALL_ACTIONS)[number];
+				const action = rawAction as CtxMemoryAction;
 				if (!dreamerAllowed && DREAMER_ONLY_ACTIONS.has(action)) {
 					return err(
 						`Error: Action '${action}' is not allowed in this context.`,
@@ -191,8 +189,7 @@ export function createCtxMemoryTool(
 				if (!sessionId) {
 					return err("Error: ctx_memory requires an active session.");
 				}
-				const mutation = !["get", "list"].includes(action);
-				if (!toolCallId && mutation) {
+				if (!toolCallId && isCtxMemoryMutation(action)) {
 					return err(
 						"Error: ctx_memory mutation requires a stable tool-call identity.",
 					);

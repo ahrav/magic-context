@@ -5,7 +5,9 @@
  * `known_as_of` tokens, the three conflict reasons, replay by operation key,
  * supersession chains, and per-surface visibility: a `labeled` row serves only
  * on `explicit_search`, `sensitive` rows hide from the automatic surfaces, and
- * `secret` rows hide everywhere. Anything else answers with a scripted state.
+ * `secret` rows hide everywhere. Rows carry the project root they were written
+ * under and serve only to that project. Scripted surface and commit states
+ * override the row-backed replies.
  */
 
 import {
@@ -15,6 +17,7 @@ import {
     type MemoryState,
     parseReadResponse,
     type Surface,
+    sha256Hex,
 } from "../kernel-client";
 
 export interface FakeObject {
@@ -29,6 +32,11 @@ export interface FakeObject {
     superseded_by: string | null;
     sensitivity: "normal" | "sensitive" | "secret";
     labeled: boolean;
+    /**
+     * The project root the row was written under. `null` marks a seeded row
+     * that serves to every project, a shape no route commit can produce.
+     */
+    project_root: string | null;
     decision?: { decision_kind: string; payload: { summary: string; rationale: string } };
 }
 
@@ -36,9 +44,43 @@ interface Receipt {
     commit_seq: number;
     request_digest: string;
     tokens: { object_id: string; known_as_of: number }[];
+    merged: string[];
 }
 
 type Operation = Record<string, unknown> & { op: string };
+
+type Sensitivity = FakeObject["sensitivity"];
+
+/** Keyed on the union so a new `Surface` member fails to typecheck here. */
+const SURFACE_SET: Record<Surface, true> = {
+    auto_inject: true,
+    auto_search: true,
+    explicit_search: true,
+};
+const SURFACES: readonly Surface[] = Object.keys(SURFACE_SET) as Surface[];
+
+const SENSITIVITY_RANK: Record<Sensitivity, number> = { normal: 0, sensitive: 1, secret: 2 };
+
+function restrictive(left: Sensitivity, right: Sensitivity): Sensitivity {
+    return SENSITIVITY_RANK[left] >= SENSITIVITY_RANK[right] ? left : right;
+}
+
+/**
+ * `project:` plus the sha256 of the root path bytes, the scope id the daemon
+ * materializes per project. The daemon canonicalizes the root first; the fake
+ * hashes `projectRoot` without canonicalizing.
+ */
+export function fakeProjectScopeId(projectRoot: string): string {
+    return `project:${sha256Hex(projectRoot)}`;
+}
+
+function invalid(reason: string): unknown {
+    return { state: { kind: "invalid", reason } };
+}
+
+function conflict(reason: string): unknown {
+    return { state: { kind: "conflict", reason } };
+}
 
 export class FakeKernel {
     tip = 0;
@@ -67,7 +109,8 @@ export class FakeKernel {
     /**
      * Seeds a live decision object as if a prior commit had written it. Route
      * writes are `labeled`; `labeled: false` stands in for a verified object
-     * only a direct store commit can produce.
+     * only a direct store commit can produce. Without `projectRoot` the row
+     * serves to every project.
      */
     seedDecision(input: {
         object_id: string;
@@ -80,6 +123,7 @@ export class FakeKernel {
         domain_id?: string;
         source_kind?: string;
         source_id?: string;
+        projectRoot?: string;
     }): FakeObject {
         const seq = this.nextSeq();
         const object: FakeObject = {
@@ -94,6 +138,7 @@ export class FakeKernel {
             superseded_by: null,
             sensitivity: input.sensitivity ?? "normal",
             labeled: input.labeled ?? true,
+            project_root: input.projectRoot ?? null,
             decision: {
                 decision_kind: input.decision_kind,
                 payload: { summary: input.summary, rationale: input.rationale ?? "" },
@@ -113,10 +158,13 @@ export class FakeKernel {
     /**
      * The snapshot a client would hold after reading `surface` at the tip,
      * parsed through the same wire decoder, for consumers that take the
-     * snapshot as a value instead of dialing.
+     * snapshot as a value instead of dialing. Without `projectRoot` no
+     * project filter applies.
      */
-    snapshot(surface: Surface = "explicit_search"): KernelMemorySnapshot {
-        const parsed = parseReadResponse(this.readReply({ surface, gated: false }));
+    snapshot(surface: Surface = "explicit_search", projectRoot?: string): KernelMemorySnapshot {
+        const parsed = parseReadResponse(
+            this.readReply({ surface, gated: false }, projectRoot ?? null),
+        );
         return parsed.payload
             ? {
                   state: parsed.state,
@@ -139,9 +187,19 @@ export class FakeKernel {
         return !object.labeled && object.sensitivity !== "sensitive";
     }
 
-    private readReply(body: Record<string, unknown>): unknown {
-        const surface = body.surface as Surface;
-        const forced = this.surfaceStates.get(surface);
+    /** Whether a row is in the calling project's scope; a seeded row without a root, or a call without one, passes. */
+    private static inProject(object: FakeObject, projectRoot: string | null): boolean {
+        return (
+            projectRoot === null ||
+            object.project_root === null ||
+            object.project_root === projectRoot
+        );
+    }
+
+    private readReply(body: Record<string, unknown>, projectRoot: string | null): unknown {
+        const surface = body.surface;
+        if (!(SURFACES as readonly unknown[]).includes(surface)) return invalid("invalid_input");
+        const forced = this.surfaceStates.get(surface as Surface);
         if (forced && forced.kind !== "available") return { state: forced };
         const asOf = typeof body.as_of === "number" ? body.as_of : this.tip;
         if (asOf > this.tip) return { state: { kind: "unavailable", reason: "snapshot_diverged" } };
@@ -152,7 +210,8 @@ export class FakeKernel {
             (object) =>
                 object.created_commit_seq <= asOf &&
                 (object.invalidated_commit_seq === null || asOf < object.invalidated_commit_seq) &&
-                FakeKernel.servesOn(object, surface),
+                FakeKernel.inProject(object, projectRoot) &&
+                FakeKernel.servesOn(object, surface as Surface),
         );
         if (objectIds !== null) {
             visible = visible.filter((object) => objectIds.has(object.object_id));
@@ -172,12 +231,12 @@ export class FakeKernel {
         const rows = visible
             .sort((left, right) => (left.object_id < right.object_id ? -1 : 1))
             .map((object) => {
-                const { labeled, decision, ...row } = object;
+                const { labeled, project_root, decision, ...row } = object;
                 return {
                     object: row,
                     visibility: labeled ? "labeled" : "visible",
                     labeled,
-                    scope_id: "project:fake",
+                    scope_id: fakeProjectScopeId(project_root ?? projectRoot ?? ""),
                     token: { object_id: object.object_id, known_as_of: asOf },
                     decision: decision ?? null,
                 };
@@ -192,23 +251,35 @@ export class FakeKernel {
         };
     }
 
-    private conflictFor(tokens: { object_id: string; known_as_of: number }[]): unknown | null {
+    /**
+     * The daemon's token check: an object the store never held or another
+     * project's object is `not_found`, so foreign ids are not enumerable; a
+     * token from a snapshot past the tip is refused before the object is
+     * consulted; an invalidated object names the disposition that invalidated
+     * it; a live object that changed after the token's `known_as_of` is
+     * `known_as_of_advanced`.
+     */
+    private conflictFor(
+        tokens: { object_id: string; known_as_of: number }[],
+        projectRoot: string | null,
+    ): unknown | null {
         for (const token of tokens) {
             const object = this.objects.get(token.object_id);
-            if (!object || object.invalidated_commit_seq !== null) {
-                if (object?.superseded_by) {
-                    return { state: { kind: "conflict", reason: "superseded" } };
-                }
-                return { state: { kind: "conflict", reason: "retracted" } };
+            if (!object || !FakeKernel.inProject(object, projectRoot)) return invalid("not_found");
+            if (token.known_as_of > this.tip) {
+                return { state: { kind: "unavailable", reason: "snapshot_diverged" } };
+            }
+            if (object.invalidated_commit_seq !== null) {
+                return conflict(object.superseded_by ? "superseded" : "retracted");
             }
             if ((this.lastChange.get(token.object_id) ?? 0) > token.known_as_of) {
-                return { state: { kind: "conflict", reason: "known_as_of_advanced" } };
+                return conflict("known_as_of_advanced");
             }
         }
         return null;
     }
 
-    private commitReply(body: Record<string, unknown>): unknown {
+    private commitReply(body: Record<string, unknown>, projectRoot: string | null): unknown {
         if (this.nextCommitState) {
             const state = this.nextCommitState;
             this.nextCommitState = null;
@@ -218,130 +289,155 @@ export class FakeKernel {
         const replayed = this.receipts.get(intent.operation_key);
         if (replayed) {
             if (replayed.request_digest !== intent.request_digest) {
-                return { state: { kind: "invalid", reason: "operation_key_reused" } };
+                return invalid("operation_key_reused");
             }
             return {
                 state: { kind: "available" },
                 receipt: { commit_seq: replayed.commit_seq, replayed: true },
                 known_as_of: replayed.commit_seq,
                 tokens: replayed.tokens,
+                merged: replayed.merged,
             };
         }
         this.beforeCommit?.();
         const tokens = (body.tokens as { object_id: string; known_as_of: number }[]) ?? [];
-        const conflict = this.conflictFor(tokens);
-        if (conflict) return conflict;
+        const tokenConflict = this.conflictFor(tokens, projectRoot);
+        if (tokenConflict) return tokenConflict;
         const operations = body.operations as Operation[];
-        const touched = new Set<string>();
         const sourceKind = typeof body.source_kind === "string" ? body.source_kind : "assistant";
-        // Every inserted object id must be new to the store, matching the daemon's duplicate-id answer; retired ids stay in `objects`, so a re-insert of an archived id answers `already_exists` too. Two inserts of the same id within one envelope also collide (the daemon's object_registry primary key rejects the whole envelope), so prospective insert ids are tracked across the loop; only supersede operations may name the same survivor id repeatedly, because a merge emits one supersession per predecessor sharing a single survivor. commentlint: allow(JUDGE)
-        const prospectiveInsertIds = new Set<string>();
-        for (const operation of operations) {
-            if (operation.op !== "insert_decision" && operation.op !== "supersede_decision") {
-                continue;
+        // One envelope is atomic: rows change on a staged overlay in envelope order, and a refusal at any operation leaves the store and the tip untouched. commentlint: allow(JUDGE)
+        const seq = this.tip + 1;
+        const staged = new Map<string, FakeObject>();
+        const touched = new Set<string>();
+        const merged = new Set<string>();
+        const view = (objectId: string): FakeObject | undefined =>
+            staged.get(objectId) ?? this.objects.get(objectId);
+        const stage = (objectId: string): FakeObject => {
+            let row = staged.get(objectId);
+            if (!row) {
+                row = { ...(this.objects.get(objectId) as FakeObject) };
+                staged.set(objectId, row);
             }
-            const objectId = (operation.spec as Record<string, unknown>).object_id as string;
-            if (this.objects.has(objectId)) {
-                return { state: { kind: "invalid", reason: "already_exists" } };
+            return row;
+        };
+        // A commit target is looked up among this project's live objects only, so a missing, foreign, or invalidated target is `not_found` alike. commentlint: allow(JUDGE)
+        const liveTarget = (objectId: string): FakeObject | null => {
+            const target = view(objectId);
+            if (
+                !target ||
+                !FakeKernel.inProject(target, projectRoot) ||
+                target.invalidated_commit_seq !== null
+            ) {
+                return null;
             }
-            if (operation.op === "insert_decision") {
-                if (prospectiveInsertIds.has(objectId)) {
-                    return { state: { kind: "invalid", reason: "already_exists" } };
-                }
-                prospectiveInsertIds.add(objectId);
-            }
-        }
-        // The daemon applies one envelope atomically: every operation is validated against pre-envelope state before any mutation, and `invalidating` rejects a second supersede or retire of a target an earlier operation in the envelope already invalidates. The commit sequence is allocated only after validation so a rejected envelope does not advance the snapshot. commentlint: allow(JUDGE)
-        const invalidating = new Set<string>();
-        for (const operation of operations) {
-            if (operation.op === "insert_decision") continue;
-            if (operation.op === "supersede_decision") {
-                const targetId = operation.replaced_object_id as string;
-                const replaced = this.objects.get(targetId);
-                // The daemon looks the target up among live objects only; a
-                // missing or invalidated one is `NotFound`, which maps to `internal`.
-                if (
-                    !replaced ||
-                    replaced.invalidated_commit_seq !== null ||
-                    invalidating.has(targetId)
-                ) {
-                    return { state: { kind: "invalid", reason: "internal" } };
-                }
-                const spec = operation.spec as Record<string, unknown>;
-                if (
-                    replaced.domain_id !== spec.domain_id ||
-                    replaced.source_id !== spec.source_id ||
-                    replaced.source_kind !== sourceKind
-                ) {
-                    return { state: { kind: "invalid", reason: "invalid_input" } };
-                }
-                if ((spec.source_revision as number) <= replaced.source_revision) {
-                    return { state: { kind: "conflict", reason: "known_as_of_advanced" } };
-                }
-                invalidating.add(targetId);
-            } else if (operation.op === "retire_decision") {
-                const targetId = operation.object_id as string;
-                const retired = this.objects.get(targetId);
-                if (
-                    !retired ||
-                    retired.invalidated_commit_seq !== null ||
-                    invalidating.has(targetId)
-                ) {
-                    return { state: { kind: "invalid", reason: "internal" } };
-                }
-                invalidating.add(targetId);
-            } else {
-                return { state: { kind: "invalid", reason: "invalid_input" } };
-            }
-        }
-        const seq = this.nextSeq();
-        const insert = (spec: Record<string, unknown>): void => {
+            return target;
+        };
+        const insert = (spec: Record<string, unknown>, sensitivity: Sensitivity): void => {
             const objectId = spec.object_id as string;
-            if (!this.objects.has(objectId)) {
-                const payload = spec.payload as { summary: string; rationale: string };
-                this.objects.set(objectId, {
-                    object_id: objectId,
-                    object_kind: "decision",
+            staged.set(objectId, {
+                object_id: objectId,
+                object_kind: "decision",
+                domain_id: spec.domain_id as string,
+                source_kind: sourceKind,
+                source_id: spec.source_id as string,
+                source_revision: spec.source_revision as number,
+                created_commit_seq: seq,
+                invalidated_commit_seq: null,
+                superseded_by: null,
+                sensitivity,
+                labeled: true,
+                project_root: projectRoot,
+                decision: {
+                    decision_kind: spec.decision_kind as string,
+                    payload: spec.payload as { summary: string; rationale: string },
+                },
+            });
+            touched.add(objectId);
+        };
+        const invalidate = (target: FakeObject, supersededBy: string | null): void => {
+            const row = stage(target.object_id);
+            row.invalidated_commit_seq = seq;
+            row.superseded_by = supersededBy;
+            touched.add(row.object_id);
+        };
+        for (const operation of operations) {
+            if (operation.op === "insert_decision") {
+                const spec = operation.spec as Record<string, unknown>;
+                // The registry's primary key refuses any held id, live or retired, this project's or another's. commentlint: allow(JUDGE)
+                if (view(spec.object_id as string)) return invalid("already_exists");
+                insert(spec, (spec.sensitivity as Sensitivity | undefined) ?? "normal");
+            } else if (operation.op === "supersede_decision") {
+                const replaced = liveTarget(operation.replaced_object_id as string);
+                if (!replaced) return invalid("not_found");
+                const spec = operation.spec as Record<string, unknown>;
+                const replacementId = spec.object_id as string;
+                // A replacement id another project holds is `not_found` whether live or retired, so its state is not revealed. A live in-project replacement is a fold survivor: the spec is discarded, the survivor keeps its stored label and revision, and the predecessor is re-pointed at it. A retired in-project one is a duplicate insert. commentlint: allow(JUDGE)
+                const replacement = view(replacementId);
+                if (replacement && !FakeKernel.inProject(replacement, projectRoot)) {
+                    return invalid("not_found");
+                }
+                const survivor =
+                    replacement && replacement.invalidated_commit_seq === null ? replacement : null;
+                if (
+                    survivor &&
+                    restrictive(survivor.sensitivity, replaced.sensitivity) !== survivor.sensitivity
+                ) {
+                    return invalid("admission_policy");
+                }
+                const successor = survivor ?? {
                     domain_id: spec.domain_id as string,
                     source_kind: sourceKind,
                     source_id: spec.source_id as string,
                     source_revision: spec.source_revision as number,
-                    created_commit_seq: seq,
-                    invalidated_commit_seq: null,
-                    superseded_by: null,
-                    // The daemon defaults an omitted spec sensitivity to `normal`.
-                    sensitivity: (spec.sensitivity as FakeObject["sensitivity"]) ?? "normal",
-                    labeled: true,
-                    decision: { decision_kind: spec.decision_kind as string, payload },
-                });
-            }
-            this.lastChange.set(objectId, seq);
-            touched.add(objectId);
-        };
-        for (const operation of operations) {
-            if (operation.op === "insert_decision") {
-                insert(operation.spec as Record<string, unknown>);
-            } else if (operation.op === "supersede_decision") {
-                const replaced = this.objects.get(operation.replaced_object_id as string);
-                const spec = operation.spec as Record<string, unknown>;
-                if (!replaced) continue;
-                insert(spec);
-                replaced.invalidated_commit_seq = seq;
-                replaced.superseded_by = spec.object_id as string;
-                this.lastChange.set(replaced.object_id, seq);
-                touched.add(replaced.object_id);
+                };
+                if (successor.source_revision <= replaced.source_revision) {
+                    return invalid("revision_not_advanced");
+                }
+                if (
+                    successor.domain_id !== replaced.domain_id ||
+                    successor.source_kind !== replaced.source_kind ||
+                    successor.source_id !== replaced.source_id
+                ) {
+                    return invalid("invalid_input");
+                }
+                if (replacement && !survivor) return invalid("already_exists");
+                if (survivor) {
+                    merged.add(survivor.object_id);
+                    touched.add(survivor.object_id);
+                } else {
+                    // A non-fold successor may raise its predecessor's label but not lower it.
+                    insert(
+                        spec,
+                        restrictive(
+                            (spec.sensitivity as Sensitivity | undefined) ?? "normal",
+                            replaced.sensitivity,
+                        ),
+                    );
+                }
+                invalidate(replaced, replacementId);
             } else if (operation.op === "retire_decision") {
-                const retired = this.objects.get(operation.object_id as string);
-                if (!retired) continue;
-                retired.invalidated_commit_seq = seq;
-                this.lastChange.set(retired.object_id, seq);
-                touched.add(retired.object_id);
+                const retired = liveTarget(operation.object_id as string);
+                if (!retired) return invalid("not_found");
+                invalidate(retired, null);
+            } else {
+                return invalid("invalid_input");
             }
         }
+        this.tip = seq;
+        for (const [objectId, row] of staged) {
+            const existing = this.objects.get(objectId);
+            if (existing) {
+                Object.assign(existing, row);
+            } else {
+                this.objects.set(objectId, row);
+            }
+        }
+        for (const objectId of touched) this.lastChange.set(objectId, seq);
         const receipt: Receipt = {
             commit_seq: seq,
             request_digest: intent.request_digest,
             tokens: [...touched].sort().map((object_id) => ({ object_id, known_as_of: seq })),
+            merged: [...merged].sort(),
         };
         this.receipts.set(intent.operation_key, receipt);
         return {
@@ -349,18 +445,24 @@ export class FakeKernel {
             receipt: { commit_seq: seq, replayed: false },
             known_as_of: seq,
             tokens: receipt.tokens,
+            merged: receipt.merged,
         };
     }
 
     reply(call: KernelTransportCall): unknown {
         const body = call.body as Record<string, unknown>;
+        // The route is bound to the transport call's root; a body root that names another project is refused before any work. The daemon canonicalizes both roots first; the fake compares the strings. commentlint: allow(JUDGE)
+        if (typeof body.project_root === "string" && body.project_root !== call.projectRoot) {
+            return invalid("project_mismatch");
+        }
+        const projectRoot = call.projectRoot;
         switch (call.method) {
             case "kernel.read":
-                return this.readReply(body);
+                return this.readReply(body, projectRoot);
             case "kernel.commit":
-                return this.commitReply(body);
+                return this.commitReply(body, projectRoot);
             default:
-                return { state: { kind: "invalid", reason: "invalid_input" } };
+                return invalid("invalid_input");
         }
     }
 }
