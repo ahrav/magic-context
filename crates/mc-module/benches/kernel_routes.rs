@@ -109,7 +109,13 @@ const SESSION: &str = "session-bench";
 const DOMAIN: &str = "domain";
 const SECRET_LINE: &str = "password=hunter-two-very-secret-value-0123456789\n";
 const FILLER_LINE: &str = "plain filler line without any credential words 0123\n";
-const PAGE_BYTES_MAX: usize = mc_module::kernel_routes::ingest::PAGE_BYTES_MAX as usize;
+/// `PAGE_BYTES_MAX` stays independent of the production cap so baseline and
+/// candidate binaries time the same byte count.
+const PAGE_BYTES_MAX: usize = 16 * 1024 * 1024;
+const _: () = assert!(
+    PAGE_BYTES_MAX as u64 <= mc_module::kernel_routes::ingest::PAGE_BYTES_MAX,
+    "the production page cap fell below the frozen bench page size; add a new case"
+);
 /// Width of the zero-padded iteration counter `ingest/finish` writes into the
 /// last line of each payload.
 const COUNTER_TAG_BYTES: usize = 16;
@@ -739,6 +745,7 @@ fn bench_commit(c: &mut Criterion) {
         black_box(daemon.call(request.clone()));
     }) {
         group.sample_size(20);
+        group.throughput(Throughput::Elements(16));
         group.bench_with_input(
             BenchmarkId::new("replay", "16-ops"),
             &request,
