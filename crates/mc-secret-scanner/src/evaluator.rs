@@ -1,4 +1,6 @@
-use aho_corasick::AhoCorasick;
+use std::sync::LazyLock;
+
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
 use regex::bytes::Captures;
 
 use crate::api::REVISION;
@@ -640,12 +642,40 @@ fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+const KEYED_KEYWORDS: [&str; 7] = [
+    "auth",
+    "bearer",
+    "credential",
+    "key",
+    "password",
+    "secret",
+    "token",
+];
+
+/// Case-insensitive automaton over `KEYED_KEYWORDS`. Its prefilter avoids
+/// scanning keyword-free quoted spans byte by byte.
+static KEYED_KEYWORD_AUTOMATON: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    AhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostFirst)
+        .ascii_case_insensitive(true)
+        .kind(Some(AhoCorasickKind::DFA))
+        .build(KEYED_KEYWORDS)
+        .expect("keyed keyword automaton")
+});
+
 fn contains_keyed_keyword(key: &[u8]) -> bool {
-    (0..key.len()).any(|index| keyed_keyword_at(key, index))
+    KEYED_KEYWORD_AUTOMATON.is_match(key)
 }
 
 // `(?:[^QUOTE\\]|\\.)*` parses left to right into single bytes and `\x` pairs, so the keyword alternation can only start on one of those unit boundaries.
 fn quoted_key_contains_keyword(key: &[u8]) -> bool {
+    if !KEYED_KEYWORD_AUTOMATON.is_match(key) {
+        return false;
+    }
+    // Without a backslash every byte starts a unit, so any occurrence qualifies.
+    if memchr::memchr(b'\\', key).is_none() {
+        return true;
+    }
     let mut index = 0;
     while index < key.len() {
         if key[index] == b'\\' {
@@ -661,19 +691,11 @@ fn quoted_key_contains_keyword(key: &[u8]) -> bool {
 }
 
 fn keyed_keyword_at(key: &[u8], index: usize) -> bool {
-    let keyword: &[u8] = match key[index].to_ascii_lowercase() {
-        b'a' => b"auth",
-        b'b' => b"bearer",
-        b'c' => b"credential",
-        b'k' => b"key",
-        b'p' => b"password",
-        b's' => b"secret",
-        b't' => b"token",
-        _ => return false,
-    };
-    key[index..]
-        .get(..keyword.len())
-        .is_some_and(|window| window.eq_ignore_ascii_case(keyword))
+    let rest = &key[index..];
+    KEYED_KEYWORDS.iter().any(|keyword| {
+        rest.get(..keyword.len())
+            .is_some_and(|window| window.eq_ignore_ascii_case(keyword.as_bytes()))
+    })
 }
 
 // Unnamed captures hold secrets; named captures mark header fields. Ignore named captures so header-only rules return their whole match.
@@ -1644,16 +1666,6 @@ mod tests {
         "magic-keyed-single-quoted",
         "magic-keyed-double-single",
         "magic-keyed-single-double",
-    ];
-
-    const KEYED_KEYWORDS: [&str; 7] = [
-        "key",
-        "token",
-        "secret",
-        "password",
-        "auth",
-        "bearer",
-        "credential",
     ];
 
     const RULE_SPACE_BYTES: [u8; 6] = [b'\t', b'\n', 0x0B, b'\x0C', b'\r', b' '];
