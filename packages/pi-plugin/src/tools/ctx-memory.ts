@@ -43,6 +43,12 @@ const AntiMemorySchema = Type.Object(
 		rootCause: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 		recovery: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 		nonApplicableWhen: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+		expiresAt: Type.Optional(
+			Type.Union([Type.Number(), Type.Null()], {
+				description:
+					"Epoch ms after which the warning stops surfacing; omitted writes default to 90 days out",
+			}),
+		),
 	},
 	{
 		description:

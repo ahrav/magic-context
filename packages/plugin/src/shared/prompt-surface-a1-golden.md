@@ -459,6 +459,17 @@ Memories created here start at candidate maturity and are surfaced through expli
             "type": "null"
           }
         ]
+      },
+      "expiresAt": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Epoch ms after which the warning stops surfacing; omitted writes default to 90 days out"
       }
     },
     "required": [

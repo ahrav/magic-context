@@ -6,6 +6,9 @@
 
 import { ClaimOperationInputError } from "./claim-operation-contract";
 
+/** Anti-memories age out: a rejected strategy is a warning about a point in time, not a permanent rule, so a write without an explicit expiry gets this horizon. commentlint: allow(JUDGE) */
+export const ANTI_MEMORY_DEFAULT_TTL_MS = 90 * 24 * 60 * 60 * 1_000;
+
 export interface AntiMemoryPayload {
     trigger: string;
     rejectedStrategy: string;
@@ -17,6 +20,8 @@ export interface AntiMemoryPayload {
     rootCause?: string | null;
     recovery?: string | null;
     nonApplicableWhen?: string | null;
+    /** Epoch milliseconds after which the payload no longer surfaces; rides in the rendered text because kernel decisions carry no lifecycle expiry. commentlint: allow(JUDGE) */
+    expiresAt?: number | null;
 }
 
 export interface StoredAntiMemoryPayload {
@@ -45,6 +50,27 @@ function optionalText(value: unknown, field: string): string | null {
     return requiredText(value, field);
 }
 
+/** `undefined` and `null` both mean no expiry; anything else must be a positive epoch-milliseconds integer. commentlint: allow(JUDGE) */
+function optionalEpochMs(value: unknown, field: string): number | null {
+    if (value === undefined || value === null) return null;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+        throw new ClaimOperationInputError(
+            `anti-memory ${field} must be a positive epoch-milliseconds integer`,
+        );
+    }
+    return value;
+}
+
+function antiMemoryExpiry(payload: AntiMemoryPayload): number | null {
+    return optionalEpochMs(payload.expiresAt, "expiresAt");
+}
+
+/** `true` once the payload's expiry horizon has passed; a payload without one never expires. commentlint: allow(JUDGE) */
+export function antiMemoryExpired(payload: AntiMemoryPayload, nowMs: number): boolean {
+    const expiresAt = antiMemoryExpiry(payload);
+    return expiresAt !== null && expiresAt <= nowMs;
+}
+
 /**
  */
 export function normalizeAntiMemoryPayload(payload: AntiMemoryPayload): StoredAntiMemoryPayload {
@@ -64,6 +90,7 @@ export function normalizeAntiMemoryPayload(payload: AntiMemoryPayload): StoredAn
 
 export function renderAntiMemoryContent(payload: AntiMemoryPayload): string {
     const stored = normalizeAntiMemoryPayload(payload);
+    const expiresAt = antiMemoryExpiry(payload);
     const lines = [
         `Trigger: ${stored.trigger}`,
         `Rejected strategy: ${stored.rejectedStrategy}`,
@@ -81,6 +108,7 @@ export function renderAntiMemoryContent(payload: AntiMemoryPayload): string {
     for (const [label, value] of optional) {
         if (value !== null) lines.push(`${label}: ${value}`);
     }
+    if (expiresAt !== null) lines.push(`Expires at: ${expiresAt}`);
     return lines.join("\n");
 }
 
@@ -106,21 +134,33 @@ export function parseAntiMemoryContent(content: string): AntiMemoryPayload {
         "Root cause",
         "Recovery",
         "Non-applicable when",
+        "Expires at",
     ]);
     for (const label of fields.keys()) {
         if (!known.has(label))
             throw new ClaimOperationInputError(`unknown anti-memory field ${label}`);
     }
-    return normalizeAntiMemoryPayload({
-        trigger: requiredText(fields.get("Trigger"), "trigger"),
-        rejectedStrategy: requiredText(fields.get("Rejected strategy"), "rejectedStrategy"),
-        rejectionReason: requiredText(fields.get("Rejection reason"), "rejectionReason"),
-        saferAlternative: fields.get("Safer alternative"),
-        preconditions: fields.get("Preconditions"),
-        attemptedApproach: fields.get("Attempted approach"),
-        observedFailure: fields.get("Observed failure"),
-        rootCause: fields.get("Root cause"),
-        recovery: fields.get("Recovery"),
-        nonApplicableWhen: fields.get("Non-applicable when"),
-    });
+    const rawExpiresAt = fields.get("Expires at");
+    const expiresAt =
+        rawExpiresAt === undefined
+            ? null
+            : optionalEpochMs(
+                  /^\d+$/.test(rawExpiresAt) ? Number(rawExpiresAt) : rawExpiresAt,
+                  "expiresAt",
+              );
+    return {
+        ...normalizeAntiMemoryPayload({
+            trigger: requiredText(fields.get("Trigger"), "trigger"),
+            rejectedStrategy: requiredText(fields.get("Rejected strategy"), "rejectedStrategy"),
+            rejectionReason: requiredText(fields.get("Rejection reason"), "rejectionReason"),
+            saferAlternative: fields.get("Safer alternative"),
+            preconditions: fields.get("Preconditions"),
+            attemptedApproach: fields.get("Attempted approach"),
+            observedFailure: fields.get("Observed failure"),
+            rootCause: fields.get("Root cause"),
+            recovery: fields.get("Recovery"),
+            nonApplicableWhen: fields.get("Non-applicable when"),
+        }),
+        ...(expiresAt === null ? {} : { expiresAt }),
+    };
 }

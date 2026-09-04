@@ -3,7 +3,9 @@ import { replaceAllCompartments } from "../../features/magic-context/compartment
 import { indexMessagesAfterOrdinal } from "../../features/magic-context/message-index";
 import type { UnifiedSearchResult } from "../../features/magic-context/search";
 import * as searchModule from "../../features/magic-context/search";
+import { ensureSessionMetaRow } from "../../features/magic-context/storage-meta-shared";
 import { createClaimReaderTestDatabase } from "../../features/magic-context/test-claim-database";
+import * as kernelClaimUsage from "../../hooks/magic-context/kernel-claim-usage";
 import { KernelClient } from "../../shared/kernel-client";
 import { FakeKernel, FakeKernelTransport } from "../../shared/kernel-client-testing/fake-kernel";
 import type { Database } from "../../shared/sqlite";
@@ -224,6 +226,97 @@ describe("createCtxSearchTools", () => {
         expect(messageText.split(EXPAND_HINT).length - 1).toBe(1);
         expect(messageText.endsWith(EXPAND_HINT)).toBe(true);
         expect(result).not.toContain("Expand with ctx_expand(start=");
+    });
+
+    it("resolves an explicit object-id query even when the id is in the injected baseline", async () => {
+        const harness = kernelHarness();
+        harness.kernel.seedDecision({
+            object_id: OBJECT_A,
+            decision_kind: "ARCHITECTURE",
+            summary: "Alpha baseline-visible memory.",
+        });
+        ensureSessionMetaRow(db, "ses-search");
+        db.prepare("UPDATE session_meta SET memory_block_ids = ? WHERE session_id = ?").run(
+            JSON.stringify([OBJECT_A]),
+            "ses-search",
+        );
+        const searchSpy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
+        try {
+            const tools = createCtxSearchTools({
+                db,
+                kernelClient: harness.kernelClient,
+                resolveProjectPath: () => "git:repo-project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+            const result = await tools.ctx_search.execute({ query: OBJECT_A }, toolContext());
+            expect(result).toContain("[1] [memory]");
+            expect(result).toContain("Alpha baseline-visible memory.");
+            // The daemon answered the id query; no fall-through to local search.
+            expect(searchSpy).not.toHaveBeenCalled();
+        } finally {
+            searchSpy.mockRestore();
+        }
+    });
+
+    it("excludes a baseline-visible memory from lexical ranking", async () => {
+        const harness = kernelHarness();
+        harness.kernel.seedDecision({
+            object_id: OBJECT_A,
+            decision_kind: "ARCHITECTURE",
+            summary: "Alpha baseline-visible memory.",
+        });
+        ensureSessionMetaRow(db, "ses-search");
+        db.prepare("UPDATE session_meta SET memory_block_ids = ? WHERE session_id = ?").run(
+            JSON.stringify([OBJECT_A]),
+            "ses-search",
+        );
+        const searchSpy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
+        try {
+            const tools = createCtxSearchTools({
+                db,
+                kernelClient: harness.kernelClient,
+                resolveProjectPath: () => "git:repo-project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+            const result = await tools.ctx_search.execute(
+                { query: "baseline visible memory" },
+                toolContext(),
+            );
+            expect(result).not.toContain("Alpha baseline-visible memory.");
+        } finally {
+            searchSpy.mockRestore();
+        }
+    });
+
+    it("records delivered kernel memory hits for claim-lane retrieval telemetry", async () => {
+        const harness = kernelHarness();
+        harness.kernel.seedDecision({
+            object_id: OBJECT_A,
+            decision_kind: "ARCHITECTURE",
+            summary: "Alpha memory only search result.",
+        });
+        const usageSpy = spyOn(kernelClaimUsage, "recordKernelMemoryRetrievals").mockImplementation(
+            () => {},
+        );
+        try {
+            const tools = createCtxSearchTools({
+                db,
+                kernelClient: harness.kernelClient,
+                resolveProjectPath: () => "git:repo-project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+            await tools.ctx_search.execute({ query: OBJECT_A, sources: ["memory"] }, toolContext());
+            expect(usageSpy).toHaveBeenCalledTimes(1);
+            expect(usageSpy.mock.calls[0]?.[0]?.objectIds).toEqual([OBJECT_A]);
+        } finally {
+            usageSpy.mockRestore();
+        }
     });
 
     it("omits the consolidated expand hint for memory-only results", async () => {

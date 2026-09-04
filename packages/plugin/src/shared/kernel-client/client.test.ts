@@ -109,7 +109,7 @@ const spec: DecisionSpecInput = {
     source_revision: 1,
 };
 
-const intent = { actor: "assistant", cause: "ctx_memory" };
+const intent = { actor: "assistant", operationId: "session-1\u001fcall-1", cause: "ctx_memory" };
 
 describe("KernelClient gating", () => {
     test("disabled returns before any transport work", async () => {
@@ -325,7 +325,7 @@ describe("KernelClient reads", () => {
 });
 
 describe("KernelClient mutations", () => {
-    test("operation_key is a deterministic function of the intent and project", () => {
+    test("operation_key is a deterministic function of the operation identity and project", () => {
         const operations = [{ op: "insert_decision" as const, spec }];
         const digest = deriveRequestDigest(operations);
         expect(digest).toBe(deriveRequestDigest([{ op: "insert_decision", spec: { ...spec } }]));
@@ -333,7 +333,7 @@ describe("KernelClient mutations", () => {
             projectRoot: PROJECT,
             producer: "plugin",
             actor: "a",
-            cause: "c",
+            operationId: "s\u001fc",
         });
         expect(key).toMatch(/^[0-9a-f]{64}$/);
         expect(
@@ -341,24 +341,24 @@ describe("KernelClient mutations", () => {
                 projectRoot: "/other",
                 producer: "plugin",
                 actor: "a",
-                cause: "c",
+                operationId: "s\u001fc",
             }),
         ).not.toBe(key);
     });
 
-    test("the same call identity keeps its key while a changed body changes only the digest", () => {
+    test("the same operation identity keeps its key while a changed body changes only the digest", () => {
         const key = deriveOperationKey({
             projectRoot: PROJECT,
             producer: "plugin",
             actor: "a",
-            cause: "call-1",
+            operationId: "session-1\u001fcall-1",
         });
         expect(
             deriveOperationKey({
                 projectRoot: PROJECT,
                 producer: "plugin",
                 actor: "a",
-                cause: "call-1",
+                operationId: "session-1\u001fcall-1",
             }),
         ).toBe(key);
         const digest = deriveRequestDigest([{ op: "insert_decision", spec }]);
@@ -367,6 +367,13 @@ describe("KernelClient mutations", () => {
         ]);
         expect(digest).toBe(deriveRequestDigest([{ op: "insert_decision", spec: { ...spec } }]));
         expect(otherDigest).not.toBe(digest);
+    });
+
+    test("sessions reusing one tool-call id derive distinct keys", () => {
+        const parts = { projectRoot: PROJECT, producer: "plugin", actor: "a" };
+        expect(deriveOperationKey({ ...parts, operationId: "session-1\u001fcall-1" })).not.toBe(
+            deriveOperationKey({ ...parts, operationId: "session-2\u001fcall-1" }),
+        );
     });
 
     test("create sends one insert_decision under a derived intent", async () => {
@@ -383,15 +390,32 @@ describe("KernelClient mutations", () => {
         expect(wireIntent.request_digest).toBe(
             deriveRequestDigest([{ op: "insert_decision", spec }]),
         );
+        expect(wireIntent.cause).toBe(intent.cause);
         expect(wireIntent.operation_key).toBe(
             deriveOperationKey({
                 projectRoot: PROJECT,
                 producer: "plugin",
                 actor: intent.actor,
-                cause: intent.cause,
+                operationId: intent.operationId,
             }),
         );
         expect(c.tokens.get(PROJECT, spec.object_id)?.known_as_of).toBe(2);
+    });
+
+    test("the free-text cause travels in the intent and never enters the operation key", async () => {
+        const transport = new FakeTransport().queue(
+            commitReply(2, false, spec.object_id),
+            commitReply(3, false, spec.object_id),
+        );
+        const c = client(transport);
+        await c.create(spec, { ...intent, cause: "call-1 reason: superseded" });
+        await c.create(spec, { ...intent, cause: "call-1 reason: obsolete" });
+        const [first, second] = transport
+            .bodies("kernel.commit")
+            .map((body) => (body as { intent: Record<string, string> }).intent);
+        expect(first?.cause).toBe("call-1 reason: superseded");
+        expect(second?.cause).toBe("call-1 reason: obsolete");
+        expect(first?.operation_key).toBe(second?.operation_key);
     });
 
     test("a mutation without a cached token does one ungated explicit_search read first", async () => {

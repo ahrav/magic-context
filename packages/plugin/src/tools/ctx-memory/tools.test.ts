@@ -320,6 +320,49 @@ describe("ctx_memory lifecycle and merge", () => {
         expect(kernel.objects.get("mem_b")?.invalidated_commit_seq).toBeNull();
     });
 
+    test("an archive redelivered with another target keeps its key regardless of the reason text", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        kernel.seedDecision({ object_id: "mem_b", decision_kind: "ARCHITECTURE", summary: "B." });
+        const tool = harness(kernel);
+        const first = parseJson<CommitJson>(
+            await tool.execute(
+                { action: "archive", objectId: "mem_a", reason: "first delivery" },
+                "call-archive-reason-swap",
+            ),
+        );
+        expect(first.outcome).toBe("applied");
+        // The reason is caller-controlled audit text and never enters the operation key, so a fresh reason cannot mint a fresh key. commentlint: allow(JUDGE)
+        expect(
+            await tool.execute(
+                { action: "archive", objectId: "mem_b", reason: "second delivery" },
+                "call-archive-reason-swap",
+            ),
+        ).toBe("Error: The operation key was reused with a different request digest.");
+        expect(kernel.objects.get("mem_b")?.invalidated_commit_seq).toBeNull();
+    });
+
+    test("two sessions sharing a tool-call id commit as distinct operations", async () => {
+        const tool = harness();
+        const args = createArgs("Session-scoped operation keys.");
+        const first = parseJson<CommitJson>(await tool.execute(args, "call-shared"));
+        expect(first.outcome).toBe("applied");
+        const otherSession = parseJson<CommitJson>(
+            (await tool.definition.execute(
+                { ...args, content: "A different fact from another session." } as never,
+                {
+                    sessionID: "ses-kernel-opencode-2",
+                    directory: ROOT,
+                    callID: "call-shared",
+                    agent: "primary",
+                } as never,
+            )) as string,
+        );
+        expect(otherSession.outcome).toBe("applied");
+        expect(otherSession.objectId).not.toBe(first.objectId);
+        expect(tool.kernel.liveRows()).toHaveLength(2);
+    });
+
     test("a target the project cannot read is refused before any commit", async () => {
         const kernel = new FakeKernel();
         kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
@@ -578,6 +621,64 @@ describe("ctx_memory domain fence and lineage", () => {
 });
 
 describe("ctx_memory anti-memory", () => {
+    test("create without an expiry defaults the anti-memory horizon and replays byte-identically", async () => {
+        const tool = harness();
+        const payload = {
+            trigger: "Choosing a cache backend",
+            rejectedStrategy: "Use Redis",
+            rejectionReason: "The project must work offline",
+        };
+        const created = parseJson<CommitJson>(
+            await tool.execute(
+                { action: "create", category: "REJECTED_APPROACH", antiMemory: payload },
+                "call-anti-ttl",
+            ),
+        );
+        const objectId = created.objects[0] as string;
+        const summary = tool.kernel.objects.get(objectId)?.decision?.payload.summary ?? "";
+        const match = summary.match(/^Expires at: (\d+)$/m);
+        expect(match).not.toBeNull();
+        const expiresAt = Number(match?.[1]);
+        const ninetyDays = 90 * 24 * 60 * 60 * 1_000;
+        const day = 24 * 60 * 60 * 1_000;
+        expect(expiresAt).toBeGreaterThanOrEqual(Date.now() + ninetyDays - day);
+        expect(expiresAt).toBeLessThanOrEqual(Date.now() + ninetyDays + day);
+
+        const replayed = parseJson<CommitJson>(
+            await tool.execute(
+                { action: "create", category: "REJECTED_APPROACH", antiMemory: payload },
+                "call-anti-ttl",
+            ),
+        );
+        expect(replayed.outcome).toBe("already applied");
+        expect(tool.kernel.liveRows()).toHaveLength(1);
+    });
+
+    test("list omits an expired anti-memory while get by id still returns it", async () => {
+        const tool = harness();
+        const expired = {
+            trigger: "Choosing a cache backend",
+            rejectedStrategy: "Use Redis",
+            rejectionReason: "The project must work offline",
+            expiresAt: Date.now() - 1_000,
+        };
+        const created = parseJson<CommitJson>(
+            await tool.execute(
+                reduced({ action: "create", category: "REJECTED_APPROACH", antiMemory: expired }),
+                "call-anti-expired",
+            ),
+        );
+        const objectId = created.objects[0] as string;
+        const listed = parseJson<ReadJson>(
+            await tool.execute({ action: "list" }, "call-anti-expired-list", DREAMER_AGENT),
+        );
+        expect(listed.memories).toHaveLength(0);
+        const got = parseJson<ReadJson>(
+            await tool.execute({ action: "get", objectIds: [objectId] }, "call-anti-expired-get"),
+        );
+        expect(got.memories).toHaveLength(1);
+    });
+
     test("creates typed anti-memory, reads it back parsed, and rejects cross-arm shapes", async () => {
         const tool = harness();
         const payload = {

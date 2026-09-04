@@ -74,6 +74,9 @@ export interface ReadArgs extends CallOptions {
 
 export interface IntentArgs {
     actor: string;
+    /** Stable identity the operation key hashes together with the project root, producer, and actor; a redelivered identity with different request bytes hits `operation_key_reused` instead of committing twice, so caller-controlled free text never rides here — it goes in `cause`. commentlint: allow(JUDGE) */
+    operationId: string;
+    /** Free-text audit trail carried in `intent.cause`; never key material. */
     cause: string;
     /** Defaults to the client's producer. */
     producer?: string;
@@ -148,7 +151,7 @@ export interface KernelClientOptions {
 const DEFAULT_PRODUCER = "plugin";
 const DEFAULT_DEADLINE_MS = 10_000;
 /**
- * Fields of the operation key are joined with the ASCII unit separator; callers strip it from free-text fields (see `archiveCause`), so distinct inputs cannot collide by concatenation. commentlint: allow(JUDGE)
+ * Fields of the operation key are joined with the ASCII unit separator; identity fields carry only harness- or content-derived ids that never contain it, so distinct inputs cannot collide by concatenation. commentlint: allow(JUDGE)
  */
 export const OPERATION_KEY_SEPARATOR = "\u001f";
 
@@ -160,15 +163,17 @@ export function deriveRequestDigest(operations: readonly CommitOperation[]): str
     return sha256Hex(stableStringify(operations));
 }
 
-/** The key names only the stable call identity — never the body, which travels in `request_digest` — so a redelivered identity with different bytes hits the daemon's `operation_key_reused` rejection instead of committing as a second operation. commentlint: allow(JUDGE) */
+/** The key names only the stable operation identity — never the body, which travels in `request_digest`, and never the free-text `cause` — so a redelivered identity with different bytes hits the daemon's `operation_key_reused` rejection instead of committing as a second operation. commentlint: allow(JUDGE) */
 export function deriveOperationKey(parts: {
     projectRoot: string;
     producer: string;
     actor: string;
-    cause: string;
+    operationId: string;
 }): string {
     return sha256Hex(
-        [parts.projectRoot, parts.producer, parts.actor, parts.cause].join(OPERATION_KEY_SEPARATOR),
+        [parts.projectRoot, parts.producer, parts.actor, parts.operationId].join(
+            OPERATION_KEY_SEPARATOR,
+        ),
     );
 }
 
@@ -375,7 +380,7 @@ export class KernelClient {
             projectRoot: this.projectRoot,
             producer,
             actor: args.actor,
-            cause: args.cause,
+            operationId: args.operationId,
         });
         return this.wireBody("kernel.commit", {
             intent: {

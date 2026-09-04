@@ -27,6 +27,10 @@ export const INVALID_REASONS = [
     "class_over_declared",
     "invalid_input",
     "admission_policy",
+    "not_found",
+    "already_exists",
+    "revision_not_advanced",
+    "scope_reserved",
     "payload_too_large",
     "page_digest",
     "page_index",
@@ -155,6 +159,22 @@ export const MEMORY_STATE_GUIDANCE = {
     "invalid:admission_policy": {
         marker: "memory: request rejected by admission policy",
         tool: "Admission policy rejected the request.",
+    },
+    "invalid:not_found": {
+        marker: "memory: named object not found",
+        tool: "The named object does not exist, is not live, or is not scoped to this project.",
+    },
+    "invalid:already_exists": {
+        marker: "memory: object id already exists",
+        tool: "The write named an id the registry already holds; retrying the same write cannot succeed.",
+    },
+    "invalid:revision_not_advanced": {
+        marker: "memory: successor revision did not advance",
+        tool: "The successor's source revision does not exceed its predecessor's; use a higher revision.",
+    },
+    "invalid:scope_reserved": {
+        marker: "memory: reserved scope occupied by a foreign scope",
+        tool: "A foreign scope occupies this project's reserved scope id; the write cannot succeed until it is removed.",
     },
     "invalid:payload_too_large": {
         marker: "memory: payload too large",

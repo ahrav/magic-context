@@ -20,9 +20,13 @@ import { MEMORY_READ_SURFACE } from "./kernel-memory-render";
 export const HISTORIAN_SOURCE_ID = "historian";
 
 /** Ids derive from the claim's public identity and the checkout root: the claim lane hands a re-emitted fact its existing `publicClaimId`, so every run resolves the same fact to the same object instead of minting a run-keyed twin. commentlint: allow(JUDGE) */
-function derivedId(prefix: string, projectRoot: string, ref: PromotedMemoryRef): string {
-    const seed = [HISTORIAN_SOURCE_ID, projectRoot, ref.publicClaimId, prefix].join("\u001f");
+function derivedId(prefix: string, projectRoot: string, publicClaimId: string): string {
+    const seed = [HISTORIAN_SOURCE_ID, projectRoot, publicClaimId, prefix].join("\u001f");
     return `${prefix}_${sha256Hex(seed).slice(0, 32)}`;
+}
+
+export function promotedObjectId(publicClaimId: string, projectRoot: string): string {
+    return derivedId("mem", projectRoot, publicClaimId);
 }
 
 export function promotedFactSpecs(
@@ -32,8 +36,8 @@ export function promotedFactSpecs(
     return refs
         .filter((ref) => ref.category.length > 0 && ref.content.length > 0)
         .map((ref) => ({
-            decision_id: derivedId("dec", projectRoot, ref),
-            object_id: derivedId("mem", projectRoot, ref),
+            decision_id: derivedId("dec", projectRoot, ref.publicClaimId),
+            object_id: promotedObjectId(ref.publicClaimId, projectRoot),
             domain_id: CTX_MEMORY_DOMAIN_ID,
             decision_kind: ref.category,
             payload: { summary: ref.content, rationale: "" },
@@ -90,7 +94,8 @@ export async function commitPromotedFactsToKernel(args: {
     }
     const result = await args.client.commit({
         actor: `agent:${args.identity.producer}`,
-        cause: `${args.identity.runId}\u001f${args.identity.batchId}`,
+        operationId: `${args.identity.runId}\u001f${args.identity.batchId}`,
+        cause: `historian promotion ${args.identity.runId}/${args.identity.batchId}`,
         sourceKind: "model",
         operations: pending.map((spec) => ({ op: "insert_decision" as const, spec })),
     });

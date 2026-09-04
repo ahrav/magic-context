@@ -110,16 +110,16 @@
         "tokens": 317
       },
       "ctx_memory": {
-        "chars": 1590,
-        "tokens": 376
+        "chars": 1752,
+        "tokens": 412
       },
       "ctx_search": {
         "chars": 878,
         "tokens": 207
       },
-      "totalTokens": 1108
+      "totalTokens": 1144
     },
-    "builtInProviderVisibleTotal": 4726
+    "builtInProviderVisibleTotal": 4762
   },
   "mutableProseBaseline": 3618,
   "integerLightCeiling": 1825,

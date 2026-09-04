@@ -35,6 +35,13 @@ const antiMemoryShape = {
     rootCause: tool.schema.string().nullable().optional(),
     recovery: tool.schema.string().nullable().optional(),
     nonApplicableWhen: tool.schema.string().nullable().optional(),
+    expiresAt: tool.schema
+        .number()
+        .nullable()
+        .optional()
+        .describe(
+            "Epoch ms after which the warning stops surfacing; omitted writes default to 90 days out",
+        ),
 };
 
 const ctxMemoryArgsShape = {

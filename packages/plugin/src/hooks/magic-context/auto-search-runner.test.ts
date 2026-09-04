@@ -20,6 +20,7 @@ import {
     executeAutoSearchDelivery,
     runAutoSearchHint,
 } from "./auto-search-runner";
+import * as kernelClaimUsage from "./kernel-claim-usage";
 import type { MessageLike } from "./transform-operations";
 
 const OBJECT_A = `mem_${"a".repeat(32)}`;
@@ -139,6 +140,39 @@ describe("auto-search-runner", () => {
             const decision = getAutoSearchHintDecisions(db, "s-kernel")[0];
             expect(decision?.decision).toBe("hint");
         } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("delivering kernel memory hits records no claim-lane retrieval telemetry", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        // Retrieval telemetry belongs to explicit ctx_search delivery alone; the
+        // auto-search hint path must not bump the lane's retrieval counts.
+        const usageSpy = spyOn(kernelClaimUsage, "recordKernelMemoryRetrievals").mockImplementation(
+            () => {},
+        );
+        const { kernel, kernelClient } = kernelHarness();
+        kernel.seedDecision({
+            object_id: OBJECT_A,
+            decision_kind: "PROJECT_RULES",
+            summary: "the historian decides to run when context passes the execute threshold",
+        });
+        try {
+            const messages = [
+                makeUserMsg("u-usage", "please explain how the historian decides when to run"),
+            ];
+            expect(
+                await runAutoSearchHint({
+                    sessionId: "s-usage",
+                    db,
+                    messages,
+                    options: { ...baseOptions, directory: "/tmp/auto-search", kernelClient },
+                }),
+            ).toEqual({ ok: true });
+            expect(findUserPromptText(messages[0])).toContain("<ctx-search-hint>");
+            expect(usageSpy).toHaveBeenCalledTimes(0);
+        } finally {
+            usageSpy.mockRestore();
             spy.mockRestore();
         }
     });

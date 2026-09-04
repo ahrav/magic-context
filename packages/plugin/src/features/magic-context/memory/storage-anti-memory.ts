@@ -1,5 +1,6 @@
 import type { Database } from "../../../shared/sqlite";
 import {
+    ANTI_MEMORY_DEFAULT_TTL_MS,
     type AntiMemoryPayload,
     normalizeAntiMemoryPayload,
     parseAntiMemoryContent,
@@ -29,14 +30,13 @@ import {
 import { ClaimGraphCorruptionError } from "./storage-claims";
 
 export {
+    ANTI_MEMORY_DEFAULT_TTL_MS,
     type AntiMemoryPayload,
     normalizeAntiMemoryPayload,
     parseAntiMemoryContent,
     renderAntiMemoryContent,
     type StoredAntiMemoryPayload,
 };
-
-export const ANTI_MEMORY_DEFAULT_TTL_MS = 90 * 24 * 60 * 60 * 1_000;
 
 export interface CreateAntiMemoryInput {
     projectId: number;

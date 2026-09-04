@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 
 import {
     type AntiMemoryPayload,
+    antiMemoryExpired,
     parseAntiMemoryContent,
 } from "../../features/magic-context/memory/anti-memory-content";
 import { ANTI_MEMORY_CATEGORY } from "../../features/magic-context/memory/constants";
@@ -115,23 +116,29 @@ export interface KernelMemorySearchArgs {
     limit: number;
     /** Objects already rendered in the injected baseline; a hit on one spends budget on visible text. */
     excludeObjectIds?: ReadonlySet<string> | null;
+    /** Expiry filtering compares timestamps against `nowMs`; defaults to the wall clock. */
+    nowMs?: number;
 }
 
-/**
- * An object-id query resolves exactly (in id order); text ranks rows by the
- * share of query terms their summary and rationale contain, ties broken by
- * newest first. Either path returns `null` when nothing matches so the caller
- * can fall through to the other sources.
- */
+/** An anti-memory past its rendered expiry never surfaces as a search hit; an unparseable summary never counts as expired. commentlint: allow(JUDGE) */
+function isExpiredAntiMemoryRow(row: ReadRow, nowMs: number): boolean {
+    const decision = row.decision;
+    if (decision?.decision_kind !== ANTI_MEMORY_CATEGORY) return false;
+    const payload = antiMemoryPayloadFromSummary(decision.payload.summary);
+    return payload !== null && antiMemoryExpired(payload, nowMs);
+}
+
+/** An object-id query resolves exactly (in id order); text ranks rows by the share of query terms their summary and rationale contain, ties broken by newest first. `excludeObjectIds` applies only to lexical searches; object-id queries ignore `excludeObjectIds` because an explicit id names one object and resolves even when the injected baseline already renders it. Either path returns `null` when nothing matches so the caller can fall through to the other sources. commentlint: allow(JUDGE) */
 export function searchKernelMemoryRows(
     args: KernelMemorySearchArgs,
 ): KernelMemorySearchResult[] | null {
-    const candidates = args.rows.filter(
-        (row) => isMemoryDecisionRow(row) && !args.excludeObjectIds?.has(row.object.object_id),
+    const nowMs = args.nowMs ?? Date.now();
+    const decisionRows = args.rows.filter(
+        (row) => isMemoryDecisionRow(row) && !isExpiredAntiMemoryRow(row, nowMs),
     );
     const ids = parseObjectIdQuery(args.query);
     if (ids) {
-        const byId = new Map(candidates.map((row) => [row.object.object_id, row]));
+        const byId = new Map(decisionRows.map((row) => [row.object.object_id, row]));
         const hits = ids
             .map((id) => byId.get(id))
             .filter((row): row is ReadRow => row !== undefined)
@@ -139,6 +146,9 @@ export function searchKernelMemoryRows(
             .map((row) => memoryResultFromRow(row, 1, "exact"));
         return hits.length > 0 ? hits : null;
     }
+    const candidates = decisionRows.filter(
+        (row) => !args.excludeObjectIds?.has(row.object.object_id),
+    );
     const terms = queryTerms(args.query);
     if (terms.length === 0) return null;
     const scored = candidates

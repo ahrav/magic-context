@@ -16,6 +16,7 @@ import {
     normalizeSearchResultLimit,
 } from "../../features/magic-context/search-bounds";
 import { getVisibleRevisionLocators } from "../../hooks/magic-context/inject-compartments";
+import { recordKernelMemoryRetrievals } from "../../hooks/magic-context/kernel-claim-usage";
 import { isAvailable, renderToolStateText } from "../../shared/kernel-client";
 import { parseObjectIdQuery, searchKernelMemoryRows } from "./kernel-memory-search";
 import { normalizeCtxSearchArgs, prepareQueryFromNormalizedArgs } from "./query-input";
@@ -100,6 +101,7 @@ export async function executeCtxSearch(
     if (!projectPath) {
         return { status: "invalid", text: "Error: Could not resolve project identity for search." };
     }
+    const projectRoot = resolveProjectRootDirectory(toolContext.directory);
     await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
     const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
     const memoryEnabled = embeddingSnapshot?.features.memoryEnabled ?? deps.memoryEnabled;
@@ -114,6 +116,16 @@ export async function executeCtxSearch(
         memoryNote?: string,
     ): CtxSearchExecution => {
         const packed = packSearchResults(query, results, toolContext.sessionID);
+        recordKernelMemoryRetrievals({
+            db: deps.db,
+            projectPath,
+            projectRoot,
+            objectIds: packed.delivered.flatMap((result) =>
+                result.source === "memory" || result.source === "anti_memory"
+                    ? [result.publicClaimId]
+                    : [],
+            ),
+        });
         return {
             status: "complete",
             text: memoryNote ? `${memoryNote}\n\n${packed.text}` : packed.text,
@@ -141,7 +153,7 @@ export async function executeCtxSearch(
     if (memoryEnabled && memorySourceAllowed) {
         const client = deps.kernelClient({
             sessionId: toolContext.sessionID,
-            projectRoot: resolveProjectRootDirectory(toolContext.directory),
+            projectRoot,
         });
         const read = await client.read({ surface: "explicit_search", gated: true });
         if (isAvailable(read)) {

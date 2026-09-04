@@ -34,5 +34,6 @@ export const CTX_MEMORY_ANTI_MEMORY_RULE: ImitatedArgRule = {
         rootCause: "string",
         recovery: "string",
         nonApplicableWhen: "string",
+        expiresAt: "number",
     },
 };

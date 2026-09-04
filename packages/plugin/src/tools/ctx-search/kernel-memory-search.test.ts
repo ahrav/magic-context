@@ -143,6 +143,73 @@ describe("searchKernelMemoryRows match labeling and domain fence", () => {
     });
 });
 
+describe("searchKernelMemoryRows anti-memory expiry", () => {
+    const NOW = 1_700_000_000_000;
+    const antiRow = (objectId: string, expiresAt: number | null) =>
+        readRow({
+            objectId,
+            decisionKind: ANTI_MEMORY_CATEGORY,
+            summary: renderAntiMemoryContent({
+                trigger: "session caching",
+                rejectedStrategy: "Redis",
+                rejectionReason: "it creates split ownership",
+                expiresAt,
+            }),
+        });
+
+    test("an expired anti-memory surfaces on neither the exact nor the lexical path", () => {
+        const rows = [antiRow(OBJECT_A, NOW - 1)];
+        expect(
+            searchKernelMemoryRows({ rows, query: "session caching", limit: 5, nowMs: NOW }),
+        ).toBeNull();
+        expect(searchKernelMemoryRows({ rows, query: OBJECT_A, limit: 5, nowMs: NOW })).toBeNull();
+    });
+
+    test("an unexpired anti-memory still surfaces", () => {
+        const rows = [antiRow(OBJECT_A, NOW + 1)];
+        const hits = searchKernelMemoryRows({
+            rows,
+            query: "session caching",
+            limit: 5,
+            nowMs: NOW,
+        });
+        expect(hits?.map((hit) => hit.source)).toEqual(["anti_memory"]);
+    });
+});
+
+describe("searchKernelMemoryRows baseline exclusion", () => {
+    const rows = [
+        readRow({
+            objectId: OBJECT_A,
+            decisionKind: "PROJECT_RULES",
+            summary: "the historian runs on a lease",
+        }),
+        readRow({
+            objectId: OBJECT_B,
+            decisionKind: "PROJECT_RULES",
+            summary: "the historian writes claims",
+        }),
+    ];
+    const excludeObjectIds = new Set([OBJECT_A]);
+
+    test("an explicit object-id query resolves a baseline-visible object", () => {
+        const hits = searchKernelMemoryRows({ rows, query: OBJECT_A, limit: 5, excludeObjectIds });
+        expect(hits?.map((hit) => [hit.publicClaimId, hit.matchType])).toEqual([
+            [OBJECT_A, "exact"],
+        ]);
+    });
+
+    test("lexical ranking still excludes baseline-visible objects", () => {
+        const hits = searchKernelMemoryRows({
+            rows,
+            query: "historian",
+            limit: 5,
+            excludeObjectIds,
+        });
+        expect(hits?.map((hit) => hit.publicClaimId)).toEqual([OBJECT_B]);
+    });
+});
+
 describe("searchKernelMemoryRows tie-breaking", () => {
     test("rows with equal score, seq, and object id keep their input order", () => {
         const rows = [

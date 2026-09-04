@@ -6,7 +6,9 @@
  */
 
 import {
+    ANTI_MEMORY_DEFAULT_TTL_MS,
     type AntiMemoryPayload,
+    antiMemoryExpired,
     parseAntiMemoryContent,
     renderAntiMemoryContent,
 } from "../../features/magic-context/memory/anti-memory-content";
@@ -151,6 +153,19 @@ function rowCategory(row: ReadRow): string {
     return row.decision?.decision_kind ?? row.object.object_kind;
 }
 
+/** An expired anti-memory stays out of `list`, matching the surface filter search applies; `get` by explicit id still returns it so retired warnings stay inspectable and archivable. An unparseable summary never counts as expired. commentlint: allow(JUDGE) */
+function isExpiredAntiMemoryRow(row: ReadRow, nowMs: number): boolean {
+    if (rowCategory(row) !== ANTI_MEMORY_CATEGORY) return false;
+    try {
+        return antiMemoryExpired(
+            parseAntiMemoryContent(row.decision?.payload.summary ?? ""),
+            nowMs,
+        );
+    } catch {
+        return false;
+    }
+}
+
 /** One survivor cannot replace facts from different categories, so every merge predecessor must carry the same `decision_kind`. commentlint: allow(JUDGE) */
 function requireMergeableCategory(predecessors: readonly ReadRow[]): string {
     const categories = [...new Set(predecessors.map(rowCategory))].sort();
@@ -274,15 +289,30 @@ function nextSourceRevision(predecessors: readonly ReadRow[]): number {
     return predecessors.reduce((max, row) => Math.max(max, row.object.source_revision), 0) + 1;
 }
 
-/** A `retire_decision` operation carries no payload, so the caller's reason rides in the commit intent's `cause` after the tool-call id; `deriveOperationKey` joins fields with `OPERATION_KEY_SEPARATOR`, and the reason drops that separator to keep operation keys unambiguous. commentlint: allow(JUDGE) */
+/** A `retire_decision` operation carries no payload, so the caller's reason rides in the commit intent's `cause` after the tool-call id. `cause` is audit text only — the operation key derives from the session and tool-call identity — so a redelivered call keeps its key regardless of the reason text. commentlint: allow(JUDGE) */
 function archiveCause(identity: CtxMemoryWriteIdentity, reason: string | undefined): string {
-    const trimmed = reason?.trim().replaceAll(OPERATION_KEY_SEPARATOR, " ");
+    const trimmed = reason?.trim();
     return trimmed ? `${identity.toolCallId} reason: ${trimmed}` : identity.toolCallId;
 }
 
+/** The stable write identity the operation key derives from: the session scopes the harness-local tool-call id, so two sessions reusing one tool-call id key distinct operations. commentlint: allow(JUDGE) */
+function operationIdOf(identity: CtxMemoryWriteIdentity): string {
+    return `${identity.sessionId}${OPERATION_KEY_SEPARATOR}${identity.toolCallId}`;
+}
+
+/** A caller-supplied anti-memory without an explicit expiry gets the default horizon: kernel writes have no lifecycle expiry, so the horizon rides in the rendered payload and the read sites filter on it. The expiry is day-aligned because the rendered payload feeds the commit's request digest: a redelivered tool call must produce byte-identical operations to replay instead of hitting `operation_key_reused`. commentlint: allow(JUDGE) */
+function withAntiMemoryExpiry(args: CtxMemoryArgs): CtxMemoryArgs {
+    if (!args.antiMemory || args.antiMemory.expiresAt !== undefined) return args;
+    const day = 24 * 60 * 60 * 1_000;
+    const expiresAt = Math.ceil((Date.now() + ANTI_MEMORY_DEFAULT_TTL_MS) / day) * day;
+    return { ...args, antiMemory: { ...args.antiMemory, expiresAt } };
+}
+
 export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<string> {
-    const { client, args, action, identity, actor, sourceKind } = input;
-    const mutation: MutationArgs = { actor, cause: identity.toolCallId };
+    const { client, action, identity, actor, sourceKind } = input;
+    const args = withAntiMemoryExpiry(input.args);
+    const operationId = operationIdOf(identity);
+    const mutation: MutationArgs = { actor, operationId, cause: identity.toolCallId };
 
     if (action === "get" || action === "list") {
         const read = await readMemoryRows(client);
@@ -307,8 +337,10 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
             });
         }
         const category = args.category?.trim();
+        const nowMs = Date.now();
         const listed = read.rows
             .filter((row) => !category || row.decision?.decision_kind === category)
+            .filter((row) => !isExpiredAntiMemoryRow(row, nowMs))
             .sort((left, right) => (left.object.object_id < right.object.object_id ? -1 : 1))
             .slice(0, normalizeLimit(args.limit));
         return JSON.stringify({
@@ -335,7 +367,11 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         requireVisible(read.rows, [target]);
         return renderCommit(
             action,
-            await client.archive(target, { actor, cause: archiveCause(identity, args.reason) }),
+            await client.archive(target, {
+                actor,
+                operationId,
+                cause: archiveCause(identity, args.reason),
+            }),
             [target],
         );
     }

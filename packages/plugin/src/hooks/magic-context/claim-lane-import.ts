@@ -1,6 +1,10 @@
 /** One-time bridge from the claim-lane SQLite tables to the kernel store, run once per project. commentlint: allow(JUDGE) */
 
 import {
+    parseAntiMemoryContent,
+    renderAntiMemoryContent,
+} from "../../features/magic-context/memory/anti-memory-content";
+import {
     ANTI_MEMORY_CATEGORY,
     PROMOTABLE_CATEGORIES,
 } from "../../features/magic-context/memory/constants";
@@ -27,7 +31,6 @@ export const CLAIM_LANE_IMPORT_SOURCE_ID = "claim-lane-import";
 export const CLAIM_LANE_IMPORT_ACTOR = "agent:claim-lane-import";
 /** The `_v2` suffix distinguishes markers for imports that include legacy categories; a project marked done under the old key imports its legacy-category claims once more. commentlint: allow(JUDGE) */
 const MARKER_PREFIX = "kernel_claim_lane_import_v2:";
-export const CLAIM_LANE_IMPORT_BATCH = 50;
 const RETRY_AFTER_MS = 5 * 60_000;
 
 /** Persisted categories are used verbatim as `decision_kind`. */
@@ -124,10 +127,11 @@ export function resetClaimLaneImportMarker(
     );
 }
 
+/** `null` means the claim-lane projection could not publish a snapshot (the reader answered `stale`); the lane's contents are unknown, which is distinct from an empty lane. commentlint: allow(JUDGE) */
 export function listClaimLaneMemories(
     db: Database,
     projectPath: string,
-): ProjectMemoryClaimSnapshot[] {
+): ProjectMemoryClaimSnapshot[] | null {
     if (!hasClaimMemoryFragment(db)) return [];
     const projectIds = resolveProjectIdsForIdentities(db, [projectPath]);
     if (projectIds.length === 0) return [];
@@ -137,7 +141,7 @@ export function listClaimLaneMemories(
         surface: "explicit_search",
         lifecycleStates: ["active"],
     });
-    if (result.status !== "ok") return [];
+    if (result.status !== "ok") return null;
     const own = new Set(projectIds);
     return result.items
         .filter(
@@ -155,6 +159,20 @@ export function importedObjectId(publicClaimId: string, projectRoot: string): st
     return `mem_${sha256Hex(`${CLAIM_LANE_IMPORT_SOURCE_ID}\u001f${projectRoot}\u001f${publicClaimId}`).slice(0, 32)}`;
 }
 
+/** The lane keeps anti-memory expiry in a column while kernel read surfaces read it from the rendered "Expires at:" line, so the imported summary re-renders the lane payload with the lane's expiry. Content that does not parse as an anti-memory payload imports verbatim instead of aborting the lane. commentlint: allow(JUDGE) */
+function claimLaneImportSummary(claim: ProjectMemoryClaimSnapshot): string {
+    const summary = claim.content.trim();
+    if (claim.category !== ANTI_MEMORY_CATEGORY || claim.expiresAt === null) return summary;
+    try {
+        return renderAntiMemoryContent({
+            ...parseAntiMemoryContent(summary),
+            expiresAt: claim.expiresAt,
+        });
+    } catch {
+        return summary;
+    }
+}
+
 export function claimLaneImportSpec(
     claim: ProjectMemoryClaimSnapshot,
     projectRoot: string,
@@ -164,7 +182,7 @@ export function claimLaneImportSpec(
         object_id: importedObjectId(claim.publicClaimId, projectRoot),
         domain_id: CTX_MEMORY_DOMAIN_ID,
         decision_kind: claim.category,
-        payload: { summary: claim.content.trim(), rationale: "" },
+        payload: { summary: claimLaneImportSummary(claim), rationale: "" },
         source_id: CLAIM_LANE_IMPORT_SOURCE_ID,
         source_revision: Math.max(1, claim.revision),
     };
@@ -192,6 +210,13 @@ export async function importClaimLaneMemories(args: {
     if (claimLaneImportDone(db, projectPath, projectRoot)) return "skipped";
     const generation = claimLaneImportGeneration(db, projectPath, projectRoot);
     const claims = listClaimLaneMemories(db, projectPath);
+    if (claims === null) {
+        sessionLog(
+            sessionId,
+            "claim-lane import deferred: the claim-lane projection answered stale; the lane replays once a snapshot publishes",
+        );
+        return "deferred";
+    }
     if (claims.length === 0) {
         return markDone(db, projectPath, projectRoot, generation, { imported: 0 })
             ? "done"
@@ -213,32 +238,40 @@ export async function importClaimLaneMemories(args: {
     const pending = claims.filter(
         (claim) =>
             !present.has(importedObjectId(claim.publicClaimId, projectRoot)) &&
-            !presentContent.has(`${claim.category}\u001f${claim.content.trim()}`),
+            !presentContent.has(`${claim.category}\u001f${claimLaneImportSummary(claim)}`),
     );
     let imported = 0;
-    for (let start = 0; start < pending.length; start += CLAIM_LANE_IMPORT_BATCH) {
-        const batch = pending.slice(start, start + CLAIM_LANE_IMPORT_BATCH);
+    let retired = 0;
+    // A claim imported and later archived is absent from the read yet
+    // re-inserts as `already_exists`. Committing claims individually treats
+    // that answer as already imported and keeps it from aborting later claims.
+    for (const claim of pending) {
         const result = await client.commit({
             actor: CLAIM_LANE_IMPORT_ACTOR,
-            cause: `import\u001f${sha256Hex(batch.map((claim) => claim.publicClaimId).join("\u001f"))}`,
+            operationId: `import\u001f${claim.publicClaimId}\u001f${claim.revisionLocator}`,
+            cause: `claim-lane import ${claim.publicClaimId}`,
             sourceKind: "model",
-            operations: batch.map((claim) => ({
-                op: "insert_decision" as const,
-                spec: claimLaneImportSpec(claim, projectRoot),
-            })),
+            operations: [
+                { op: "insert_decision" as const, spec: claimLaneImportSpec(claim, projectRoot) },
+            ],
         });
         if (!isAvailable(result)) {
+            if (result.state.kind === "invalid" && result.state.reason === "already_exists") {
+                retired += 1;
+                continue;
+            }
             sessionLog(
                 sessionId,
                 `claim-lane import deferred after ${imported} of ${pending.length} memories: kernel commit answered ${stateKey(result.state)}`,
             );
             return "deferred";
         }
-        imported += batch.length;
+        imported += 1;
     }
     if (
         !markDone(db, projectPath, projectRoot, generation, {
             imported,
+            retired,
             alreadyPresent: claims.length - pending.length,
         })
     ) {
@@ -250,7 +283,7 @@ export async function importClaimLaneMemories(args: {
     }
     sessionLog(
         sessionId,
-        `claim-lane import complete: ${imported} memories committed to the kernel, ${claims.length - pending.length} already present`,
+        `claim-lane import complete: ${imported} memories committed to the kernel, ${retired} retired in the registry, ${claims.length - pending.length} already present`,
     );
     return "done";
 }

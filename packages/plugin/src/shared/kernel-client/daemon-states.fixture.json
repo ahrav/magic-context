@@ -74,6 +74,22 @@
   },
   {
     "kind": "invalid",
+    "reason": "not_found"
+  },
+  {
+    "kind": "invalid",
+    "reason": "already_exists"
+  },
+  {
+    "kind": "invalid",
+    "reason": "revision_not_advanced"
+  },
+  {
+    "kind": "invalid",
+    "reason": "scope_reserved"
+  },
+  {
+    "kind": "invalid",
     "reason": "payload_too_large"
   },
   {

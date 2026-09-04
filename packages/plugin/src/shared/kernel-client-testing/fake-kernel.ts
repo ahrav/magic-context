@@ -209,15 +209,14 @@ export class FakeKernel {
         const operations = body.operations as Operation[];
         const touched = new Set<string>();
         const sourceKind = typeof body.source_kind === "string" ? body.source_kind : "assistant";
-        // Every inserted object id must be new to the store; one envelope may name the same
-        // survivor from several supersessions.
+        // Every inserted object id must be new to the store, matching the daemon's duplicate-id answer; retired ids stay in `objects`, so a re-insert of an archived id answers `already_exists` too. One envelope may name the same survivor from several supersessions. commentlint: allow(JUDGE)
         for (const operation of operations) {
             if (operation.op !== "insert_decision" && operation.op !== "supersede_decision") {
                 continue;
             }
             const objectId = (operation.spec as Record<string, unknown>).object_id as string;
             if (this.objects.has(objectId)) {
-                return { state: { kind: "invalid", reason: "invalid_input" } };
+                return { state: { kind: "invalid", reason: "already_exists" } };
             }
         }
         const seq = this.nextSeq();
