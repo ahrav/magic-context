@@ -1425,12 +1425,10 @@ pub(super) fn load_object_states(
     let states = statement
         .query_map([ids], object_state_from)
         .map_err(map_sqlite)?
-        .collect::<rusqlite::Result<Vec<_>>>()
+        .map(|state| state.map(|state| (state.object.object_id.clone(), state)))
+        .collect::<rusqlite::Result<HashMap<_, _>>>()
         .map_err(map_sqlite)?;
-    Ok(states
-        .into_iter()
-        .map(|state| (state.object.object_id.clone(), state))
-        .collect())
+    Ok(states)
 }
 
 fn load_object(tx: &Transaction<'_>, object_id: &str) -> Result<Option<ObjectRow>, KernelError> {
