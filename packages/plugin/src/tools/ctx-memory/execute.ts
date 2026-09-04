@@ -511,6 +511,11 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
     }
 
     const targets = uniqueIds(args.objectIds);
+    // A duplicate id in the merge list is a caller-side bug; the duplicate check precedes arity validation so duplicate input cannot pass as a smaller merge after deduplication. commentlint: allow(JUDGE)
+    const suppliedCount = (args.objectIds ?? []).filter((id) => id.trim().length > 0).length;
+    if (suppliedCount !== targets.length) {
+        throw new ClaimOperationInputError("merge requires distinct objectIds");
+    }
     if (targets.length < 2) {
         throw new ClaimOperationInputError("merge requires at least two objectIds");
     }
