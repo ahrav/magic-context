@@ -127,10 +127,13 @@ export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): Par
  */
 export function removeNamedOutput(argv: readonly string[], root: string = E2E_ROOT): void {
     if (helpRequested(argv)) return;
+    const pairs = flagPairs(argv);
+    // A misspelled input flag hides its path from the protected set, so an unknown token means nothing is removed.
+    if (pairs.some(({ flag }) => !KNOWN_FLAGS.includes(flag))) return;
     // Every value of a repeated flag counts: the parser refuses the duplicate, and the stale report may sit at the second.
     const values = new Map<string, string[]>();
-    for (const { flag, value } of flagPairs(argv)) {
-        if (KNOWN_FLAGS.includes(flag) && value !== undefined) values.set(flag, [...(values.get(flag) ?? []), value]);
+    for (const { flag, value } of pairs) {
+        if (value !== undefined) values.set(flag, [...(values.get(flag) ?? []), value]);
     }
     const inputs = inputPaths(values, root);
     for (const value of values.get("--out") ?? []) {

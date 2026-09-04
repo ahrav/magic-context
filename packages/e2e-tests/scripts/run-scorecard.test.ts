@@ -91,11 +91,18 @@ describe("removeNamedOutput", () => {
         removeNamedOutput(["--out", out, "-h"]);
         expect(existsSync(out)).toBe(true);
         // A lost value leaves its flag valueless instead of shifting the pairs, so the output is still recognized.
-        for (const argv of [["--freeze", "--out", out], ["--freeze", "f", "--freeze-fingerprint", "--out", out, "--artifacts"], ["stray", "--out", out]]) {
+        for (const argv of [["--freeze", "--out", out], ["--freeze", "f", "--freeze-fingerprint", "--out", out, "--artifacts"]]) {
             writeFileSync(out, "{\"stale\":true}\n");
-            expect(() => parseArgs(argv, "/root")).toThrow(/requires a value|unknown argument/);
+            expect(() => parseArgs(argv, "/root")).toThrow(/requires a value/);
             removeNamedOutput(argv, "/root");
             expect(existsSync(out)).toBe(false);
+        }
+        // An unknown flag may be a misspelled input whose path is then unprotected, so nothing is removed.
+        for (const argv of [["--basline", out, "--out", out], ["stray", "--out", out]]) {
+            writeFileSync(out, "{\"stale\":true}\n");
+            expect(() => parseArgs(argv, "/root")).toThrow(/unknown argument/);
+            removeNamedOutput(argv, "/root");
+            expect(existsSync(out)).toBe(true);
         }
     });
 
