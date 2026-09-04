@@ -2490,6 +2490,7 @@ export function registerPiContextHandler(
 						projectRoot: memoryProjectRoot,
 					}),
 					projectPath: projectIdentity,
+					projectRoot: memoryProjectRoot,
 					sessionId,
 				});
 			}

@@ -15,6 +15,7 @@ interface CommitJson {
     outcome: string;
     commitSeq: number;
     knownAsOf: number;
+    objectId?: string;
     objects: string[];
 }
 
@@ -92,6 +93,7 @@ describe("ctx_memory create and revise through the cached token", () => {
         expect(created).toMatchObject({ action: "create", outcome: "applied", commitSeq: 1 });
         expect(created.objects).toHaveLength(1);
         const objectId = created.objects[0] as string;
+        expect(created.objectId).toBe(objectId);
         expect(objectId).toMatch(/^mem_[0-9a-f]{32}$/);
         expect(tool.kernel.objects.get(objectId)?.decision).toEqual({
             decision_kind: "ARCHITECTURE",
@@ -107,6 +109,8 @@ describe("ctx_memory create and revise through the cached token", () => {
         expect(revised.outcome).toBe("applied");
         expect(revised.objects).toContain(objectId);
         const survivor = revised.objects.find((id) => id !== objectId) as string;
+        // The tool result names the survivor apart from the retired predecessor.
+        expect(revised.objectId).toBe(survivor);
         expect(tool.kernel.objects.get(objectId)?.superseded_by).toBe(survivor);
         expect(tool.kernel.objects.get(survivor)?.decision?.payload.summary).toBe(
             "OpenCode uses the kernel routes.",
@@ -256,6 +260,7 @@ describe("ctx_memory lifecycle and merge", () => {
             ),
         );
         expect(archived.outcome).toBe("applied");
+        expect(archived.objectId).toBeUndefined();
         expect(kernel.objects.get("mem_a")?.invalidated_commit_seq).not.toBeNull();
 
         const merged = parseJson<CommitJson>(
@@ -267,6 +272,13 @@ describe("ctx_memory lifecycle and merge", () => {
         expect(merged.outcome).toBe("applied");
         expect(merged.objects).toContain("mem_b");
         expect(merged.objects).toContain("mem_c");
+        // The tool result names the merge survivor apart from the retired predecessors.
+        expect(merged.objectId).toMatch(/^mem_[0-9a-f]{32}$/);
+        expect(merged.objectId).not.toBe("mem_b");
+        expect(merged.objectId).not.toBe("mem_c");
+        expect(kernel.objects.get(merged.objectId as string)?.decision?.payload.summary).toBe(
+            "B and C.",
+        );
         expect(kernel.liveRows().map((row) => row.decision?.payload.summary)).toEqual(["B and C."]);
         expect(await tool.execute({ action: "merge", objectIds: ["only"] }, "call-merge-one")).toBe(
             "Error: merge requires at least two objectIds",

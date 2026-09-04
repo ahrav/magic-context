@@ -8,13 +8,15 @@
 //! classes, so visibility follows the kernel's admission rules rather than
 //! anything the caller asserts.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use mc_host::RouteHandle;
 use mc_kernel::{
     AdmissionEvent, AdmissionRequest, CommitIntent, CommitReceipt, DecisionPayload, DecisionSpec,
-    Envelope, EventKind, KernelError, KernelStore, ObservationDependencySpec, ObservationPayload,
-    ObservationSpec, Sensitivity, SourceClass, TaintClass, TokenCheck, TokenConflict,
+    DomainSpec, Envelope, EventKind, KernelError, KernelStore, ObservationDependencySpec,
+    ObservationPayload, ObservationSpec, Sensitivity, SourceClass, TaintClass, TokenCheck,
+    TokenConflict,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -327,6 +329,33 @@ fn ensure_scope(
     Ok(())
 }
 
+const DOMAIN_SOURCE_KIND: &str = "kernel_route";
+
+/// The shared transaction prevents concurrent commits from inserting the same domain twice.
+fn ensure_domain(
+    envelope: &mut Envelope<'_>,
+    domain_id: &str,
+    ready: &mut HashSet<String>,
+) -> Result<(), KernelError> {
+    if ready.contains(domain_id) {
+        return Ok(());
+    }
+    if !envelope.domain_exists(domain_id)? {
+        let object_id = format!("domain:{domain_id}");
+        envelope.insert_domain(DomainSpec {
+            domain_id: domain_id.to_string(),
+            object_id: object_id.clone(),
+            name: domain_id.to_string(),
+            source_kind: DOMAIN_SOURCE_KIND.to_string(),
+            source_id: object_id,
+            source_revision: 1,
+            sensitivity: Sensitivity::Normal,
+        })?;
+    }
+    ready.insert(domain_id.to_string());
+    Ok(())
+}
+
 fn is_live(envelope: &Envelope<'_>, object_id: &str) -> Result<bool, KernelError> {
     Ok(envelope
         .object_state(object_id)?
@@ -338,10 +367,12 @@ fn is_live(envelope: &Envelope<'_>, object_id: &str) -> Result<bool, KernelError
 fn apply(envelope: &mut Envelope<'_>, plan: &CommitPlan) -> Result<String, KernelError> {
     let scope_id = plan.project.scope_id();
     let mut scope_ready = false;
+    let mut domains_ready: HashSet<String> = HashSet::new();
     let mut touched: Vec<String> = Vec::new();
     for operation in &plan.operations {
         match operation {
             Operation::InsertDecision { spec } => {
+                ensure_domain(envelope, &spec.domain_id, &mut domains_ready)?;
                 ensure_scope(envelope, &plan.project, &spec.domain_id, &mut scope_ready)?;
                 let spec = spec.clone().into_spec(&plan.source_kind, &scope_id);
                 let outcome = envelope.insert_decision(spec)?;
@@ -352,6 +383,7 @@ fn apply(envelope: &mut Envelope<'_>, plan: &CommitPlan) -> Result<String, Kerne
                 replaced_object_id,
                 spec,
             } => {
+                ensure_domain(envelope, &spec.domain_id, &mut domains_ready)?;
                 ensure_scope(envelope, &plan.project, &spec.domain_id, &mut scope_ready)?;
                 let replacement_live = is_live(envelope, &spec.object_id)?;
                 let spec = spec.clone().into_spec(&plan.source_kind, &scope_id);
@@ -367,6 +399,7 @@ fn apply(envelope: &mut Envelope<'_>, plan: &CommitPlan) -> Result<String, Kerne
                 touched.push(object_id.clone());
             }
             Operation::InsertObservation { spec } => {
+                ensure_domain(envelope, &spec.domain_id, &mut domains_ready)?;
                 ensure_scope(envelope, &plan.project, &spec.domain_id, &mut scope_ready)?;
                 let spec = spec.clone().into_spec(&plan.source_kind, &scope_id);
                 let outcome = envelope.insert_observation(spec)?;

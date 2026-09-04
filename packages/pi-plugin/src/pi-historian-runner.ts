@@ -1139,13 +1139,15 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			completedSuccessfully = true;
 
 			if (promotionIdentity && promotedRefs.length > 0) {
+				const promotionProjectRoot = resolveProjectRootDirectory(directory);
 				await commitPromotedFactsToKernel({
 					client: kernelClient?.({
 						sessionId,
-						projectRoot: resolveProjectRootDirectory(directory),
+						projectRoot: promotionProjectRoot,
 					}),
 					db,
 					projectPath,
+					projectRoot: promotionProjectRoot,
 					sessionId,
 					refs: promotedRefs,
 					identity: promotionIdentity,

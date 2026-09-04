@@ -57,6 +57,8 @@ export async function commitPromotedFactsToKernel(args: {
     client: KernelClient | undefined;
     db: Database;
     projectPath: string;
+    /** The checkout root the client's kernel scope is bound to; the import marker is keyed by it. */
+    projectRoot: string;
     sessionId: string;
     refs: readonly PromotedMemoryRef[];
     identity: HistorianPromotionIdentity;
@@ -72,7 +74,7 @@ export async function commitPromotedFactsToKernel(args: {
     });
     if (!isAvailable(result)) {
         if (args.projectPath.length > 0) {
-            resetClaimLaneImportMarker(args.db, args.projectPath);
+            resetClaimLaneImportMarker(args.db, args.projectPath, args.projectRoot);
         }
         sessionLog(
             args.sessionId,

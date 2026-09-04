@@ -633,6 +633,25 @@ fn ingest(key: &str, payload: &[u8], sensitivity: Sensitivity) -> ArtifactIngest
 }
 
 #[tokio::test]
+async fn a_commit_on_a_fresh_store_provisions_the_referenced_domain() {
+    let daemon = Daemon::start().await;
+    // No seeded domain: the first commit materializes its referenced domain.
+    let first = daemon
+        .commit("fresh-1", vec![insert_decision(1)], vec![])
+        .await;
+    assert_state(&first, "available", None);
+    let read = daemon.read("explicit_search", None).await;
+    assert_eq!(object_ids(&read), ["decision-object-1"]);
+
+    // The provisioned domain row backs later commits without a second insert.
+    let again = daemon
+        .commit("fresh-2", vec![insert_decision(2)], vec![])
+        .await;
+    assert_state(&again, "available", None);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn replayed_intents_return_one_receipt_and_projects_never_collide() {
     let daemon = Daemon::start().await;
     seed_domain(&daemon.store());

@@ -49,6 +49,7 @@ import {
 	appendAutoSearchHintDecision,
 	getAutoSearchHintDecisions,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { collectAntiMemoryWarningFragments } from "@magic-context/core/hooks/magic-context/auto-search-hint";
 import { extractBoundedAutoSearchQuery } from "@magic-context/core/hooks/magic-context/auto-search-prompt";
 import {
 	type AutoSearchDelivery,
@@ -349,15 +350,24 @@ export async function runAutoSearchHintForPi(args: {
 	// Prefix with double newline so the hint is a separate block, matching
 	// OpenCode's auto-search runner.
 	const payload = `\n\n${delivery.hintText}`;
-	// Kernel memory hits carry no claim fragments, so the persisted hint replays on later passes.
+	// Any anti-memory fragment marks the persisted decision as non-replayable;
+	// decisions without anti-memory fragments remain eligible for replay.
+	const { warningResults, memoryFragments } = collectAntiMemoryWarningFragments(
+		delivery.delivered,
+	);
 	const outcome = appendAutoSearchHintDecision(db, sessionId, {
 		messageId: userMsgId,
 		decision: "hint",
 		text: payload,
-		memoryFragments: [],
+		memoryFragments,
 	});
 	if (!outcome.ok) return messages;
-	replayHintIfEligible(outcome.decision);
+	if (outcome.kind === "appended" && warningResults.length > 0) {
+		// A freshly delivered warning bypasses replay; later passes cannot re-serve it.
+		appendHintToUserMessage(userMsg, payload);
+	} else {
+		replayHintIfEligible(outcome.decision);
+	}
 	sessionLog(
 		sessionId,
 		`auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,

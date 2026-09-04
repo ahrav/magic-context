@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { ANTI_MEMORY_CATEGORY } from "../../features/magic-context/memory/constants";
 import {
     BUDGET_OMITTED_MARKER,
     EMPTY_PROJECT_MARKER,
@@ -122,6 +123,33 @@ describe("domain fence on rendered rows", () => {
         expect(snapshot.rows).toHaveLength(2);
         const rows = memoryRows(snapshot);
         expect(rows.map((row) => row.decision?.payload.summary)).toEqual(["a memory-domain row"]);
+    });
+});
+
+describe("anti-memory fence on automatic surfaces", () => {
+    function kernelWithAntiMemory(): FakeKernel {
+        const kernel = seededKernel([{ id: "a", summary: "a positive memory" }]);
+        kernel.seedDecision({
+            object_id: `mem_${"d".repeat(32)}`,
+            decision_kind: ANTI_MEMORY_CATEGORY,
+            summary: "Trigger: retries. Rejected strategy: unbounded retry loop.",
+        });
+        return kernel;
+    }
+
+    test("memoryRows excludes anti-memory rows while the snapshot keeps them", () => {
+        const kernel = kernelWithAntiMemory();
+        const snapshot = kernel.snapshot();
+        expect(snapshot.rows).toHaveLength(2);
+        const rows = memoryRows(snapshot);
+        expect(rows.map((row) => row.decision?.payload.summary)).toEqual(["a positive memory"]);
+    });
+
+    test("the historian baseline omits anti-memory rows", async () => {
+        const { client } = kernelHarness(kernelWithAntiMemory());
+        const block = await readHistorianMemoryBlock({ client, sessionId: SESSION });
+        expect(block).toContain("a positive memory");
+        expect(block).not.toContain("unbounded retry loop");
     });
 });
 

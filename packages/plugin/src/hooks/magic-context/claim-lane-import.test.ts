@@ -18,6 +18,7 @@ import {
 
 const PROJECT = "git:import-project";
 const OTHER_PROJECT = "git:other-project";
+const ROOT = "/repo/import";
 
 function seedClaim(
     db: Database,
@@ -77,19 +78,31 @@ describe("claim-lane import", () => {
         const second = seedClaim(db, PROJECT, "b", "Own claim B.");
 
         expect(
-            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
         ).toBe("done");
-        expect(claimLaneImportDone(db, PROJECT)).toBe(true);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
         const live = kernel.liveRows();
         expect(live.map((row) => row.object_id).sort()).toEqual(
-            [importedObjectId(first), importedObjectId(second)].sort(),
+            [importedObjectId(first, ROOT), importedObjectId(second, ROOT)].sort(),
         );
         expect(live.every((row) => row.source_id === CLAIM_LANE_IMPORT_SOURCE_ID)).toBe(true);
         expect(live.every((row) => row.source_kind === "model")).toBe(true);
 
         const commitsBefore = transport.methods().filter((m) => m === "kernel.commit").length;
         expect(
-            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
         ).toBe("skipped");
         expect(transport.methods().filter((m) => m === "kernel.commit").length).toBe(commitsBefore);
     });
@@ -99,12 +112,18 @@ describe("claim-lane import", () => {
         const first = seedClaim(db, PROJECT, "a", "Own claim A.");
         seedClaim(db, PROJECT, "b", "Own claim B.");
         kernel.seedDecision({
-            object_id: importedObjectId(first),
+            object_id: importedObjectId(first, ROOT),
             decision_kind: "ARCHITECTURE",
             summary: "Own claim A.",
         });
         expect(
-            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
         ).toBe("done");
         expect(kernel.liveRows()).toHaveLength(2);
     });
@@ -117,19 +136,31 @@ describe("claim-lane import", () => {
             reason: "store_starting",
         });
         expect(
-            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
         ).toBe("deferred");
-        expect(claimLaneImportDone(db, PROJECT)).toBe(false);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(false);
         expect(kernel.liveRows()).toHaveLength(0);
     });
 
     test("a project with no claims is marked done without dialing the daemon", async () => {
         const { db, transport, client } = harness();
         expect(
-            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
         ).toBe("done");
         expect(transport.calls).toHaveLength(0);
-        expect(claimLaneImportDone(db, PROJECT)).toBe(true);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
     });
 
     test("a legacy-category active claim imports with its category as the decision kind", async () => {
@@ -137,7 +168,13 @@ describe("claim-lane import", () => {
         seedClaim(db, PROJECT, "a", "Prefers tabs over spaces.", "USER_PREFERENCES");
         seedClaim(db, PROJECT, "b", "CI requires two approvals.", "WORKFLOW_RULES");
         expect(
-            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
         ).toBe("done");
         const kinds = kernel
             .liveRows()
@@ -155,7 +192,7 @@ describe("claim-lane import", () => {
         const imported = seedClaim(db, PROJECT, "a", "Own claim A.");
         seedClaim(db, PROJECT, "b", "Legacy directive.", "USER_DIRECTIVES");
         kernel.seedDecision({
-            object_id: importedObjectId(imported),
+            object_id: importedObjectId(imported, ROOT),
             decision_kind: "ARCHITECTURE",
             summary: "Own claim A.",
             domain_id: "memory",
@@ -163,9 +200,15 @@ describe("claim-lane import", () => {
             source_id: CLAIM_LANE_IMPORT_SOURCE_ID,
         });
 
-        expect(claimLaneImportDone(db, PROJECT)).toBe(false);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(false);
         expect(
-            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
         ).toBe("done");
         expect(kernel.liveRows()).toHaveLength(2);
         expect(kernel.liveRows().map((row) => row.decision?.payload.summary)).toContain(
@@ -174,7 +217,13 @@ describe("claim-lane import", () => {
 
         const commitsBefore = transport.methods().filter((m) => m === "kernel.commit").length;
         expect(
-            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
         ).toBe("skipped");
         expect(transport.methods().filter((m) => m === "kernel.commit").length).toBe(commitsBefore);
         expect(kernel.liveRows()).toHaveLength(2);
@@ -184,15 +233,33 @@ describe("claim-lane import", () => {
         const { db, kernel, client } = harness();
         resetClaimLaneImportScheduleForTest();
         expect(
-            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
         ).toBe("done");
-        scheduleClaimLaneImport({ db, client, projectPath: PROJECT, sessionId: "s1" });
+        scheduleClaimLaneImport({
+            db,
+            client,
+            projectPath: PROJECT,
+            projectRoot: ROOT,
+            sessionId: "s1",
+        });
 
         seedClaim(db, PROJECT, "a", "Fact from a failed promotion.");
-        resetClaimLaneImportMarker(db, PROJECT);
-        expect(claimLaneImportDone(db, PROJECT)).toBe(false);
+        resetClaimLaneImportMarker(db, PROJECT, ROOT);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(false);
 
-        scheduleClaimLaneImport({ db, client, projectPath: PROJECT, sessionId: "s1" });
+        scheduleClaimLaneImport({
+            db,
+            client,
+            projectPath: PROJECT,
+            projectRoot: ROOT,
+            sessionId: "s1",
+        });
         for (let waited = 0; waited < 200 && kernel.liveRows().length === 0; waited++) {
             await new Promise((resolve) => setTimeout(resolve, 1));
         }
@@ -201,5 +268,48 @@ describe("claim-lane import", () => {
             "Fact from a failed promotion.",
         );
         resetClaimLaneImportScheduleForTest();
+    });
+
+    test("two checkouts sharing a root-commit identity each import into their own kernel scope", async () => {
+        const { db, client } = harness();
+        const otherKernel = new FakeKernel();
+        const otherClient = new KernelClient({
+            transport: new FakeKernelTransport(otherKernel),
+            enabled: true,
+            sessionId: "s1",
+            projectRoot: "/repo/import-second",
+        });
+        const claim = seedClaim(db, PROJECT, "a", "Own claim A.");
+
+        expect(
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
+        ).toBe("done");
+        // The first checkout's marker does not cover the second checkout.
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
+        expect(claimLaneImportDone(db, PROJECT, "/repo/import-second")).toBe(false);
+
+        expect(
+            await importClaimLaneMemories({
+                db,
+                client: otherClient,
+                projectPath: PROJECT,
+                projectRoot: "/repo/import-second",
+                sessionId: "s1",
+            }),
+        ).toBe("done");
+        expect(otherKernel.liveRows()).toHaveLength(1);
+        // Object ids differ per checkout root, so both scopes' rows coexist in one store.
+        expect(importedObjectId(claim, ROOT)).not.toBe(
+            importedObjectId(claim, "/repo/import-second"),
+        );
+        expect(otherKernel.liveRows()[0]?.object_id).toBe(
+            importedObjectId(claim, "/repo/import-second"),
+        );
     });
 });

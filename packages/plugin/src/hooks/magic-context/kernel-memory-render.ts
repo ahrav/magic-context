@@ -6,7 +6,10 @@
  */
 
 import { escapeXmlAttr, escapeXmlContent } from "../../features/magic-context/compartment-storage";
-import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
+import {
+    ANTI_MEMORY_CATEGORY,
+    V2_MEMORY_CATEGORIES,
+} from "../../features/magic-context/memory/constants";
 import {
     abstained,
     disabled,
@@ -121,8 +124,11 @@ export function memorySnapshotKey(snapshot: KernelMemorySnapshot): string {
     return `${stateKey(snapshot.state)}#${rows.length}@${sha256Hex(rows.join("\u001e")).slice(0, 16)}`;
 }
 
+/** Rows the automatic surfaces (m[0] injection, historian baseline) render. Anti-memories are excluded because rewriting can drop the negation and recreate a rejected strategy as guidance; they stay visible to search and the explicit ctx_memory actions, which read the snapshot rows directly. commentlint: allow(JUDGE) */
 export function memoryRows(snapshot: KernelMemorySnapshot): ReadRow[] {
-    return snapshot.rows.filter(isMemoryDecisionRow);
+    return snapshot.rows.filter(
+        (row) => isMemoryDecisionRow(row) && row.decision?.decision_kind !== ANTI_MEMORY_CATEGORY,
+    );
 }
 
 /** The identity a rendered row is tracked by in cache manifests and search exclusion. */

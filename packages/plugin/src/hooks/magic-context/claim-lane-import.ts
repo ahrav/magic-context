@@ -34,8 +34,9 @@ const IMPORTED_CATEGORIES: readonly string[] = [...PROMOTABLE_CATEGORIES, ANTI_M
 
 export type ClaimLaneImportOutcome = "skipped" | "done" | "deferred";
 
-function markerKey(projectPath: string): string {
-    return `${MARKER_PREFIX}${sha256Hex(projectPath).slice(0, 32)}`;
+/** Checkouts sharing a root commit share `projectPath` but bind distinct kernel scopes, so the marker joins both and each checkout imports into its own scope. commentlint: allow(JUDGE) */
+function markerKey(projectPath: string, projectRoot: string): string {
+    return `${MARKER_PREFIX}${sha256Hex(`${projectPath}\u001f${projectRoot}`).slice(0, 32)}`;
 }
 
 function hasMetaTable(db: Database): boolean {
@@ -48,26 +49,45 @@ function hasMetaTable(db: Database): boolean {
     );
 }
 
-export function claimLaneImportDone(db: Database, projectPath: string): boolean {
+export function claimLaneImportDone(
+    db: Database,
+    projectPath: string,
+    projectRoot: string,
+): boolean {
     if (!hasMetaTable(db)) return false;
     return (
-        db.prepare("SELECT 1 FROM context_store_meta WHERE key = ?").get(markerKey(projectPath)) !=
-        null
+        db
+            .prepare("SELECT 1 FROM context_store_meta WHERE key = ?")
+            .get(markerKey(projectPath, projectRoot)) != null
     );
 }
 
-function markDone(db: Database, projectPath: string, detail: Record<string, unknown>): void {
+function markDone(
+    db: Database,
+    projectPath: string,
+    projectRoot: string,
+    detail: Record<string, unknown>,
+): void {
     if (!hasMetaTable(db)) return;
     db.prepare(
         "INSERT INTO context_store_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    ).run(markerKey(projectPath), JSON.stringify({ importedAt: Date.now(), ...detail }));
+    ).run(
+        markerKey(projectPath, projectRoot),
+        JSON.stringify({ importedAt: Date.now(), ...detail }),
+    );
 }
 
 /** Clearing the schedule entry drops the in-process done-pin so the next `scheduleClaimLaneImport` call re-runs the importer. commentlint: allow(JUDGE) */
-export function resetClaimLaneImportMarker(db: Database, projectPath: string): void {
-    attemptedAt.delete(projectPath);
+export function resetClaimLaneImportMarker(
+    db: Database,
+    projectPath: string,
+    projectRoot: string,
+): void {
+    attemptedAt.delete(scheduleKey(projectPath, projectRoot));
     if (!hasMetaTable(db)) return;
-    db.prepare("DELETE FROM context_store_meta WHERE key = ?").run(markerKey(projectPath));
+    db.prepare("DELETE FROM context_store_meta WHERE key = ?").run(
+        markerKey(projectPath, projectRoot),
+    );
 }
 
 export function listClaimLaneMemories(
@@ -96,15 +116,18 @@ export function listClaimLaneMemories(
         .sort((left, right) => left.publicClaimId.localeCompare(right.publicClaimId));
 }
 
-/** Stable across runs so a partial import resumes. */
-export function importedObjectId(publicClaimId: string): string {
-    return `mem_${sha256Hex(`${CLAIM_LANE_IMPORT_SOURCE_ID}\u001f${publicClaimId}`).slice(0, 32)}`;
+/** Stable across runs so a partial import resumes; the root keeps ids distinct across kernel scopes because object ids are unique store-wide. commentlint: allow(JUDGE) */
+export function importedObjectId(publicClaimId: string, projectRoot: string): string {
+    return `mem_${sha256Hex(`${CLAIM_LANE_IMPORT_SOURCE_ID}\u001f${projectRoot}\u001f${publicClaimId}`).slice(0, 32)}`;
 }
 
-export function claimLaneImportSpec(claim: ProjectMemoryClaimSnapshot): DecisionSpecInput {
+export function claimLaneImportSpec(
+    claim: ProjectMemoryClaimSnapshot,
+    projectRoot: string,
+): DecisionSpecInput {
     return {
-        decision_id: `dec_${sha256Hex(`${CLAIM_LANE_IMPORT_SOURCE_ID}\u001f${claim.publicClaimId}\u001f${claim.revisionLocator}`).slice(0, 32)}`,
-        object_id: importedObjectId(claim.publicClaimId),
+        decision_id: `dec_${sha256Hex(`${CLAIM_LANE_IMPORT_SOURCE_ID}\u001f${projectRoot}\u001f${claim.publicClaimId}\u001f${claim.revisionLocator}`).slice(0, 32)}`,
+        object_id: importedObjectId(claim.publicClaimId, projectRoot),
         domain_id: CTX_MEMORY_DOMAIN_ID,
         decision_kind: claim.category,
         payload: { summary: claim.content.trim(), rationale: "" },
@@ -118,13 +141,15 @@ export async function importClaimLaneMemories(args: {
     db: Database;
     client: KernelClient;
     projectPath: string;
+    /** The checkout root the client's kernel scope is bound to. */
+    projectRoot: string;
     sessionId: string;
 }): Promise<ClaimLaneImportOutcome> {
-    const { db, client, projectPath, sessionId } = args;
-    if (claimLaneImportDone(db, projectPath)) return "skipped";
+    const { db, client, projectPath, projectRoot, sessionId } = args;
+    if (claimLaneImportDone(db, projectPath, projectRoot)) return "skipped";
     const claims = listClaimLaneMemories(db, projectPath);
     if (claims.length === 0) {
-        markDone(db, projectPath, { imported: 0 });
+        markDone(db, projectPath, projectRoot, { imported: 0 });
         return "done";
     }
     const existing = await client.read({ surface: MEMORY_READ_SURFACE, gated: false });
@@ -146,7 +171,7 @@ export async function importClaimLaneMemories(args: {
     );
     const pending = claims.filter(
         (claim) =>
-            !present.has(importedObjectId(claim.publicClaimId)) &&
+            !present.has(importedObjectId(claim.publicClaimId, projectRoot)) &&
             !presentContent.has(`${claim.category}\u001f${claim.content.trim()}`),
     );
     let imported = 0;
@@ -158,7 +183,7 @@ export async function importClaimLaneMemories(args: {
             sourceKind: "model",
             operations: batch.map((claim) => ({
                 op: "insert_decision" as const,
-                spec: claimLaneImportSpec(claim),
+                spec: claimLaneImportSpec(claim, projectRoot),
             })),
         });
         if (!isAvailable(result)) {
@@ -170,7 +195,7 @@ export async function importClaimLaneMemories(args: {
         }
         imported += batch.length;
     }
-    markDone(db, projectPath, {
+    markDone(db, projectPath, projectRoot, {
         imported,
         alreadyPresent: claims.length - pending.length,
     });
@@ -183,21 +208,28 @@ export async function importClaimLaneMemories(args: {
 
 const attemptedAt = new Map<string, number>();
 
+function scheduleKey(projectPath: string, projectRoot: string): string {
+    return `${projectPath}\u001f${projectRoot}`;
+}
+
 export function scheduleClaimLaneImport(args: {
     db: Database;
     client: KernelClient | undefined;
     projectPath: string;
+    /** The checkout root the client's kernel scope is bound to. */
+    projectRoot: string;
     sessionId: string;
 }): void {
     if (!args.client) return;
-    const last = attemptedAt.get(args.projectPath);
+    const key = scheduleKey(args.projectPath, args.projectRoot);
+    const last = attemptedAt.get(key);
     const now = Date.now();
     if (last !== undefined && now - last < RETRY_AFTER_MS) return;
-    if (claimLaneImportDone(args.db, args.projectPath)) {
-        attemptedAt.set(args.projectPath, Number.POSITIVE_INFINITY);
+    if (claimLaneImportDone(args.db, args.projectPath, args.projectRoot)) {
+        attemptedAt.set(key, Number.POSITIVE_INFINITY);
         return;
     }
-    attemptedAt.set(args.projectPath, now);
+    attemptedAt.set(key, now);
     void importClaimLaneMemories({ ...args, client: args.client }).catch((error) => {
         log(`[magic-context] claim-lane import failed for ${args.projectPath}`, error);
     });

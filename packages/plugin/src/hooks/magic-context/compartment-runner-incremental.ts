@@ -637,13 +637,15 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         deps.onCompartmentStatePublished?.(sessionId);
 
         if (promotionIdentity && promotedRefs.length > 0) {
+            const promotionProjectRoot = resolveProjectRootDirectory(sessionDirectory ?? directory);
             await commitPromotedFactsToKernel({
                 client: deps.kernelClient?.({
                     sessionId,
-                    projectRoot: resolveProjectRootDirectory(sessionDirectory ?? directory),
+                    projectRoot: promotionProjectRoot,
                 }),
                 db,
                 projectPath: promotionProjectIdentity,
+                projectRoot: promotionProjectRoot,
                 sessionId,
                 refs: promotedRefs,
                 identity: promotionIdentity,

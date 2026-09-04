@@ -1498,6 +1498,7 @@ export function createTransform(deps: TransformDeps) {
                 db: deps.db,
                 client: deps.kernelClient?.({ sessionId, projectRoot: memoryProjectRoot }),
                 projectPath: projectIdentity,
+                projectRoot: memoryProjectRoot,
                 sessionId,
             });
         }

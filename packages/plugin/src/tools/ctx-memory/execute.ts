@@ -172,13 +172,20 @@ function requireTarget(args: CtxMemoryArgs): string {
     return objectId;
 }
 
-function renderCommit(action: CtxMemoryAction, result: CommitResult, targets: string[]): string {
+/** `objectId` names the written object (the survivor for revise/merge) apart from the retired predecessors that `objects` also lists; `archive` writes none. commentlint: allow(JUDGE) */
+function renderCommit(
+    action: CtxMemoryAction,
+    result: CommitResult,
+    targets: string[],
+    writtenObjectId?: string,
+): string {
     if (!isAvailable(result)) return renderCtxMemoryStateText(result.state, targets);
     return JSON.stringify({
         action,
         outcome: result.receipt.replayed ? "already applied" : "applied",
         commitSeq: result.receipt.commit_seq,
         knownAsOf: result.known_as_of,
+        ...(writtenObjectId === undefined ? {} : { objectId: writtenObjectId }),
         objects: result.tokens.map((token) => token.object_id),
     });
 }
@@ -273,7 +280,7 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
             sourceRevision: 1,
         });
         const createMutation = sourceKind === undefined ? mutation : { ...mutation, sourceKind };
-        return renderCommit(action, await client.create(spec, createMutation), []);
+        return renderCommit(action, await client.create(spec, createMutation), [], spec.object_id);
     }
 
     if (action === "archive") {
@@ -308,6 +315,7 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
             action,
             await client.revise(target, spec, { ...mutation, sourceKind: lineage.sourceKind }),
             [target],
+            spec.object_id,
         );
     }
 
@@ -331,5 +339,6 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         action,
         await client.merge(targets, spec, { ...mutation, sourceKind: lineage.sourceKind }),
         targets,
+        spec.object_id,
     );
 }

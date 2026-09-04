@@ -13,6 +13,7 @@ import { claimLaneImportDone, importClaimLaneMemories } from "./claim-lane-impor
 import { commitPromotedFactsToKernel, promotedFactSpecs } from "./kernel-memory-promotion";
 
 const PROJECT = "git:promotion-project";
+const ROOT = "/repo";
 
 const identity: HistorianPromotionIdentity = {
     producer: "test-historian",
@@ -82,7 +83,15 @@ describe("historian kernel promotion", () => {
     test("a rerun of the same batch replays instead of minting a second object", async () => {
         const { db, kernel, transport, client } = harness();
         const refs = [ref("PROJECT_RULES", "the build runs in CI only")];
-        const args = { client, db, projectPath: PROJECT, sessionId: "s1", refs, identity };
+        const args = {
+            client,
+            db,
+            projectPath: PROJECT,
+            projectRoot: ROOT,
+            sessionId: "s1",
+            refs,
+            identity,
+        };
         await commitPromotedFactsToKernel(args);
         await commitPromotedFactsToKernel(args);
         expect(kernel.liveRows()).toHaveLength(1);
@@ -97,6 +106,7 @@ describe("historian kernel promotion", () => {
             client: undefined,
             db,
             projectPath: PROJECT,
+            projectRoot: ROOT,
             sessionId: "s1",
             refs: [],
             identity,
@@ -106,6 +116,7 @@ describe("historian kernel promotion", () => {
             client,
             db,
             projectPath: PROJECT,
+            projectRoot: ROOT,
             sessionId: "s1",
             refs: [],
             identity,
@@ -117,9 +128,15 @@ describe("historian kernel promotion", () => {
     test("a non-available answer resets the import marker and a later importer run lands the fact", async () => {
         const { db, kernel, client } = harness();
         expect(
-            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
         ).toBe("done");
-        expect(claimLaneImportDone(db, PROJECT)).toBe(true);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
 
         seedClaim(db, PROJECT, "a", "The gateway retries twice.");
         kernel.nextCommitState = { kind: "unavailable", reason: "store_starting" };
@@ -127,17 +144,24 @@ describe("historian kernel promotion", () => {
             client,
             db,
             projectPath: PROJECT,
+            projectRoot: ROOT,
             sessionId: "s1",
             refs: [ref("ARCHITECTURE", "The gateway retries twice.")],
             identity,
         });
-        expect(claimLaneImportDone(db, PROJECT)).toBe(false);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(false);
         expect(kernel.liveRows()).toHaveLength(0);
 
         expect(
-            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
         ).toBe("done");
-        expect(claimLaneImportDone(db, PROJECT)).toBe(true);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
         const live = kernel.liveRows();
         expect(live).toHaveLength(1);
         expect(live[0]?.decision?.payload.summary).toBe("The gateway retries twice.");
@@ -147,7 +171,13 @@ describe("historian kernel promotion", () => {
     test("a reset replay skips claims the historian already promoted under its own ids", async () => {
         const { db, kernel, client } = harness();
         expect(
-            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
         ).toBe("done");
 
         seedClaim(db, PROJECT, "a", "Fact already promoted.");
@@ -155,6 +185,7 @@ describe("historian kernel promotion", () => {
             client,
             db,
             projectPath: PROJECT,
+            projectRoot: ROOT,
             sessionId: "s1",
             refs: [ref("ARCHITECTURE", "Fact already promoted.")],
             identity,
@@ -167,14 +198,21 @@ describe("historian kernel promotion", () => {
             client,
             db,
             projectPath: PROJECT,
+            projectRoot: ROOT,
             sessionId: "s1",
             refs: [ref("ARCHITECTURE", "Fact the kernel never saw.")],
             identity: { ...identity, batchId: "10-19" },
         });
-        expect(claimLaneImportDone(db, PROJECT)).toBe(false);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(false);
 
         expect(
-            await importClaimLaneMemories({ db, client, projectPath: PROJECT, sessionId: "s1" }),
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
         ).toBe("done");
         const summaries = kernel
             .liveRows()
