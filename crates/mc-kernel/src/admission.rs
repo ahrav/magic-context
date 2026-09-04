@@ -2407,7 +2407,7 @@ fn served_rows(
              ORDER BY o.object_id"
         ))
         .map_err(map_sqlite)?;
-    debug_assert_served_columns(&statement);
+    assert_served_columns(&statement);
     let rows = statement
         .query_map(
             rusqlite::named_params! {
@@ -2453,10 +2453,13 @@ fn served_rows(
     Ok(rows)
 }
 
-fn debug_assert_served_columns(statement: &rusqlite::Statement<'_>) {
-    if !cfg!(debug_assertions) {
-        return;
-    }
+/// Fail-stop guard for the positional reads in `decided_row`: every offset
+/// constant must name the alias it was written against. Runs in release
+/// builds too — the columns adjacent to each offset are all TEXT, so a
+/// desynced constant reads a type-compatible wrong value and misgates
+/// visibility instead of erroring. A few string compares per call is
+/// negligible next to the multi-join query this guards.
+fn assert_served_columns(statement: &rusqlite::Statement<'_>) {
     // Per-field checks catch swapped interior aliases that count and
     // block-anchor checks miss.
     let expected = [
@@ -2504,14 +2507,14 @@ fn debug_assert_served_columns(statement: &rusqlite::Statement<'_>) {
         (OWN_HISTORY_INCONSISTENT_COLUMN, "own_history_inconsistent"),
         (SCOPE_ID_COLUMN, "scope_id"),
     ];
-    debug_assert_eq!(
+    assert_eq!(
         statement.column_count(),
         SCOPE_ID_COLUMN + 1,
         "served_rows must select exactly {} columns",
         SCOPE_ID_COLUMN + 1
     );
     for (index, alias) in expected {
-        debug_assert_eq!(
+        assert_eq!(
             statement.column_name(index).ok(),
             Some(alias),
             "served_rows column {index} must be {alias}"
