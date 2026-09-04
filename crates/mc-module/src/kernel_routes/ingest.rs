@@ -246,6 +246,11 @@ impl Upload {
 pub(crate) struct UploadCoordinator {
     budget: StagingBudget,
     uploads: HashMap<RouteHandle, Upload>,
+    /// The generation of the newest upload each bound route has begun. It
+    /// outlives the upload's removal so that a finish which took an earlier
+    /// generation cannot restore it over a newer one; the route's unbind
+    /// drops the entry.
+    latest_generation: HashMap<RouteHandle, u64>,
     stale_after: Duration,
     next_generation: u64,
 }
@@ -255,6 +260,7 @@ impl Default for UploadCoordinator {
         Self {
             budget: StagingBudget::default(),
             uploads: HashMap::new(),
+            latest_generation: HashMap::new(),
             stale_after: UPLOAD_STALE_AFTER,
             next_generation: 1,
         }
@@ -299,6 +305,7 @@ impl UploadCoordinator {
         }
         upload.generation = self.next_generation;
         self.next_generation += 1;
+        self.latest_generation.insert(route, upload.generation);
         self.uploads.insert(route, upload);
         Ok(BeginOutcome::Started)
     }
@@ -345,8 +352,10 @@ impl UploadCoordinator {
     }
 
     /// Removes the route's upload and returns its declared size to the budget.
-    /// Answers whether an upload was in flight.
+    /// Answers whether an upload was in flight. The route is going away, so a
+    /// finish still running for it can no longer restore anything either.
     pub(crate) fn discard(&mut self, route: RouteHandle) -> bool {
+        self.latest_generation.remove(&route);
         self.take(route).is_some()
     }
 
@@ -366,7 +375,7 @@ impl UploadCoordinator {
     pub(crate) fn clear(&mut self) {
         let routes: Vec<RouteHandle> = self.uploads.keys().copied().collect();
         for route in routes {
-            self.discard(route);
+            self.take(route);
         }
     }
 
@@ -430,7 +439,11 @@ impl UploadCoordinator {
     /// when the upload is held again and releases it when the upload comes
     /// back because the route has begun another one in the meantime.
     fn restore(&mut self, route: RouteHandle, mut upload: Upload, now: Instant) -> Option<Upload> {
-        if self.uploads.contains_key(&route) {
+        // A newer upload that has since begun on this route supersedes the
+        // returning one, whether or not it is still in the map.
+        if self.uploads.contains_key(&route)
+            || self.latest_generation.get(&route) != Some(&upload.generation)
+        {
             return Some(upload);
         }
         upload.last_activity = now;
@@ -1037,6 +1050,39 @@ mod tests {
         assert_eq!(
             (uploads.budget().total_bytes, uploads.budget().pending),
             (3, 1)
+        );
+
+        // A newer upload under the same id that began and finished while the
+        // older finish ran leaves the map empty, but the older one still
+        // comes back rather than taking the newer one's place.
+        uploads
+            .stage(
+                route(1),
+                "v",
+                generation(&uploads, route(1), "v"),
+                0,
+                page(b"xyz"),
+                now,
+            )
+            .unwrap();
+        let older = uploads.take_complete(route(1), "v").unwrap();
+        started(uploads.begin(route(1), upload("v", 3, 1, b"xyz"), now));
+        uploads
+            .stage(
+                route(1),
+                "v",
+                generation(&uploads, route(1), "v"),
+                0,
+                page(b"xyz"),
+                now,
+            )
+            .unwrap();
+        let newer = uploads.take_complete(route(1), "v").unwrap();
+        assert!(uploads.restore(route(1), older, now).is_some());
+        assert!(uploads.restore(route(1), newer, now).is_none());
+        assert_eq!(
+            (uploads.budget().total_bytes, uploads.budget().pending),
+            (6, 2)
         );
     }
 
