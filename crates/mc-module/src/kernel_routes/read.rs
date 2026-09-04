@@ -50,9 +50,9 @@ pub(crate) struct ReadResponse {
     known_as_of: i64,
     tip: i64,
     rows: Vec<VisibleRow>,
-    /// Decision rows keyed by `object_id`, looked up at `known_as_of` for
-    /// exactly the visible decision objects; a read with none skips the
-    /// query entirely.
+    /// Decision rows keyed by `object_id`, looked up at `known_as_of`. Total
+    /// over the visible decision-kind rows in `rows`: a missing entry fails
+    /// the read, so a `None` lookup during rendering means a non-decision row.
     decisions: HashMap<String, DecisionRow>,
 }
 

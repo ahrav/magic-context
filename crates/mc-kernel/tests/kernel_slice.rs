@@ -457,7 +457,9 @@ fn decisions_for_objects_as_of_returns_only_requested_live_rows() {
     assert_eq!(tip, retired.commit_seq);
 
     let ids = |rows: Vec<mc_kernel::DecisionRow>| -> Vec<String> {
-        rows.into_iter().map(|row| row.object_id).collect()
+        let mut ids: Vec<String> = rows.into_iter().map(|row| row.object_id).collect();
+        ids.sort();
+        ids
     };
     let requested = [
         "decision-object-1".to_string(),

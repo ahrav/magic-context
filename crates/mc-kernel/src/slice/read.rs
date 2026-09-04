@@ -102,9 +102,8 @@ impl KernelStore {
     }
 }
 
-/// Upper bound on `object_id` placeholders per `IN (...)` query. The bundled SQLite build
-/// permits 32766 bound variables, one of which carries the sequence parameter; 500 is a
-/// deliberate margin under that limit, not a hard constraint.
+/// Object identifiers bound per `IN (...)` query. SQLite permits at most 32766
+/// parameters; one is reserved for the sequence in `?1`.
 const DECISION_LOOKUP_CHUNK: usize = 500;
 
 /// Loads one snapshot from the caller's transaction so tip and rows share a database view.
@@ -164,7 +163,7 @@ pub(super) fn load_decisions(
 }
 
 /// Same live-at-`requested` predicate as [`load_decisions`], restricted to `object_ids`.
-/// Placeholders start at `?2` because `?1` carries the sequence.
+/// Result order is unspecified. Placeholders start at `?2` because `?1` carries the sequence.
 fn load_decisions_for_objects(
     tx: &Transaction<'_>,
     requested: i64,

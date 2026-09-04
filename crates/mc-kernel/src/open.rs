@@ -58,7 +58,7 @@ pub enum KernelError {
     FenceLost,
     #[error("kernel operation conflicts with an existing receipt")]
     Conflict,
-    #[error("kernel canonical row payload could not be decoded")]
+    #[error("kernel canonical row is corrupt or missing")]
     CorruptCanonicalRow,
     #[error("kernel operation input is invalid")]
     InvalidInput,
