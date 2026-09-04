@@ -533,9 +533,17 @@ impl KernelStore {
         )
     }
 
-    /// The latest commit sequence, read without loading any object row.
+    /// The latest commit sequence, read without loading any object row. One
+    /// statement is its own snapshot, so no transaction brackets it.
     pub fn tip(&self) -> Result<i64, KernelError> {
-        self.read_snapshot(0, |_| Ok(())).map(|(tip, ())| tip)
+        let reader = self.lock_reader()?;
+        reader
+            .query_row_cached(
+                "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_sqlite)
     }
 
     /// States for `object_ids` in request order from one read transaction,
