@@ -9,6 +9,10 @@ description = "Directly linked host for Magic Context, Synapse, and Broca compon
 [lints.clippy]
 duplicate_mod = "allow"
 
+[features]
+# Exposes the sanitized host.status encoder so sibling crates' tests can reconstruct wire JSON. Gated so the surface never ships in production builds.
+test-support = []
+
 [dependencies]
 serde = { workspace = true }
 hmac = "0.12"

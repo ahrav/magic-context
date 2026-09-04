@@ -439,6 +439,14 @@ mod tests {
         (dir, holder)
     }
 
+    /// `wait_for_first_backoff` resolves after the spawned opener receives `Held` from `open_once` and parks in its first backoff `select!`.
+    ///
+    /// The paused clock does not auto-advance during a `spawn_blocking` task, and the opener's backoff timer lies past this 1ms deadline.
+    /// The runtime therefore cannot reach this deadline before the opener is parked.
+    async fn wait_for_first_backoff() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_held_lease_past_the_wait_window_is_store_unavailable() {
         let (dir, _holder) = held_root();
@@ -457,7 +465,9 @@ mod tests {
             UnavailableReason::StoreUnavailable
         );
         assert!(coordinator.kernel_store().is_err());
-        assert!(started.elapsed() >= Duration::from_secs(60));
+        // Exactly the window: the final backoff is clamped to the remaining window, so the opener never sleeps past the configured wait.
+        // Without the clamp the jittered backoffs would overshoot to 60.79s.
+        assert_eq!(started.elapsed(), Duration::from_secs(60));
         let block = &coordinator.health_block().block;
         assert_eq!(block.kernel_state, KernelState::Unavailable);
         assert_eq!(
@@ -481,11 +491,14 @@ mod tests {
                     .await
             }
         });
-        tokio::time::advance(Duration::from_millis(300)).await;
-        tokio::task::yield_now().await;
+        wait_for_first_backoff().await;
         assert_eq!(coordinator.state(), KernelState::Starting);
+        let cancelled_at = tokio::time::Instant::now();
         cancel.cancel();
         task.await.unwrap();
+        // Cancellation interrupted the backoff: no timer had to fire for the opener to finish, so the clock never auto-advanced.
+        // If the opener only noticed the token after its sleep, this would read 249ms.
+        assert_eq!(cancelled_at.elapsed(), Duration::ZERO);
         assert_eq!(coordinator.state(), KernelState::Unavailable);
         assert_eq!(
             coordinator.unavailable_reason(),
@@ -497,6 +510,7 @@ mod tests {
     async fn a_lease_released_during_the_wait_opens_the_store() {
         let (dir, holder) = held_root();
         let coordinator = Arc::new(KernelOpenCoordinator::new());
+        let started = tokio::time::Instant::now();
         let task = tokio::spawn({
             let coordinator = Arc::clone(&coordinator);
             let root = dir.path().to_path_buf();
@@ -510,13 +524,14 @@ mod tests {
                     .await
             }
         });
-        tokio::time::advance(Duration::from_millis(500)).await;
-        tokio::task::yield_now().await;
+        wait_for_first_backoff().await;
         assert_eq!(coordinator.state(), KernelState::Starting);
         drop(holder);
         task.await.unwrap();
         assert_eq!(coordinator.state(), KernelState::Ready);
         assert!(coordinator.kernel_store().is_ok());
+        // The store opened on the retry after the first 250ms backoff, not on the initial attempt.
+        assert_eq!(started.elapsed(), Duration::from_millis(250));
     }
 
     #[test]
