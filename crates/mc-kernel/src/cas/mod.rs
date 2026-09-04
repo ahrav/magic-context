@@ -198,6 +198,10 @@ pub enum ArtifactErrorKind {
     /// The intent's `operation_key` already carries a receipt for a different
     /// `request_digest`; no retry with this key can succeed.
     OperationKeyReused,
+    /// A database constraint rejected the reference: an `object_id` or
+    /// `evidence_id` the registry already holds, or a reference to a row that
+    /// does not exist. Retrying the same request cannot succeed.
+    StorageConstraint,
     PurgeIntent,
     PurgeUnlinkPending,
 }
@@ -360,6 +364,9 @@ impl fmt::Display for ArtifactErrorMessage<'_> {
             }
             ArtifactErrorKind::OperationKeyReused => {
                 formatter.write_str("operation key already used with a different request digest")
+            }
+            ArtifactErrorKind::StorageConstraint => {
+                formatter.write_str("artifact reference violates a storage constraint")
             }
         }
     }

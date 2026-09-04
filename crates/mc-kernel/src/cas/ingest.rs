@@ -28,6 +28,7 @@ use crate::durable_fs::{
     sync_publish_directories_with, temp_name, write_and_sync, PublishOutcome, StorageError,
 };
 use crate::envelope::{check_fence, commit_with_writer, ObjectRow, PendingChange};
+use crate::object_write::map_write_error;
 use crate::redaction::{
     identity, payload_has_secret, record, redact_lossy, redact_payload, RedactedField,
 };
@@ -498,13 +499,16 @@ impl KernelStore {
         // The receipt lookup runs before the operation, so a `Conflict` raised
         // without entering it is a reused `operation_key`, not a constraint.
         let mut entered = false;
+        // Names the reason behind a `Conflict` the operation raises itself,
+        // since a storage constraint surfaces as the same error.
+        let mut refusal = None;
         let commit_result = commit_with_writer(
             &mut writer,
             self.lease_epoch(),
             prepared.request.intent.clone(),
             |envelope| {
                 entered = true;
-                insert_reference(envelope, &prepared, &reservation_id)
+                insert_reference(envelope, &prepared, &reservation_id, &mut refusal)
             },
             || {
                 if faults.after_events {
@@ -570,6 +574,9 @@ impl KernelStore {
                 Err(ArtifactError::new(match error {
                     KernelError::InvalidInput => ArtifactErrorKind::InvalidInput,
                     KernelError::Conflict if !entered => ArtifactErrorKind::OperationKeyReused,
+                    KernelError::Conflict => {
+                        refusal.unwrap_or(ArtifactErrorKind::StorageConstraint)
+                    }
                     _ => ArtifactErrorKind::ReferenceCommit,
                 }))
             }
@@ -708,8 +715,10 @@ fn insert_reference(
     envelope: &mut crate::Envelope<'_>,
     prepared: &PreparedArtifact,
     reservation_id: &str,
+    refusal: &mut Option<ArtifactErrorKind>,
 ) -> Result<String, KernelError> {
     if artifact_is_blocked(envelope.tx, &prepared.digest)? {
+        *refusal = Some(ArtifactErrorKind::ReAdmissionBlocked);
         return Err(KernelError::Conflict);
     }
     let reservation_state: Option<String> = envelope
@@ -722,6 +731,7 @@ fn insert_reference(
         .optional()
         .map_err(|_| KernelError::Io)?;
     if reservation_state.as_deref() != Some("Live") {
+        *refusal = Some(ArtifactErrorKind::ReferenceCommit);
         return Err(KernelError::Conflict);
     }
     let reclaiming: i64 = envelope
@@ -733,6 +743,7 @@ fn insert_reference(
         )
         .map_err(|_| KernelError::Io)?;
     if reclaiming != 0 {
+        *refusal = Some(ArtifactErrorKind::ReclaimInProgress);
         return Err(KernelError::Conflict);
     }
 
@@ -772,7 +783,7 @@ fn insert_reference(
                 sensitivity.as_str(),
             ],
         )
-        .map_err(|_| KernelError::Io)?;
+        .map_err(map_write_error)?;
     let first_detection = prepared.payload_redaction.detections.first();
     envelope
         .tx
@@ -811,7 +822,7 @@ fn insert_reference(
                 sensitivity.as_str(),
             ],
         )
-        .map_err(|_| KernelError::Io)?;
+        .map_err(map_write_error)?;
     record(
         envelope.tx,
         "evidence",

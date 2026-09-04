@@ -354,19 +354,21 @@ impl UploadCoordinator {
     /// `stage`, and a `begin` in that gap may replace the upload under the
     /// same id; the generation is what `stage` compares to refuse the page.
     fn accepts_page(
-        &self,
+        &mut self,
         route: RouteHandle,
         upload_id: &str,
         index: u32,
+        now: Instant,
     ) -> Result<u64, InvalidReason> {
         let upload = self
-            .uploads
-            .get(&route)
-            .filter(|upload| upload.upload_id == upload_id)
+            .upload_mut(route, upload_id)
             .ok_or(InvalidReason::UploadNotFound)?;
         if index >= upload.page_count {
             return Err(InvalidReason::PageIndex);
         }
+        // Accepting the page is activity: the decode that follows must not
+        // lose the upload to a concurrent `begin`'s stale eviction.
+        upload.last_activity = now;
         Ok(upload.generation)
     }
 
@@ -681,7 +683,12 @@ impl McHandler {
         let decode_bytes = (parsed.bytes_base64.len() as u64).div_ceil(4) * 3;
         let generation = {
             let mut uploads = self.kernel.uploads();
-            let generation = match uploads.accepts_page(channel, &parsed.upload_id, parsed.index) {
+            let generation = match uploads.accepts_page(
+                channel,
+                &parsed.upload_id,
+                parsed.index,
+                Instant::now(),
+            ) {
                 Ok(generation) => generation,
                 Err(reason) => return state_only(KernelOutcome::invalid(reason)),
             };
@@ -867,7 +874,12 @@ mod tests {
 
     /// The live generation of the route's upload, as a page handler learns it.
     fn generation(uploads: &UploadCoordinator, route: RouteHandle, upload_id: &str) -> u64 {
-        uploads.accepts_page(route, upload_id, 0).unwrap()
+        uploads
+            .uploads
+            .get(&route)
+            .filter(|upload| upload.upload_id == upload_id)
+            .map(|upload| upload.generation)
+            .unwrap()
     }
 
     #[test]
@@ -934,18 +946,18 @@ mod tests {
         assert_eq!(uploads.budget().pending, 1);
 
         assert_eq!(
-            uploads.accepts_page(route(1), "other", 0),
+            uploads.accepts_page(route(1), "other", 0, now),
             Err(InvalidReason::UploadNotFound)
         );
         assert_eq!(
-            uploads.accepts_page(route(2), "u", 0),
+            uploads.accepts_page(route(2), "u", 0, now),
             Err(InvalidReason::UploadNotFound)
         );
         assert_eq!(
-            uploads.accepts_page(route(1), "u", 3),
+            uploads.accepts_page(route(1), "u", 3, now),
             Err(InvalidReason::PageIndex)
         );
-        assert!(uploads.accepts_page(route(1), "u", 2).is_ok());
+        assert!(uploads.accepts_page(route(1), "u", 2, now).is_ok());
         assert_eq!(
             uploads.stage(route(1), "other", 1, 0, page(b"ab"), now),
             Err(InvalidReason::UploadNotFound)
@@ -1212,10 +1224,10 @@ mod tests {
             (10, 1)
         );
         assert_eq!(
-            uploads.accepts_page(route(1), "u", 0),
+            uploads.accepts_page(route(1), "u", 0, now),
             Err(InvalidReason::UploadNotFound)
         );
-        assert!(uploads.accepts_page(route(1), "v", 0).is_ok());
+        assert!(uploads.accepts_page(route(1), "v", 0, now).is_ok());
     }
 
     #[test]
@@ -1265,7 +1277,7 @@ mod tests {
             (4, 1)
         );
         assert_eq!(
-            uploads.accepts_page(route(1), "u", 0),
+            uploads.accepts_page(route(1), "u", 0, now),
             Err(InvalidReason::UploadNotFound)
         );
     }
@@ -1301,11 +1313,12 @@ mod tests {
         let third = resumed + Duration::from_secs(59);
         started(uploads.begin(route(3), upload_at("w", 4, 1, b"", third), third));
         assert_eq!(uploads.budget().pending, 2);
-        assert!(uploads.accepts_page(route(1), "u", 1).is_ok());
-        let fourth = resumed + Duration::from_secs(60);
+        // Accepting a page is activity too, so the idle clock restarts at `third`.
+        assert!(uploads.accepts_page(route(1), "u", 1, third).is_ok());
+        let fourth = third + Duration::from_secs(60);
         started(uploads.begin(route(4), upload_at("x", 4, 1, b"", fourth), fourth));
         assert_eq!(
-            uploads.accepts_page(route(1), "u", 1),
+            uploads.accepts_page(route(1), "u", 1, fourth),
             Err(InvalidReason::UploadNotFound)
         );
     }

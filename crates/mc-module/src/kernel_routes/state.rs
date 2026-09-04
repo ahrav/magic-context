@@ -184,6 +184,7 @@ impl From<ArtifactErrorKind> for KernelOutcome {
             ArtifactErrorKind::OperationKeyReused => {
                 Self::invalid(InvalidReason::OperationKeyReused)
             }
+            ArtifactErrorKind::StorageConstraint => Self::invalid(InvalidReason::AlreadyExists),
             ArtifactErrorKind::InvalidInput
             | ArtifactErrorKind::TextFieldTooLong
             | ArtifactErrorKind::DetectionLimit => Self::invalid(InvalidReason::InvalidInput),
@@ -245,6 +246,7 @@ mod tests {
         ArtifactErrorKind::TextFieldTooLong,
         ArtifactErrorKind::InvalidInput,
         ArtifactErrorKind::OperationKeyReused,
+        ArtifactErrorKind::StorageConstraint,
         ArtifactErrorKind::PurgeIntent,
         ArtifactErrorKind::PurgeUnlinkPending,
     ];

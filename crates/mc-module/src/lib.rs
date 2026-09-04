@@ -14048,17 +14048,23 @@ const MAX_TRANSFORM_FRAME_BYTES: usize = 32 * 1024 * 1024;
 /// Serde ignores the remaining fields, avoiding a full `Value` parse of a multi-MiB array.
 #[derive(Deserialize)]
 struct RequestMethodProbe {
+    /// Held as a `Value` so a non-string field does not fail the probe: dispatch
+    /// reads each field with `Value::as_str` and treats anything else as absent.
     #[serde(default)]
-    method: Option<String>,
+    method: Option<Value>,
     #[serde(default)]
-    kind: Option<String>,
+    kind: Option<Value>,
 }
 
 impl RequestMethodProbe {
     fn is_transform_class(&self) -> bool {
         // Dispatch reads `method` and falls back to `kind`, so the class is
         // read the same way; a `kind` beside a `method` names nothing.
-        let route = self.method.as_deref().or(self.kind.as_deref());
+        let route = self
+            .method
+            .as_ref()
+            .and_then(Value::as_str)
+            .or_else(|| self.kind.as_ref().and_then(Value::as_str));
         route == Some("transform")
             // The state-sync path uses the transform-class ceiling because one row can exceed the facade cap.
             || route == Some("state_sync")
@@ -17253,6 +17259,12 @@ mod tests {
             "x".repeat(two_mib)
         );
         assert!(enforce_request_byte_cap(widened.as_bytes()).is_err());
+        // A non-string `method` is absent to dispatch, which then reads `kind`.
+        let fallback = format!(
+            "{{\"method\":0,\"kind\":\"kernel.artifact.ingest.page\",\"pad\":\"{}\"}}",
+            "x".repeat(two_mib)
+        );
+        assert!(enforce_request_byte_cap(fallback.as_bytes()).is_ok());
         // Oversized facade bodies reject at 1 MiB.
         assert!(enforce_request_byte_cap(&pad("ctx_memory", "method", two_mib)).is_err());
         // Unparseable oversized bodies reject conservatively.

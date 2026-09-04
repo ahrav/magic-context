@@ -2879,6 +2879,23 @@ async fn an_ingestion_key_reused_with_another_payload_is_a_permanent_refusal() {
         .await;
     assert_state(&reused, "invalid", Some("operation_key_reused"));
     assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
+
+    // A fresh key whose request names an evidence id the registry already
+    // holds is a storage constraint, refused for good rather than as a
+    // store outage.
+    let mut taken = ingest_begin_request(&daemon.project, "taken", b"third payload", 1);
+    taken["request"]["evidence_id"] = json!("evidence-reused");
+    assert_state(&daemon.call(daemon.route, taken).await, "available", None);
+    assert_state(
+        &daemon
+            .ingest_page(daemon.route, "taken", 0, b"third payload")
+            .await,
+        "available",
+        None,
+    );
+    let finished = daemon.ingest_finish(daemon.route, "taken").await;
+    assert_state(&finished, "invalid", Some("already_exists"));
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
     daemon.handler.shutdown().await.unwrap();
 }
 
