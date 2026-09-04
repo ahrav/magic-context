@@ -13,10 +13,12 @@ import { cosineSimilarity } from "./memory/cosine-similarity";
 import { embedBatchForProject, getProjectEmbeddingSnapshot } from "./memory/embedding";
 import type { EmbeddingPurpose } from "./memory/embedding-provider";
 import { listActiveAntiMemoryPublicIds, readAntiMemories } from "./memory/storage-anti-memory";
+// The anti-memory lane reads claim state directly. Production callers strip the `memory` source before calling `unifiedSearch` (ctx-search filters it out; the auto-search runner does the same), so only tests and the retrieval benchmark reach this lane; the kernel client serves the production memory source. commentlint: allow(JUDGE)
 import {
     type ProjectMemoryClaimSnapshot,
     readProjectMemoryCurrentState,
     resolveProjectIdsForIdentities,
+    // biome-ignore lint/style/noRestrictedImports: `readProjectMemoryCurrentState` reads anti-memory claim state for the test- and benchmark-only anti-memory lane.
 } from "./memory/storage-claim-current-state";
 import { getIndexedMessageCorpusSize } from "./message-index";
 import {

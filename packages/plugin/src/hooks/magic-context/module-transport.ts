@@ -43,28 +43,12 @@ import { qualifiedHarnessClosures } from "../../shared/mc-host-lifecycle/generat
 import { defaultConnectionFilePath } from "../../shared/mc-host-lifecycle/paths";
 import { isRecord } from "../../shared/record-type-guard";
 import {
-    buildClaimEffectDeliveryWireBody,
-    buildClaimIntentAckWireBody,
-    buildClaimIntentInspectWireBody,
-    buildClaimIntentStageWireBody,
     buildClaimMirrorReceiptWireBody,
     buildClaimMirrorSnapshotWireBody,
-    type ClaimEffectDeliveryRequest,
-    type ClaimEffectDeliveryResponse,
-    type ClaimIntentAckRequest,
-    type ClaimIntentAckResponse,
-    type ClaimIntentInspectRequest,
-    type ClaimIntentInspectResponse,
-    type ClaimIntentStageRequest,
-    type ClaimIntentStageResponse,
     type ClaimMirrorReceiptRequest,
     type ClaimMirrorReceiptResponse,
     type ClaimMirrorSnapshotRequest,
     type ClaimMirrorSnapshotResponse,
-    decodeClaimEffectDeliveryResponse,
-    decodeClaimIntentAckResponse,
-    decodeClaimIntentInspectResponse,
-    decodeClaimIntentStageResponse,
     decodeClaimMirrorReceiptResponse,
     decodeClaimMirrorSnapshotResponse,
     type ModuleAuthorityMethod,
@@ -982,70 +966,6 @@ export class McHostModuleTransport {
         if (!isRecord(response.page)) throw new Error("mirror.pull omitted page");
         // `isRecord(response.page)` only proves that `response.page` is an object; the cast assumes `ChangefeedPage` fields.
         return { page: response.page as unknown as ChangefeedPage };
-    }
-
-    async claimIntentStage(args: {
-        sessionId: string;
-        projectRoot: string;
-        request: ClaimIntentStageRequest;
-    }): Promise<ClaimIntentStageResponse> {
-        const response = await this.call({
-            sessionId: args.sessionId,
-            projectRoot: args.projectRoot,
-            method: "claim.intent.stage",
-            body: buildClaimIntentStageWireBody(args.request),
-        });
-        return decodeClaimIntentStageResponse(response, args.request);
-    }
-
-    async claimIntentInspect(args: {
-        sessionId: string;
-        projectRoot: string;
-        request: ClaimIntentInspectRequest;
-    }): Promise<ClaimIntentInspectResponse> {
-        const response = await this.call({
-            sessionId: args.sessionId,
-            projectRoot: args.projectRoot,
-            method: "claim.intent.inspect",
-            body: buildClaimIntentInspectWireBody(args.request),
-        });
-        return decodeClaimIntentInspectResponse(response);
-    }
-
-    async claimIntentAck(args: {
-        sessionId: string;
-        projectRoot: string;
-        request: ClaimIntentAckRequest;
-    }): Promise<ClaimIntentAckResponse> {
-        const response = await this.call({
-            sessionId: args.sessionId,
-            projectRoot: args.projectRoot,
-            method: "claim.intent.ack",
-            body: buildClaimIntentAckWireBody(args.request),
-        });
-        return decodeClaimIntentAckResponse(response, args.request);
-    }
-
-    async claimEffectsApply(args: {
-        sessionId: string;
-        projectRoot: string;
-        request: ClaimEffectDeliveryRequest;
-    }): Promise<ClaimEffectDeliveryResponse> {
-        // `receipt.effects` must be nonempty because its last effect is the delivery checkpoint.
-        // An empty `receipt.effects` list violates the upstream receipt contract; it is not a zero acknowledgement.
-        const expectedEffectId = args.request.receipt.effects.at(-1)?.id;
-        if (expectedEffectId === undefined) {
-            throw new Error(
-                `claim effect receipt ${args.request.receipt.receiptId} has no effects`,
-            );
-        }
-        const response = await this.call({
-            sessionId: args.sessionId,
-            projectRoot: args.projectRoot,
-            method: "claim.effects.apply",
-            body: buildClaimEffectDeliveryWireBody(args.request),
-        });
-        return decodeClaimEffectDeliveryResponse(response, expectedEffectId);
     }
 
     async claimMirrorReplace(args: {

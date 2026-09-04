@@ -74,6 +74,7 @@
             "includes": [
                 "src/tools/ctx-memory/**",
                 "src/tools/ctx-search/**",
+                "src/features/magic-context/search.ts",
                 "src/hooks/magic-context/kernel-transport.ts",
                 "src/hooks/magic-context/kernel-memory-render.ts",
                 "src/hooks/magic-context/inject-compartments.ts",

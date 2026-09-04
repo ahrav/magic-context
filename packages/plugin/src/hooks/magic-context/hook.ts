@@ -699,13 +699,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 authoritySeed: (args) => transport.authoritySeed(args),
                 authorityDrain: (args) => transport.authorityDrain(args),
                 mirrorPull: (args) => transport.mirrorPull(args),
-                // In Rust transform mode, rustModeModuleClient must include the claim lanes.
-                // Omitting the claim lanes makes every ctx_memory mutation fail its availability guard.
-                // When claim lanes are omitted, mirror sync reports "unavailable".
-                claimIntentStage: (args) => transport.claimIntentStage(args),
-                claimIntentInspect: (args) => transport.claimIntentInspect(args),
-                claimIntentAck: (args) => transport.claimIntentAck(args),
-                claimEffectsApply: (args) => transport.claimEffectsApply(args),
+                // In Rust transform mode, rustModeModuleClient must include the claim mirror lanes.
+                // When the mirror lanes are omitted, mirror sync reports "unavailable".
                 claimMirrorReplace: (args) => transport.claimMirrorReplace(args),
                 claimMirrorApply: (args) => transport.claimMirrorApply(args),
                 getCompartmentsAfter: async (sessionId, afterSequence) => {
