@@ -307,8 +307,9 @@ export function scheduleClaimLaneImport(args: {
     const last = attemptedAt.get(key);
     const now = Date.now();
     if (last !== undefined && now - last < RETRY_AFTER_MS) return;
+    // Another process can clear the shared done marker with `resetClaimLaneImportMarker`; a permanent process-local pin would never observe that reset, so a done answer gets the ordinary cooldown and re-reads the marker after it elapses. commentlint: allow(JUDGE)
     if (claimLaneImportDone(args.db, args.projectPath, args.projectRoot)) {
-        attemptedAt.set(key, Number.POSITIVE_INFINITY);
+        attemptedAt.set(key, now);
         return;
     }
     attemptedAt.set(key, now);

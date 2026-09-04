@@ -71,18 +71,21 @@ describe("memoryResultFromRow", () => {
         expect(result.claimId).toBe(-1);
     });
 
-    test("a rejected-approach row with an unparseable summary falls back to the memory shape", () => {
+    test("a rejected-approach row with an unparseable summary stays a conservative anti-memory warning", () => {
         const row = readRow({
             objectId: OBJECT_A,
             decisionKind: ANTI_MEMORY_CATEGORY,
             summary: "free-form text without labeled anti-memory fields",
         });
         const result = memoryResultFromRow(row, 0.5, "lexical");
-        expect(result.source).toBe("memory");
-        if (result.source !== "memory") return;
-        expect(result.content).toBe("free-form text without labeled anti-memory fields");
-        expect(result.category).toBe(ANTI_MEMORY_CATEGORY);
+        expect(result.source).toBe("anti_memory");
+        if (result.source !== "anti_memory") return;
+        expect(result.rejectedStrategy).toBe("free-form text without labeled anti-memory fields");
+        expect(result.trigger).toBe("");
+        expect(result.rejectionReason).toContain("unparseable");
+        expect(result.saferAlternative).toBeNull();
         expect(result.matchType).toBe("lexical");
+        expect(result.claimId).toBe(-1);
     });
 
     test("an ordinary decision row keeps the memory shape", () => {

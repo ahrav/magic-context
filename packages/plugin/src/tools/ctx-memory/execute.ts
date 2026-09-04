@@ -369,7 +369,32 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
             sourceRevision: 1,
         });
         const createMutation = sourceKind === undefined ? mutation : { ...mutation, sourceKind };
-        return renderCommit(action, await client.create(spec, createMutation), [], spec.object_id);
+        const result = await client.create(spec, createMutation);
+        // A generated expiry drifts across UTC day boundaries, so a call redelivered later produces a different request digest under the same operation key and the daemon answers `operation_key_reused` instead of replaying. The object id derives from the same identity, so a visible object under it proves the first delivery committed; answer the replay the daemon would have given. commentlint: allow(JUDGE)
+        const generatedExpiry =
+            args.antiMemory !== undefined && input.args.antiMemory?.expiresAt === undefined;
+        if (
+            generatedExpiry &&
+            !isAvailable(result) &&
+            result.state.kind === "invalid" &&
+            result.state.reason === "operation_key_reused"
+        ) {
+            const read = await readMemoryRows(client, signal);
+            const existing = read.ok
+                ? read.rows.find((row) => row.object.object_id === spec.object_id)
+                : undefined;
+            if (read.ok && existing) {
+                return JSON.stringify({
+                    action,
+                    outcome: "already applied",
+                    commitSeq: existing.object.created_commit_seq,
+                    knownAsOf: read.knownAsOf,
+                    objectId: spec.object_id,
+                    objects: [spec.object_id],
+                });
+            }
+        }
+        return renderCommit(action, result, [], spec.object_id);
     }
 
     if (action === "archive") {

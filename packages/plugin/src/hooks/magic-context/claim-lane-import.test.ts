@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
 import {
     ANTI_MEMORY_DEFAULT_TTL_MS,
     parseAntiMemoryContent,
@@ -492,6 +492,70 @@ describe("claim-lane import", () => {
             "Fact from a failed promotion.",
         );
         resetClaimLaneImportScheduleForTest();
+    });
+
+    test("a done marker cleared by another process is re-read after the cooldown", async () => {
+        const { db, kernel, client } = harness();
+        resetClaimLaneImportScheduleForTest();
+        const start = Date.now();
+        try {
+            expect(
+                await importClaimLaneMemories({
+                    db,
+                    client,
+                    projectPath: PROJECT,
+                    projectRoot: ROOT,
+                    sessionId: "s1",
+                }),
+            ).toBe("done");
+            // This schedule observes the done marker and caches the answer.
+            scheduleClaimLaneImport({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            });
+            // Deleting the marker row directly stands in for another process
+            // clearing it: this process keeps its cached schedule state,
+            // unlike a local resetClaimLaneImportMarker call.
+            seedClaim(db, PROJECT, "a", "Fact from another process.");
+            db.prepare(
+                "DELETE FROM context_store_meta WHERE key LIKE 'kernel_claim_lane_import_v2:%'",
+            ).run();
+            expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(false);
+
+            // Within the cooldown the cached answer holds and no import runs.
+            scheduleClaimLaneImport({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            });
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            expect(kernel.liveRows()).toHaveLength(0);
+
+            // After the cooldown the marker is re-read and the claim imports.
+            setSystemTime(new Date(start + 6 * 60_000));
+            scheduleClaimLaneImport({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            });
+            for (let waited = 0; waited < 200 && kernel.liveRows().length === 0; waited++) {
+                await new Promise((resolve) => setTimeout(resolve, 1));
+            }
+            expect(kernel.liveRows()).toHaveLength(1);
+            expect(kernel.liveRows()[0]?.decision?.payload.summary).toBe(
+                "Fact from another process.",
+            );
+        } finally {
+            setSystemTime();
+            resetClaimLaneImportScheduleForTest();
+        }
     });
 
     test("a marker reset during an in-flight import fences the stale done write", async () => {

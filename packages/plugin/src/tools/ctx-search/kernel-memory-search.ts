@@ -61,11 +61,7 @@ function antiMemoryPayloadFromSummary(summary: string): AntiMemoryPayload | null
     }
 }
 
-/**
- * A rejected-approach row with a parseable summary emits the `anti_memory`
- * variant; anything else — including an unparseable summary — falls back to
- * the generic memory shape so the row still surfaces.
- */
+/** A rejected-approach row emits `anti_memory`, not `memory`: an unparseable stored summary becomes a conservative warning carrying the raw summary as the rejected strategy, so a legacy or malformed anti-memory cannot resurface as ordinary guidance. commentlint: allow(JUDGE) */
 export function memoryResultFromRow(
     row: ReadRow,
     score: number,
@@ -73,11 +69,8 @@ export function memoryResultFromRow(
 ): KernelMemorySearchResult {
     const decision = row.decision;
     const revisionLocator = `${row.object.object_id}@${row.object.created_commit_seq}`;
-    const payload =
-        decision?.decision_kind === ANTI_MEMORY_CATEGORY
-            ? antiMemoryPayloadFromSummary(decision.payload.summary)
-            : null;
-    if (decision && payload) {
+    if (decision?.decision_kind === ANTI_MEMORY_CATEGORY) {
+        const payload = antiMemoryPayloadFromSummary(decision.payload.summary);
         // Kernel rows carry no claim-lane row: the digest of the served
         // summary stands in for both content hashes, and the sentinel claim
         // id marks the absence of a local rowid.
@@ -90,10 +83,12 @@ export function memoryResultFromRow(
             contentDigest: digest,
             claimId: -1,
             normalizedHash: digest,
-            trigger: payload.trigger,
-            rejectedStrategy: payload.rejectedStrategy,
-            rejectionReason: payload.rejectionReason,
-            saferAlternative: payload.saferAlternative ?? null,
+            trigger: payload?.trigger ?? "",
+            rejectedStrategy: payload?.rejectedStrategy ?? decision.payload.summary,
+            rejectionReason:
+                payload?.rejectionReason ??
+                "stored anti-memory payload is unparseable; the approach stays rejected",
+            saferAlternative: payload?.saferAlternative ?? null,
             matchType,
             ...(row.labeled ? { policyLabel: "labeled" } : {}),
         };

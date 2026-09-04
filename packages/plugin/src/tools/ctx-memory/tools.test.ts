@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DREAMER_AGENT } from "../../agents/dreamer";
@@ -220,6 +220,31 @@ describe("ctx_memory create and revise through the cached token", () => {
             "Error: The operation key was reused with a different request digest.",
         );
         expect(tool.kernel.liveRows()).toHaveLength(1);
+    });
+
+    test("an omitted-expiry anti-memory create redelivered across a day boundary replays", async () => {
+        const tool = harness();
+        const args = {
+            action: "create",
+            category: "REJECTED_APPROACH",
+            antiMemory: {
+                trigger: "session caching",
+                rejectedStrategy: "Redis",
+                rejectionReason: "it creates split ownership",
+            },
+        };
+        try {
+            setSystemTime(new Date("2026-01-01T12:00:00Z"));
+            const first = parseJson<CommitJson>(await tool.execute(args, "call-anti-replay"));
+            expect(first.outcome).toBe("applied");
+            setSystemTime(new Date("2026-01-03T12:00:00Z"));
+            const second = parseJson<CommitJson>(await tool.execute(args, "call-anti-replay"));
+            expect(second.outcome).toBe("already applied");
+            expect(second.objects).toEqual(first.objects);
+            expect(tool.kernel.liveRows()).toHaveLength(1);
+        } finally {
+            setSystemTime();
+        }
     });
 });
 
