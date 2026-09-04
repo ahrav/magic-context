@@ -132,6 +132,11 @@ describe("parseScorecardReport", () => {
         expect(() => parseScorecardReport(withBaseline({ adverseDeltas: [{ ...adverse(deltas[0]!), delta: -0.2 }] }))).toThrow(/adverseDeltas: derived-mismatch/);
         const missingFamily: AdverseRow = { familyId: "fam-a", endpoint: "mc-on-vs-mc-off", kind: "family-missing", noiseLabel: null, delta: null, interval: null, blocking: true };
         expect(() => parseScorecardReport(withBaseline({ adverseDeltas: [adverse(deltas[0]!), missingFamily] }))).toThrow(/adverseDeltas\[1\]: family-present/);
+        // A missing-family row must name its endpoint and carry no comparison fields, so it cannot dodge the key check.
+        expect(() => parseScorecardReport(withBaseline({ adverseDeltas: [adverse(deltas[0]!), { ...missingFamily, endpoint: null as unknown as AdverseRow["endpoint"] }] })))
+            .toThrow(/adverseDeltas\[1\].endpoint: enum-invalid/);
+        expect(() => parseScorecardReport(withBaseline({ adverseDeltas: [adverse(deltas[0]!), { ...missingFamily, familyId: "fam-z", delta: -0.1 }] })))
+            .toThrow(/adverseDeltas\[1\]: shape-invalid/);
         const absentFamily = { ...missingFamily, familyId: "fam-z" };
         expect(parseScorecardReport(withBaseline({ adverseDeltas: [adverse(deltas[0]!), absentFamily] })).body.outcome.blockingRegressionCount).toBe(2);
         expect(() => parseScorecardReport(withBaseline({ adverseDeltas: [absentFamily, adverse(deltas[0]!)] }))).toThrow(/adverseDeltas: order-invalid/);

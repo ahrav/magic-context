@@ -156,9 +156,10 @@ export type DeltaRow =
 export const ADVERSE_KINDS = ["adverse-interval", "family-missing"] as const;
 export type AdverseKind = (typeof ADVERSE_KINDS)[number];
 
+/** Both kinds name an `(endpoint, familyId)` estimate key; only `adverse-interval` carries a measured comparison. */
 export interface AdverseRow {
     familyId: string;
-    endpoint: PrimaryEndpoint | null;
+    endpoint: PrimaryEndpoint;
     kind: AdverseKind;
     noiseLabel: NoiseComparison | null;
     delta: number | null;
@@ -379,7 +380,7 @@ function parseAdverseRow(raw: unknown, index: number): AdverseRow {
     exact(value, ["familyId", "endpoint", "kind", "noiseLabel", "delta", "interval", "blocking"], label);
     const row: AdverseRow = {
         familyId: staticId(value.familyId, `${label}.familyId`, ESTIMATE_FAMILY_ID_RE),
-        endpoint: nullable(value.endpoint, (endpoint) => enumeration(endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`)),
+        endpoint: enumeration(value.endpoint, PRIMARY_ENDPOINTS, `${label}.endpoint`),
         kind: enumeration(value.kind, ADVERSE_KINDS, `${label}.kind`),
         noiseLabel: nullable(value.noiseLabel, (noise) => enumeration(noise, NOISE_LABELS, `${label}.noiseLabel`)),
         delta: nullable(value.delta, (delta) => finiteNumber(delta, `${label}.delta`)),
@@ -387,9 +388,7 @@ function parseAdverseRow(raw: unknown, index: number): AdverseRow {
         blocking: boolean(value.blocking, `${label}.blocking`),
     };
     const measured = row.kind === "adverse-interval";
-    if (measured !== (row.endpoint !== null && row.noiseLabel !== null && row.delta !== null && row.interval !== null)) {
-        fail(`${label}: shape-invalid`);
-    }
+    if ([row.noiseLabel, row.delta, row.interval].some((field) => (field !== null) !== measured)) fail(`${label}: shape-invalid`);
     if (row.blocking !== (row.kind === "family-missing" || row.noiseLabel === "outside-floor")) fail(`${label}.blocking: cross-field-invalid`);
     return row;
 }
@@ -509,12 +508,11 @@ function verifyComparison(body: ScorecardReportBody): void {
         }
     }
     const adverse = body.adverseDeltas;
-    const adverseKey = (row: AdverseRow): string => estimateKey({ endpoint: row.endpoint!, familyId: row.familyId });
-    unique(adverse.map((row) => `${row.kind}:${adverseKey(row)}`), "report.body.adverseDeltas");
-    sorted(adverse, (row) => [row.familyId, row.endpoint ?? "", row.kind], "report.body.adverseDeltas");
+    unique(adverse.map((row) => `${row.kind}:${estimateKey(row)}`), "report.body.adverseDeltas");
+    sorted(adverse, (row) => [row.familyId, row.endpoint, row.kind], "report.body.adverseDeltas");
     if (adverse.length > 0 && !baselinePresent) fail("report.body.adverseDeltas: baseline-required");
     const expected = deltas.filter((row): row is Extract<DeltaRow, { status: "compared" }> => row.status === "compared" && row.interval.upper < 0);
-    const claimedByKey = new Map(adverse.filter((row) => row.kind === "adverse-interval").map((row) => [adverseKey(row), row]));
+    const claimedByKey = new Map(adverse.filter((row) => row.kind === "adverse-interval").map((row) => [estimateKey(row), row]));
     if (claimedByKey.size !== expected.length) fail("report.body.adverseDeltas: derived-mismatch");
     for (const row of expected) {
         const claimed = claimedByKey.get(estimateKey(row));
@@ -528,7 +526,7 @@ function verifyComparison(body: ScorecardReportBody): void {
     }
     const currentKeys = new Set(familyEstimates.map(estimateKey));
     for (const [index, row] of adverse.entries()) {
-        if (row.kind === "family-missing" && currentKeys.has(adverseKey(row))) fail(`report.body.adverseDeltas[${index}]: family-present`);
+        if (row.kind === "family-missing" && currentKeys.has(estimateKey(row))) fail(`report.body.adverseDeltas[${index}]: family-present`);
     }
 }
 
