@@ -2301,7 +2301,6 @@ async fn another_projects_objects_are_not_found_through_commit_targets_or_tokens
         "available",
         None,
     );
-    let tip = daemon.tip();
 
     let retired = daemon
         .commit(
@@ -2331,6 +2330,30 @@ async fn another_projects_objects_are_not_found_through_commit_targets_or_tokens
         )
         .await;
     assert_state(&folded, "invalid", Some("not_found"));
+    assert!(is_live(&store, "decision-object-1"));
+
+    // A retired foreign id answers the same as a live one, not `already_exists`.
+    assert_state(
+        &commit_b(
+            &daemon,
+            route_b,
+            &project_b,
+            "retire-b",
+            vec![json!({"op": "retire_decision", "object_id": "decision-object-2"})],
+        )
+        .await,
+        "available",
+        None,
+    );
+    let tip = daemon.tip();
+    let folded_into_retired = daemon
+        .commit(
+            "fold-into-retired-foreign",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": decision_spec(2)})],
+            vec![],
+        )
+        .await;
+    assert_state(&folded_into_retired, "invalid", Some("not_found"));
     assert!(is_live(&store, "decision-object-1"));
 
     let probed = daemon

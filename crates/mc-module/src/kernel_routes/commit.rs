@@ -434,15 +434,23 @@ fn apply(
                     refused,
                 )?;
                 let predecessor = scoped_object_state(envelope, filter, replaced_object_id)?;
-                // A live replacement must belong to the bound project too. Its
-                // stored revision, not the spec's, is what the kernel compares.
+                // An existing replacement must belong to the bound project
+                // whether or not it is live: a foreign retired id answering
+                // `already_exists` where a foreign live one answers
+                // `not_found` would reveal the foreign object's state. A live
+                // one's stored revision, not the spec's, is what the kernel
+                // compares.
                 let (replacement_live, successor_revision) =
                     match envelope.object_state(&spec.object_id)? {
-                        Some(state) if state.object.invalidated_commit_seq.is_none() => {
+                        Some(state) => {
                             scoped_object_state(envelope, filter, &spec.object_id)?;
-                            (true, state.object.source_revision)
+                            if state.object.invalidated_commit_seq.is_none() {
+                                (true, state.object.source_revision)
+                            } else {
+                                (false, spec.source_revision)
+                            }
                         }
-                        _ => (false, spec.source_revision),
+                        None => (false, spec.source_revision),
                     };
                 if successor_revision <= predecessor.object.source_revision {
                     *refused = Some(CommitFailure::RevisionNotAdvanced);
