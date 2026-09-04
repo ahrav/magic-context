@@ -287,12 +287,17 @@ export class KernelClient {
     ): Promise<Invoked> {
         const gated = this.gate(options.signal);
         if (gated) return { ok: false, state: gated };
-        const absent = (): Invoked => ({
-            ok: false,
-            state: nonAvailable(unavailable("daemon_absent")),
-        });
         let rebound = false;
         let reissued = false;
+        // After a mutating call's ambiguous send, every later failure exit stays `outcome_unknown`: a reissue that is never sent, an unbound route, or a transport error cannot resolve whether the first attempt committed, and any definitive-looking failure invites a retry under a fresh identity. commentlint: allow(JUDGE)
+        const failed = (state: MemoryState): Invoked => ({
+            ok: false,
+            state:
+                reissued && options.mutating
+                    ? nonAvailable(unavailable("outcome_unknown"))
+                    : nonAvailable(state),
+        });
+        const absent = (): Invoked => failed(unavailable("daemon_absent"));
         for (;;) {
             if (options.deadline.isExpired()) {
                 // After a reissued unknown outcome on a write, an expired deadline still leaves the original request possibly applied; a plain cancellation would invite a retry under a fresh identity. commentlint: allow(JUDGE)
@@ -321,7 +326,7 @@ export class KernelClient {
                     return {
                         ok: false,
                         state:
-                            unknownOutcome && options.mutating
+                            (unknownOutcome || reissued) && options.mutating
                                 ? nonAvailable(unavailable("outcome_unknown"))
                                 : nonAvailable(cancelled()),
                     };
@@ -351,12 +356,12 @@ export class KernelClient {
                         continue;
                     }
                     if (isUnknownMethod(error.code)) {
-                        return { ok: false, state: nonAvailable(invalid("unrecognized_state")) };
+                        return failed(invalid("unrecognized_state"));
                     }
-                    return { ok: false, state: nonAvailable(invalid("internal")) };
+                    return failed(invalid("internal"));
                 }
                 if (isDaemonAbsent(error)) return absent();
-                return { ok: false, state: nonAvailable(invalid("internal")) };
+                return failed(invalid("internal"));
             }
         }
     }

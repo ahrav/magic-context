@@ -238,6 +238,17 @@ describe("KernelClient transport mapping", () => {
         expect(transport.bodies("kernel.commit")).toHaveLength(2);
     });
 
+    test("a write reissue that is never sent keeps the first attempt's ambiguity", async () => {
+        const transport = new FakeTransport().queue(
+            new McHostCallError("outcome_unknown", "deadline"),
+            new McHostCallError("not_sent", "connection retired"),
+        );
+        const result = await client(transport).create(spec, intent);
+        // `not_sent` proves only that the reissue never left; the first attempt may still have committed. commentlint: allow(JUDGE)
+        expect(result.state).toEqual({ kind: "unavailable", reason: "outcome_unknown" });
+        expect(transport.bodies("kernel.commit")).toHaveLength(2);
+    });
+
     test("route_unbound rebinds once, then retries once, then is daemon_absent", async () => {
         const unbound = () => new McHostCallError("terminal", "no binding", "route_unbound");
         const recovered = new FakeTransport().queue(unbound(), readReply(1));

@@ -102,6 +102,7 @@ const scenarioSchema = z.strictObject({
         "packer-empty",
         "empty",
         "memory-abstained",
+        "memory-truncated",
         "memory-unavailable",
         "below-threshold",
         "timeout",

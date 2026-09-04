@@ -333,6 +333,8 @@ export async function importClaimLaneMemories(args: {
     /** The checkout root the client's kernel scope is bound to. */
     projectRoot: string;
     sessionId: string;
+    /** Guards the authorization-drift retry to one level: a run that observes drift a second time defers to the scheduler instead of recursing. commentlint: allow(JUDGE) */
+    retryOnDrift?: boolean;
 }): Promise<ClaimLaneImportOutcome> {
     const { db, client, projectPath, projectRoot, sessionId } = args;
     if (claimLaneImportDone(db, projectPath, projectRoot)) return "skipped";
@@ -450,6 +452,16 @@ export async function importClaimLaneMemories(args: {
             return "deferred";
         }
         imported += 1;
+    }
+    // The captured authorization can go stale while the asynchronous reads and commits run: a mid-run revocation would otherwise complete under a marker recording a policy that no longer holds, leaving a just-inserted or just-kept foreign memory servable until the next policy change. A drifted run re-runs once under the fresh authorization; a second drift defers to the scheduler. commentlint: allow(JUDGE)
+    const currentAuthorization = claimLaneAuthorizationFingerprint(db, projectPath);
+    if (currentAuthorization !== authorization) {
+        sessionLog(
+            sessionId,
+            "claim-lane import: workspace authorization changed during the run; reconciling against the current policy",
+        );
+        if (args.retryOnDrift === false) return "deferred";
+        return importClaimLaneMemories({ ...args, retryOnDrift: false });
     }
     if (
         !markDone(db, projectPath, projectRoot, generation, {

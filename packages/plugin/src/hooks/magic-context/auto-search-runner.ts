@@ -63,6 +63,7 @@ export type AutoSearchOutcome =
               | "search-failure"
               | "cas-exhaustion"
               | "memory-abstained"
+              | "memory-truncated"
               | "memory-unavailable";
       };
 
@@ -72,6 +73,7 @@ export type AutoSearchDeliveryReason =
     | "delivered"
     | "empty"
     | "memory-abstained"
+    | "memory-truncated"
     | "memory-unavailable"
     | "below-threshold"
     | "packer-empty"
@@ -131,8 +133,12 @@ function localSources(sources: readonly SearchSource[]): SearchSource[] {
 /** The no-hint reason an empty turn records, given how the kernel answered. Every non-`available` state is withheld memory — `invalid` and `cancelled` reads served no rows just as `unavailable` does — so only a served-and-empty read records the project as having nothing relevant. commentlint: allow(JUDGE) */
 function emptyReason(
     memory: KernelMemorySnapshot | null,
-): "empty" | "memory-abstained" | "memory-unavailable" {
-    if (memory === null || memory.state.kind === "available") return "empty";
+): "empty" | "memory-abstained" | "memory-truncated" | "memory-unavailable" {
+    if (memory === null) return "empty";
+    if (memory.state.kind === "available") {
+        // A truncated snapshot is a capped prefix: a relevant memory can live entirely in the omitted older rows, so an empty or below-threshold ranking over it is incomplete evidence, not a completed no-hint outcome. commentlint: allow(JUDGE)
+        return memory.truncated ? "memory-truncated" : "empty";
+    }
     if (memory.state.kind === "abstained") return "memory-abstained";
     return "memory-unavailable";
 }
@@ -441,7 +447,11 @@ export async function runAutoSearchHint(args: {
     if (delivery.reason === "packer-empty") {
         return writeNoHintAndReconcile("empty");
     }
-    if (delivery.reason === "memory-abstained" || delivery.reason === "memory-unavailable") {
+    if (
+        delivery.reason === "memory-abstained" ||
+        delivery.reason === "memory-truncated" ||
+        delivery.reason === "memory-unavailable"
+    ) {
         // A withheld memory lane is transient evidence like a timeout: the pass persists no decision, so a later pass re-evaluates the message once the daemon recovers.
         sessionLog(
             sessionId,
