@@ -75,6 +75,14 @@ describe("removeNamedOutput", () => {
         expect(() => parseArgs(argv, "/root")).toThrow(/hex64/);
         removeNamedOutput(argv);
         expect(existsSync(out)).toBe(false);
+        const scratch = join(root, "scratch.json");
+        writeFileSync(out, "{\"stale\":true}\n");
+        writeFileSync(scratch, "{}\n");
+        const duplicated = ["--out", scratch, "--out", out];
+        expect(() => parseArgs(duplicated, "/root")).toThrow(/given twice/);
+        removeNamedOutput(duplicated);
+        expect(existsSync(scratch)).toBe(false);
+        expect(existsSync(out)).toBe(false);
         writeFileSync(out, "{\"stale\":true}\n");
         removeNamedOutput(["--out"]);
         removeNamedOutput(["--out", "--freeze", out]);

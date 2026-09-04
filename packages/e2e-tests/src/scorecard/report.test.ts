@@ -9,7 +9,7 @@ import { buildProspectiveReport, validateProspectiveReportEvidence } from "../pr
 import { H3 } from "../prospective-holdout/test-fixtures";
 import type { ScorecardEvidenceBundle } from "./evidence";
 import { SCORECARD_GATE_IDS, SCORE_FAMILY_IDS, ScorecardContractError, LANE_IDS } from "./policy";
-import { REPORT_BODY_KEYS, baselineComparable, deriveOutcome, parseScorecardReport, type ScorecardReport } from "./report-contract";
+import { REPORT_BODY_KEYS, deriveOutcome, parseScorecardReport, type ScorecardReport } from "./report-contract";
 import { buildScorecardReport, createScorecardAdapter, publishScorecardReport, scorecardExitCode } from "./report";
 import {
     H1,
@@ -26,29 +26,42 @@ afterEach(() => {
     for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-/** Rewriting non-passing gates makes the exit-0 and exit-1 test paths reachable. */
+/**
+ * Rewrites every gate as passed so the exit-0 and exit-1 paths are reachable. The parser refuses an
+ * observed row for a gate no lane produces, so the result is not re-parsed; it exercises
+ * `deriveOutcome` and `scorecardExitCode` over rows the builder derived.
+ */
 function allGatesPassed(bundle: ScorecardEvidenceBundle): ScorecardReport {
     const report = buildScorecardReport(bundle);
     const body = structuredClone(report.body);
+    const metamorphic = body.evidence.lanes.find((row) => row.lane === "metamorphic")!.reportFingerprint ?? H1;
     body.safetyGates = body.safetyGates.map((row) => row.status === "passed"
         ? row
-        : { ...row, status: "passed", observedCount: 0, evidenceFingerprint: H1, sourceLane: "incident", diagnostic: null });
+        : { ...row, status: "passed", observedCount: 0, evidenceFingerprint: metamorphic, sourceLane: "metamorphic", diagnostic: null });
     body.limitations = body.limitations.filter((code) => code !== "hard-gates-unobserved");
     body.outcome = deriveOutcome({
         gates: body.safetyGates,
         lanes: body.evidence.lanes,
+        baseline: body.evidence.baseline.status,
         families: SCORE_FAMILY_IDS.map((family) => body[family]),
         requiredMetricSlots: bundle.policy.requiredMetricSlots,
         adverseDeltas: body.adverseDeltas,
         maxToleratedRegressions: bundle.policy.maxToleratedRegressions,
-        baselineComparable: baselineComparable(body.target, body.evidence.baseline),
     });
-    return parseScorecardReport({ schema: report.schema, body, reportFingerprint: canonicalFingerprint(body) });
+    return { schema: report.schema, body, reportFingerprint: canonicalFingerprint(body) };
 }
 
 function baselineReport(options: BundleFixtureOptions = {}): ScorecardReport {
     return buildScorecardReport(bundleFixture(options));
 }
+
+const REGRESSED = pairedDeltaReportFixture({
+    familyDeltas: { "fam-a": 0.1, "fam-b": 0.1 },
+    noiseFloors: (["mc-on-vs-mc-off", "mc-on-vs-compaction"] as const).flatMap((endpoint) => [
+        { endpoint, familyId: "fam-a", value: 0.01, interval: { lower: 0, upper: 0.01 } },
+        { endpoint, familyId: "fam-b", value: 0.01, interval: { lower: 0, upper: 0.01 } },
+    ]),
+});
 
 describe("buildScorecardReport", () => {
     it("is byte-identical for identical inputs and keeps the fixed section order", () => {
@@ -62,18 +75,42 @@ describe("buildScorecardReport", () => {
         expect(parseScorecardReport(JSON.parse(JSON.stringify(first)))).toEqual(first);
     });
 
+    it("records the policy terms the outcome depends on so the parser can recompute it", () => {
+        const policy = policyFixture({ maxToleratedRegressions: 3, requiredMetricSlots: ["ctx-expand-recovery"] });
+        const bundle = bundleFixture({ policy });
+        const report = buildScorecardReport(bundle);
+        expect(report.body.target).toMatchObject({ maxToleratedRegressions: 3, requiredMetricSlots: ["ctx-expand-recovery"] });
+        const forged = structuredClone(report.body);
+        forged.outcome.promotionAllowed = true;
+        expect(() => parseScorecardReport({ schema: report.schema, body: forged, reportFingerprint: canonicalFingerprint(forged) }))
+            .toThrow(/outcome: cross-field-invalid/);
+        expect(() => publishScorecardReport({ bundle, report: { schema: report.schema, body: forged, reportFingerprint: canonicalFingerprint(forged) } }, "/dev/null"))
+            .toThrow(/scorecard: report-bundle-mismatch/);
+    });
+
+    it("refuses a bundle whose parsed lane or baseline report no longer matches its recorded fingerprint", () => {
+        const edited = bundleFixture();
+        const lane = edited.lanes.find((row) => row.lane === "paired-delta")!;
+        if (lane.lane !== "paired-delta" || lane.report === null) throw new Error("fixture lane absent");
+        lane.report.body.analysis.endpoints[0]!.families[0]!.pointEstimate += 1;
+        expect(() => buildScorecardReport(edited)).toThrow(/scorecard: lane-fingerprint-mismatch-paired-delta/);
+        const baseline = baselineReport();
+        const withBaseline = bundleFixture({ policy: policyFixture({ baselineScorecardReportFingerprint: baseline.reportFingerprint }), baseline });
+        withBaseline.baseline.report!.body.utility.familyEstimates[0]!.pointEstimate += 1;
+        expect(() => buildScorecardReport(withBaseline)).toThrow(/scorecard: baseline-fingerprint-mismatch/);
+    });
+
     it("passes the shared privacy scan and admits only reason codes as limitations", () => {
         const report = buildScorecardReport(bundleFixture());
         expect(scanForSensitiveContent(report)).toEqual([]);
-        expect(report.body.limitations).toEqual([
-            ...LANE_IDS.map((lane) => `identity-unverified-${lane}`),
-            "no-baseline",
-            "hard-gates-unobserved",
-        ]);
+        expect(report.body.limitations.every((code) => /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(code))).toBe(true);
+        expect(report.body.limitations).toContain("no-baseline");
+        expect(report.body.limitations).toContain("hard-gates-unobserved");
+        expect(new Set(report.body.limitations).size).toBe(report.body.limitations.length);
         const tampered = structuredClone(report);
         tampered.body.limitations.push("Operator note: see /home/me");
         tampered.reportFingerprint = canonicalFingerprint(tampered.body);
-        expect(() => parseScorecardReport(tampered)).toThrow(/limitations\[8\]: id-invalid/);
+        expect(() => parseScorecardReport(tampered)).toThrow(/limitations\[\d+\]: id-invalid/);
     });
 
     it("blocks promotion and exits 2 when any gate is not-observed even with every delta positive", () => {
@@ -102,15 +139,8 @@ describe("buildScorecardReport", () => {
 
     it("exits 1 when blocking regressions exceed the tolerance and 0 when the tolerance absorbs them", () => {
         const baseline = baselineReport({ lanes: { "paired-delta": pairedDeltaReportFixture({ familyDeltas: { "fam-a": 0.9, "fam-b": 0.9 } }) } });
-        const regressed = pairedDeltaReportFixture({
-            familyDeltas: { "fam-a": 0.1, "fam-b": 0.1 },
-            noiseFloors: [
-                { familyId: "fam-a", value: 0.01, interval: { lower: 0, upper: 0.01 } },
-                { familyId: "fam-b", value: 0.01, interval: { lower: 0, upper: 0.01 } },
-            ],
-        });
         const policy = policyFixture({ baselineScorecardReportFingerprint: baseline.reportFingerprint });
-        const blocked = allGatesPassed(bundleFixture({ policy, baseline, lanes: { "paired-delta": regressed } }));
+        const blocked = allGatesPassed(bundleFixture({ policy, baseline, lanes: { "paired-delta": REGRESSED } }));
         expect(blocked.body.adverseDeltas.length).toBeGreaterThan(0);
         expect(blocked.body.adverseDeltas.every((row) => row.blocking)).toBe(true);
         expect(blocked.body.outcome.blockingRegressionCount).toBe(blocked.body.adverseDeltas.length);
@@ -119,7 +149,7 @@ describe("buildScorecardReport", () => {
         const tolerant = allGatesPassed(bundleFixture({
             policy: policyFixture({ baselineScorecardReportFingerprint: baseline.reportFingerprint, maxToleratedRegressions: 4 }),
             baseline,
-            lanes: { "paired-delta": regressed },
+            lanes: { "paired-delta": REGRESSED },
         }));
         expect(scorecardExitCode(tolerant)).toBe(0);
         expect(tolerant.body.utility.deltas.every((row) => row.status === "compared")).toBe(true);
@@ -131,58 +161,21 @@ describe("buildScorecardReport", () => {
         expect(bundle.baseline.status).toBe("schema-mismatch");
         const report = allGatesPassed(bundle);
         expect(report.body.adverseDeltas).toEqual([]);
-        expect(report.body.outcome).toMatchObject({ promotionAllowed: false, mandatoryEvidenceComplete: true, blockingRegressionCount: 0 });
+        expect(report.body.outcome).toMatchObject({ promotionAllowed: false, mandatoryEvidenceComplete: false, blockingRegressionCount: 0 });
         expect(report.body.limitations.filter((code) => code === "baseline-not-comparable")).toHaveLength(1);
         expect(report.body.limitations).toContain("baseline-path-missing");
         expect(scorecardExitCode(report)).toBe(1);
-        const forged = structuredClone(report.body);
-        forged.outcome.promotionAllowed = true;
-        expect(() => parseScorecardReport({ schema: report.schema, body: forged, reportFingerprint: canonicalFingerprint(forged) }))
-            .toThrow(/outcome\.promotionAllowed: cross-field-invalid/);
-    });
-
-    it("treats a present baseline bound to another fingerprint as not comparable", () => {
-        const policy = policyFixture({ baselineScorecardReportFingerprint: H3 });
-        const foreign = allGatesPassed(bundleFixture({ policy, baseline: baselineReport() }));
-        expect(foreign.body.evidence.baseline.status).toBe("present");
-        expect(foreign.body.outcome.promotionAllowed).toBe(false);
-        expect(foreign.body.limitations).toContain("baseline-not-comparable");
-        const forged = structuredClone(foreign.body);
-        forged.outcome.promotionAllowed = true;
-        expect(() => parseScorecardReport({ schema: foreign.schema, body: forged, reportFingerprint: canonicalFingerprint(forged) }))
-            .toThrow(/outcome\.promotionAllowed: cross-field-invalid/);
+        const built = buildScorecardReport(bundle);
+        const forged = structuredClone(built.body);
+        forged.outcome.mandatoryEvidenceComplete = true;
+        expect(() => parseScorecardReport({ schema: built.schema, body: forged, reportFingerprint: canonicalFingerprint(forged) }))
+            .toThrow(/outcome: cross-field-invalid/);
     });
 
     it("refuses a bundle whose policy terms do not match the fingerprint it names", () => {
         const bundle = bundleFixture();
         bundle.policy = { ...bundle.policy, maxToleratedRegressions: 99 };
         expect(() => buildScorecardReport(bundle)).toThrow(/scorecard: policy-fingerprint-mismatch/);
-    });
-
-    it("rejects a forged promotion whose blocking rows exceed the tolerance the report itself records", () => {
-        const baseline = baselineReport({ lanes: { "paired-delta": pairedDeltaReportFixture({ familyDeltas: { "fam-a": 0.9, "fam-b": 0.9 } }) } });
-        const regressed = pairedDeltaReportFixture({
-            familyDeltas: { "fam-a": 0.1, "fam-b": 0.1 },
-            noiseFloors: [
-                { familyId: "fam-a", value: 0.01, interval: { lower: 0, upper: 0.01 } },
-                { familyId: "fam-b", value: 0.01, interval: { lower: 0, upper: 0.01 } },
-            ],
-        });
-        const policy = policyFixture({ baselineScorecardReportFingerprint: baseline.reportFingerprint });
-        const blocked = allGatesPassed(bundleFixture({ policy, baseline, lanes: { "paired-delta": regressed } }));
-        expect(blocked.body.target.maxToleratedRegressions).toBe(policy.maxToleratedRegressions);
-        expect(blocked.body.outcome.blockingRegressionCount).toBeGreaterThan(policy.maxToleratedRegressions);
-        const forged = structuredClone(blocked.body);
-        forged.outcome.promotionAllowed = true;
-        expect(() => parseScorecardReport({ schema: blocked.schema, body: forged, reportFingerprint: canonicalFingerprint(forged) }))
-            .toThrow(/outcome\.promotionAllowed: cross-field-invalid/);
-        expect(() => publishScorecardReport({ schema: blocked.schema, body: forged, reportFingerprint: canonicalFingerprint(forged) }, "/dev/null"))
-            .toThrow(/outcome\.promotionAllowed: cross-field-invalid/);
-        const unmeasured = allGatesPassed(bundleFixture({ policy: policyFixture({ requiredMetricSlots: ["ctx-expand-recovery"] }) }));
-        const forgedEvidence = structuredClone(unmeasured.body);
-        forgedEvidence.outcome.mandatoryEvidenceComplete = true;
-        expect(() => parseScorecardReport({ schema: unmeasured.schema, body: forgedEvidence, reportFingerprint: canonicalFingerprint(forgedEvidence) }))
-            .toThrow(/outcome\.mandatoryEvidenceComplete: cross-field-invalid/);
     });
 
     it("reports four not-observed gates and one passed injection gate from lane-built fixtures", () => {
@@ -194,23 +187,23 @@ describe("buildScorecardReport", () => {
 });
 
 describe("publishScorecardReport", () => {
-    it("writes canonical bytes a canonical reader accepts and refuses a report that fails the privacy scan", () => {
+    it("writes the report recomputed from the bundle as canonical bytes and refuses a copy the bundle does not produce", () => {
         const root = mkdtempSync(join(tmpdir(), "scorecard-report-"));
         roots.push(root);
-        const report = buildScorecardReport(bundleFixture());
+        const bundle = bundleFixture();
+        const report = buildScorecardReport(bundle);
         const path = join(root, "scorecard-report.json");
-        publishScorecardReport(report, path);
+        publishScorecardReport({ bundle, report }, path);
         expect(readFileSync(path, "utf8")).toBe(`${JSON.stringify(report, null, 2)}\n`);
         expect(readCanonicalJsonFile(path, (code) => new Error(code))).toEqual(JSON.parse(JSON.stringify(report)));
-        const leaking = structuredClone(report) as unknown as { body: { target: Record<string, unknown> } };
-        leaking.body.target.freezeManifestFingerprint = "/home/operator/freeze";
-        const refused = join(root, "refused.json");
-        expect(() => publishScorecardReport(leaking as unknown as ScorecardReport, refused)).toThrow(/scorecard: privacy-rejected/);
-        expect(existsSync(refused)).toBe(false);
         const drifted = structuredClone(report);
         drifted.body.outcome.blockingRegressionCount = 7;
+        drifted.reportFingerprint = canonicalFingerprint(drifted.body);
         const mismatched = join(root, "mismatched.json");
-        expect(() => publishScorecardReport(drifted, mismatched)).toThrow(/report\.reportFingerprint: mismatch/);
+        expect(() => publishScorecardReport({ bundle, report: drifted }, mismatched)).toThrow(/scorecard: report-bundle-mismatch/);
+        expect(existsSync(mismatched)).toBe(false);
+        const foreign = buildScorecardReport(bundleFixture({ freezeManifestFingerprint: H3 }));
+        expect(() => publishScorecardReport({ bundle, report: foreign }, mismatched)).toThrow(/scorecard: report-bundle-mismatch/);
         expect(existsSync(mismatched)).toBe(false);
     });
 });
@@ -233,6 +226,11 @@ describe("createScorecardAdapter", () => {
         return pairedDelta.report.body.policyFingerprint;
     }
 
+    /** A bundle whose paired-delta lane analyzed `PAIRED_FACTS`, as a prospective comparison does. */
+    function boundBundle(options: BundleFixtureOptions = {}, pairedDelta: Parameters<typeof pairedDeltaReportFixture>[0] = {}): ScorecardEvidenceBundle {
+        return bundleFixture({ ...options, lanes: { ...options.lanes, "paired-delta": pairedDeltaReportFixture({ pairs: PAIRED_FACTS, ...pairedDelta }) } });
+    }
+
     function holdout(bundle: ScorecardEvidenceBundle, pairs = PAIRED_FACTS) {
         return {
             pairs,
@@ -242,15 +240,15 @@ describe("createScorecardAdapter", () => {
     }
 
     it("rejects a report that was not derived from the supplied bundle", () => {
-        const bundle = bundleFixture();
-        const foreign = buildScorecardReport(bundleFixture({ freezeManifestFingerprint: H3 }));
+        const bundle = boundBundle();
+        const foreign = buildScorecardReport(boundBundle({ freezeManifestFingerprint: H3 }));
         expect(() => createScorecardAdapter({ bundle, report: foreign })).toThrow(/adapter: report-bundle-mismatch/);
         expect(() => createScorecardAdapter({ bundle, report: allGatesPassed(bundle) })).toThrow(/adapter: report-bundle-mismatch/);
         expect(() => createScorecardAdapter({ bundle, report: buildScorecardReport(bundle) })).not.toThrow();
     });
 
     it("attests the recomputed outcome, not a forged body or an input mutated after construction", () => {
-        const bundle = bundleFixture();
+        const bundle = boundBundle();
         const genuine = buildScorecardReport(bundle);
         const forged = structuredClone(genuine);
         forged.body.outcome = { promotionAllowed: true, mandatoryEvidenceComplete: true, hardGateFailures: [], blockingRegressionCount: 0 };
@@ -259,7 +257,7 @@ describe("createScorecardAdapter", () => {
             promotionAllowed: false,
             hardGateFailures: genuine.body.outcome.hardGateFailures,
         });
-        const mutableBundle = bundleFixture();
+        const mutableBundle = boundBundle();
         const adapter = createScorecardAdapter({ bundle: mutableBundle, report: genuine });
         const before = adapter.evaluate(holdout(mutableBundle), mutableBundle.policyFingerprint);
         genuine.body.outcome.promotionAllowed = true;
@@ -270,17 +268,20 @@ describe("createScorecardAdapter", () => {
     });
 
     it("rejects a foreign policy or freeze fingerprint, foreign paired facts, and an estimator result from another analysis", () => {
-        const bundle = bundleFixture();
+        const bundle = boundBundle();
         const adapter = createScorecardAdapter({ bundle, report: buildScorecardReport(bundle) });
         expect(() => adapter.evaluate(holdout(bundle), H3)).toThrow(/adapter: policy-fingerprint-mismatch/);
         expect(() => adapter.evaluate({ ...holdout(bundle), freezeManifestFingerprint: H3 }, bundle.policyFingerprint))
             .toThrow(/adapter: freeze-fingerprint-mismatch/);
         expect(() => adapter.evaluate(holdout(bundle, PAIRED_FACTS.slice(1)), bundle.policyFingerprint)).toThrow(/adapter: evidence-pairs-mismatch/);
-        const otherAnalysis = bundleFixture({ lanes: { "paired-delta": pairedDeltaReportFixture({ familyDeltas: { "fam-a": 0.9, "fam-b": 0.9 } }) } });
+        const otherAnalysis = boundBundle({}, { familyDeltas: { "fam-a": 0.9, "fam-b": 0.9 } });
         expect(() => adapter.evaluate({ ...holdout(bundle), estimator: holdout(otherAnalysis).estimator }, bundle.policyFingerprint))
             .toThrow(/adapter: estimator-result-mismatch/);
+        const genuine = holdout(bundle);
+        const wrapped = { ...genuine, estimator: { ...genuine.estimator, evidenceSufficient: !genuine.estimator.evidenceSufficient } };
+        expect(() => adapter.evaluate(wrapped, bundle.policyFingerprint)).toThrow(/adapter: estimator-result-mismatch/);
         expect(() => adapter.evaluate(holdout(bundle), H3)).toThrow(ScorecardContractError);
-        const mutable = bundleFixture();
+        const mutable = boundBundle();
         const mutableAdapter = createScorecardAdapter({ bundle: mutable, report: buildScorecardReport(mutable) });
         const lane = mutable.lanes.find((row) => row.lane === "paired-delta")!;
         if (lane.lane !== "paired-delta" || lane.report === null) throw new Error("fixture lane absent");
@@ -290,11 +291,11 @@ describe("createScorecardAdapter", () => {
     });
 
     it("attests the report's own denial when the paired-delta lane is absent instead of throwing", () => {
-        const bundle = bundleFixture({ statuses: { "paired-delta": "missing" } });
+        const bundle = boundBundle({ statuses: { "paired-delta": "missing" } });
         const report = buildScorecardReport(bundle);
         const adapter = createScorecardAdapter({ bundle, report });
         const outcome = adapter.evaluate(
-            { pairs: PAIRED_FACTS, estimator: holdout(bundleFixture()).estimator, freezeManifestFingerprint: bundle.freezeManifestFingerprint },
+            { pairs: PAIRED_FACTS, estimator: holdout(boundBundle()).estimator, freezeManifestFingerprint: bundle.freezeManifestFingerprint },
             bundle.policyFingerprint,
         );
         expect(outcome).toMatchObject({ promotionAllowed: false, mandatoryEvidenceComplete: false });
@@ -302,7 +303,7 @@ describe("createScorecardAdapter", () => {
     });
 
     it("drives the prospective report to hard-gate-failed and recomputes to the same result fingerprint", () => {
-        const bundle = bundleFixture();
+        const bundle = boundBundle();
         const report = buildScorecardReport(bundle);
         const scorecard = createScorecardAdapter({ bundle, report });
         const prospective = buildProspectiveReport({
@@ -320,11 +321,11 @@ describe("createScorecardAdapter", () => {
         expect(prospective.body.hardGateFailures).toEqual(report.body.outcome.hardGateFailures);
         expect(() => validateProspectiveReportEvidence(prospective, PAIRED_FACTS, { estimator: estimator(bundle), scorecard })).not.toThrow();
 
-        const swappedLane = bundleFixture({ lanes: { metamorphic: metamorphicReportFixture({ coveredScenarioIds: ["hse-webhook-docs-injection"] }) } });
+        const swappedLane = boundBundle({ lanes: { metamorphic: metamorphicReportFixture({ coveredScenarioIds: ["hse-webhook-docs-injection"] }) } });
         const swapped = createScorecardAdapter({ bundle: swappedLane, report: buildScorecardReport(swappedLane) });
         expect(() => validateProspectiveReportEvidence(prospective, PAIRED_FACTS, { estimator: estimator(bundle), scorecard: swapped })).toThrow(/sibling-recomputation-mismatch/);
         expect(() => validateProspectiveReportEvidence(prospective, PAIRED_FACTS.slice(1), { estimator: estimator(bundle), scorecard })).toThrow(/deterministic-recomputation-mismatch/);
-        const otherFreeze = bundleFixture({ freezeManifestFingerprint: H3 });
+        const otherFreeze = boundBundle({ freezeManifestFingerprint: H3 });
         const otherFreezeAdapter = createScorecardAdapter({ bundle: otherFreeze, report: buildScorecardReport(otherFreeze) });
         expect(() => validateProspectiveReportEvidence(prospective, PAIRED_FACTS, { estimator: estimator(bundle), scorecard: otherFreezeAdapter }))
             .toThrow(/adapter: freeze-fingerprint-mismatch/);

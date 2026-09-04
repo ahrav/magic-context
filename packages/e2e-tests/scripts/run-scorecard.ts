@@ -70,8 +70,11 @@ export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): Par
  */
 export function removeNamedOutput(argv: readonly string[]): void {
     if (helpRequested(argv)) return;
-    const value = argv[argv.indexOf("--out") + 1];
-    if (argv.includes("--out") && value !== undefined && !value.startsWith("--")) rmSync(resolve(value), { force: true });
+    // Every value, not the first: a duplicate flag is refused by the parser, and the stale report may sit at the second.
+    for (const [index, flag] of argv.entries()) {
+        const value = argv[index + 1];
+        if (flag === "--out" && value !== undefined && !value.startsWith("--")) rmSync(resolve(value), { force: true });
+    }
 }
 
 export function runScorecard(args: ScorecardCliArgs, log: (line: string) => void = console.log): ScorecardExitCode {
@@ -80,7 +83,7 @@ export function runScorecard(args: ScorecardCliArgs, log: (line: string) => void
     try {
         const bundle = loadEvidenceBundle(args.sources);
         const report = buildScorecardReport(bundle);
-        publishScorecardReport(report, args.out);
+        publishScorecardReport({ bundle, report }, args.out);
         log(JSON.stringify({ reportFingerprint: report.reportFingerprint, outcome: report.body.outcome, limitations: report.body.limitations }, null, 2));
         return scorecardExitCode(report);
     } catch (error) {
