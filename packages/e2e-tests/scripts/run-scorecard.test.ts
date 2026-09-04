@@ -91,6 +91,32 @@ describe("removeNamedOutput", () => {
         removeNamedOutput(["--out", out, "-h"]);
         expect(existsSync(out)).toBe(true);
     });
+
+    it("leaves an output that names or lies inside an input alone, and the parser refuses that invocation", () => {
+        const root = mkdtempSync(join(tmpdir(), "scorecard-overlap-"));
+        roots.push(root);
+        const artifacts = join(root, "artifacts");
+        mkdirSync(artifacts);
+        const baseline = join(root, "scorecard-report.json");
+        const inside = join(artifacts, "scorecard-report.json");
+        writeFileSync(baseline, "{}\n");
+        writeFileSync(inside, "{}\n");
+        const hex = "a".repeat(64);
+        const common = ["--freeze", join(root, "freeze"), "--freeze-fingerprint", hex, "--artifacts", artifacts];
+        for (const argv of [
+            [...common, "--baseline", baseline, "--out", baseline],
+            [...common, "--out", inside],
+            [...common, "--out", artifacts],
+            [...common, "--out", join(root, "freeze", "manifest.json")],
+            [...common, "--policies", root, "--out", join(root, "anything.json")],
+        ]) {
+            expect(() => parseArgs(argv, "/root")).toThrow(/--out must not name an input/);
+            removeNamedOutput(argv, "/root");
+        }
+        expect(existsSync(baseline)).toBe(true);
+        expect(existsSync(inside)).toBe(true);
+        expect(parseArgs([...common, "--baseline", baseline, "--out", join(root, "out", "report.json")], "/root").kind).toBe("run");
+    });
 });
 
 describe("run-scorecard parseArgs", () => {

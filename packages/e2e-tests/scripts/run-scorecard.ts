@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { rmSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { HEX64_RE } from "../src/contract-primitives";
 import { loadEvidenceBundle, type EvidenceSources } from "../src/scorecard/evidence";
 import { ScorecardContractError } from "../src/scorecard/policy";
@@ -28,6 +28,25 @@ function helpRequested(argv: readonly string[]): boolean {
     return argv.includes("--help") || argv.includes("-h");
 }
 
+/** The files and directories a run reads, resolved from whichever flags are present plus the defaults. */
+function inputPaths(values: ReadonlyMap<string, string>, root: string): string[] {
+    return [
+        values.get("--freeze"),
+        values.get("--artifacts"),
+        values.get("--baseline"),
+        values.get("--policies") ?? join(root, "prospective-holdout", "policies"),
+        values.get("--paired-delta-policy") ?? join(root, "pools", "paired-delta-policy.json"),
+    ].filter((path): path is string => path !== undefined).map((path) => resolve(path));
+}
+
+/** Whether `out` names an input or lies inside an input directory; the run deletes `out` before reading. */
+function overlapsInput(out: string, inputs: readonly string[]): boolean {
+    return inputs.some((input) => {
+        const step = relative(input, out);
+        return step === "" || (!step.startsWith("..") && !isAbsolute(step));
+    });
+}
+
 export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): ParsedArgs {
     if (helpRequested(argv)) return HELP_REQUESTED;
     const values = new Map<string, string>();
@@ -46,6 +65,8 @@ export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): Par
     };
     const freezeFingerprint = required("--freeze-fingerprint");
     if (!HEX64_RE.test(freezeFingerprint)) throw new Error("--freeze-fingerprint must be the lowercase hex64 fingerprint recorded in the trusted manifest registry");
+    const out = resolve(required("--out"));
+    if (overlapsInput(out, inputPaths(values, root))) throw new Error("--out must not name an input or lie inside an input directory");
     const policiesDir = resolve(values.get("--policies") ?? join(root, "prospective-holdout", "policies"));
     const baseline = values.get("--baseline");
     return {
@@ -60,20 +81,29 @@ export function parseArgs(argv: readonly string[], root: string = E2E_ROOT): Par
             artifactsDir: resolve(required("--artifacts")),
             baselinePath: baseline === undefined ? null : resolve(baseline),
         },
-        out: resolve(required("--out")),
+        out,
     };
 }
 
 /**
  * Argument parsing is fallible and runs before `runScorecard` can remove the previous report, so a
- * malformed rerun clears the path it names first.
+ * malformed rerun clears the paths it names first. A value that overlaps an input is left alone; the
+ * parser refuses that invocation without reading anything.
  */
-export function removeNamedOutput(argv: readonly string[]): void {
+export function removeNamedOutput(argv: readonly string[], root: string = E2E_ROOT): void {
     if (helpRequested(argv)) return;
+    const values = new Map<string, string>();
+    for (const [index, flag] of argv.entries()) {
+        const value = argv[index + 1];
+        if (flag.startsWith("--") && value !== undefined && !value.startsWith("--") && !values.has(flag)) values.set(flag, value);
+    }
+    const inputs = inputPaths(values, root);
     // Every value, not the first: a duplicate flag is refused by the parser, and the stale report may sit at the second.
     for (const [index, flag] of argv.entries()) {
         const value = argv[index + 1];
-        if (flag === "--out" && value !== undefined && !value.startsWith("--")) rmSync(resolve(value), { force: true });
+        if (flag !== "--out" || value === undefined || value.startsWith("--")) continue;
+        const out = resolve(value);
+        if (!overlapsInput(out, inputs)) rmSync(out, { force: true });
     }
 }
 
