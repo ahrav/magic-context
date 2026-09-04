@@ -200,7 +200,8 @@ pub(crate) struct Rule {
 pub(crate) struct RuleSet {
     rules: Vec<Rule>,
     anchors: AhoCorasick,
-    anchor_owners: Vec<usize>,
+    /// Rules declaring the anchor at the same index in `anchors`.
+    anchor_owners: Vec<RuleMask>,
     overlay: RuleMask,
     context_safelist: RegexSet,
     value_safelist: RegexSet,
@@ -219,6 +220,17 @@ impl RuleMask {
 
     fn insert(&mut self, index: usize) {
         self.words[index / 64] |= 1u64 << (index % 64);
+    }
+
+    fn union(self, other: Self) -> Self {
+        let mut words = [0u64; Self::WORDS];
+        for (slot, (left, right)) in words
+            .iter_mut()
+            .zip(self.words.into_iter().zip(other.words))
+        {
+            *slot = left | right;
+        }
+        Self { words }
     }
 
     fn intersect(self, other: Self) -> Self {
@@ -336,8 +348,8 @@ impl RuleSet {
     pub fn preselect(&self, profile: ScanProfile, bytes: &[u8]) -> impl Iterator<Item = &Rule> {
         let mut anchored = RuleMask::default();
         for hit in self.anchors.find_overlapping_iter(bytes) {
-            if let Some(owner) = self.anchor_owners.get(hit.pattern().as_usize()) {
-                anchored.insert(*owner);
+            if let Some(owners) = self.anchor_owners.get(hit.pattern().as_usize()) {
+                anchored = anchored.union(*owners);
             }
         }
         let selected = match profile {
@@ -419,13 +431,24 @@ fn hash_safelists(hash: &mut Sha256, context: &[&str], value: &[&str]) {
     }
 }
 
-fn build_anchor_index(rules: &[Rule]) -> Result<(AhoCorasick, Vec<usize>), ConstructionError> {
-    let mut patterns = Vec::new();
-    let mut owners = Vec::new();
+/// Anchors are matched ASCII-case-insensitively, so spellings that differ only in
+/// case, and the same anchor declared by several rules, compile to one pattern
+/// whose owner mask names every declaring rule. An overlapping search reports
+/// each pattern separately at every position it ends, so on anchor-dense text
+/// the duplicate patterns cost more than the automaton walk itself.
+fn build_anchor_index(rules: &[Rule]) -> Result<(AhoCorasick, Vec<RuleMask>), ConstructionError> {
+    let mut patterns: Vec<Vec<u8>> = Vec::new();
+    let mut owners: Vec<RuleMask> = Vec::new();
+    let mut slots: std::collections::BTreeMap<Vec<u8>, usize> = std::collections::BTreeMap::new();
     for (index, rule) in rules.iter().enumerate() {
         for anchor in &rule.declaration.anchors {
-            patterns.push(anchor.as_bytes().to_vec());
-            owners.push(index);
+            let folded = anchor.to_ascii_lowercase().into_bytes();
+            let slot = *slots.entry(folded).or_insert_with(|| {
+                patterns.push(anchor.as_bytes().to_vec());
+                owners.push(RuleMask::default());
+                patterns.len() - 1
+            });
+            owners[slot].insert(index);
         }
     }
     let automaton = AhoCorasickBuilder::new()
