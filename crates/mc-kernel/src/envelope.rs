@@ -1389,6 +1389,45 @@ pub(super) fn load_object_state(
     .map_err(map_sqlite)
 }
 
+/// The states of every object named in `ids`, a JSON array of object ids,
+/// keyed by object id; ids the registry has never seen are absent.
+pub(super) fn load_object_states(
+    tx: &Transaction<'_>,
+    ids: &str,
+) -> Result<HashMap<String, ObjectState>, KernelError> {
+    let mut statement = tx
+        .prepare_cached(&format!(
+            "SELECT {OBJECT_ROW_COLUMNS},
+                    COALESCE(dec.scope_id,obs.scope_id),
+                    (SELECT MAX(commit_seq) FROM change_event c WHERE c.object_id=o.object_id),
+                    em.artifact_digest
+             FROM object_registry o
+             LEFT JOIN decisions dec ON dec.object_id=o.object_id
+             LEFT JOIN observations obs ON obs.object_id=o.object_id
+             LEFT JOIN evidence_meta em
+                    ON em.evidence_id=COALESCE(dec.evidence_id,obs.evidence_id)
+                   AND em.invalidated_commit_seq IS NULL
+             WHERE o.object_id IN (SELECT value FROM json_each(?1))"
+        ))
+        .map_err(map_sqlite)?;
+    let states = statement
+        .query_map([ids], |row| {
+            Ok(ObjectState {
+                object: object_row_from(row)?,
+                scope_id: row.get(10)?,
+                latest_change_commit_seq: row.get(11)?,
+                artifact_digest: row.get(12)?,
+            })
+        })
+        .map_err(map_sqlite)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(map_sqlite)?;
+    Ok(states
+        .into_iter()
+        .map(|state| (state.object.object_id.clone(), state))
+        .collect())
+}
+
 fn load_object(tx: &Transaction<'_>, object_id: &str) -> Result<Option<ObjectRow>, KernelError> {
     tx.query_row_cached(
         "SELECT object_id,object_kind,domain_id,source_kind,source_id,source_revision,
