@@ -4,7 +4,7 @@
 //! source and name, then indexed by a fixed 256-bit mask. Preselection is
 //! allocation-free after construction and preserves rule-vector order.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
 use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
@@ -439,7 +439,7 @@ fn hash_safelists(hash: &mut Sha256, context: &[&str], value: &[&str]) {
 fn build_anchor_index(rules: &[Rule]) -> Result<(AhoCorasick, Vec<RuleMask>), ConstructionError> {
     let mut patterns: Vec<Vec<u8>> = Vec::new();
     let mut owners: Vec<RuleMask> = Vec::new();
-    let mut slots: std::collections::BTreeMap<Vec<u8>, usize> = std::collections::BTreeMap::new();
+    let mut slots: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     for (index, rule) in rules.iter().enumerate() {
         for anchor in &rule.declaration.anchors {
             let folded = anchor.to_ascii_lowercase().into_bytes();
