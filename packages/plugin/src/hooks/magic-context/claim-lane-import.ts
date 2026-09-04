@@ -120,12 +120,15 @@ export function resetClaimLaneImportMarker(
 ): void {
     attemptedAt.delete(scheduleKey(projectPath, projectRoot));
     if (!hasMetaTable(db)) return;
-    db.prepare(
-        "INSERT INTO context_store_meta(key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
-    ).run(generationKey(projectPath, projectRoot));
-    db.prepare("DELETE FROM context_store_meta WHERE key = ?").run(
-        markerKey(projectPath, projectRoot),
-    );
+    // One transaction covers the generation bump and the marker delete: a crash between them would leave the stale marker in place and report the import done despite the reset. commentlint: allow(JUDGE)
+    db.transaction(() => {
+        db.prepare(
+            "INSERT INTO context_store_meta(key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+        ).run(generationKey(projectPath, projectRoot));
+        db.prepare("DELETE FROM context_store_meta WHERE key = ?").run(
+            markerKey(projectPath, projectRoot),
+        );
+    })();
 }
 
 /** `null` means the claim-lane projection could not publish a snapshot (the reader answered `stale`); the lane's contents are unknown, which is distinct from an empty lane. commentlint: allow(JUDGE) */

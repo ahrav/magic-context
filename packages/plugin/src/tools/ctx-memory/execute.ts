@@ -48,6 +48,10 @@ function normalizeLimit(limit: number | undefined): number {
 }
 
 function uniqueIds(ids: readonly string[] | undefined): string[] {
+    // The wrappers fall back to unvalidated raw arguments when schema parsing fails, so the check rejects non-string entries before `.trim()` throws a TypeError. commentlint: allow(JUDGE)
+    if (ids !== undefined && (!Array.isArray(ids) || ids.some((id) => typeof id !== "string"))) {
+        throw new ClaimOperationInputError("'objectIds' must be an array of strings");
+    }
     return [...new Set((ids ?? []).map((id) => id.trim()).filter((id) => id.length > 0))];
 }
 
@@ -217,6 +221,9 @@ function requireVisible(rows: readonly ReadRow[], targets: readonly string[]): R
 }
 
 function requireTarget(args: CtxMemoryArgs): string {
+    if (args.objectId !== undefined && typeof args.objectId !== "string") {
+        throw new ClaimOperationInputError("'objectId' must be a string");
+    }
     const objectId = args.objectId?.trim();
     if (!objectId) {
         throw new ClaimOperationInputError(

@@ -390,7 +390,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 ? await readHistorianMemoryBlock({
                       client: deps.kernelClient?.({
                           sessionId,
-                          projectRoot: resolveProjectRootDirectory(sessionDirectory ?? directory),
+                          projectRoot: resolveProjectRootDirectory(sessionDirectory || directory),
                       }),
                       sessionId,
                   })
@@ -637,7 +637,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         deps.onCompartmentStatePublished?.(sessionId);
 
         if (promotionIdentity && promotedRefs.length > 0) {
-            const promotionProjectRoot = resolveProjectRootDirectory(sessionDirectory ?? directory);
+            const promotionProjectRoot = resolveProjectRootDirectory(sessionDirectory || directory);
             await commitPromotedFactsToKernel({
                 client: deps.kernelClient?.({
                     sessionId,

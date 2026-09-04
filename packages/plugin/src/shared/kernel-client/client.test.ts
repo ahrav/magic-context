@@ -175,13 +175,24 @@ describe("KernelClient transport mapping", () => {
         }
     });
 
-    test("outcome_unknown on a read is daemon_absent with no reissue", async () => {
+    test("outcome_unknown on a read reissues once and serves the retried response", async () => {
         const transport = new FakeTransport().queue(
             new McHostCallError("outcome_unknown", "deadline", "request_deadline"),
+            readReply(1),
+        );
+        const result = await client(transport).read({ surface: "auto_inject" });
+        expect(isAvailable(result)).toBe(true);
+        expect(transport.calls).toHaveLength(2);
+    });
+
+    test("a second outcome_unknown on the same read is daemon_absent", async () => {
+        const transport = new FakeTransport().queue(
+            new McHostCallError("outcome_unknown", "deadline"),
+            new McHostCallError("outcome_unknown", "deadline"),
         );
         const result = await client(transport).read({ surface: "auto_inject" });
         expect(result.state).toEqual({ kind: "unavailable", reason: "daemon_absent" });
-        expect(transport.calls).toHaveLength(1);
+        expect(transport.calls).toHaveLength(2);
     });
 
     test("outcome_unknown on a write is reissued once with identical bytes", async () => {

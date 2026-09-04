@@ -160,7 +160,8 @@ export function sha256Hex(input: string | Uint8Array): string {
 }
 
 export function deriveRequestDigest(operations: readonly CommitOperation[]): string {
-    return sha256Hex(stableStringify(operations));
+    // The JSON round-trip drops explicitly-undefined keys so a spec built by spread and a spec that omits the field hash identically; `stableStringify` then fixes key order. commentlint: allow(JUDGE)
+    return sha256Hex(stableStringify(JSON.parse(JSON.stringify(operations))));
 }
 
 /** The key names only the stable operation identity — never the body, which travels in `request_digest`, and never the free-text `cause` — so a redelivered identity with different bytes hits the daemon's `operation_key_reused` rejection instead of committing as a second operation. commentlint: allow(JUDGE) */
@@ -352,7 +353,8 @@ export class KernelClient {
                 as_of: asOf,
                 gated: args.gated ?? false,
             }),
-            { signal: args.signal, deadline, reissuable: false },
+            // Reads have no side effects, so an ambiguous transport outcome reissues once instead of answering daemon_absent for a transient drop. commentlint: allow(JUDGE)
+            { signal: args.signal, deadline, reissuable: true },
             parseReadResponse,
         );
         if (isAvailable(result)) {
