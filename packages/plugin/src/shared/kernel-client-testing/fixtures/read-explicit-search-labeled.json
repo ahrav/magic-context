@@ -1,0 +1,39 @@
+{
+  "gated": false,
+  "known_as_of": 2,
+  "rows": [
+    {
+      "decision": {
+        "decision_kind": "memory",
+        "payload": {
+          "rationale": "because 1",
+          "summary": "decision 1"
+        }
+      },
+      "labeled": true,
+      "object": {
+        "created_commit_seq": 2,
+        "domain_id": "domain",
+        "invalidated_commit_seq": null,
+        "object_id": "decision-object-1",
+        "object_kind": "decision",
+        "sensitivity": "normal",
+        "source_id": "memory-lineage",
+        "source_kind": "assistant",
+        "source_revision": 1,
+        "superseded_by": null
+      },
+      "scope_id": "project:<digest>",
+      "token": {
+        "known_as_of": 2,
+        "object_id": "decision-object-1"
+      },
+      "visibility": "labeled"
+    }
+  ],
+  "state": {
+    "kind": "available"
+  },
+  "tip": 2,
+  "truncated": false
+}

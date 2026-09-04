@@ -46,18 +46,18 @@ import {
 	renderDecayedCompartments,
 } from "@magic-context/core/hooks/magic-context/decay-render";
 import {
-	DEFAULT_MEMORY_BUDGET_TOKENS,
 	DEFAULT_USER_PROFILE_BUDGET_TOKENS,
 	stripMemoryMuralBlock,
 	stripProjectMemoryBlock,
 	trimUserMemoriesToBudget,
 } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import {
+	budgetedMemoryRows,
+	DEFAULT_MEMORY_BUDGET_TOKENS,
 	memoryRowLocator,
 	memoryRows,
 	memorySnapshotKey,
 	renderKernelMemoryBlock,
-	trimKernelRowsToBudget,
 	withheldMemoryRowCount,
 } from "@magic-context/core/hooks/magic-context/kernel-memory-render";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
@@ -371,8 +371,8 @@ function memoryProjectPath(state: PiM0M1State): string | undefined {
 /** Rows the injector renders: only a session bound to a project has a kernel scope to read under. */
 function renderedMemoryRows(state: PiM0M1State): ReadRow[] {
 	return memoryProjectPath(state)
-		? trimKernelRowsToBudget(
-				memoryRows(state.memory),
+		? budgetedMemoryRows(
+				state.memory,
 				state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
 			)
 		: [];

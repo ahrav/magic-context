@@ -1,6 +1,7 @@
 //! Daemon-side kernel route proofs.
 
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1239,6 +1240,326 @@ async fn a_plugin_route_cannot_declare_a_class_above_the_derived_one() {
     daemon.handler.shutdown().await.unwrap();
 }
 
+// ---------------------------------------------------------------------------
+// Recorded replies. The TypeScript `FakeKernel` contract test replays each
+// fixture, so the in-memory fake is held to the bytes this route produces.
+// ---------------------------------------------------------------------------
+
+/// The directory the contract test loads fixtures from.
+const ROUTE_FIXTURE_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../packages/plugin/src/shared/kernel-client-testing/fixtures"
+);
+
+/// `scope_id` embeds the digest of a temporary root, so the fixture carries a
+/// placeholder in its place.
+const SCOPE_PLACEHOLDER: &str = "project:<digest>";
+
+/// Replaces every row's `scope_id` with the placeholder after checking it is
+/// `project:` plus the digest of the canonical root, the formula the fake
+/// reproduces.
+fn with_scope_placeholder(project: &Path, mut read: Value) -> Value {
+    // The binding hashes the canonical path's raw bytes.
+    let expected = {
+        use sha2::Digest as _;
+        let root = project.canonicalize().unwrap();
+        format!(
+            "project:{:x}",
+            sha2::Sha256::digest(root.as_os_str().as_bytes())
+        )
+    };
+    for row in read["rows"].as_array_mut().unwrap() {
+        assert_eq!(row["scope_id"], expected);
+        row["scope_id"] = json!(SCOPE_PLACEHOLDER);
+    }
+    read
+}
+
+/// Compares `actual` with the checked-in fixture, or rewrites the fixture when
+/// `UPDATE_KERNEL_ROUTE_FIXTURES=1`.
+fn assert_matches_route_fixture(actual: &Value, name: &str) {
+    let path = Path::new(ROUTE_FIXTURE_DIR).join(name);
+    let mut serialized = serde_json::to_string_pretty(actual).unwrap();
+    serialized.push('\n');
+    if std::env::var_os("UPDATE_KERNEL_ROUTE_FIXTURES").is_some_and(|value| value == "1") {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &serialized).unwrap();
+        return;
+    }
+    let recorded = fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "cannot read {}: {error}; regenerate it with \
+             UPDATE_KERNEL_ROUTE_FIXTURES=1 cargo test -p mc-module --test kernel_routes",
+            path.display()
+        )
+    });
+    let recorded: Value = serde_json::from_str(&recorded).unwrap();
+    assert_eq!(
+        actual,
+        &recorded,
+        "{} is out of date; regenerate it with \
+         UPDATE_KERNEL_ROUTE_FIXTURES=1 cargo test -p mc-module --test kernel_routes\n\
+         route reply:\n{serialized}",
+        path.display()
+    );
+}
+
+/// A plugin write is inference-class: the commit receipt names it, it serves
+/// labeled on `explicit_search`, and `auto_inject` serves nothing.
+#[tokio::test]
+async fn recorded_create_serves_labeled_on_explicit_search_and_absent_on_auto_inject() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let created = daemon
+        .commit("create", vec![insert_decision(1)], vec![])
+        .await;
+    assert_state(&created, "available", None);
+    assert_matches_route_fixture(&created, "commit-available-create.json");
+
+    let explicit = daemon.read("explicit_search", None).await;
+    assert_state(&explicit, "available", None);
+    assert_eq!(object_ids(&explicit), ["decision-object-1"]);
+    assert_eq!(explicit["rows"][0]["labeled"], true);
+    assert_matches_route_fixture(
+        &with_scope_placeholder(&daemon.project, explicit),
+        "read-explicit-search-labeled.json",
+    );
+
+    let injected = daemon.read("auto_inject", None).await;
+    assert_state(&injected, "available", None);
+    assert!(object_ids(&injected).is_empty());
+    assert_matches_route_fixture(&injected, "read-auto-inject-empty.json");
+    daemon.handler.shutdown().await.unwrap();
+}
+
+/// A commit refused before any work answers with the state alone: a token
+/// behind the object's last change, a supersede of an id the store never
+/// held, and a successor whose revision does not advance.
+#[tokio::test]
+async fn recorded_refusals_answer_with_the_state_alone() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let created = daemon
+        .commit("create", vec![insert_decision(1)], vec![])
+        .await;
+    let n = created["known_as_of"].as_i64().unwrap();
+    let changed = daemon
+        .commit(
+            "change",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": decision_spec(2)})],
+            vec![],
+        )
+        .await;
+    assert_state(&changed, "available", None);
+
+    let stale = daemon
+        .commit(
+            "stale",
+            vec![json!({"op": "retire_decision", "object_id": "decision-object-2"})],
+            vec![token("decision-object-2", n)],
+        )
+        .await;
+    assert_state(&stale, "conflict", Some("known_as_of_advanced"));
+    assert_matches_route_fixture(&stale, "commit-conflict-known-as-of-advanced.json");
+
+    let missing = daemon
+        .commit(
+            "supersede-missing",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "never-written", "spec": decision_spec(3)})],
+            vec![],
+        )
+        .await;
+    assert_state(&missing, "invalid", Some("not_found"));
+    assert_matches_route_fixture(&missing, "commit-invalid-not-found.json");
+
+    let mut same_revision = decision_spec(3);
+    same_revision["source_revision"] = json!(2);
+    let not_advanced = daemon
+        .commit(
+            "supersede-same-revision",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-2", "spec": same_revision})],
+            vec![],
+        )
+        .await;
+    assert_state(&not_advanced, "invalid", Some("revision_not_advanced"));
+    assert_matches_route_fixture(&not_advanced, "commit-invalid-revision-not-advanced.json");
+    daemon.handler.shutdown().await.unwrap();
+}
+
+/// A route bound to another project reads none of this project's rows.
+#[tokio::test]
+async fn recorded_cross_project_read_is_empty() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let created = daemon
+        .commit("create", vec![insert_decision(1)], vec![])
+        .await;
+    assert_state(&created, "available", None);
+    let (route_b, project_b) = daemon.bind_project("project-b").await;
+    let mut request_b = read_request(&project_b, "explicit_search", None);
+    request_b["session_id"] = json!("session-b");
+    let read_b = daemon.call(route_b, request_b).await;
+    assert_state(&read_b, "available", None);
+    assert!(object_ids(&read_b).is_empty());
+    assert_matches_route_fixture(&read_b, "read-cross-project-empty.json");
+    daemon.handler.shutdown().await.unwrap();
+}
+
+fn supersede_decision(replaced: i64, spec: Value) -> Value {
+    json!({
+        "op": "supersede_decision",
+        "replaced_object_id": format!("decision-object-{replaced}"),
+        "spec": spec,
+    })
+}
+
+/// Client `merge` creates the shared survivor from its first supersession and
+/// folds each later predecessor into it; `merged` names the survivor once.
+#[tokio::test]
+async fn recorded_client_shaped_merge_names_the_survivor_once() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let created = daemon
+        .commit(
+            "create",
+            vec![insert_decision(1), insert_decision(2), insert_decision(3)],
+            vec![],
+        )
+        .await;
+    assert_state(&created, "available", None);
+    let merged = daemon
+        .commit(
+            "merge",
+            vec![
+                supersede_decision(1, decision_spec(4)),
+                supersede_decision(2, decision_spec(4)),
+                supersede_decision(3, decision_spec(4)),
+            ],
+            vec![],
+        )
+        .await;
+    assert_state(&merged, "available", None);
+    assert_eq!(merged["merged"], json!(["decision-object-4"]));
+    assert_matches_route_fixture(&merged, "commit-available-merge.json");
+    let read = daemon.read("explicit_search", None).await;
+    assert_eq!(object_ids(&read), ["decision-object-4"]);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+/// A fold into a survivor labeled below the predecessor is refused.
+#[tokio::test]
+async fn recorded_fold_below_the_sensitivity_floor_is_admission_policy() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let mut guarded = decision_spec(1);
+    guarded["sensitivity"] = json!("sensitive");
+    let created = daemon
+        .commit(
+            "create",
+            vec![
+                json!({"op": "insert_decision", "spec": guarded}),
+                insert_decision(2),
+            ],
+            vec![],
+        )
+        .await;
+    assert_state(&created, "available", None);
+    let tip = daemon.tip();
+    let laundered = daemon
+        .commit(
+            "fold-down",
+            vec![supersede_decision(1, decision_spec(2))],
+            vec![],
+        )
+        .await;
+    assert_state(&laundered, "invalid", Some("admission_policy"));
+    assert_eq!(daemon.tip(), tip);
+    assert_matches_route_fixture(&laundered, "commit-invalid-admission-policy.json");
+    daemon.handler.shutdown().await.unwrap();
+}
+
+/// A replacement id this project retired is a duplicate write, not a fold.
+#[tokio::test]
+async fn recorded_supersede_into_a_retired_id_is_already_exists() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let created = daemon
+        .commit(
+            "create",
+            vec![insert_decision(1), insert_decision(2)],
+            vec![],
+        )
+        .await;
+    assert_state(&created, "available", None);
+    let retired = daemon
+        .commit(
+            "retire",
+            vec![json!({"op": "retire_decision", "object_id": "decision-object-2"})],
+            vec![],
+        )
+        .await;
+    assert_state(&retired, "available", None);
+    let tip = daemon.tip();
+    let duplicate = daemon
+        .commit(
+            "supersede-retired",
+            vec![supersede_decision(1, decision_spec(2))],
+            vec![],
+        )
+        .await;
+    assert_state(&duplicate, "invalid", Some("already_exists"));
+    assert_eq!(daemon.tip(), tip);
+    assert_matches_route_fixture(&duplicate, "commit-invalid-already-exists.json");
+    daemon.handler.shutdown().await.unwrap();
+}
+
+/// A body `project_root` other than the bound root is refused before any work.
+#[tokio::test]
+async fn recorded_body_project_root_mismatch_is_refused() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let tip = daemon.tip();
+    let elsewhere = daemon._data.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let response = daemon
+        .call(
+            daemon.route,
+            commit_request(&elsewhere, "foreign", vec![insert_decision(1)], vec![]),
+        )
+        .await;
+    assert_state(&response, "invalid", Some("project_mismatch"));
+    assert_eq!(daemon.tip(), tip);
+    assert_matches_route_fixture(&response, "commit-invalid-project-mismatch.json");
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[test]
+fn recorded_fixture_directory_holds_no_fixture_the_tests_do_not_record() {
+    let source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/kernel_routes.rs"
+    ))
+    .unwrap();
+    let mut recorded: Vec<&str> = source
+        .split("assert_matches_route_fixture(")
+        .skip(1)
+        .map(|rest| {
+            let start = rest.find('"').unwrap() + 1;
+            let end = start + rest[start..].find('"').unwrap();
+            &rest[start..end]
+        })
+        .filter(|name| name.ends_with(".json"))
+        .collect();
+    recorded.sort_unstable();
+    recorded.dedup();
+    let mut on_disk: Vec<String> = fs::read_dir(ROUTE_FIXTURE_DIR)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    on_disk.sort_unstable();
+    assert_eq!(on_disk, recorded);
+}
+
 #[tokio::test]
 async fn a_request_naming_another_project_root_is_refused_before_any_work() {
     let daemon = Daemon::start().await;
@@ -1268,6 +1589,178 @@ async fn a_request_naming_another_project_root_is_refused_before_any_work() {
         daemon.handler.dispatch_value_for_test(daemon.route, missing).await,
         PreparedOutcome::Error { code, .. } if code == "invalid_params"
     ));
+    daemon.handler.shutdown().await.unwrap();
+}
+
+/// `gated` defaults to `false`, so a request that misspells it would otherwise
+/// parse as an ungated read and serve rows the freshness gate should withhold.
+#[tokio::test]
+async fn a_read_with_an_unknown_key_is_refused_instead_of_served_ungated() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    daemon
+        .commit("create", vec![insert_decision(1)], vec![])
+        .await;
+    let mut misspelled = read_request(&daemon.project, "explicit_search", None);
+    let fields = misspelled.as_object_mut().unwrap();
+    fields.remove("gated");
+    fields.insert("gatd".to_string(), json!(true));
+    let outcome = daemon
+        .handler
+        .dispatch_value_for_test(daemon.route, misspelled)
+        .await;
+    assert!(
+        matches!(
+            &outcome,
+            PreparedOutcome::Error { code, message }
+                if code == "invalid_params" && message.contains("gatd")
+        ),
+        "{outcome:?}"
+    );
+    // The transport envelope itself is not an unknown key.
+    let read = daemon.read("explicit_search", None).await;
+    assert_state(&read, "available", None);
+    assert_eq!(read["rows"].as_array().unwrap().len(), 1);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_read_of_an_unknown_surface_answers_invalid_input() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let read = daemon.read("auto_everything", None).await;
+    assert_state(&read, "invalid", Some("invalid_input"));
+    assert!(read.get("rows").is_none(), "{read}");
+    daemon.handler.shutdown().await.unwrap();
+}
+
+/// A successor cannot lower its predecessor's sensitivity by omitting the field or naming a weaker label.
+#[tokio::test]
+async fn a_successor_inherits_its_predecessors_sensitivity() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let mut guarded = decision_spec(1);
+    guarded["sensitivity"] = json!("sensitive");
+    let created = daemon
+        .commit(
+            "create",
+            vec![json!({"op": "insert_decision", "spec": guarded})],
+            vec![],
+        )
+        .await;
+    assert_state(&created, "available", None);
+
+    // The supersession omits `sensitivity`; the replacement stays sensitive.
+    let superseded = daemon
+        .commit(
+            "supersede",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": decision_spec(2)})],
+            vec![],
+        )
+        .await;
+    assert_state(&superseded, "available", None);
+    let read = daemon.read("explicit_search", None).await;
+    assert_eq!(object_ids(&read), ["decision-object-2"]);
+    assert_eq!(read["rows"][0]["object"]["sensitivity"], json!("sensitive"));
+
+    // An explicit `normal` on the next revision is lifted back to the floor.
+    let mut relaxed = decision_spec(3);
+    relaxed["sensitivity"] = json!("normal");
+    let relabeled = daemon
+        .commit(
+            "relabel",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-2", "spec": relaxed})],
+            vec![],
+        )
+        .await;
+    assert_state(&relabeled, "available", None);
+    let read = daemon.read("explicit_search", None).await;
+    assert_eq!(object_ids(&read), ["decision-object-3"]);
+    assert_eq!(read["rows"][0]["object"]["sensitivity"], json!("sensitive"));
+
+    // Raising the label is still the successor's call.
+    let mut secret = decision_spec(4);
+    secret["sensitivity"] = json!("secret");
+    let raised = daemon
+        .commit(
+            "raise",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-3", "spec": secret})],
+            vec![],
+        )
+        .await;
+    assert_state(&raised, "available", None);
+    assert!(object_ids(&daemon.read("explicit_search", None).await).is_empty());
+    daemon.handler.shutdown().await.unwrap();
+}
+
+/// A fold keeps the survivor's stored label, so a sensitive predecessor may
+/// only fold into a survivor labeled at least as strictly.
+#[tokio::test]
+async fn a_fold_into_a_less_restrictive_survivor_is_refused() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let mut guarded = decision_spec(1);
+    guarded["sensitivity"] = json!("sensitive");
+    let mut guarded_survivor = decision_spec(3);
+    guarded_survivor["sensitivity"] = json!("sensitive");
+    let created = daemon
+        .commit(
+            "create",
+            vec![
+                json!({"op": "insert_decision", "spec": guarded}),
+                insert_decision(2),
+                json!({"op": "insert_decision", "spec": guarded_survivor}),
+            ],
+            vec![],
+        )
+        .await;
+    assert_state(&created, "available", None);
+    let tip = daemon.tip();
+
+    let laundered = daemon
+        .commit(
+            "fold-down",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": decision_spec(2)})],
+            vec![],
+        )
+        .await;
+    assert_state(&laundered, "invalid", Some("admission_policy"));
+    assert_eq!(daemon.tip(), tip);
+
+    let folded = daemon
+        .commit(
+            "fold-level",
+            vec![json!({"op": "supersede_decision", "replaced_object_id": "decision-object-1", "spec": decision_spec(3)})],
+            vec![],
+        )
+        .await;
+    assert_state(&folded, "available", None);
+    assert_eq!(folded["merged"], json!(["decision-object-3"]));
+    let read = daemon.read("explicit_search", None).await;
+    assert_eq!(
+        object_ids(&read),
+        ["decision-object-2", "decision-object-3"]
+    );
+    daemon.handler.shutdown().await.unwrap();
+}
+
+/// The route-owned domain that holds project scopes is not writable by
+/// callers.
+#[tokio::test]
+async fn a_caller_cannot_write_into_the_project_scopes_domain() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let mut squatting = decision_spec(1);
+    squatting["domain_id"] = json!("project-scopes");
+    let refused = daemon
+        .commit(
+            "squat",
+            vec![json!({"op": "insert_decision", "spec": squatting})],
+            vec![],
+        )
+        .await;
+    assert_state(&refused, "invalid", Some("invalid_input"));
+    assert!(object_ids(&daemon.read("explicit_search", None).await).is_empty());
     daemon.handler.shutdown().await.unwrap();
 }
 

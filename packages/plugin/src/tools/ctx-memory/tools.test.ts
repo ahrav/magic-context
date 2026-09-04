@@ -1,9 +1,13 @@
 import { describe, expect, setSystemTime, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import { DREAMER_AGENT } from "../../agents/dreamer";
 import { KernelClient, TokenCache } from "../../shared/kernel-client";
 import { FakeKernel, FakeKernelTransport } from "../../shared/kernel-client-testing/fake-kernel";
+import {
+    bundleModuleGraph,
+    reachableModules,
+} from "../../shared/kernel-client-testing/module-graph";
 import { createCtxMemoryTools } from "./tools";
 
 const PROJECT = "git:kernel-opencode";
@@ -75,6 +79,13 @@ describe("ctx_memory without a daemon", () => {
         expect(text).toBe("Error: Memory is unavailable because the daemon is not running.");
         expect(text.toLowerCase()).not.toContain("retry");
         expect(tool.transport.calls).toHaveLength(0);
+    });
+
+    test("the tool holds no database handle and its module graph reaches no claim storage", async () => {
+        const graph = await bundleModuleGraph(resolve(import.meta.dir, "tools.ts"));
+        expect(graph.inputs.length).toBeGreaterThan(0);
+        expect(reachableModules(graph, /storage-claim/)).toEqual([]);
+        expect(reachableModules(graph, /memory\/storage-memory/)).toEqual([]);
     });
 
     test("a disabled client answers with the disabled text", async () => {
@@ -1185,38 +1196,42 @@ describe("ctx_memory human authority", () => {
     });
 });
 
-/** Every OpenCode file on the memory path; the text bans below scan this list. */
-export const OPENCODE_MEMORY_PATH_FILES = [
-    "tools/ctx-memory/tools.ts",
-    "tools/ctx-memory/types.ts",
-    "tools/ctx-memory/constants.ts",
-    "tools/ctx-memory/write-shape.ts",
-    "tools/ctx-search/tools.ts",
-    "hooks/magic-context/kernel-transport.ts",
-    "hooks/magic-context/kernel-memory-render.ts",
-    "hooks/magic-context/inject-compartments.ts",
-    "hooks/magic-context/transform.ts",
-    "hooks/magic-context/transform-compartment-phase.ts",
-    "hooks/magic-context/m0-token-breakdown.ts",
-    "hooks/magic-context/auto-search-runner.ts",
-    "plugin/rpc-handlers.ts",
-    "plugin/tool-registry.ts",
-];
+const PLUGIN_ROOT = resolve(import.meta.dir, "../../..");
+const PI_ROOT = resolve(PLUGIN_ROOT, "../pi-plugin");
+
+interface BiomeOverride {
+    includes?: string[];
+    linter?: { rules?: { style?: { noRestrictedImports?: { options?: unknown } } } };
+}
+
+/** Expands the claim-import ban's `biome.json` globs so this scan and the lint rule cover the same files. */
+function memoryPathFiles(packageRoot: string): string[] {
+    const biome = JSON.parse(readFileSync(resolve(packageRoot, "biome.json"), "utf8")) as {
+        overrides?: BiomeOverride[];
+    };
+    const override = (biome.overrides ?? []).find((candidate) =>
+        JSON.stringify(candidate.linter?.rules?.style?.noRestrictedImports?.options ?? {}).includes(
+            "storage-claim",
+        ),
+    );
+    if (!override?.includes)
+        throw new Error(`${packageRoot}/biome.json has no memory-path override`);
+    const files = new Set<string>();
+    for (const pattern of override.includes) {
+        if (pattern.startsWith("!")) continue;
+        for (const match of new Bun.Glob(pattern).scanSync({ cwd: packageRoot })) {
+            if (match.endsWith(".test.ts")) continue;
+            files.add(relative(resolve(packageRoot, "src"), resolve(packageRoot, match)));
+        }
+    }
+    return [...files].sort();
+}
+
+/** Every OpenCode file on the memory path, relative to `packages/plugin/src`; the text bans below scan this list. */
+export const OPENCODE_MEMORY_PATH_FILES = memoryPathFiles(PLUGIN_ROOT);
 
 /** Every Pi file on the memory path, relative to `packages/pi-plugin/src`; the same bans scan it. */
-export const PI_MEMORY_PATH_FILES = [
-    "tools/ctx-memory.ts",
-    "tools/ctx-search.ts",
-    "tools/index.ts",
-    "kernel-client-pi.ts",
-    "inject-compartments-pi.ts",
-    "context-handler.ts",
-    "auto-search-pi.ts",
-    "dialogs/status-dialog.ts",
-    "commands/ctx-status.ts",
-    "clone-inheritance.ts",
-    "pi-historian-runner.ts",
-];
+export const PI_MEMORY_PATH_FILES = memoryPathFiles(PI_ROOT);
 
 const TEXT_BANS = ["claim.intent", "authorityState", "rustToolBackends.memory"];
 
@@ -1240,6 +1255,36 @@ function scanForBans(
 }
 
 describe("ctx_memory memory path text bans", () => {
+    test("the biome overrides name the tool, transport, renderer, and injector on both harnesses", () => {
+        expect(OPENCODE_MEMORY_PATH_FILES).toEqual(
+            expect.arrayContaining([
+                "tools/ctx-memory/tools.ts",
+                "tools/ctx-memory/execute.ts",
+                "tools/ctx-search/tools.ts",
+                "features/magic-context/search.ts",
+                "hooks/magic-context/kernel-transport.ts",
+                "hooks/magic-context/kernel-memory-render.ts",
+                "hooks/magic-context/kernel-claim-usage.ts",
+                "hooks/magic-context/inject-compartments.ts",
+                "hooks/magic-context/transform.ts",
+                "hooks/magic-context/compartment-runner-incremental.ts",
+                "plugin/rpc-handlers.ts",
+                "plugin/tool-registry.ts",
+            ]),
+        );
+        expect(OPENCODE_MEMORY_PATH_FILES).not.toContain("tools/ctx-memory/tools.test.ts");
+        expect(PI_MEMORY_PATH_FILES).toEqual(
+            expect.arrayContaining([
+                "tools/ctx-memory.ts",
+                "tools/ctx-search.ts",
+                "kernel-client-pi.ts",
+                "inject-compartments-pi.ts",
+                "context-handler.ts",
+                "pi-historian-runner.ts",
+            ]),
+        );
+    });
+
     test("no memory-path file names the claim lane, authority state, or the Rust memory backend", () => {
         const sources = new Map<string, string>();
         for (const file of OPENCODE_MEMORY_PATH_FILES) {

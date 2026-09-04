@@ -118,6 +118,7 @@ fn identity_bytes(root: &Path) -> std::borrow::Cow<'_, [u8]> {
 /// A commit intent as the wire carries it; `kernel.commit` and artifact
 /// ingestion accept the same shape.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct IntentRequest {
     pub(crate) producer: String,
     pub(crate) operation_key: String,

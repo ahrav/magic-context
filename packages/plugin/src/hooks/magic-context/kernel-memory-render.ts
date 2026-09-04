@@ -37,6 +37,9 @@ export const MEMORY_READ_SURFACE = "explicit_search";
 /** The host waits at most this long for a memory read before the model call. */
 export const INJECTION_READ_DEADLINE_MS = 3_000;
 
+/** Token budget for the rendered memory block when the host names none. */
+export const DEFAULT_MEMORY_BUDGET_TOKENS = 8_000;
+
 /** The snapshot an injector renders when no client can be reached at all. */
 export function daemonAbsentSnapshot(): KernelMemorySnapshot {
     return { state: unavailable("daemon_absent"), rows: [], knownAsOf: null };
@@ -91,10 +94,14 @@ export function withholdLaggingMemory(snapshot: KernelMemorySnapshot): KernelMem
 /**
  * The historian deduplicates against the block the model saw; a non-`available`
  * read — including a gated read's `stale` answer — yields no baseline.
+ *
+ * `budgetTokens` bounds the rendered rows; the caller derives it from the
+ * historian model's window so the baseline and the raw chunk fit together.
  */
 export async function readHistorianMemoryBlock(args: {
     client: KernelClient | undefined;
     sessionId: string;
+    budgetTokens: number;
 }): Promise<string> {
     if (!args.client) return "";
     const read = await args.client.read({
@@ -110,14 +117,26 @@ export async function readHistorianMemoryBlock(args: {
         return "";
     }
     const snapshot = withoutSensitiveRows(kernelMemorySnapshotFrom(read));
-    const rows = memoryRows(snapshot);
     return renderKernelMemoryBlock(
-        rows,
+        budgetedMemoryRows(snapshot, args.budgetTokens),
         read.state,
-        rows.length,
+        memoryRows(snapshot).length,
         snapshot.truncated === true,
         withheldMemoryRowCount(snapshot),
     );
+}
+
+/**
+ * Rows a surface renders from a snapshot, trimmed to `budgetTokens`. Only an
+ * `available` snapshot renders rows: the client attaches none to any other
+ * state, and a renderer handed rows anyway must still show the marker alone.
+ */
+export function budgetedMemoryRows(
+    snapshot: KernelMemorySnapshot,
+    budgetTokens: number,
+): ReadRow[] {
+    if (snapshot.state.kind !== "available") return [];
+    return trimKernelRowsToBudget(memoryRows(snapshot), budgetTokens);
 }
 
 /** Excludes the store-wide `known_as_of`, which every commit to any project advances; a changed key rematerializes m[0] and the prompt prefix. The truncation flag keys because it changes the zero-row marker. commentlint: allow(JUDGE) */

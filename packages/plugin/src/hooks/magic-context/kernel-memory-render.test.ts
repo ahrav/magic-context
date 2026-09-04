@@ -19,6 +19,8 @@ import {
 } from "./kernel-memory-render";
 
 const SESSION = "ses-kernel-render";
+/** Half of the smallest historian chunk: what a 16k-window historian gets. */
+const BASELINE_BUDGET = 4_000;
 const PROJECT = "git:kernel-render";
 
 /** A kernel client over an in-memory fake; the resolver shape matches the transform's. */
@@ -127,9 +129,40 @@ describe("sensitivity filtering on automatic surfaces", () => {
 
     test("the historian baseline excludes sensitive rows while normal rows pass", async () => {
         const { client } = kernelHarness(seededKernel(seeds));
-        const block = await readHistorianMemoryBlock({ client, sessionId: SESSION });
+        const block = await readHistorianMemoryBlock({
+            client,
+            sessionId: SESSION,
+            budgetTokens: BASELINE_BUDGET,
+        });
         expect(block).toContain("a normal memory");
         expect(block).not.toContain("a sensitive memory");
+    });
+});
+
+describe("historian baseline budget", () => {
+    test("the baseline is trimmed to the caller's budget", async () => {
+        // Each summary is ~600 tokens; 40 of them exceed a 4k baseline budget.
+        const filler = "budget ".repeat(600);
+        const kernel = seededKernel(
+            Array.from({ length: 40 }, (_, index) => ({
+                id: String.fromCharCode(97 + (index % 26)) + String(index),
+                summary: `memory ${index} ${filler}`,
+            })),
+        );
+        const { client } = kernelHarness(kernel);
+        const block = await readHistorianMemoryBlock({
+            client,
+            sessionId: SESSION,
+            budgetTokens: BASELINE_BUDGET,
+        });
+        const rendered = block.split("\n").filter((line) => line.startsWith("mem_")).length;
+        const expected = trimKernelRowsToBudget(
+            memoryRows(kernel.snapshot()),
+            BASELINE_BUDGET,
+        ).length;
+        expect(expected).toBeGreaterThan(0);
+        expect(expected).toBeLessThan(40);
+        expect(rendered).toBe(expected);
     });
 });
 
@@ -170,7 +203,11 @@ describe("anti-memory fence on automatic surfaces", () => {
 
     test("the historian baseline omits anti-memory rows", async () => {
         const { client } = kernelHarness(kernelWithAntiMemory());
-        const block = await readHistorianMemoryBlock({ client, sessionId: SESSION });
+        const block = await readHistorianMemoryBlock({
+            client,
+            sessionId: SESSION,
+            budgetTokens: BASELINE_BUDGET,
+        });
         expect(block).toContain("a positive memory");
         expect(block).not.toContain("unbounded retry loop");
     });
@@ -210,7 +247,11 @@ describe("serving-policy gating on automatic reads", () => {
             oldest_unconsumed_age_ms: 60_000,
         });
         const { client, transport } = kernelHarness(kernel);
-        const block = await readHistorianMemoryBlock({ client, sessionId: SESSION });
+        const block = await readHistorianMemoryBlock({
+            client,
+            sessionId: SESSION,
+            budgetTokens: BASELINE_BUDGET,
+        });
         expect(transport.calls[0]?.body).toMatchObject({ gated: true });
         expect(block).toBe("");
     });

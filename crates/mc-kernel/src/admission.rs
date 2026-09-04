@@ -1110,7 +1110,21 @@ impl Envelope<'_> {
         replacement: DecisionSpec,
     ) -> Result<DecisionWriteOutcome, KernelError> {
         let facts = load_subject_facts(self, replaced_object_id)?;
-        if load_prior_decision(self, &facts)?.is_some_and(|stored| {
+        self.refuse_barred_lineage(&facts)?;
+        // A live replacement is a fold target, so a barred survivor is refused before correction.
+        if self
+            .object_state(&replacement.object_id)?
+            .is_some_and(|state| state.object.invalidated_commit_seq.is_none())
+        {
+            let survivor = load_subject_facts(self, &replacement.object_id)?;
+            self.refuse_barred_lineage(&survivor)?;
+        }
+        self.correct_decision(replaced_object_id, replacement)
+    }
+
+    /// A lineage barred by its latest admission decision cannot be corrected or folded.
+    fn refuse_barred_lineage(&self, facts: &SubjectFacts) -> Result<(), KernelError> {
+        if load_prior_decision(self, facts)?.is_some_and(|stored| {
             matches!(
                 stored.decision.disposition,
                 Disposition::Quarantined | Disposition::Rejected | Disposition::Contradicted
@@ -1118,7 +1132,7 @@ impl Envelope<'_> {
         }) {
             return Err(KernelError::AdmissionPolicy);
         }
-        self.correct_decision(replaced_object_id, replacement)
+        Ok(())
     }
 
     pub fn revoke_approval(

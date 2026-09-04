@@ -227,6 +227,13 @@ describe("KernelClient transport mapping", () => {
         expect(JSON.stringify(bodies[0])).toBe(JSON.stringify(bodies[1]));
     });
 
+    test("an already-expired deadline is cancelled before any transport call", async () => {
+        const transport = new FakeTransport().queue(commitReply(5, false, "decision-object-1"));
+        const result = await client(transport).create(spec, { ...intent, deadlineMs: 0 });
+        expect(result.state).toEqual({ kind: "cancelled" });
+        expect(transport.calls).toHaveLength(0);
+    });
+
     test("a second outcome_unknown on the same write stays ambiguous", async () => {
         const transport = new FakeTransport().queue(
             new McHostCallError("outcome_unknown", "deadline"),

@@ -8,6 +8,7 @@
  * Historian chunks scale with the historian model because historian is constrained by its own context.
  */
 
+import { MAX_MEMORY_INJECTION_BUDGET_TOKENS } from "../../config/schema/magic-context";
 import { getSdkContextLimit } from "../../shared/models-dev-cache";
 
 const TRIGGER_BUDGET_PERCENTAGE = 0.05;
@@ -49,6 +50,23 @@ export function deriveHistorianChunkTokens(historianContextLimit: number): numbe
     }
     const derived = Math.round(historianContextLimit * HISTORIAN_CHUNK_PERCENTAGE);
     return Math.max(HISTORIAN_CHUNK_MIN, Math.min(HISTORIAN_CHUNK_MAX, derived));
+}
+
+/**
+ * The historian's project-memory baseline is trimmed to this budget.
+ *
+ * The chunk is one quarter of the historian's window, so half a chunk keeps
+ * the baseline to one eighth and leaves the rest for instructions, reference
+ * blocks, and the model's answer. The configurable injection maximum caps it
+ * so the baseline never exceeds what any session's injector could have shown.
+ *
+ * @param historianChunkTokens Budget from `deriveHistorianChunkTokens`.
+ */
+export function deriveHistorianMemoryTokens(historianChunkTokens: number): number {
+    if (!Number.isFinite(historianChunkTokens) || historianChunkTokens <= 0) {
+        return 0;
+    }
+    return Math.min(MAX_MEMORY_INJECTION_BUDGET_TOKENS, Math.floor(historianChunkTokens / 2));
 }
 
 /**

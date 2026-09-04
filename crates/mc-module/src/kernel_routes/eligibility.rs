@@ -48,12 +48,14 @@ pub enum Verdict {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BatchRequest {
     destination: String,
     candidates: Vec<Candidate>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Candidate {
     object_id: String,
     source_revision: i64,
@@ -375,17 +377,12 @@ impl McHandler {
     pub(crate) async fn handle_kernel_eligibility_batch(
         &self,
         channel: RouteHandle,
-        request: &Value,
+        request: Value,
     ) -> PreparedOutcome {
-        let scope = match self.kernel_route_scope(channel, request, OPERATION) {
-            Ok(scope) => scope,
+        let (scope, parsed) = match self.kernel_request::<BatchRequest>(channel, request, OPERATION)
+        {
+            Ok(bound) => bound,
             Err(outcome) => return outcome,
-        };
-        let parsed = match BatchRequest::deserialize(request) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                return crate::invalid_params_error(format!("invalid {OPERATION}: {error}"))
-            }
         };
         let Some(destination) = parse_destination(&parsed.destination) else {
             return crate::invalid_params_error(format!(

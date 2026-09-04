@@ -3533,6 +3533,10 @@ impl McHandler {
                     .policy
                     .lock()
                     .expect("store open policy mutex");
+                // Only SQLite hosts a kernel; the flag is set before the open
+                // so health never reads a kernel this deployment lacks as
+                // still opening.
+                kernel.set_expected(matches!(descriptor.backend, StorageBackend::Sqlite { .. }));
                 let opened =
                     Self::run_store_open(store, task_coordinator, &descriptor, cancel.clone())
                         .await;
@@ -11798,7 +11802,7 @@ impl CompositeComponent for McHandler {
         // A sampler that stopped publishing must not leave its last `Ready`
         // block standing, so an old sample reads as unavailable.
         let (kernel, stale) = self.kernel.health_block().reported();
-        if storage_state == "ready" && kernel.degrades_health() {
+        if storage_state == "ready" && self.kernel.health_degrades(&kernel) {
             report.status = HealthStatus::Degraded;
             let reason = match kernel.kernel_state {
                 _ if stale => "kernel health sample is stale",
@@ -12148,21 +12152,20 @@ impl McHandler {
                 "session.status" => self.handle_session_status_value(channel, &request),
                 "session.delete" => self.handle_session_delete_value(channel, &request),
                 "session.wrapup" => self.handle_session_wrapup_value(channel, &request).await,
-                "kernel.read" => self.handle_kernel_read(channel, &request).await,
-                "kernel.commit" => self.handle_kernel_commit(channel, &request).await,
+                "kernel.read" => self.handle_kernel_read(channel, request).await,
+                "kernel.commit" => self.handle_kernel_commit(channel, request).await,
                 "kernel.eligibility.batch" => {
-                    self.handle_kernel_eligibility_batch(channel, &request)
-                        .await
+                    self.handle_kernel_eligibility_batch(channel, request).await
                 }
-                "kernel.egress.decide" => self.handle_kernel_egress_decide(channel, &request).await,
+                "kernel.egress.decide" => self.handle_kernel_egress_decide(channel, request).await,
                 "kernel.artifact.ingest.begin" => {
-                    self.handle_kernel_ingest_begin(channel, &request).await
+                    self.handle_kernel_ingest_begin(channel, request).await
                 }
                 "kernel.artifact.ingest.page" => {
                     self.handle_kernel_ingest_page(channel, request).await
                 }
                 "kernel.artifact.ingest.finish" => {
-                    self.handle_kernel_ingest_finish(channel, &request).await
+                    self.handle_kernel_ingest_finish(channel, request).await
                 }
                 // The handler echoes only explicit wire-debugging requests.
                 // Unknown request bodies must fail so misrouted callers cannot mistake an echo for success.

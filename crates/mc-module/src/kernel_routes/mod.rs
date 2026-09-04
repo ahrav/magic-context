@@ -22,6 +22,7 @@ use std::time::Instant;
 
 use mc_host::RouteHandle;
 use mc_kernel::{KernelError, KernelStore};
+use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -133,6 +134,10 @@ pub(crate) struct KernelOpenCoordinator {
     /// against, so they are dropped whenever the slot changes hands.
     uploads: Mutex<ingest::UploadCoordinator>,
     background_sampler: AtomicBool,
+    /// Whether the deployment provisions a kernel at all. A backend that
+    /// cannot host one reports `unavailable` on the routes without pulling
+    /// daemon health down, since nothing is missing that was promised.
+    expected: AtomicBool,
 }
 
 impl KernelOpenCoordinator {
@@ -144,7 +149,18 @@ impl KernelOpenCoordinator {
             eligibility_cache: Mutex::new(eligibility::VerdictCache::default()),
             uploads: Mutex::new(ingest::UploadCoordinator::default()),
             background_sampler: AtomicBool::new(true),
+            expected: AtomicBool::new(true),
         }
+    }
+
+    pub(crate) fn set_expected(&self, expected: bool) {
+        self.expected.store(expected, Ordering::Release);
+    }
+
+    /// Whether `block` downgrades the daemon's health status; never for a
+    /// deployment that does not provision a kernel.
+    pub(crate) fn health_degrades(&self, block: &health::KernelHealthBlock) -> bool {
+        self.expected.load(Ordering::Acquire) && block.degrades_health()
     }
 
     pub(crate) fn uploads(&self) -> std::sync::MutexGuard<'_, ingest::UploadCoordinator> {
@@ -335,10 +351,16 @@ fn open_failure_kind(error: KernelError) -> UnavailableKind {
     }
 }
 
+/// A worker panic is reported as a failed open rather than re-raised: the
+/// open task owns the phase transition, and a panic would end it while the
+/// phase still reads `Starting`. commentlint: allow(JUDGE)
 async fn open_once(root: PathBuf) -> Result<KernelStore, KernelError> {
     match tokio::task::spawn_blocking(move || KernelStore::open(&root)).await {
         Ok(result) => result,
-        Err(error) => panic!("kernel store open worker failed: {error}"),
+        Err(error) => {
+            eprintln!("mc-module: kernel store open worker failed: {error}");
+            Err(KernelError::Fault)
+        }
     }
 }
 
@@ -401,6 +423,38 @@ impl McHandler {
         let store = self.kernel.kernel_store().map_err(state_only)?;
         Ok(RouteScope { store, project })
     }
+
+    /// Binds the route scope, then parses the request body with the transport
+    /// envelope removed. Request structs deny unknown fields, so a misspelled
+    /// key is refused instead of falling back to a field default.
+    pub(crate) fn kernel_request<T: DeserializeOwned>(
+        &self,
+        channel: RouteHandle,
+        request: Value,
+        operation: &str,
+    ) -> Result<(RouteScope, T), PreparedOutcome> {
+        let scope = self.kernel_route_scope(channel, &request, operation)?;
+        let parsed = parse_request_body(request, operation)?;
+        Ok((scope, parsed))
+    }
+}
+
+/// Keys the transport adds around every `kernel.*` body. They are removed
+/// before the body is parsed so `deny_unknown_fields` judges only the route's
+/// own fields.
+const ENVELOPE_KEYS: [&str; 5] = ["method", "kind", "v", "session_id", "project_root"];
+
+pub(crate) fn parse_request_body<T: DeserializeOwned>(
+    mut request: Value,
+    operation: &str,
+) -> Result<T, PreparedOutcome> {
+    if let Some(fields) = request.as_object_mut() {
+        for key in ENVELOPE_KEYS {
+            fields.remove(key);
+        }
+    }
+    serde_json::from_value::<T>(request)
+        .map_err(|error| crate::invalid_params_error(format!("invalid {operation}: {error}")))
 }
 
 /// Runs kernel work off the async workers; a panic inside the store closure is
@@ -556,5 +610,20 @@ mod tests {
         for error in unsupported {
             assert!(KernelError::ALL.contains(&error), "{error:?} not in ALL");
         }
+    }
+
+    #[test]
+    fn an_unexpected_kernel_reports_unavailable_without_degrading_health() {
+        let coordinator = KernelOpenCoordinator::new();
+        coordinator.mark_unavailable(UnavailableKind::Unsupported);
+        let block = coordinator.health_block().reported().0;
+        assert_eq!(block.kernel_state, KernelState::Unavailable);
+        assert!(coordinator.health_degrades(&block));
+
+        coordinator.set_expected(false);
+        let block = coordinator.health_block().reported().0;
+        assert_eq!(block.kernel_state, KernelState::Unavailable);
+        assert!(!coordinator.health_degrades(&block));
+        assert!(coordinator.kernel_store().is_err());
     }
 }

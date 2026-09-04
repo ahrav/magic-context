@@ -72,6 +72,55 @@ describe("FakeKernel commit prevalidation", () => {
         expect(kernel.objects.get("mem_b")?.superseded_by).toBe("mem_survivor");
         expect(kernel.objects.get("mem_survivor")?.invalidated_commit_seq).toBeNull();
     });
+
+    it("answers not_found for a replacement id another project holds", () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: "mem_a",
+            decision_kind: "ARCHITECTURE",
+            summary: "ours",
+            projectRoot: "/repo",
+        });
+        kernel.seedDecision({
+            object_id: "mem_theirs",
+            decision_kind: "ARCHITECTURE",
+            summary: "theirs",
+            projectRoot: "/elsewhere",
+        });
+        const reply = kernel.reply(
+            commitCall([
+                {
+                    op: "supersede_decision",
+                    replaced_object_id: "mem_a",
+                    spec: decisionSpec("mem_theirs"),
+                },
+            ]),
+        );
+        expect(reply).toEqual({ state: { kind: "invalid", reason: "not_found" } });
+        expect(kernel.objects.get("mem_a")?.invalidated_commit_seq).toBeNull();
+    });
+
+    it("floors a non-fold successor's sensitivity at its predecessor's", () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: "mem_a",
+            decision_kind: "ARCHITECTURE",
+            summary: "guarded",
+            sensitivity: "sensitive",
+        });
+        const reply = kernel.reply(
+            commitCall([
+                {
+                    op: "supersede_decision",
+                    replaced_object_id: "mem_a",
+                    spec: { ...decisionSpec("mem_b"), sensitivity: "normal" },
+                },
+            ]),
+        ) as { state: { kind: string }; merged: string[] };
+        expect(reply.state).toEqual({ kind: "available" });
+        expect(reply.merged).toEqual([]);
+        expect(kernel.objects.get("mem_b")?.sensitivity).toBe("sensitive");
+    });
 });
 
 function readCall(body: Record<string, unknown>): KernelTransportCall {

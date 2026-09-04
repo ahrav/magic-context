@@ -1,0 +1,31 @@
+{
+  "known_as_of": 3,
+  "merged": [
+    "decision-object-4"
+  ],
+  "receipt": {
+    "commit_seq": 3,
+    "replayed": false
+  },
+  "state": {
+    "kind": "available"
+  },
+  "tokens": [
+    {
+      "known_as_of": 3,
+      "object_id": "decision-object-1"
+    },
+    {
+      "known_as_of": 3,
+      "object_id": "decision-object-2"
+    },
+    {
+      "known_as_of": 3,
+      "object_id": "decision-object-3"
+    },
+    {
+      "known_as_of": 3,
+      "object_id": "decision-object-4"
+    }
+  ]
+}

@@ -15,6 +15,8 @@ export const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE = 65;
 export const EXECUTE_THRESHOLD_CAP_MESSAGE =
     "execute_threshold is capped at 90% for cache safety: output capacity is reserved from the usable context window, and the remaining 10% absorbs mid-turn growth before the absolute 95% emergency wall. Use a value between 20 and 90.";
 export const DEFAULT_HISTORIAN_TIMEOUT_MS = 300_000;
+/** Upper bound a session may configure for `memory.injection_budget_tokens`. */
+export const MAX_MEMORY_INJECTION_BUDGET_TOKENS = 20_000;
 export const DEFAULT_HISTORY_BUDGET_PERCENTAGE = 0.15;
 
 export const DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/bge-small-en-v1.5";
@@ -948,7 +950,7 @@ export const MagicContextConfigSchema = z
                 injection_budget_tokens: z
                     .number()
                     .min(500)
-                    .max(20000)
+                    .max(MAX_MEMORY_INJECTION_BUDGET_TOKENS)
                     .default(4000)
                     .describe(
                         "Token budget for memory injection on session start (min: 500, max: 20000, default: 4000)",

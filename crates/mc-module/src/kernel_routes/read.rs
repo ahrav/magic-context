@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use super::project::{stored_terms, ProjectBinding, ScopeFilter};
 use super::serving;
-use super::{blocking, kernel_response, state_only, KernelOutcome};
+use super::{blocking, kernel_response, state_only, InvalidReason, KernelOutcome};
 use crate::dispatch::PreparedOutcome;
 use crate::McHandler;
 
@@ -29,6 +29,7 @@ pub const MAX_READ_ROW_BYTES: usize = crate::dispatch::MAX_WIRE_BODY_BYTES / 8;
 pub const MAX_READ_OBJECT_IDS: usize = 64;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReadRequest {
     surface: String,
     /// `None` reads the tip.
@@ -244,17 +245,12 @@ impl McHandler {
     pub(crate) async fn handle_kernel_read(
         &self,
         channel: RouteHandle,
-        request: &Value,
+        request: Value,
     ) -> PreparedOutcome {
-        let scope = match self.kernel_route_scope(channel, request, OPERATION) {
-            Ok(scope) => scope,
+        let (scope, parsed) = match self.kernel_request::<ReadRequest>(channel, request, OPERATION)
+        {
+            Ok(bound) => bound,
             Err(outcome) => return outcome,
-        };
-        let parsed = match ReadRequest::deserialize(request) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                return crate::invalid_params_error(format!("invalid {OPERATION}: {error}"))
-            }
         };
         if parsed
             .object_ids
@@ -266,9 +262,7 @@ impl McHandler {
             ));
         }
         let Ok(surface) = Surface::try_from(parsed.surface.as_str()) else {
-            return crate::invalid_params_error(format!(
-                "{OPERATION} surface must be one of auto_inject, auto_search, explicit_search"
-            ));
+            return state_only(KernelOutcome::invalid(InvalidReason::InvalidInput));
         };
         let mut as_of = parsed.as_of;
         if parsed.gated {

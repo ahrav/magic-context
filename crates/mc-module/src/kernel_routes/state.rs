@@ -307,34 +307,73 @@ impl From<ArtifactErrorKind> for KernelOutcome {
 mod tests {
     use super::*;
 
-    const ARTIFACT_ERRORS: &[ArtifactErrorKind] = &[
-        ArtifactErrorKind::PayloadTooLarge,
-        ArtifactErrorKind::Capacity,
-        ArtifactErrorKind::StorageExhausted,
-        ArtifactErrorKind::IngestionFailClosed,
-        ArtifactErrorKind::ReAdmissionBlocked,
-        ArtifactErrorKind::MissingObject,
-        ArtifactErrorKind::CorruptObject,
-        ArtifactErrorKind::ReferenceUnavailable,
-        ArtifactErrorKind::ReferenceCommit,
-        ArtifactErrorKind::AlignmentRebuild,
-        ArtifactErrorKind::ReclaimInProgress,
-        ArtifactErrorKind::UnredactableSecret,
-        ArtifactErrorKind::ScanIncomplete,
-        ArtifactErrorKind::DetectionLimit,
-        ArtifactErrorKind::TextFieldTooLong,
-        ArtifactErrorKind::InvalidInput,
-        ArtifactErrorKind::OperationKeyReused,
-        ArtifactErrorKind::StorageConstraint,
-        ArtifactErrorKind::PurgeIntent,
-        ArtifactErrorKind::PurgeUnlinkPending,
-    ];
+    fn expected_kernel(error: KernelError) -> KernelOutcome {
+        use KernelError as E;
+        match error {
+            E::Held | E::Busy | E::Deadline | E::ConsumerPending => {
+                KernelOutcome::unavailable(UnavailableReason::StoreBusy)
+            }
+            E::EngineUnsupported
+            | E::Foreign
+            | E::Inconclusive
+            | E::IdentityMismatch
+            | E::CorruptCanonicalRow => {
+                KernelOutcome::unavailable(UnavailableReason::StoreUnsupported)
+            }
+            E::FenceLost | E::Io | E::Fault => {
+                KernelOutcome::unavailable(UnavailableReason::StoreUnavailable)
+            }
+            E::FutureSnapshot => KernelOutcome::unavailable(UnavailableReason::SnapshotDiverged),
+            E::NoRequiredConsumers => {
+                KernelOutcome::unavailable(UnavailableReason::NoRequiredConsumer)
+            }
+            E::Conflict => KernelOutcome::conflict(ConflictReason::KnownAsOfAdvanced),
+            E::InvalidInput => KernelOutcome::invalid(InvalidReason::InvalidInput),
+            E::AdmissionPolicy => KernelOutcome::invalid(InvalidReason::AdmissionPolicy),
+            E::NotFound => KernelOutcome::invalid(InvalidReason::NotFound),
+            E::InvalidCheckpoint | E::UnsafeDestination | E::InvalidBackup | E::InvalidRestore => {
+                KernelOutcome::invalid(InvalidReason::Internal)
+            }
+        }
+    }
 
+    fn expected_artifact(kind: ArtifactErrorKind) -> KernelOutcome {
+        use ArtifactErrorKind as K;
+        match kind {
+            K::Capacity | K::ReclaimInProgress => {
+                KernelOutcome::unavailable(UnavailableReason::StoreBusy)
+            }
+            K::StorageExhausted
+            | K::CorruptObject
+            | K::MissingObject
+            | K::ReferenceCommit
+            | K::AlignmentRebuild
+            | K::PurgeIntent
+            | K::PurgeUnlinkPending => {
+                KernelOutcome::unavailable(UnavailableReason::StoreUnavailable)
+            }
+            K::PayloadTooLarge => KernelOutcome::invalid(InvalidReason::PayloadTooLarge),
+            K::OperationKeyReused => KernelOutcome::invalid(InvalidReason::OperationKeyReused),
+            K::StorageConstraint => KernelOutcome::invalid(InvalidReason::AlreadyExists),
+            K::InvalidInput | K::TextFieldTooLong | K::DetectionLimit => {
+                KernelOutcome::invalid(InvalidReason::InvalidInput)
+            }
+            K::IngestionFailClosed => KernelOutcome::invalid(InvalidReason::IngestionFailClosed),
+            K::ReAdmissionBlocked
+            | K::ReferenceUnavailable
+            | K::UnredactableSecret
+            | K::ScanIncomplete => KernelOutcome::invalid(InvalidReason::ArtifactUnusable),
+        }
+    }
+
+    /// The mapping is spelled out a second time here so a change to the
+    /// production table has to be made deliberately in both places.
     #[test]
-    fn every_kernel_error_serializes_to_a_tagged_non_available_state() {
+    fn every_kernel_error_maps_to_its_tagged_non_available_state() {
         for error in KernelError::ALL {
             let outcome = KernelOutcome::from(*error);
             assert!(!outcome.is_available(), "{error:?}");
+            assert_eq!(outcome, expected_kernel(*error), "{error:?}");
             let value = serde_json::to_value(&outcome).unwrap();
             assert!(value["kind"].is_string(), "{error:?}: {value}");
             assert!(value["reason"].is_string(), "{error:?}: {value}");
@@ -342,10 +381,11 @@ mod tests {
     }
 
     #[test]
-    fn every_artifact_error_serializes_to_a_tagged_non_available_state() {
-        for kind in ARTIFACT_ERRORS {
+    fn every_artifact_error_maps_to_its_tagged_non_available_state() {
+        for kind in ArtifactErrorKind::ALL {
             let outcome = KernelOutcome::from(*kind);
             assert!(!outcome.is_available(), "{kind:?}");
+            assert_eq!(outcome, expected_artifact(*kind), "{kind:?}");
             let value = serde_json::to_value(&outcome).unwrap();
             assert!(value["kind"].is_string(), "{kind:?}: {value}");
             assert!(value["reason"].is_string(), "{kind:?}: {value}");

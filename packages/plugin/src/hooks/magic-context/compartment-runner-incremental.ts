@@ -54,6 +54,7 @@ import {
     validateChunkCoverage,
     validateStoredCompartments,
 } from "./compartment-runner-validation";
+import { deriveHistorianMemoryTokens } from "./derive-budgets";
 import { cleanupHistorianStateFile } from "./historian-state-file";
 import { clearInjectionCache } from "./inject-compartments";
 import { commitPromotedFactsToKernel } from "./kernel-memory-promotion";
@@ -394,6 +395,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                           projectRoot: resolveProjectRootDirectory(sessionDirectory || directory),
                       }),
                       sessionId,
+                      budgetTokens: deriveHistorianMemoryTokens(historianChunkTokens),
                   })
                 : "";
 
