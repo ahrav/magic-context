@@ -31,6 +31,7 @@ export {
     BUDGET_OMITTED_MARKER,
     EMPTY_PROJECT_MARKER,
     isServedMemoryDecisionRow,
+    POLICY_WITHHELD_MARKER,
     READ_TRUNCATED_MARKER,
     renderMemoryStateMarker,
     renderToolStateText,

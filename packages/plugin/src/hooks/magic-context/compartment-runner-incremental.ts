@@ -40,6 +40,7 @@ import { getLatestHistorianInvocationId } from "../../features/magic-context/sto
 import { insertUserMemoryCandidates } from "../../features/magic-context/user-memory/storage-user-memory";
 import { describeError } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
+import { resetClaimLaneImportMarkerInCurrentTransaction } from "./claim-lane-import";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
 import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
@@ -611,6 +612,14 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                     endMessageId: lastNewEndMessageId,
                     publishedAt: Date.now(),
                 });
+            }
+            // The kernel promotion runs after COMMIT, so a crash in between would strand the just-published facts in the claim lane behind a done import marker; arming the bridge inside the same transaction makes the import replay them after restart. commentlint: allow(JUDGE)
+            if (promotionIdentity && promotedRefs.length > 0 && promotionProjectIdentity) {
+                resetClaimLaneImportMarkerInCurrentTransaction(
+                    db,
+                    promotionProjectIdentity,
+                    resolveProjectRootDirectory(sessionDirectory || directory),
+                );
             }
             db.exec("COMMIT");
             published = true;

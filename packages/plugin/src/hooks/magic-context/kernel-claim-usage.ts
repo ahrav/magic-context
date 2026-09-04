@@ -6,7 +6,11 @@
 import { recordClaimUsage } from "../../features/magic-context/memory/storage-claim-operations";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
-import { importedObjectId, listClaimLaneMemories } from "./claim-lane-import";
+import {
+    importedObjectId,
+    listClaimLaneMemories,
+    readImportRegenerations,
+} from "./claim-lane-import";
 import { promotedObjectId } from "./kernel-memory-promotion";
 
 export function recordKernelMemoryRetrievals(args: {
@@ -24,10 +28,19 @@ export function recordKernelMemoryRetrievals(args: {
     try {
         const claims = listClaimLaneMemories(args.db, args.projectPath);
         if (claims === null) return;
+        // A claim revoked and reauthorized lives under a regenerated import id; matching only generation zero would leave its retrieval count frozen and let the curate policy archive an actively retrieved memory. commentlint: allow(JUDGE)
+        const regenerations = readImportRegenerations(args.db, args.projectPath, args.projectRoot);
         const publicClaimIds = claims
             .filter(
                 (claim) =>
                     hits.has(importedObjectId(claim.publicClaimId, args.projectRoot)) ||
+                    hits.has(
+                        importedObjectId(
+                            claim.publicClaimId,
+                            args.projectRoot,
+                            regenerations[claim.publicClaimId] ?? 0,
+                        ),
+                    ) ||
                     hits.has(promotedObjectId(claim.publicClaimId, args.projectRoot)),
             )
             .map((claim) => claim.publicClaimId);

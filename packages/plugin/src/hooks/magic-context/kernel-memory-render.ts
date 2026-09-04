@@ -111,7 +111,13 @@ export async function readHistorianMemoryBlock(args: {
     }
     const snapshot = withoutSensitiveRows(kernelMemorySnapshotFrom(read));
     const rows = memoryRows(snapshot);
-    return renderKernelMemoryBlock(rows, read.state, rows.length, snapshot.truncated === true);
+    return renderKernelMemoryBlock(
+        rows,
+        read.state,
+        rows.length,
+        snapshot.truncated === true,
+        withheldMemoryRowCount(snapshot),
+    );
 }
 
 /** Excludes the store-wide `known_as_of`, which every commit to any project advances; a changed key rematerializes m[0] and the prompt prefix. The truncation flag keys because it changes the zero-row marker. commentlint: allow(JUDGE) */
@@ -130,6 +136,11 @@ export function memoryRows(snapshot: KernelMemorySnapshot): ReadRow[] {
     return snapshot.rows.filter(
         (row) => isMemoryDecisionRow(row) && row.decision?.decision_kind !== ANTI_MEMORY_CATEGORY,
     );
+}
+
+/** Memory-domain rows the snapshot holds that `memoryRows` withholds from automatic rendering: a project whose memories are all anti-memories must render a policy-withheld marker, not the empty-project line. commentlint: allow(JUDGE) */
+export function withheldMemoryRowCount(snapshot: KernelMemorySnapshot): number {
+    return snapshot.rows.filter(isMemoryDecisionRow).length - memoryRows(snapshot).length;
 }
 
 /** The identity a rendered row is tracked by in cache manifests and search exclusion. */
@@ -220,16 +231,23 @@ export function trimKernelRowsToBudget(rows: readonly ReadRow[], budgetTokens: n
  * clean `available` with rows, the state marker line. An `available` snapshot
  * with zero rows renders the empty-project marker so the model learns the
  * project has no memories rather than inferring the block was cut.
- * `totalRowCount` distinguishes a budget-trimmed block from an empty project; `truncated` identifies a truncated read. commentlint: allow(JUDGE)
+ * `totalRowCount` distinguishes a budget-trimmed block from an empty project; `truncated` identifies a truncated read; `withheldRowCount` distinguishes a project whose only memories are policy-withheld (anti-memories) from a genuinely empty one. commentlint: allow(JUDGE)
  */
 export function renderKernelMemoryBlock(
     rows: readonly ReadRow[],
     state: MemoryState,
     totalRowCount: number = rows.length,
     truncated = false,
+    withheldRowCount = 0,
     wrapper = PROJECT_MEMORY_WRAPPER,
 ): string {
-    const marker = renderMemoryStateMarker(state, rows.length, totalRowCount, truncated);
+    const marker = renderMemoryStateMarker(
+        state,
+        rows.length,
+        totalRowCount,
+        truncated,
+        withheldRowCount,
+    );
     if (rows.length === 0 && marker.length === 0) return "";
     const lines = [`<${wrapper}>`];
     if (marker.length > 0) lines.push(escapeXmlContent(marker));

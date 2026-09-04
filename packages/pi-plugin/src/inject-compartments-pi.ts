@@ -58,6 +58,7 @@ import {
 	memorySnapshotKey,
 	renderKernelMemoryBlock,
 	trimKernelRowsToBudget,
+	withheldMemoryRowCount,
 } from "@magic-context/core/hooks/magic-context/kernel-memory-render";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
@@ -991,6 +992,7 @@ export function renderM0Pi(
 				state.memory.state,
 				memoryRows(state.memory).length,
 				state.memory.truncated === true,
+				withheldMemoryRowCount(state.memory),
 			)
 		: "";
 	// Facts render through <project-memory>, not through decayed compartments.

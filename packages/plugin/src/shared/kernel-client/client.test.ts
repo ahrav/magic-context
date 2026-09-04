@@ -249,6 +249,13 @@ describe("KernelClient transport mapping", () => {
         expect(transport.bodies("kernel.commit")).toHaveLength(2);
     });
 
+    test("an undecodable commit response stays ambiguous instead of a definitive error", async () => {
+        const transport = new FakeTransport().queue({ garbage: true });
+        const result = await client(transport).create(spec, intent);
+        // The transport delivered a response, so the commit may have applied; only its receipt was lost to the malformed payload. commentlint: allow(JUDGE)
+        expect(result.state).toEqual({ kind: "unavailable", reason: "outcome_unknown" });
+    });
+
     test("route_unbound rebinds once, then retries once, then is daemon_absent", async () => {
         const unbound = () => new McHostCallError("terminal", "no binding", "route_unbound");
         const recovered = new FakeTransport().queue(unbound(), readReply(1));

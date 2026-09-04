@@ -28,6 +28,10 @@ export const BUDGET_OMITTED_MARKER =
 export const READ_TRUNCATED_MARKER =
     "memory: the memory read was truncated; recorded memories may be missing from this block";
 
+/** An `available` read whose only rows are withheld from automatic rendering by policy (anti-memories, sensitive rows); the project is not empty, and search still serves them. commentlint: allow(JUDGE) */
+export const POLICY_WITHHELD_MARKER =
+    "memory: this project's recorded memories are withheld from this block by policy; explicit search still serves them";
+
 /**
  * One line for an injected block. An `available` state with rows renders the
  * empty string: the rows are the marker, and a header line would spend budget
@@ -42,11 +46,13 @@ export function renderMemoryStateMarker(
     rowCount: number,
     totalRowCount: number = rowCount,
     truncated = false,
+    withheldRowCount = 0,
 ): string {
     if (state.kind === "available") {
         if (rowCount > 0) return "";
         if (totalRowCount > 0) return BUDGET_OMITTED_MARKER;
-        return truncated ? READ_TRUNCATED_MARKER : EMPTY_PROJECT_MARKER;
+        if (truncated) return READ_TRUNCATED_MARKER;
+        return withheldRowCount > 0 ? POLICY_WITHHELD_MARKER : EMPTY_PROJECT_MARKER;
     }
     if (state.kind === "stale" || state.kind === "abstained") {
         return `${guidanceFor(state).marker} (${state.lag_positions} behind, oldest ${state.oldest_unconsumed_age_ms} ms)`;

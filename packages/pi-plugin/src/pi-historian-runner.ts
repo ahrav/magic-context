@@ -57,6 +57,7 @@ import { updateSessionMeta } from "@magic-context/core/features/magic-context/st
 import { insertPrimerCandidates } from "@magic-context/core/features/magic-context/storage-primers";
 import { getLatestHistorianInvocationId } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
 import { insertUserMemoryCandidates } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
+import { resetClaimLaneImportMarkerInCurrentTransaction } from "@magic-context/core/hooks/magic-context/claim-lane-import";
 import {
 	buildCompartmentAgentPrompt,
 	buildHistorianEditorPrompt,
@@ -1122,6 +1123,14 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						summary: markerSummary,
 						publishedAt: Date.now(),
 					});
+				}
+				// The kernel promotion runs after COMMIT, so a crash in between would strand the just-published facts in the claim lane behind a done import marker; arming the bridge inside the same transaction makes the import replay them after restart. commentlint: allow(JUDGE)
+				if (promotionIdentity && promotedRefs.length > 0 && projectPath) {
+					resetClaimLaneImportMarkerInCurrentTransaction(
+						db,
+						projectPath,
+						resolveProjectRootDirectory(directory),
+					);
 				}
 				db.exec("COMMIT");
 				published = true;

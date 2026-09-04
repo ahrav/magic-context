@@ -376,6 +376,13 @@ export class KernelClient {
         if (!invoked.ok) return { state: invoked.state };
         const parsed = parse(invoked.raw);
         if (parsed.state.kind !== "available" || parsed.payload === null) {
+            // A daemon-produced negative state proves a mutating request was not applied, but an undecodable response does not: the commit may have succeeded and only its receipt was lost to a malformed or version-skewed payload, so a definitive-looking error would invite a fresh-identity retry. commentlint: allow(JUDGE)
+            const undecodable =
+                (parsed.state.kind === "invalid" && parsed.state.reason === "unrecognized_state") ||
+                (parsed.state.kind === "available" && parsed.payload === null);
+            if (undecodable && options.mutating) {
+                return { state: nonAvailable(unavailable("outcome_unknown")) };
+            }
             return { state: nonAvailable(parsed.state) };
         }
         return { state: parsed.state, ...parsed.payload };

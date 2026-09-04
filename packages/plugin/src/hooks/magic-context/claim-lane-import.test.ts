@@ -232,6 +232,47 @@ describe("claim-lane import", () => {
         expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
     });
 
+    test("a revoked row's content does not suppress a same-text authorized claim's import", async () => {
+        const { db, kernel, client } = harness();
+        db.exec(
+            `INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+             VALUES (1, 'shared', 0, 0, '["CONSTRAINTS"]');
+             INSERT INTO workspace_members
+                 (workspace_id, project_path, display_name, display_path, added_at)
+             VALUES
+                 (1, '${PROJECT}', 'own', '${PROJECT}', 0),
+                 (1, '${OTHER_PROJECT}', 'foreign', '${OTHER_PROJECT}', 0);`,
+        );
+        const foreignId = seedClaim(
+            db,
+            OTHER_PROJECT,
+            "a",
+            "Never commit directly to main.",
+            "CONSTRAINTS",
+            "shareable",
+        );
+        const run = () =>
+            importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            });
+        expect(await run()).toBe("done");
+        expect(kernel.liveRows().map((row) => row.object_id)).toContain(
+            importedObjectId(foreignId, ROOT),
+        );
+
+        // The same fact recorded as an own claim must survive the foreign copy's revocation in one pass.
+        const ownId = seedClaim(db, PROJECT, "b", "Never commit directly to main.", "CONSTRAINTS");
+        db.exec(`UPDATE workspaces SET share_categories = '[]' WHERE id = 1`);
+        expect(await run()).toBe("done");
+        const live = kernel.liveRows().map((row) => row.object_id);
+        expect(live).not.toContain(importedObjectId(foreignId, ROOT));
+        expect(live).toContain(importedObjectId(ownId, ROOT));
+    });
+
     test("a revocation landing mid-run reconciles before the marker is written", async () => {
         const { db, kernel, client } = harness();
         db.exec(

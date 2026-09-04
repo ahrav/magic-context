@@ -5,6 +5,7 @@ import {
     EMPTY_PROJECT_MARKER,
     KernelClient,
     type KernelClientResolver,
+    POLICY_WITHHELD_MARKER,
 } from "../../shared/kernel-client";
 import { FakeKernel, FakeKernelTransport } from "../../shared/kernel-client-testing/fake-kernel";
 import {
@@ -13,6 +14,7 @@ import {
     readInjectionMemorySnapshot,
     renderKernelMemoryBlock,
     trimKernelRowsToBudget,
+    withheldMemoryRowCount,
     withoutSensitiveRows,
 } from "./kernel-memory-render";
 
@@ -71,6 +73,27 @@ describe("renderKernelMemoryBlock markers", () => {
         const block = renderKernelMemoryBlock(rows, snapshot.state, rows.length);
         expect(block).toContain(EMPTY_PROJECT_MARKER);
         expect(block).not.toContain(BUDGET_OMITTED_MARKER);
+    });
+
+    test("a project holding only anti-memories renders the policy-withheld marker, not empty-project", () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: `mem_${"w".repeat(32)}`,
+            decision_kind: ANTI_MEMORY_CATEGORY,
+            summary: "Trigger: caching\nRejected strategy: Redis\nWhy rejected: offline builds",
+        });
+        const snapshot = kernel.snapshot();
+        const rows = memoryRows(snapshot);
+        expect(rows).toEqual([]);
+        const block = renderKernelMemoryBlock(
+            rows,
+            snapshot.state,
+            rows.length,
+            false,
+            withheldMemoryRowCount(snapshot),
+        );
+        expect(block).toContain(POLICY_WITHHELD_MARKER);
+        expect(block).not.toContain(EMPTY_PROJECT_MARKER);
     });
 });
 

@@ -50,6 +50,7 @@ import {
     memorySnapshotKey,
     renderKernelMemoryBlock,
     trimKernelRowsToBudget,
+    withheldMemoryRowCount,
 } from "./kernel-memory-render";
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
@@ -355,6 +356,7 @@ export function prepareCompartmentInjection(
               args.memory.state,
               memoryRows(args.memory).length,
               args.memory.truncated === true,
+              withheldMemoryRowCount(args.memory),
           ) || undefined
         : undefined;
     const memoryCount = renderedRows.length;
@@ -1593,6 +1595,7 @@ export function renderM0(args: {
               args.memory.state,
               memoryRows(args.memory).length,
               args.memory.truncated === true,
+              withheldMemoryRowCount(args.memory),
           )
         : "";
     if (memoriesBlock) sections.push(memoriesBlock);

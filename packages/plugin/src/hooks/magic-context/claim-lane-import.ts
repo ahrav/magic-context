@@ -167,13 +167,24 @@ export function resetClaimLaneImportMarker(
     if (!hasMetaTable(db)) return;
     // One transaction covers the generation bump and the marker delete: a crash between them would leave the stale marker in place and report the import done despite the reset. commentlint: allow(JUDGE)
     db.transaction(() => {
-        db.prepare(
-            "INSERT INTO context_store_meta(key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
-        ).run(generationKey(projectPath, projectRoot));
-        db.prepare("DELETE FROM context_store_meta WHERE key = ?").run(
-            markerKey(projectPath, projectRoot),
-        );
+        resetClaimLaneImportMarkerInCurrentTransaction(db, projectPath, projectRoot);
     })();
+}
+
+/** Requires the caller to hold a write transaction. A publisher that commits lane facts and promotes them to the kernel only after its COMMIT arms the bridge inside the same transaction: a crash before the post-commit promotion then leaves no done marker, so the next schedule imports the facts instead of leaving them stranded in the lane. commentlint: allow(JUDGE) */
+export function resetClaimLaneImportMarkerInCurrentTransaction(
+    db: Database,
+    projectPath: string,
+    projectRoot: string,
+): void {
+    attemptedAt.delete(scheduleKey(projectPath, projectRoot));
+    if (!hasMetaTable(db)) return;
+    db.prepare(
+        "INSERT INTO context_store_meta(key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+    ).run(generationKey(projectPath, projectRoot));
+    db.prepare("DELETE FROM context_store_meta WHERE key = ?").run(
+        markerKey(projectPath, projectRoot),
+    );
 }
 
 interface ClaimLaneWorkspace {
@@ -501,6 +512,12 @@ export async function importClaimLaneMemories(args: {
     );
     let revoked = 0;
     for (const row of revocable) {
+        // The generation bump persists before the archive so a crash between the two stores cannot burn the identity: a bumped-but-live row is re-revoked (wasting one generation), while an archived-but-unbumped row would make every later reauthorization collide with the sticky retired id forever. commentlint: allow(JUDGE)
+        const publicId = claimIdByImportId.get(row.object.object_id);
+        if (publicId !== undefined) {
+            regenerations[publicId] = generationOf(publicId) + 1;
+            writeImportRegenerations(db, projectPath, projectRoot, regenerations);
+        }
         const result = await client.archive(row.object.object_id, {
             actor: CLAIM_LANE_IMPORT_ACTOR,
             // The authorization fingerprint scopes the operation key to this policy change; the same revocation replays, and a later distinct policy change keys fresh operations. commentlint: allow(JUDGE)
@@ -514,19 +531,17 @@ export async function importClaimLaneMemories(args: {
             );
             return "deferred";
         }
-        // Recording the importer's own revocation is what makes it reversible: retired ids are sticky, so a reauthorized claim re-imports under the next generation, while an archive the importer never performed keeps its stable id burned. commentlint: allow(JUDGE)
-        const publicId = claimIdByImportId.get(row.object.object_id);
-        if (publicId !== undefined) {
-            regenerations[publicId] = generationOf(publicId) + 1;
-            writeImportRegenerations(db, projectPath, projectRoot, regenerations);
-        }
         revoked += 1;
     }
     const present = new Set(existing.rows.map((row) => row.object.object_id));
     // A marker reset replays the whole lane, so claims the historian already
     // promoted under its own derived ids dedupe by (kind, summary) instead of
     // duplicating as import-id rows.
-    const presentContent = liveMemoryContentKeys(existing.rows);
+    // Exclude revoked rows because their archived copies no longer block importing an authorized same-content claim. commentlint: allow(JUDGE)
+    const revokedIds = new Set(revocable.map((row) => row.object.object_id));
+    const presentContent = liveMemoryContentKeys(
+        existing.rows.filter((row) => !revokedIds.has(row.object.object_id)),
+    );
     const pending = claims.filter(
         (claim) =>
             !present.has(
