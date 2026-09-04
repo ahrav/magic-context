@@ -156,6 +156,30 @@ export async function executeCtxSearch(
             text: `Error: ${renderToolStateText(disabled())}`,
         };
     }
+    // The local search and kernel read are independent except for object-id queries, so starting both concurrently pays the slower round-trip instead of their sum. commentlint: allow(JUDGE)
+    const startLocalSearch = () =>
+        unifiedSearch(deps.db, toolContext.sessionID, projectPath, query, {
+            limit: normalizeSearchResultLimit(args.limit),
+            memoryEnabled,
+            embeddingEnabled,
+            embedQuery: async (text, signal) => {
+                const result = await embedTextForProject(projectPath, text, signal, "query");
+                return result;
+            },
+            isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
+            readMessages: deps.readMessages,
+            maxMessageOrdinal: messageOrdinalCutoff,
+            gitCommitsEnabled,
+            sources: localSources,
+            explicitSearch: true,
+        });
+    // An object-id query is daemon-first with local search as fallback only, and a memory-only request has no local sources, so neither starts the local search eagerly. commentlint: allow(JUDGE)
+    let localResultsPromise: ReturnType<typeof startLocalSearch> | null = null;
+    if (!parseObjectIdQuery(query) && !memoryOnly) {
+        localResultsPromise = startLocalSearch();
+        // The no-op handler prevents an unawaited local-search rejection from becoming unhandled on an early return; awaiting the promise later still propagates it. commentlint: allow(JUDGE)
+        localResultsPromise.catch(() => {});
+    }
     if (memoryEnabled && memorySourceAllowed) {
         const client = deps.kernelClient({
             sessionId: toolContext.sessionID,
@@ -181,21 +205,7 @@ export async function executeCtxSearch(
         }
     }
 
-    const results = await unifiedSearch(deps.db, toolContext.sessionID, projectPath, query, {
-        limit: normalizeSearchResultLimit(args.limit),
-        memoryEnabled,
-        embeddingEnabled,
-        embedQuery: async (text, signal) => {
-            const result = await embedTextForProject(projectPath, text, signal, "query");
-            return result;
-        },
-        isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
-        readMessages: deps.readMessages,
-        maxMessageOrdinal: messageOrdinalCutoff,
-        gitCommitsEnabled,
-        sources: localSources,
-        explicitSearch: true,
-    });
+    const results = await (localResultsPromise ?? startLocalSearch());
 
     if (memoryResults.length === 0) return completeFrom(results, memoryNote);
     const merged = [...memoryResults, ...results]

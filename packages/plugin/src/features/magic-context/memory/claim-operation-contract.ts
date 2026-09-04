@@ -8,7 +8,8 @@
  *
  */
 
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
+import { sha256Hex } from "../../../shared/kernel-client";
 
 export const CLAIM_REQUEST_ENCODING_VERSION = 1;
 export const CLAIM_RESULT_ENCODING_VERSION = 1;
@@ -122,7 +123,7 @@ export function canonicalJsonEncode(value: unknown): string {
 }
 
 export function sha256HexUtf8(text: string): string {
-    return createHash("sha256").update(text, "utf8").digest("hex");
+    return sha256Hex(text);
 }
 
 function protocolDigest(protocol: string, value: unknown): string {

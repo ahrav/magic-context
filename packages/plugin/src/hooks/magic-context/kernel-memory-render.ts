@@ -143,15 +143,19 @@ export function memoryRowCategory(row: ReadRow): string {
 /** The taxonomy categories all match; the store also holds free-form kinds from other producers. commentlint: allow(JUDGE) */
 const XML_ELEMENT_NAME = /^[A-Za-z_][A-Za-z0-9._-]*$/;
 
-/** A category that is a legal XML element name opens as itself; any other value rides as an escaped attribute on a fixed element so it cannot corrupt the block's markup. commentlint: allow(JUDGE) */
+/** A category may open as its own element only when it is a legal XML name that cannot collide with the enclosing wrapper: a `decision_kind` equal to the wrapper tag would end the block early for the non-greedy block extractor and leave dangling markup in the served text. commentlint: allow(JUDGE) */
+function categoryOpensAsElement(category: string): boolean {
+    return XML_ELEMENT_NAME.test(category) && category !== PROJECT_MEMORY_WRAPPER;
+}
+
 export function memoryCategoryOpenTag(category: string): string {
-    return XML_ELEMENT_NAME.test(category)
+    return categoryOpensAsElement(category)
         ? `<${category}>`
         : `<memory-category name="${escapeXmlAttr(category)}">`;
 }
 
 export function memoryCategoryCloseTag(category: string): string {
-    return XML_ELEMENT_NAME.test(category) ? `</${category}>` : "</memory-category>";
+    return categoryOpensAsElement(category) ? `</${category}>` : "</memory-category>";
 }
 
 export function renderKernelMemoryLine(row: ReadRow): string {

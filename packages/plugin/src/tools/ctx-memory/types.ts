@@ -28,6 +28,8 @@ export type { KernelClientResolver };
 export interface CtxMemoryToolDeps {
     kernelClient: KernelClientResolver;
     resolveProjectPath: (directory: string) => string | undefined;
+    /** Populates the project's embedding snapshot before the disabled gate reads it. */
+    ensureProjectRegistered?: (directory: string) => Promise<void>;
     memoryEnabled?: boolean;
     allowedActions?: CtxMemoryAction[];
 }

@@ -56,7 +56,6 @@ export function stubKernelClient(state: MemoryState, rows: ReadRow[] = []): Kern
         revise: commit,
         merge: commit,
         archive: commit,
-        restore: commit,
     };
     return stub as unknown as KernelClient;
 }

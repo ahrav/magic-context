@@ -819,14 +819,26 @@ export function registerRpcHandlers(
     // The status surface reports what an explicit search would see, lag included,
     // so the sidebar shows `stale` when the projector is behind.
     const kernelClient = kernelClientResolver(config);
+    // The cache reuses snapshots for `RUST_STATUS_CACHE_TTL_MS` to avoid a daemon read on each sidebar poll. commentlint: allow(JUDGE)
+    const memorySnapshotCache = new Map<
+        string,
+        { snapshot: KernelMemorySnapshot; cachedAt: number }
+    >();
     const readMemory = async (sessionId: string, dir: string): Promise<KernelMemorySnapshot> => {
         if (config.memory?.enabled === false) {
             return { state: disabled(), rows: [], knownAsOf: null };
         }
+        const cacheKey = `${sessionId}\u001f${dir}`;
+        const cached = memorySnapshotCache.get(cacheKey);
+        if (cached && Date.now() - cached.cachedAt < RUST_STATUS_CACHE_TTL_MS) {
+            return cached.snapshot;
+        }
         const client = kernelClient({ sessionId, projectRoot: resolveProjectRootDirectory(dir) });
-        return kernelMemorySnapshotFrom(
+        const snapshot = kernelMemorySnapshotFrom(
             await client.read({ surface: "explicit_search", gated: true }),
         );
+        memorySnapshotCache.set(cacheKey, { snapshot, cachedAt: Date.now() });
+        return snapshot;
     };
 
     rpcServer.handle("sidebar-snapshot", async (params) => {
@@ -834,16 +846,18 @@ export function registerRpcHandlers(
         const dir = String(params.directory ?? directory);
         const db = getDb();
         if (!db || !sessionId) return { error: "unavailable" };
-        const moduleStatus =
+        const [moduleStatus, memory] = await Promise.all([
             config.transform_mode === "rust"
-                ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
-                : undefined;
+                ? loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
+                : Promise.resolve(undefined),
+            readMemory(sessionId, dir),
+        ]);
         return buildSidebarSnapshotRpcResponse(
             db,
             sessionId,
             dir,
             liveSessionState,
-            await readMemory(sessionId, dir),
+            memory,
             rawConfig,
             moduleStatus,
             compactionEnabled,
@@ -856,10 +870,12 @@ export function registerRpcHandlers(
         const modelKey = params.modelKey ? String(params.modelKey) : undefined;
         const db = getDb();
         if (!db || !sessionId) return { error: "unavailable" };
-        const moduleStatus =
+        const [moduleStatus, memory] = await Promise.all([
             config.transform_mode === "rust"
-                ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
-                : undefined;
+                ? loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
+                : Promise.resolve(undefined),
+            readMemory(sessionId, dir),
+        ]);
         return buildStatusDetail(
             db,
             sessionId,
@@ -867,7 +883,7 @@ export function registerRpcHandlers(
             modelKey,
             rawConfig,
             liveSessionState,
-            await readMemory(sessionId, dir),
+            memory,
             moduleStatus,
             compactionEnabled,
         ) as unknown as Record<string, unknown>;

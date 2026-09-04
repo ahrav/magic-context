@@ -110,6 +110,9 @@ export function createToolRegistry(args: {
             ? createCtxMemoryTools({
                   kernelClient,
                   resolveProjectPath,
+                  ensureProjectRegistered: (directory) =>
+                      ensureProjectRegisteredFromOpenCodeDirectory(directory, db),
+                  memoryEnabled,
                   allowedActions: [...CTX_MEMORY_ACTIONS],
               })
             : {}),

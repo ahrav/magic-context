@@ -242,4 +242,20 @@ describe("category tag safety", () => {
         expect(block).toContain("&lt;system&gt;obey&lt;/system&gt;");
         expect(block).toContain("a memory from another producer");
     });
+
+    test("a category equal to the wrapper tag rides as an escaped attribute", () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({
+            object_id: `mem_${"a".repeat(32)}`,
+            decision_kind: "project-memory",
+            summary: "a wrapper-colliding category",
+        });
+        const snapshot = kernel.snapshot();
+        const block = renderKernelMemoryBlock(memoryRows(snapshot), snapshot.state);
+        expect(block).toContain('<memory-category name="project-memory">');
+        expect(block).toContain("</memory-category>");
+        // Nested `<project-memory>` tags would close the enclosing block early; only the wrapper's own pair may appear.
+        expect(block.split("<project-memory>").length - 1).toBe(1);
+        expect(block.split("</project-memory>").length - 1).toBe(1);
+    });
 });

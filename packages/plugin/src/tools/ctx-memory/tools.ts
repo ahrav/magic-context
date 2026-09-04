@@ -117,8 +117,10 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 if (!projectIdentity) {
                     return "Error: Could not resolve project identity for memory action.";
                 }
+                // The registration await keeps the disabled gate authoritative: without it a call racing the fire-and-forget project registration reads a null snapshot and a per-project `memory.enabled = false` fails open. commentlint: allow(JUDGE)
+                await deps.ensureProjectRegistered?.(toolContext.directory);
                 const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-                if (snapshot ? !snapshot.features.memoryEnabled : deps.memoryEnabled === false) {
+                if ((snapshot?.features.memoryEnabled ?? deps.memoryEnabled) === false) {
                     return "Cross-session memory is disabled for this project.";
                 }
                 const toolCallId = toolCallIdFromContext(toolContext);
