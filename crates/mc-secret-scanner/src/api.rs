@@ -1,10 +1,32 @@
+//! Public scanner inputs, limits, findings, and errors.
+
 use std::fmt;
 
+/// Hard ceiling for one scanner input, in bytes.
 pub const MAX_INPUT_BYTES: usize = 512 * 1024;
 
+/// The scanner reports findings whose full matches are at most `MAX_MATCH_BYTES` bytes.
+/// Candidates exceeding this byte limit stop scanning with [`LimitExhausted::Match`];
+/// otherwise, rule regexes such as `private-key`'s `[\s\S-]{64,}?` can match unbounded input.
+/// A finding's footprint is at most `MAX_MATCH_BYTES + 2 * MAX_RULE_RADIUS +
+/// 2 * MAX_LOCAL_CONTEXT_BYTES` bytes, so text longer than `MAX_INPUT_BYTES`
+/// can be scanned in windows whose overlap is at least that wide.
+pub const MAX_MATCH_BYTES: usize = 32 * 1024;
+
+/// Largest `radius` or two-phase `full_radius` a rule may declare, in bytes.
+/// Construction rejects a rule set that exceeds it.
+pub const MAX_RULE_RADIUS: usize = 16 * 1024;
+
+/// Largest `lookbehind` or `lookahead` a rule's local context may declare, in
+/// bytes. Construction rejects a rule set that exceeds it.
+pub const MAX_LOCAL_CONTEXT_BYTES: usize = 1024;
+
+/// Selects the active secret-detection rule set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanProfile {
+    /// Runs only the conservative overlay rules, so upstream-only secrets are not detected.
     Conservative,
+    /// Runs upstream rules and the same conservative overlay, so its findings are a superset of `Conservative`.
     Comprehensive,
 }
 
@@ -17,12 +39,16 @@ impl ScanProfile {
     }
 }
 
+/// Identifies the corpus that supplied a matching rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RuleSource {
+    /// Rule imported from the pinned upstream corpus.
     Upstream,
+    /// Rule added by the local conservative overlay.
     ConservativeOverlay,
 }
 
+/// Half-open UTF-8 byte range within scanner input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TextSpan {
     start: usize,
@@ -61,21 +87,25 @@ impl TextSpan {
         Self::new(input, start, end)
     }
 
+    /// Returns the inclusive starting byte offset.
     #[must_use]
     pub const fn start(self) -> usize {
         self.start
     }
 
+    /// Returns the exclusive ending byte offset.
     #[must_use]
     pub const fn end(self) -> usize {
         self.end
     }
 
+    /// Returns the span length in bytes.
     #[must_use]
     pub const fn len(self) -> usize {
         self.end - self.start
     }
 
+    /// Returns whether the start and end offsets are equal.
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.start == self.end
@@ -86,27 +116,41 @@ impl TextSpan {
     }
 }
 
+/// One secret match and its source locations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finding {
+    /// Stable rule identifier.
     pub rule_id: String,
+    /// Corpus that supplied the rule.
     pub rule_source: RuleSource,
+    /// Range covering the complete match.
     pub full_span: TextSpan,
+    /// Range covering the secret value.
     pub value_span: TextSpan,
+    /// Optional range covering an associated key.
     pub key_span: Option<TextSpan>,
 }
 
+/// Version identifiers that define scanner semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScannerRevision {
+    /// Scanner crate version.
     pub crate_version: &'static str,
+    /// Version of the semantic digest encoding.
     pub semantic_digest_version: u8,
+    /// Commit of the embedded upstream rule corpus.
     pub upstream_commit: &'static str,
 }
 
 /// Which bound stopped a scan before the rule set was exhausted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LimitExhausted {
+    /// Candidate evaluation count reached its configured ceiling.
     Candidates,
+    /// Charged input work reached its configured byte ceiling.
     Work,
+    /// A candidate's full match exceeded [`MAX_MATCH_BYTES`].
+    Match,
 }
 
 impl fmt::Display for LimitExhausted {
@@ -114,16 +158,23 @@ impl fmt::Display for LimitExhausted {
         f.write_str(match self {
             Self::Candidates => "scanner candidate limit reached",
             Self::Work => "scanner work limit reached",
+            Self::Match => "scanner match length limit reached",
         })
     }
 }
 
+/// Findings and accounting produced by one scan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanReport {
+    /// Findings sorted by input position.
     pub findings: Vec<Finding>,
+    /// Scanner and corpus revision used for this scan.
     pub revision: ScannerRevision,
+    /// Digest of semantics that affect scan results.
     pub semantic_digest: [u8; 32],
+    /// Number of candidate matches evaluated.
     pub candidates_evaluated: usize,
+    /// Total bytes charged while evaluating rules.
     pub work_bytes: usize,
     /// `Some` when a bound stopped the scan early, so absence of a finding
     /// proves nothing.
@@ -142,10 +193,14 @@ impl ScanReport {
     }
 }
 
+/// Resource ceilings for one scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanLimits {
+    /// Maximum accepted input length in bytes.
     pub max_input_bytes: usize,
+    /// Maximum candidate matches evaluated.
     pub max_candidates: usize,
+    /// Maximum bytes charged across rule evaluation.
     pub max_work_bytes: usize,
 }
 
@@ -175,53 +230,46 @@ impl ScanLimits {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Failure to validate embedded rules or configured limits.
+#[derive(thiserror::Error, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConstructionError {
+    /// Embedded upstream corpus does not match its pinned digest.
+    #[error("embedded scanner corpus digest mismatch")]
     CorpusDigestMismatch,
+    /// Embedded conservative overlay does not match its pinned digest.
+    #[error("embedded scanner overlay digest mismatch")]
     OverlayDigestMismatch,
+    /// Embedded rule document cannot be decoded.
+    #[error("invalid embedded scanner rule document")]
     InvalidRuleDocument,
+    /// Rule identity is missing or invalid.
+    #[error("invalid embedded scanner rule identity")]
     InvalidRuleIdentity,
+    /// Rule pattern cannot be compiled.
+    #[error("invalid embedded scanner rule pattern")]
     InvalidRulePattern,
+    /// Rule policy is invalid.
+    #[error("invalid embedded scanner rule policy")]
     InvalidRulePolicy,
+    /// One or more scan limits are zero or exceed the hard input ceiling.
+    #[error("invalid scanner limits")]
     InvalidLimits,
 }
 
-impl fmt::Display for ConstructionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::CorpusDigestMismatch => "embedded scanner corpus digest mismatch",
-            Self::OverlayDigestMismatch => "embedded scanner overlay digest mismatch",
-            Self::InvalidRuleDocument => "invalid embedded scanner rule document",
-            Self::InvalidRuleIdentity => "invalid embedded scanner rule identity",
-            Self::InvalidRulePattern => "invalid embedded scanner rule pattern",
-            Self::InvalidRulePolicy => "invalid embedded scanner rule policy",
-            Self::InvalidLimits => "invalid scanner limits",
-        })
-    }
-}
-
-impl std::error::Error for ConstructionError {}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Failure while scanning one input.
+#[derive(thiserror::Error, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanError {
+    /// Input exceeds the configured byte ceiling.
+    #[error("scanner input limit exceeded")]
     InputLimitExceeded,
+    /// A matched range is out of bounds or not on UTF-8 boundaries.
+    #[error("scanner produced an invalid span")]
     InvalidSpan,
 }
 
-impl fmt::Display for ScanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::InputLimitExceeded => "scanner input limit exceeded",
-            Self::InvalidSpan => "scanner produced an invalid span",
-        })
-    }
-}
-
-impl std::error::Error for ScanError {}
-
 pub(crate) const REVISION: ScannerRevision = ScannerRevision {
     crate_version: env!("CARGO_PKG_VERSION"),
-    semantic_digest_version: 4,
+    semantic_digest_version: 7,
     upstream_commit: "3d2869011138cd7812a12f893dc93635a961b0d7",
 };
 

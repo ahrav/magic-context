@@ -15,7 +15,7 @@ interface ScenarioSpec {
     locatorId: string;
 }
 
-/** A pre-search gate for the runner: the resolved ids are interpolated into the model-visible prompt, and a random `mcm_<32hex>` id contains a given two-digit answer roughly one run in nine, which would expose the gold before any retrieval. On true the runner reseeds to obtain different ids rather than scoring the cell — the sample is preserved because reseeding is free, where invalidating would bias against the scenarios with short numeric answers. commentlint: allow(JUDGE) */
+/** A pre-search gate for the runner: the resolved ids are interpolated into the model-visible prompt, and a random `mcm_<32hex>` id contains a given two-digit answer roughly one run in nine, which would expose the gold before any retrieval. On true the runner reseeds to obtain different ids rather than scoring the cell — the sample is preserved because reseeding is free, where invalidating would bias against the scenarios with short numeric answers. */
 export function r1QueryLeaksAnswer(
     declaration: ScenarioDeclaration,
     resolvedLocatorIds: readonly string[],
@@ -23,7 +23,7 @@ export function r1QueryLeaksAnswer(
     return resolvedLocatorIds.some((id) => revealsAnswer(declaration.expectedAnswer, id));
 }
 
-/** A validity gate, not a scored check: `ArmedCellResult` keeps only aggregate counts, so scoring this on R1 alone would give R1 a larger denominator than the arms it is subtracted from and manufacture a retrieval delta. A runner calls this and, on false, records the R1 cell as not completed instead of letting it contribute a score. Keyed on the declaration's full handle set, because a runner that resolves only some handles would otherwise pass while R1 held less gold than R2. Matches the delivered memory-row marker (`[memory] ... id=<publicClaimId>`), not a bare id: the empty-results renderer echoes the query back, and a locator query *is* the resolved ids, so a bare substring test passes on zero retrieval. commentlint: allow(JUDGE) */
+/** A validity gate, not a scored check: `ArmedCellResult` keeps only aggregate counts, so scoring this on R1 alone would give R1 a larger denominator than the arms it is subtracted from and manufacture a retrieval delta. A runner calls this and, on false, records the R1 cell as not completed instead of letting it contribute a score. Keyed on the declaration's full handle set, because a runner that resolves only some handles would otherwise pass while R1 held less gold than R2. Matches the delivered memory-row marker (`[memory] ... id=<publicClaimId>`), not a bare id: the empty-results renderer echoes the query back, and a locator query *is* the resolved ids, so a bare substring test passes on zero retrieval. */
 export function r1WireDelivered(
     declaration: ScenarioDeclaration,
     context: VerifierContext,
@@ -31,16 +31,16 @@ export function r1WireDelivered(
     const resolved = context.resolvedLocatorIds ?? [];
     if (resolved.length !== declaration.interventions.r1.locatorIds.length) return false;
     if (new Set(resolved).size !== resolved.length) return false;
-    /** Shape-check each id through the production predicate before searching: an empty or malformed value makes the marker degenerate to `id=`, which every rendered memory row contains, so a broken handle-to-claim mapping would satisfy the gate against unrelated rows. commentlint: allow(JUDGE) */
+    /** Shape-check each id through the production predicate before searching: an empty or malformed value makes the marker degenerate to `id=`, which every rendered memory row contains, so a broken handle-to-claim mapping would satisfy the gate against unrelated rows. */
     if (!resolved.every((id) => isValidPublicClaimId(id))) return false;
     const wire = context.scriptedTurnText ?? "";
     return resolved.every((id) => wire.includes(`id=${id}`));
 }
 
-/** Casing is part of the gold only for scenarios that say so. Elsewhere a strict comparison would fail an agent that recalled the fact and transcribed it differently, scoring output formatting instead of the retrieval the lane measures. commentlint: allow(JUDGE) */
+/** Casing is part of the gold only for scenarios that say so. Elsewhere a strict comparison would fail an agent that recalled the fact and transcribed it differently, scoring output formatting instead of the retrieval the lane measures. */
 function answerMatches(actual: string | null, spec: ScenarioSpec): boolean {
     if (actual === null) return false;
-    /** Canonical form on both operands, matching the contract's gold check: without it a declaration whose evidence and answer differ only in Unicode form freezes as valid while this comparison rejects the model's faithful copy. Form is never part of the declared gold, unlike casing. commentlint: allow(JUDGE) */
+    /** Canonical form on both operands, matching the contract's gold check: without it a declaration whose evidence and answer differ only in Unicode form freezes as valid while this comparison rejects the model's faithful copy. Form is never part of the declared gold, unlike casing. */
     const fold = (value: string): string =>
         spec.answerMatch === "exact"
             ? value.normalize("NFC")
@@ -51,7 +51,7 @@ function answerMatches(actual: string | null, spec: ScenarioSpec): boolean {
 export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
     const verifier = (context: VerifierContext) => {
         const answerPath = join(context.workspacePath, "result", "answer.txt");
-        /** A model can leave a directory or an unreadable file at the answer path; reading it unguarded throws EISDIR or EACCES, which a runner records as a harness failure and excludes from scoring instead of the ordinary scenario failure it is. commentlint: allow(JUDGE) */
+        /** A model can leave a directory or an unreadable file at the answer path; reading it unguarded throws EISDIR or EACCES, which a runner records as a harness failure and excludes from scoring instead of the ordinary scenario failure it is. */
         let actual: string | null = null;
         try {
             if (statSync(answerPath).isFile()) {
@@ -92,14 +92,14 @@ export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
                 insertAfterTurnId: "turn-burial",
                 locatorIds: [spec.locatorId],
             },
-            /** The same gold content R3 receives, so `R3 - R2` isolates representation rather than also comparing a bare answer against a distractor-bearing sentence — which would make R2 the easier arm. commentlint: allow(JUDGE) */
+            /** The same gold content R3 receives, so `R3 - R2` isolates representation rather than also comparing a bare answer against a distractor-bearing sentence — which would make R2 the easier arm. */
             r2: {
                 memories: [{ claim: spec.evidence, evidence: spec.evidence }],
             },
         },
         absencePrecondition: {
             evidenceTurnId: "turn-evidence",
-            /** 16,384 tokens at CHARS_PER_TOKEN — twice the 8,192-token window, so honoring the minimum genuinely evicts the evidence turn. commentlint: allow(JUDGE) */
+            /** 16,384 tokens at CHARS_PER_TOKEN — twice the 8,192-token window, so honoring the minimum genuinely evicts the evidence turn. */
             minimumBallastBytes: 65_536,
         },
         modelContextLimit: 8_192,

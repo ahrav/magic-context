@@ -1,13 +1,13 @@
+//! Broca shares resource limits across request admission, host reservations, and run supervision.
 //!
-//! The product contract fixes these caps as constants rather than deployment configuration.
-//! The product contract fixes these values so producers, host resource declarations, and the run supervisor use the same limits.
-//! `BrocaLimits::default` mirrors these constants one-to-one.
-//! Production uses `BrocaLimits` defaults; tests may lower limits through `BrocaLimits`.
+//! Product limits are fixed constants, not deployment settings. `BrocaLimits::default` uses each
+//! constant, while tests may construct smaller limits to exercise saturation and eviction.
 
 use std::time::Duration;
 
-/// A `session.send` at exactly `MAX_SEND_BODY_BYTES` is admitted; the first byte beyond it is rejected before any run state exists.
-/// state exists.
+/// Limits a `session.send` body length in bytes.
+///
+/// Admission accepts a body exactly at this limit and rejects a larger body before creating run state.
 pub const MAX_SEND_BODY_BYTES: usize = 512 * 1024;
 
 /// The OpenCode adapter passes inline `OPENCODE_CONFIG_CONTENT` as one environment string.
@@ -77,15 +77,14 @@ pub const DELETION_TOMBSTONE_HEADROOM_BYTES: u64 =
 /// Oversize environments fail startup with a named limit rather than exceed ingress headroom.
 /// Startup rejects oversize environments rather than truncate variables.
 /// Truncation can silently remove provider credentials.
-/// credentials.
 ///
 /// The 1536 KiB cap leaves 512 KiB below a 2 MiB exec-payload limit.
 /// The child exec payload includes the snapshot, adapter variables, and argv.
 /// The child exec payload also includes generation and identity controls.
 /// Startup rejects snapshots that would cause child execs to fail with `E2BIG`.
-/// fails `E2BIG`.
 pub const MAX_ENV_SNAPSHOT_BYTES: usize = 1536 * 1024;
 
+/// Estimates allocation overhead per captured environment entry, in bytes.
 ///
 /// Charging only string bytes would admit environments with many short variables without accounting for per-entry allocation costs.
 /// `ENV_ENTRY_OVERHEAD_BYTES` charges each variable for container and allocation overhead beyond its string bytes.
@@ -96,13 +95,13 @@ pub const ENV_ENTRY_OVERHEAD_BYTES: usize = 128;
 /// `ADAPTER_ENV_HEADROOM_BYTES` is multiplied by three because each spawn holds three child-environment representations.
 pub const ADAPTER_ENV_HEADROOM_BYTES: u64 = MAX_OPENCODE_CONFIG_BYTES as u64 + 8 * 1024;
 
+/// Reserves peak resident bytes for environment snapshots and per-spawn representations.
 ///
 /// Each concurrent spawn holds three additional snapshot representations at peak.
 /// `spawn` materializes the exec-ready C-string array in the parent.
 /// The three per-spawn representations are freed when the child exits.
 /// Each per-spawn representation includes [`ADAPTER_ENV_HEADROOM_BYTES`] in addition to the snapshot.
 /// Admission charges [`ENV_ENTRY_OVERHEAD_BYTES`] per variable against [`MAX_ENV_SNAPSHOT_BYTES`], covering each representation's container overhead.
-/// [`ROUTE_IDENTITY_HEADROOM_BYTES`].
 pub const ENV_SNAPSHOT_HEADROOM_BYTES: u64 = (1 + 3 * MAX_BACKEND_PROCESSES as u64)
     * MAX_ENV_SNAPSHOT_BYTES as u64
     + 3 * MAX_BACKEND_PROCESSES as u64 * ADAPTER_ENV_HEADROOM_BYTES;
@@ -110,7 +109,6 @@ pub const ENV_SNAPSHOT_HEADROOM_BYTES: u64 = (1 + 3 * MAX_BACKEND_PROCESSES as u
 /// The reservation includes the supervisor's enforced budget and retention classes outside that budget.
 /// The host subtracts `DECLARED_RETAINED_RESIDENT_BYTES` from ingress headroom.
 /// Ingress sizing around Broca must use `DECLARED_RETAINED_RESIDENT_BYTES`, not `MAX_RETAINED_BYTES` alone.
-/// [`MAX_RETAINED_BYTES`] alone.
 pub const DECLARED_RETAINED_RESIDENT_BYTES: u64 = MAX_RETAINED_BYTES
     + ROUTE_IDENTITY_HEADROOM_BYTES
     + BACKEND_CAPTURE_HEADROOM_BYTES
@@ -134,6 +132,7 @@ pub const MAX_COMMAND_CALLBACKS: usize = 32;
 /// `MAX_SUBSCRIBERS_PER_RUN` limits each run to two concurrent subscribers.
 pub const MAX_SUBSCRIBERS_PER_RUN: usize = 2;
 
+/// Limits concurrent subscribers across all runs.
 pub const MAX_TOTAL_SUBSCRIBERS: usize = 64;
 
 /// Runs admitted after all eight backend permits are occupied remain `queued` until a permit frees.
@@ -142,19 +141,20 @@ pub const MAX_BACKEND_PROCESSES: usize = 8;
 /// The paired reservations prevent saturated Broca work from consuming a general admission slot.
 pub const RESERVED_PENDING_REQUESTS: usize = 96;
 
+/// Reserves handler tasks for Broca requests so general host work cannot consume their capacity.
 pub const RESERVED_HANDLER_TASKS: usize = 96;
 
 /// `MAX_OUTPUT_TOKENS_BOUND` rejects `generation.max_output_tokens` values above 1,000,000.
 /// Providers enforce per-model ceilings separately from this bound.
 pub const MAX_OUTPUT_TOKENS_BOUND: u64 = 1_000_000;
 
-/// `TEMPERATURE_RANGE` accepts `generation.temperature` values from 0.0 through 2.0.
-/// provider convention.
+/// Accepts `generation.temperature` values from 0.0 through 2.0, inclusive.
 pub const TEMPERATURE_RANGE: std::ops::RangeInclusive<f64> = 0.0..=2.0;
 
-/// `BrocaLimits::default()` uses the fixed product-contract capacities.
+/// Configures capacities for admission, replay retention, and backend scheduling.
 ///
-/// `BrocaLimits` lets deterministic tests exercise eviction, overflow, and saturation with smaller capacities.
+/// `BrocaLimits::default()` uses the fixed product-contract capacities. Deterministic tests may
+/// use smaller values to exercise eviction, overflow, and saturation.
 #[derive(Debug, Clone)]
 pub struct BrocaLimits {
     pub max_active_runs: usize,

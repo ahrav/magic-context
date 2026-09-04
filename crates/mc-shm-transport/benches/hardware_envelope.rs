@@ -1,3 +1,8 @@
+//! Process-isolated shared-memory transport smoke measurements.
+//!
+//! Durations use nanoseconds, payload sizes use bytes, and operation counters cover one arm run.
+//! Parent process alternates arm order; each arm executes in a fresh child process.
+
 use std::hint::black_box;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -193,6 +198,8 @@ fn failed(arm: &str, payload: usize, iterations: u64, reason: &str) -> Measureme
 }
 
 fn run_h0(iterations: u64) -> Result<(Duration, u64, u64, u64, u64, u64), &'static str> {
+    // SAFETY: Arguments request one anonymous 4096-byte mapping. Code checks `MAP_FAILED` before
+    // dereference and passes the same address and length to `munmap` after both processes finish.
     let mapped = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -207,13 +214,19 @@ fn run_h0(iterations: u64) -> Result<(Duration, u64, u64, u64, u64, u64), &'stat
         return Err("h0 mapping");
     }
     let line = mapped.cast::<AtomicU64>();
+    // SAFETY: Successful `mmap` returned writable storage aligned for `AtomicU64` at page start.
     unsafe { line.write(AtomicU64::new(0)) };
+    // SAFETY: `fork` has no Rust preconditions. Both branches restrict post-fork work to atomics
+    // and libc process primitives until the child calls `_exit`.
     let child = unsafe { libc::fork() };
     if child < 0 {
+        // SAFETY: `mapped` names the live 4096-byte mapping created above.
         unsafe { libc::munmap(mapped, 4096) };
         return Err("h0 fork");
     }
     if child == 0 {
+        // SAFETY: `line` points to an initialized `AtomicU64` in shared memory. Parent keeps the
+        // mapping live until this child exits. Atomic access coordinates both processes.
         for sequence in 0..iterations {
             let request = sequence * 2 + 1;
             while unsafe { (*line).load(Ordering::Acquire) } != request {
@@ -221,6 +234,7 @@ fn run_h0(iterations: u64) -> Result<(Duration, u64, u64, u64, u64, u64), &'stat
             }
             unsafe { (*line).store(request + 1, Ordering::Release) };
         }
+        // SAFETY: Child terminates without running inherited Rust destructors after `fork`.
         unsafe { libc::_exit(0) };
     }
     let start = Instant::now();
@@ -232,7 +246,9 @@ fn run_h0(iterations: u64) -> Result<(Duration, u64, u64, u64, u64, u64), &'stat
         }
     }
     let status = wait_child(child)?;
+    // SAFETY: `line` remains initialized and mapped until the following `munmap`.
     let checksum = unsafe { (*line).load(Ordering::Relaxed) };
+    // SAFETY: Child has exited, and `mapped` names the live 4096-byte mapping created above.
     unsafe { libc::munmap(mapped, 4096) };
     if status != 0 {
         return Err("h0 peer failed");
@@ -267,6 +283,8 @@ fn run_ring(
     let profile = ring_profile()?;
     let ring = Ring::create(&profile, 0).map_err(|_| "ring setup")?;
     let body = vec![0x5a; payload_len];
+    // SAFETY: Arguments request one anonymous 4096-byte mapping. Code checks `MAP_FAILED` before
+    // dereference and passes the same address and length to `munmap` after both processes finish.
     let mapped = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -281,14 +299,21 @@ fn run_ring(
         return Err("ring counter mapping");
     }
     let park_wakes = mapped.cast::<AtomicU64>();
+    // SAFETY: Successful `mmap` returned writable storage aligned for `AtomicU64` at page start.
     unsafe { park_wakes.write(AtomicU64::new(0)) };
+    // SAFETY: `fork` has no Rust preconditions. Child uses inherited ring state, atomics, and libc
+    // process primitives, then calls `_exit` without running inherited destructors.
     let child = unsafe { libc::fork() };
     if child < 0 {
+        // SAFETY: `mapped` names the live 4096-byte mapping created above.
         unsafe { libc::munmap(mapped, 4096) };
         return Err("ring peer fork");
     }
     if child == 0 {
+        // SAFETY: `park_wakes` points to an initialized shared `AtomicU64`; parent retains the
+        // mapping until `wait_child` returns.
         let status = ring_consumer(&ring, iterations, copied_receiver, unsafe { &*park_wakes });
+        // SAFETY: Child terminates without running inherited Rust destructors after `fork`.
         unsafe { libc::_exit(status) };
     }
 
@@ -316,7 +341,9 @@ fn run_ring(
         reservation.commit(payload_len).map_err(|_| "commit")?;
     }
     let status = wait_child(child);
+    // SAFETY: `park_wakes` remains initialized and mapped until the following `munmap`.
     let park_wakes = unsafe { (*park_wakes).load(Ordering::Relaxed) };
+    // SAFETY: Child has exited, and `mapped` names the live 4096-byte mapping created above.
     unsafe { libc::munmap(mapped, 4096) };
     if status? != 0 {
         return Err("ring peer failed");
@@ -380,6 +407,7 @@ fn ring_consumer(
 
 fn wait_child(child: libc::pid_t) -> Result<i32, &'static str> {
     let mut status = 0;
+    // SAFETY: `status` is writable, and `child` is the positive PID returned by `fork`.
     if unsafe { libc::waitpid(child, &mut status, 0) } != child {
         return Err("peer wait failed");
     }

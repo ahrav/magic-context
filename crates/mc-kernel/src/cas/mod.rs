@@ -1,0 +1,521 @@
+//! Content-addressed artifact types, limits, layout, and fail-closed state.
+//!
+//! Payload limits are byte counts. The store latches non-capacity storage
+//! failures with release/acquire ordering so later ingestion fails closed.
+
+mod deletion;
+pub(super) mod gc;
+mod ingest;
+mod read;
+
+use std::fmt;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+
+use super::{CommitIntent, RepositoryProvenance, Sensitivity};
+use crate::durable_fs::{
+    classify_io, open_or_create_secure_directory, open_secure_directory, StorageError,
+};
+use crate::{KernelError, KernelStore};
+
+/// Default total artifact capacity in bytes.
+pub(super) const DEFAULT_ARTIFACT_CAP: u64 = 4 * 1024 * 1024 * 1024;
+/// Maximum payload accepted by one ingest, in bytes. Ingestion accepts exactly
+/// this many bytes and rejects one more with `PayloadTooLarge`.
+pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum recognized-secret findings accepted in one payload, counted before
+/// overlapping findings merge into detections; the scan stops at the cap.
+pub(super) const MAX_PAYLOAD_DETECTIONS: usize = 4096;
+/// Maximum UTF-8 byte length of each artifact text field.
+pub(super) const MAX_TEXT_FIELD_BYTES: usize = 1024;
+
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactIngestFault {
+    Write,
+    FileSync,
+    ReservationCommit,
+    Rename,
+    AfterDirectorySync,
+    AfterEvents,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactIngestHook {
+    AfterReservation,
+    AfterPublish,
+}
+
+/// Injection flags carried through ingest so the private path keeps one signature
+/// in every feature configuration. Production passes `Default`, which folds away.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct IngestFaults {
+    pub write: bool,
+    pub file_sync: bool,
+    pub reservation_commit: bool,
+    pub rename: bool,
+    pub after_directory_sync: bool,
+    pub after_events: bool,
+}
+
+#[cfg(feature = "test-support")]
+impl From<ArtifactIngestFault> for IngestFaults {
+    fn from(fault: ArtifactIngestFault) -> Self {
+        Self {
+            write: fault == ArtifactIngestFault::Write,
+            file_sync: fault == ArtifactIngestFault::FileSync,
+            reservation_commit: fault == ArtifactIngestFault::ReservationCommit,
+            rename: fault == ArtifactIngestFault::Rename,
+            after_directory_sync: fault == ArtifactIngestFault::AfterDirectorySync,
+            after_events: fault == ArtifactIngestFault::AfterEvents,
+        }
+    }
+}
+
+/// Most permissive destination class allowed by a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderEgress {
+    RemoteAllowed,
+    LocalOnly,
+}
+
+impl ProviderEgress {
+    /// Egress proofs derive provider classes from this list.
+    pub const ALL: &'static [Self] = &[Self::RemoteAllowed, Self::LocalOnly];
+
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::RemoteAllowed => "remote_allowed",
+            Self::LocalOnly => "local_only",
+        }
+    }
+
+    pub(super) fn from_stored(value: &str) -> Self {
+        match value {
+            "remote_allowed" => Self::RemoteAllowed,
+            _ => Self::LocalOnly,
+        }
+    }
+
+    pub(super) fn restrictive(self, other: Self) -> Self {
+        if self == Self::LocalOnly || other == Self::LocalOnly {
+            Self::LocalOnly
+        } else {
+            Self::RemoteAllowed
+        }
+    }
+}
+
+/// Complete metadata and payload for one atomic artifact ingest.
+///
+/// Validation rejects oversized payloads, oversized text fields, negative source
+/// revisions, and negative retention deadlines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactIngestRequest {
+    pub intent: CommitIntent,
+    pub payload: Vec<u8>,
+    pub evidence_id: String,
+    pub object_id: String,
+    pub object_kind: String,
+    pub domain_id: String,
+    pub source_kind: String,
+    pub source_id: String,
+    /// Nonnegative revision supplied by the source system.
+    pub source_revision: i64,
+    pub media_type: String,
+    pub retention_class: String,
+    /// Optional absolute retention deadline in milliseconds.
+    pub retain_until: Option<i64>,
+    pub asserted_sensitivity: Sensitivity,
+    pub provider_egress: ProviderEgress,
+    pub provenance: Option<RepositoryProvenance>,
+}
+
+/// Stable identifiers returned after artifact bytes and evidence are committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactHandle {
+    pub digest: String,
+    pub evidence_id: String,
+}
+
+/// Destination considered by artifact egress eligibility checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArtifactDestination {
+    Local,
+    Remote,
+}
+
+impl ArtifactDestination {
+    /// Egress proofs derive destinations from this list.
+    pub const ALL: &'static [Self] = &[Self::Local, Self::Remote];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EligibilityDeniedReason {
+    UnknownSensitive,
+    SensitiveRemote,
+    ProviderRestricted,
+    Secret,
+    Tombstoned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactEligibility {
+    Allowed,
+    Denied(EligibilityDeniedReason),
+}
+
+/// An egress verdict and the class it was derived from, read in one snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactEgressFacts {
+    pub eligibility: ArtifactEligibility,
+    /// The restrictive fold over every live reference to the digest; `None`
+    /// when no live reference exists or the digest is tombstoned.
+    pub stored_class: Option<(Sensitivity, ProviderEgress)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactErrorKind {
+    PayloadTooLarge,
+    Capacity,
+    StorageExhausted,
+    IngestionFailClosed,
+    ReAdmissionBlocked,
+    MissingObject,
+    CorruptObject,
+    ReferenceUnavailable,
+    ReferenceCommit,
+    AlignmentRebuild,
+    ReclaimInProgress,
+    UnredactableSecret,
+    /// The secret scan stopped before covering the whole payload, so the payload is refused unscanned rather than stored unproven.
+    ScanIncomplete,
+    DetectionLimit,
+    TextFieldTooLong,
+    InvalidInput,
+    /// The intent's `operation_key` already carries a receipt for a different
+    /// `request_digest`; no retry with this key can succeed.
+    OperationKeyReused,
+    /// A database constraint rejected the reference: an `object_id` or
+    /// `evidence_id` the registry already holds, or a reference to a row that
+    /// does not exist. Retrying the same request cannot succeed.
+    StorageConstraint,
+    PurgeIntent,
+    PurgeUnlinkPending,
+}
+
+/// Bounded artifact failure with optional capacity or digest context.
+///
+/// Display and debug output expose no payload bytes.
+#[derive(thiserror::Error)]
+#[error("{}", artifact_error_message(.kind, .usage, .cap, .digest))]
+pub struct ArtifactError {
+    kind: ArtifactErrorKind,
+    usage: Option<u64>,
+    cap: Option<u64>,
+    digest: Option<String>,
+}
+
+impl ArtifactError {
+    pub fn kind(&self) -> ArtifactErrorKind {
+        self.kind
+    }
+
+    pub fn usage(&self) -> Option<u64> {
+        self.usage
+    }
+
+    pub fn cap(&self) -> Option<u64> {
+        self.cap
+    }
+
+    pub fn digest(&self) -> Option<&str> {
+        self.digest.as_deref()
+    }
+
+    pub fn is_retriable(&self) -> bool {
+        matches!(
+            self.kind,
+            ArtifactErrorKind::Capacity
+                | ArtifactErrorKind::StorageExhausted
+                | ArtifactErrorKind::ReclaimInProgress
+                | ArtifactErrorKind::PurgeUnlinkPending
+        )
+    }
+
+    pub(super) fn new(kind: ArtifactErrorKind) -> Self {
+        Self {
+            kind,
+            usage: None,
+            cap: None,
+            digest: None,
+        }
+    }
+
+    pub(super) fn capacity(usage: u64, cap: u64) -> Self {
+        Self {
+            kind: ArtifactErrorKind::Capacity,
+            usage: Some(usage),
+            cap: Some(cap),
+            digest: None,
+        }
+    }
+
+    pub(super) fn for_digest(kind: ArtifactErrorKind, digest: &str) -> Self {
+        Self {
+            kind,
+            usage: None,
+            cap: None,
+            digest: Some(digest.to_string()),
+        }
+    }
+}
+
+/// `Display` and `Debug` for `ArtifactError` both write through this type into the
+/// caller's `Formatter`, which avoids building an owned `String` per rendering.
+struct ArtifactErrorMessage<'a> {
+    kind: &'a ArtifactErrorKind,
+    usage: &'a Option<u64>,
+    cap: &'a Option<u64>,
+    digest: &'a Option<String>,
+}
+
+fn artifact_error_message<'a>(
+    kind: &'a ArtifactErrorKind,
+    usage: &'a Option<u64>,
+    cap: &'a Option<u64>,
+    digest: &'a Option<String>,
+) -> ArtifactErrorMessage<'a> {
+    ArtifactErrorMessage {
+        kind,
+        usage,
+        cap,
+        digest,
+    }
+}
+
+impl fmt::Display for ArtifactErrorMessage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            ArtifactErrorKind::PayloadTooLarge => write!(
+                formatter,
+                "artifact payload exceeds {MAX_PAYLOAD_BYTES} bytes"
+            ),
+            ArtifactErrorKind::Capacity => write!(
+                formatter,
+                "artifact capacity exceeded (usage={}, cap={})",
+                self.usage.unwrap_or(0),
+                self.cap.unwrap_or(0)
+            ),
+            ArtifactErrorKind::StorageExhausted => {
+                formatter.write_str("artifact storage capacity is exhausted")
+            }
+            ArtifactErrorKind::IngestionFailClosed => {
+                formatter.write_str("artifact ingestion is fail-closed until the store is reopened")
+            }
+            ArtifactErrorKind::ReAdmissionBlocked => write!(
+                formatter,
+                "artifact re-admission is blocked for digest {}",
+                self.digest.as_deref().unwrap_or("unknown")
+            ),
+            ArtifactErrorKind::MissingObject => write!(
+                formatter,
+                "artifact object is missing for digest {}",
+                self.digest.as_deref().unwrap_or("unknown")
+            ),
+            ArtifactErrorKind::CorruptObject => write!(
+                formatter,
+                "artifact object hash mismatch for digest {}",
+                self.digest.as_deref().unwrap_or("unknown")
+            ),
+            ArtifactErrorKind::ReferenceUnavailable => {
+                formatter.write_str("artifact reference is not live")
+            }
+            ArtifactErrorKind::ReferenceCommit => {
+                formatter.write_str("artifact canonical reference commit failed")
+            }
+            ArtifactErrorKind::AlignmentRebuild => {
+                formatter.write_str("artifact deletion could not rebuild the alignment projection")
+            }
+            ArtifactErrorKind::ReclaimInProgress => {
+                formatter.write_str("artifact reclamation is in progress; retry ingestion")
+            }
+            ArtifactErrorKind::UnredactableSecret => formatter
+                .write_str("artifact payload holds a recognized secret that cannot be redacted"),
+            ArtifactErrorKind::ScanIncomplete => {
+                formatter.write_str("artifact payload could not be fully scanned for secrets")
+            }
+            ArtifactErrorKind::TextFieldTooLong => write!(
+                formatter,
+                "artifact text field exceeds {MAX_TEXT_FIELD_BYTES} bytes"
+            ),
+            ArtifactErrorKind::DetectionLimit => write!(
+                formatter,
+                "artifact payload exceeds {MAX_PAYLOAD_DETECTIONS} recognized secrets"
+            ),
+            ArtifactErrorKind::InvalidInput => formatter.write_str("artifact input is invalid"),
+            ArtifactErrorKind::PurgeIntent => {
+                formatter.write_str("artifact purge intent could not be made durable")
+            }
+            ArtifactErrorKind::PurgeUnlinkPending => {
+                formatter.write_str("artifact purge committed with durable unlink pending")
+            }
+            ArtifactErrorKind::OperationKeyReused => {
+                formatter.write_str("operation key already used with a different request digest")
+            }
+            ArtifactErrorKind::StorageConstraint => {
+                formatter.write_str("artifact reference violates a storage constraint")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub use deletion::{ArtifactDeletionFault, ArtifactDeletionHook};
+pub use deletion::{
+    ArtifactDeletionIdentity, ArtifactDeletionKind, ArtifactDeletionRequest,
+    ArtifactDeletionResult, BarrierConsumerStatus, DeletionBarrierStatus,
+};
+#[cfg(feature = "test-support")]
+pub use gc::ArtifactGcFault;
+pub use gc::ArtifactGcResult;
+pub(crate) use read::egress_facts_tx;
+
+impl fmt::Debug for ArtifactError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+pub(super) fn prepare_layout(root: &Path) -> Result<PathBuf, KernelError> {
+    let root_directory = File::open(root).map_err(|_| KernelError::Io)?;
+    let artifacts = open_or_create_secure_directory(&root_directory, "artifacts")
+        .map_err(|_| KernelError::Io)?;
+    open_or_create_secure_directory(&artifacts, "objects").map_err(|_| KernelError::Io)?;
+    let tmp = open_or_create_secure_directory(&artifacts, "tmp").map_err(|_| KernelError::Io)?;
+    for entry in std::fs::read_dir(root.join("artifacts/tmp")).map_err(|_| KernelError::Io)? {
+        let entry = entry.map_err(|_| KernelError::Io)?;
+        let file_type = entry.file_type().map_err(|_| KernelError::Io)?;
+        if file_type.is_file() || file_type.is_symlink() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            crate::durable_fs::durable_unlink(&tmp, &name).map_err(|_| KernelError::Io)?;
+        }
+    }
+    Ok(root.join("artifacts"))
+}
+
+impl KernelStore {
+    /// A same-UID process can replace `artifacts` or `objects` with a symlink
+    /// after the store is open, so neither is trusted as a path component.
+    pub(super) fn open_objects_directory(&self) -> Result<File, StorageError> {
+        self.open_artifacts_subdirectory("objects")
+    }
+
+    pub(super) fn open_artifacts_subdirectory(&self, name: &str) -> Result<File, StorageError> {
+        let Some(store_root) = self.artifacts_path.parent() else {
+            return Err(classify_io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "artifact root has no parent directory",
+            )));
+        };
+        let root = File::open(store_root).map_err(classify_io)?;
+        let artifacts = open_secure_directory(&root, "artifacts")?;
+        open_secure_directory(&artifacts, name)
+    }
+
+    pub(super) fn cas_is_failed(&self) -> bool {
+        self.cas_failed.load(Ordering::Acquire)
+    }
+
+    pub(super) fn latch_cas_failure(&self) {
+        self.cas_failed.store(true, Ordering::Release);
+    }
+
+    pub(super) fn map_cas_storage_error(
+        &self,
+        error: StorageError,
+        non_capacity_kind: ArtifactErrorKind,
+    ) -> ArtifactError {
+        match error {
+            StorageError::Exhausted(_) => ArtifactError::new(ArtifactErrorKind::StorageExhausted),
+            StorageError::Other(_) => {
+                self.latch_cas_failure();
+                ArtifactError::new(non_capacity_kind)
+            }
+        }
+    }
+
+    pub(super) fn fail_cas_storage(&self, kind: ArtifactErrorKind) -> ArtifactError {
+        self.latch_cas_failure();
+        ArtifactError::new(kind)
+    }
+}
+
+pub(super) fn read_capped(source: impl std::io::Read) -> std::io::Result<Option<Vec<u8>>> {
+    let limit = u64::try_from(MAX_PAYLOAD_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    source.take(limit).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_PAYLOAD_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+pub(crate) fn is_artifact_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod lattice_tests {
+    use super::ProviderEgress;
+    use crate::envelope::Sensitivity;
+
+    #[test]
+    fn sensitivity_merge_keeps_the_more_restrictive_class() {
+        use Sensitivity::{Normal, Secret, Sensitive};
+        for (left, right, expected) in [
+            (Normal, Normal, Normal),
+            (Normal, Sensitive, Sensitive),
+            (Normal, Secret, Secret),
+            (Sensitive, Normal, Sensitive),
+            (Sensitive, Sensitive, Sensitive),
+            (Sensitive, Secret, Secret),
+            (Secret, Normal, Secret),
+            (Secret, Sensitive, Secret),
+            (Secret, Secret, Secret),
+        ] {
+            assert_eq!(left.restrictive(right), expected, "{left:?} + {right:?}");
+        }
+    }
+
+    #[test]
+    fn egress_merge_keeps_the_more_restrictive_class() {
+        use ProviderEgress::{LocalOnly, RemoteAllowed};
+        for (left, right, expected) in [
+            (RemoteAllowed, RemoteAllowed, RemoteAllowed),
+            (RemoteAllowed, LocalOnly, LocalOnly),
+            (LocalOnly, RemoteAllowed, LocalOnly),
+            (LocalOnly, LocalOnly, LocalOnly),
+        ] {
+            assert_eq!(left.restrictive(right), expected, "{left:?} + {right:?}");
+        }
+    }
+
+    #[test]
+    fn unrecognized_stored_classes_read_back_restrictive() {
+        assert_eq!(Sensitivity::from_stored("internal"), Sensitivity::Secret);
+        assert_eq!(
+            ProviderEgress::from_stored("internal"),
+            ProviderEgress::LocalOnly
+        );
+    }
+}

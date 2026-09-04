@@ -6,6 +6,7 @@ use super::{
     redaction_type_for_key, Detection, Redaction, RedactionError, RedactionErrorKind, DETECTOR_ID,
 };
 
+/// Stable classification and replacement text for a provider-specific rule.
 struct RuleLabel {
     secret_type: &'static str,
     replacement: &'static str,
@@ -57,7 +58,7 @@ const PROVIDER_PRECEDENCE: u8 = 1;
 const GENERIC_PRECEDENCE: u8 = 2;
 
 #[derive(Debug)]
-struct Replacement {
+pub(super) struct Replacement {
     start: usize,
     end: usize,
     /// Lowest `specificity` supplies the label when findings overlap.
@@ -66,7 +67,19 @@ struct Replacement {
     replacement: String,
 }
 
-pub(super) fn redact(input: &str, findings: &[Finding]) -> Result<Redaction, RedactionError> {
+/// Describes each finding in `input` as a replacement positioned at `base +
+/// span`, so findings from one scan window can be rendered against the text
+/// that window was cut from.
+///
+/// Detection offsets and lengths are UTF-8 byte positions in `input`. Findings
+/// may arrive in any order. Returns [`RedactionErrorKind::InvalidSpan`] when
+/// any span is not a valid string range, and [`RedactionErrorKind::UnknownRule`]
+/// for an unclassified conservative-overlay rule.
+pub(super) fn describe_findings(
+    input: &str,
+    findings: &[Finding],
+    base: usize,
+) -> Result<Vec<Replacement>, RedactionError> {
     let mut replacements = Vec::with_capacity(findings.len());
     for finding in findings {
         let value = finding.value_span;
@@ -85,12 +98,49 @@ pub(super) fn redact(input: &str, findings: &[Finding]) -> Result<Redaction, Red
             &finding.rule_id,
             finding.rule_source,
             key,
-            value.start(),
-            value.end(),
+            base.checked_add(value.start()).ok_or_else(invalid_span)?,
+            base.checked_add(value.end()).ok_or_else(invalid_span)?,
         )?);
     }
-    // Widest span first so a cluster's union is known from its first member, then
-    // most specific, so `render` can pick a winner without rescanning.
+    Ok(replacements)
+}
+
+/// Replaces all described spans and reports one detection per overlapping
+/// cluster. Keyed labels win provider labels, which win generic labels.
+pub(super) fn render(
+    input: &str,
+    mut replacements: Vec<Replacement>,
+) -> Result<Redaction, RedactionError> {
+    sort_for_clustering(&mut replacements);
+    render_sorted(input, replacements)
+}
+
+/// Collapses every overlapping cluster into one replacement covering its union, labelled by its winner.
+///
+/// Rendering the result is identical to rendering the input, so a windowed scan can merge after every
+/// window and count detections rather than raw findings.
+pub(super) fn merge(mut replacements: Vec<Replacement>) -> Vec<Replacement> {
+    sort_for_clustering(&mut replacements);
+    let mut merged: Vec<Replacement> = Vec::with_capacity(replacements.len());
+    for replacement in replacements {
+        match merged.last_mut() {
+            Some(cluster) if replacement.start < cluster.end => {
+                cluster.end = cluster.end.max(replacement.end);
+                if replacement.specificity < cluster.specificity {
+                    cluster.specificity = replacement.specificity;
+                    cluster.secret_type = replacement.secret_type;
+                    cluster.replacement = replacement.replacement;
+                }
+            }
+            _ => merged.push(replacement),
+        }
+    }
+    merged
+}
+
+/// Widest span first so a cluster's union is known from its first member, then
+/// most specific, so the cluster walk can pick a winner without rescanning.
+fn sort_for_clustering(replacements: &mut [Replacement]) {
     replacements.sort_by(|left, right| {
         (left.start, Reverse(left.end), left.specificity).cmp(&(
             right.start,
@@ -98,7 +148,6 @@ pub(super) fn redact(input: &str, findings: &[Finding]) -> Result<Redaction, Red
             right.specificity,
         ))
     });
-    render(input, replacements)
 }
 
 fn describe(
@@ -141,8 +190,24 @@ fn describe(
     })
 }
 
-fn render(input: &str, mut replacements: Vec<Replacement>) -> Result<Redaction, RedactionError> {
-    let mut text = String::with_capacity(input.len());
+/// Renders replacements sorted by start, descending end, then precedence.
+///
+/// Touching spans remain separate. Transitively overlapping spans form one
+/// maximal cluster whose full byte union is replaced once.
+fn render_sorted(
+    input: &str,
+    mut replacements: Vec<Replacement>,
+) -> Result<Redaction, RedactionError> {
+    // Reserving the whole upper bound keeps the buffer from doubling on its
+    // first byte past `input.len()`, which for a payload near the cap would
+    // hold twice the payload while the input is still resident.
+    let bound = input.len()
+        + replacements
+            .iter()
+            .map(|replacement| replacement.replacement.len())
+            .sum::<usize>();
+    let mut text = String::with_capacity(bound);
+    let reserved = text.capacity();
     let mut detections = Vec::with_capacity(replacements.len());
     let mut cursor = 0;
     let mut index = 0;
@@ -176,6 +241,7 @@ fn render(input: &str, mut replacements: Vec<Replacement>) -> Result<Redaction, 
         index = next;
     }
     text.push_str(input.get(cursor..).ok_or_else(invalid_span)?);
+    debug_assert!(text.capacity() == reserved, "rendering must not reallocate");
     Ok(Redaction { text, detections })
 }
 
@@ -188,6 +254,28 @@ const fn invalid_span() -> RedactionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendering_reserves_its_bound_once_and_never_grows() {
+        // Every one-byte span becomes a 17-byte placeholder, so the output is
+        // far longer than the input.
+        let input = "x".repeat(64);
+        let replacements: Vec<Replacement> = (0..64)
+            .map(|start| Replacement {
+                start,
+                end: start + 1,
+                specificity: GENERIC_PRECEDENCE,
+                secret_type: "secret".to_owned(),
+                replacement: "<REDACTED:secret>".to_owned(),
+            })
+            .collect();
+        // The debug assertion inside `render_sorted` is what proves the buffer
+        // never reallocated; the output length shows the bound was needed.
+        let redaction = render(&input, replacements).unwrap();
+        assert_eq!(redaction.text.len(), 64 * "<REDACTED:secret>".len());
+        assert!(redaction.text.len() > input.len());
+        assert_eq!(redaction.detections.len(), 64);
+    }
 
     #[test]
     fn every_overlay_rule_is_classified() {

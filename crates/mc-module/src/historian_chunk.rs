@@ -27,6 +27,7 @@ use crate::historian_validate::{
 };
 use crate::memory_render::MirroredClaimMemory;
 
+/// `ChunkSnapshotOwnedItem` stores block identity and bytes used to fingerprint a historian chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkSnapshotOwnedItem {
     pub id: String,
@@ -35,6 +36,7 @@ pub struct ChunkSnapshotOwnedItem {
 }
 
 impl ChunkSnapshotOwnedItem {
+    /// `as_item` borrows snapshot data without copying fingerprint input.
     pub fn as_item(&self) -> ChunkSnapshotItem<'_> {
         ChunkSnapshotItem {
             id: &self.id,
@@ -44,6 +46,7 @@ impl ChunkSnapshotOwnedItem {
     }
 }
 
+/// `HistorianBuiltChunk` couples rendered input with coverage and fingerprint metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistorianBuiltChunk {
     pub text: String,
@@ -341,6 +344,10 @@ fn completed_tool_arc_ranges(blocks: &[FlatBlock]) -> Vec<MessageRange> {
     ranges
 }
 
+/// Builds the next historian chunk before `eligible_end_ordinal`.
+///
+/// `token_budget` bounds the chunk except for a first block that exceeds it alone, which is emitted whole so the chunk is never empty.
+/// A caller that must respect a provider context limit still truncates the result.
 pub fn build_historian_chunk(
     messages: &[CkIngressMessage],
     blocks: &[FlatBlock],
@@ -499,6 +506,7 @@ pub struct AssembledHistorianFiring {
 }
 
 impl AssembledHistorianFiring {
+    /// `as_fire_request` borrows assembled state without duplicating prompt data.
     pub fn as_fire_request<'a>(
         &'a self,
         store: &'a McStore,
@@ -588,6 +596,7 @@ fn historian_claim_block(store: &McStore, expected: Option<&SnapshotVector>) -> 
     render_historian_claim_block(&claims)
 }
 
+/// Assembles one fenced historian firing or returns the first no-fire reason.
 pub fn assemble_historian_firing(
     store: &McStore,
     messages: &[CkIngressMessage],
@@ -761,6 +770,7 @@ pub fn assemble_historian_firing(
 const HISTORIAN_TRUNCATION_MARKER: &str =
     "\n[… tokens truncated by Magic Context to fit the historian window …]";
 
+/// Truncates input on a UTF-16 boundary and appends the standard marker when needed.
 pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> String {
     if estimate_tokens(input) <= token_budget {
         return input.to_string();
@@ -1107,7 +1117,6 @@ mod tests {
             msg("a3", 3, "assistant", vec![text("done")]),
         ];
         let built = project_and_build(&messages, 1, 1_000, 4);
-        // not conversation)...
         assert!(!built.text.contains("identity"));
         assert!(!built.text.contains("second pinned block"));
         assert!(built.text.contains("U: hello"));

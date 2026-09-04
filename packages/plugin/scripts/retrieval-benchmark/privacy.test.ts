@@ -174,14 +174,19 @@ describe("scanForSensitiveContent fingerprint allowlist", () => {
             "implementation_digest",
             "revisionLocator",
             "runtimeDigest",
-            "corpus",
-            "judgments",
-            "syntheticProfiles",
-            "manifest",
         ]) {
             expect(scanForSensitiveContent({ [key]: HEX })).toEqual([]);
         }
         expect(scanForSensitiveContent({ laneDigest: HEX }).map((v) => v.category)).toContain("hash-like");
+    });
+
+    it("accepts the release fingerprint nouns only inside a releaseFingerprints container", () => {
+        const fingerprints = { corpus: HEX, judgments: HEX, syntheticProfiles: HEX, manifest: HEX };
+        expect(scanForSensitiveContent({ semantic: { releaseFingerprints: fingerprints } })).toEqual([]);
+        for (const key of Object.keys(fingerprints)) {
+            expect(scanForSensitiveContent({ [key]: HEX }).map((v) => v.category)).toContain("hash-like");
+            expect(scanForSensitiveContent({ notReleaseFingerprints: { [key]: HEX } }).map((v) => v.category)).toContain("hash-like");
+        }
     });
 
     it("rejects a lane-keyed fingerprint map because the immediate key is the lane, not a fingerprint field", () => {

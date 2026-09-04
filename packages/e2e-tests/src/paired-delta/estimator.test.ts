@@ -158,6 +158,17 @@ describe("family-clustered delta estimator", () => {
     });
 
     it("labels estimates when no calibration noise floor exists", () => {
+        // A blank identifier would name a report row the parser refuses.
+        expect(() => estimate({
+            observations: observations.map((row, index) => index === 0 ? { ...row, familyId: " " } : row),
+        })).toThrow(/identifier-blank/);
+        expect(() => estimate({ bootstrapResamples: 10 ** 9 })).toThrow(/bootstrap-resamples-too-large/);
+        expect(() => estimate({
+            bootstrapResamples: 100_000,
+            observations: Array.from({ length: 300 }, (_, index) => ({
+                ...observations[0]!, coordinateId: `var-z:${index}`,
+            })),
+        })).toThrow(/bootstrap-work-too-large/);
         const result = estimate({ noiseFloors: undefined });
         expect(result.endpoints[0]!.families.every(({ noise }) =>
             noise.label === "no-noise-floor" && noise.floor === null)).toBe(true);
@@ -368,7 +379,7 @@ describe("bound prospective estimator adapter", () => {
         /** Shifted clear of every family floor: a delta inside its floor is not separable from measured noise, so it must not project a direction. */
         const positive = adapter(estimate({
             minimumAnalyzableFamilyCount: 1,
-            observations: observations.map((row) => ({ ...row, delta: Math.abs(row.delta) + 0.7 })),
+            observations: observations.map((row) => ({ ...row, delta: Math.min(1, Math.abs(row.delta) + 0.7) })),
         })).analyze(pairs, H3);
         expect(positive.direction).toBe("improvement");
         const insideFloor = adapter(estimate({
@@ -379,7 +390,7 @@ describe("bound prospective estimator adapter", () => {
 
         const negative = adapter(estimate({
             minimumAnalyzableFamilyCount: 1,
-            observations: observations.map((row) => ({ ...row, delta: -Math.abs(row.delta) - 0.7 })),
+            observations: observations.map((row) => ({ ...row, delta: Math.max(-1, -Math.abs(row.delta) - 0.7) })),
         })).analyze(pairs, H3);
         expect(negative.direction).toBe("regression");
 
@@ -388,8 +399,8 @@ describe("bound prospective estimator adapter", () => {
             observations: observations.map((row) => ({
                 ...row,
                 delta: row.endpoint === "mc-on-vs-mc-off"
-                    ? Math.abs(row.delta) + 0.7
-                    : -Math.abs(row.delta) - 0.7,
+                    ? Math.min(1, Math.abs(row.delta) + 0.7)
+                    : Math.max(-1, -Math.abs(row.delta) - 0.7),
             })),
         })).analyze(pairs, H3);
         expect(mixed.direction).toBe("no-change");

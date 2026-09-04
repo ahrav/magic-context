@@ -1,4 +1,7 @@
-//! The module defines the rendered-tail hygiene metric used by Channel-1 and Channel-2 nudges.
+//! Rendered-tail hygiene measurement for Channel-1 and Channel-2 nudges.
+//!
+//! `T` counts eligible rendered-tail tokens. `U` counts the unprotected,
+//! actively tagged subset, so every result maintains `0 <= U <= T`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -47,6 +50,10 @@ impl HygieneBand {
     }
 }
 
+/// One hygiene walk, with token counts and content-addressed part evidence.
+///
+/// `u` and `t` are estimated token counts. `content_signature` commits to part
+/// order, identity, kind, and content without retaining rendered content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TailHygieneMeasurement {
     pub(crate) u: i64,
@@ -199,6 +206,10 @@ fn image_dimensions(header: &str, bytes: &[u8]) -> Option<(u64, u64)> {
     None
 }
 
+/// Estimates image tokens from dimensions in a bounded base64 header preview.
+///
+/// Unknown formats use a fixed fallback. Known dimensions use one token per
+/// 750 pixels, clamped to 1 through 4,500 tokens.
 fn estimate_image_tokens(data_url: &str) -> i64 {
     let Some((header, payload)) = data_url.split_once(',') else {
         return IMAGE_FALLBACK_TOKENS;
@@ -466,6 +477,11 @@ fn block_is_protected(
             .is_some_and(|arc_id| protected_arc_ids.contains(arc_id))
 }
 
+/// Measures eligible projection parts in projection order.
+///
+/// Synthetic, system, covered, reduced, sentinel, reasoning, and opaque parts
+/// contribute zero. Protected parts contribute to `T` but not `U`. Arithmetic
+/// saturates, and the returned counts preserve `0 <= U <= T`.
 pub(crate) fn measure_tail_hygiene(
     projection: &FlatProjection,
     core: &CoreState,
@@ -648,6 +664,10 @@ fn same_measured_prefix(
     Some(boundary_advance_u)
 }
 
+/// Refreshes a baseline after a full cache bust or an append-only defer pass.
+///
+/// Non-append mutation invalidates evaluation until the next cache-busting
+/// walk. Generation numbers increase only on full replacement.
 pub(crate) fn refresh_tail_hygiene_baseline(
     measured: TailHygieneMeasurement,
     cache_busting: bool,
@@ -716,6 +736,7 @@ pub(crate) fn effective_tail_hygiene(baseline: &TailHygieneBaseline) -> (i64, i6
     (u, t)
 }
 
+/// Classifies clamped token counts using fixed floor and severity thresholds.
 pub(crate) fn hygiene_band(u: i64, t: i64) -> HygieneBand {
     let t = t.max(0);
     let u = u.clamp(0, t);

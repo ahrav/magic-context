@@ -16,6 +16,7 @@ pub enum Class {
 }
 
 impl Class {
+    /// Returns the stable manifest label for this class.
     pub fn label(self) -> &'static str {
         match self {
             Class::SameL3 => "same-l3",
@@ -23,6 +24,9 @@ impl Class {
         }
     }
 
+    /// Parses a manifest label.
+    ///
+    /// Returns an error for labels other than `same-l3` and `cross-numa`.
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "same-l3" => Ok(Class::SameL3),
@@ -32,10 +36,12 @@ impl Class {
     }
 }
 
+/// Linux topology attributes used to validate benchmark CPU pairs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuDesc {
-    /// (physical_package_id, core_id): distinct tuples are distinct cores.
+    /// `(physical_package_id, core_id)`; distinct tuples identify distinct cores.
     pub core: (u32, u32),
+    /// NUMA node number reported by sysfs.
     pub node: u32,
     /// `l3` stores the `shared_cpu_list` that identifies the CPU's unified L3.
     pub l3: Option<String>,
@@ -49,6 +55,10 @@ pub struct Topology {
     pub cpus: BTreeMap<u32, CpuDesc>,
 }
 
+/// Parses Linux cpulist syntax into ascending, deduplicated CPU numbers.
+///
+/// Empty input produces an empty set. Reversed ranges, non-numeric fields, and
+/// malformed endpoints return an error.
 pub fn parse_cpu_list(list: &str) -> Result<BTreeSet<u32>, String> {
     let mut out = BTreeSet::new();
     let trimmed = list.trim();
@@ -83,7 +93,11 @@ fn read_trimmed(path: &Path) -> Result<String, String> {
         .map_err(|err| format!("{}: {err}", path.display()))
 }
 
-/// Production callers pass `/`; tests pass synthetic sysfs roots.
+/// Reads online CPU, core, NUMA, SMT, and unified-L3 data below `root`.
+///
+/// Production callers pass `/`; tests pass synthetic sysfs roots. Missing or
+/// malformed required sysfs data returns an error. A system without a node
+/// directory is treated as one NUMA node numbered zero.
 pub fn read_topology(root: &Path) -> Result<Topology, String> {
     let cpu_base = root.join("sys/devices/system/cpu");
     let online = parse_cpu_list(&read_trimmed(&cpu_base.join("online"))?)?;
@@ -144,8 +158,10 @@ pub fn read_topology(root: &Path) -> Result<Topology, String> {
     Ok(Topology { cpus })
 }
 
-/// The CPU's `shared_cpu_list` identifies its unified L3 cache.
-/// shared_cpu_list string.
+/// Returns the CPU's unified-L3 `shared_cpu_list`, if sysfs exposes one.
+///
+/// The list must include `cpu`; malformed or inconsistent cache data returns
+/// an error.
 fn unified_l3(cache_dir: &Path, cpu: u32) -> Result<Option<String>, String> {
     let Ok(entries) = std::fs::read_dir(cache_dir) else {
         return Ok(None);
@@ -260,6 +276,7 @@ pub fn auto_select(topology: &Topology, allowed: &BTreeSet<u32>, class: Class) -
     AutoSelection::Unavailable(reason.to_owned())
 }
 
+/// Returns whether `affinity` contains exactly `cpu`.
 pub fn is_singleton_affinity(affinity: &BTreeSet<u32>, cpu: u32) -> bool {
     affinity.len() == 1 && affinity.contains(&cpu)
 }
@@ -318,6 +335,7 @@ pub fn set_current_thread_affinity(cpus: &BTreeSet<u32>) -> Result<(), String> {
         .map_err(|err| format!("sched_setaffinity({cpus:?}): {err}"))
 }
 
+/// Returns the Linux CPU number on which the calling thread currently runs.
 pub fn current_cpu() -> u32 {
     rustix::thread::sched_getcpu() as u32
 }

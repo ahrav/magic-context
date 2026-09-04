@@ -85,6 +85,7 @@ pub enum Event {
     HandlerDropped,
 }
 
+/// Scripted bind behavior for [`TestHandler`].
 #[derive(Debug, Clone)]
 pub enum BindPolicy {
     AcceptAll,
@@ -139,6 +140,7 @@ impl Clone for TestHandler {
 }
 
 impl TestHandler {
+    /// Creates an accepting handler with open lifecycle callbacks and empty observations.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -174,6 +176,7 @@ impl TestHandler {
         }
     }
 
+    /// Returns a snapshot of events in occurrence order.
     pub fn events(&self) -> Vec<Event> {
         self.inner.events.lock().expect("events lock").clone()
     }
@@ -182,6 +185,7 @@ impl TestHandler {
         self.inner.dispatches.load(Ordering::SeqCst)
     }
 
+    /// Returns number of `reserve_then_await_completion` output reservations.
     pub fn output_reservation_count(&self) -> usize {
         self.inner.output_reservations.load(Ordering::SeqCst)
     }
@@ -565,6 +569,10 @@ impl McHostHandler for TestHandler {
     }
 }
 
+/// Running single-handler host test harness.
+///
+/// Dropping the harness requests shutdown. Call [`Self::shutdown`] to observe
+/// runtime errors and await task completion.
 pub struct TestHost {
     pub handler: TestHandler,
     pub info: Discovered,
@@ -575,12 +583,20 @@ pub struct TestHost {
 }
 
 impl TestHost {
-    /// `start` waits for publication before returning.
+    /// Starts a default handler and waits for publication.
+    ///
+    /// # Panics
+    ///
+    /// Panics if startup fails or no publication appears within ten seconds.
     pub async fn start() -> Self {
         Self::start_with(|_config| {}).await
     }
 
-    /// `start` waits for publication before returning.
+    /// Starts a default handler with a configuration mutation and waits for publication.
+    ///
+    /// # Panics
+    ///
+    /// Panics if startup fails or no publication appears within ten seconds.
     pub async fn start_with(tweak: impl FnOnce(&mut HostConfig)) -> Self {
         Self::try_start_with(TestHandler::new(), tweak)
             .await
@@ -723,6 +739,7 @@ impl Drop for TestHost {
     }
 }
 
+/// Returns the host publication path below `data_root`.
 pub fn connection_file(data_root: &Path) -> PathBuf {
     data_root
         .join("cortexkit")
@@ -730,6 +747,11 @@ pub fn connection_file(data_root: &Path) -> PathBuf {
         .join(mc_host::CONNECTION_FILE_NAME)
 }
 
+/// Serializes an echo-mode request body.
+///
+/// # Panics
+///
+/// Panics only if serializing the fixed JSON shape fails.
 pub fn echo_body(payload: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({"mode": "echo", "payload": payload}))
         .expect("body serializes")
@@ -739,8 +761,10 @@ pub fn mode_body(value: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&value).expect("body serializes")
 }
 
-/// `TestComponent` serves as a scriptable child for three-component hosts. Request body `hang` parks the task while retaining pending and task permits for capacity-isolation tests; other bodies return `{"served_by": id}`.
-/// `TestComponent` chooses behavior from the request body: `hang` parks the handler task forever while retaining pending and task permits for capacity-isolation tests; other bodies return `{"served_by": id}`.
+/// Scriptable child for three-component host tests.
+///
+/// A request body with mode `hang` parks forever while retaining pending and
+/// task permits. Other bodies return `{"served_by": id}`.
 #[derive(Clone)]
 pub struct StubComponent {
     id: &'static str,
@@ -830,8 +854,10 @@ pub fn stub_trio() -> (StubComponent, StubComponent, StubComponent) {
     )
 }
 
-/// `CompositeTestHost` runs a real loopback host over an arbitrary linked handler.
-/// `CompositeTestHost` supports three-child composite tests that [`TestHost`]'s fixed [`TestHandler`] cannot express.
+/// Real loopback host for composite tests that [`TestHost`] cannot express.
+///
+/// Dropping the harness requests shutdown. Call [`Self::shutdown`] to observe
+/// runtime errors and await task completion.
 pub struct CompositeTestHost {
     pub info: Discovered,
     shutdown: CancellationToken,

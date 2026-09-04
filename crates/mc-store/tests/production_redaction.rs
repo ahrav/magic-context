@@ -550,10 +550,23 @@ fn durable_write_registry_references_real_bindings_and_checked_tests() {
             include_str!("production_redaction.rs"),
         ),
         ("lib", store_source),
-        ("kernel_redaction", include_str!("kernel_redaction.rs")),
-        ("kernel_envelope", include_str!("kernel_envelope.rs")),
-        ("kernel_outbox", include_str!("kernel_outbox.rs")),
-        ("kernel_schema", include_str!("kernel_schema.rs")),
+        // Kernel oracles live in the extracted crate; the registry still names them.
+        (
+            "kernel_redaction",
+            include_str!("../../mc-kernel/tests/kernel_redaction.rs"),
+        ),
+        (
+            "kernel_envelope",
+            include_str!("../../mc-kernel/tests/kernel_envelope.rs"),
+        ),
+        (
+            "kernel_outbox",
+            include_str!("../../mc-kernel/tests/kernel_outbox.rs"),
+        ),
+        (
+            "kernel_schema",
+            include_str!("../../mc-kernel/tests/kernel_schema.rs"),
+        ),
     ]);
     for entry in DURABLE_WRITE_REGISTRY {
         assert!(!entry.preparation.trim().is_empty());

@@ -26,8 +26,7 @@ use mc_host::{
 };
 use mc_module::release_contract;
 
-// -------------------------------------------------------------------------
-// -------------------------------------------------------------------------
+// Lifecycle deadlines.
 
 /// The outer aggregate caps fresh Linux request-to-authenticated-transport handling at 60 seconds.
 const OUTER_AGGREGATE: Duration = Duration::from_secs(60);
@@ -66,10 +65,7 @@ fn phase_deadline(outer: Instant, cap: Duration) -> Instant {
     now + cap.min(remaining)
 }
 
-// -------------------------------------------------------------------------
 // Result reasons use the closed v1 vocabulary.
-// generated JSON.
-// -------------------------------------------------------------------------
 
 const SCHEMA: &str = "magic-context.daemon/v1";
 
@@ -96,13 +92,14 @@ fn remediation_for(reason: &'static str) -> Option<&'static str> {
         | "incompatible_daemon"
         | "incompatible_module"
         | "incompatible_epochs" => Some("align_versions"),
-        "lifecycle_busy" | "storage_starting" | "synapse_starting" | "stopping" | "starting" => {
-            Some("wait_and_retry")
-        }
-        "storage_unavailable" => Some("inspect_storage"),
+        "lifecycle_busy" | "storage_starting" | "kernel_starting" | "synapse_starting"
+        | "stopping" | "starting" => Some("wait_and_retry"),
+        "storage_unavailable" | "kernel_unavailable" => Some("inspect_storage"),
         "synapse_degraded" => Some("inspect_synapse"),
         "not_running" => Some("run_daemon_start"),
-        // Non-failing reasons.
+        // Mirrors `warn_remediations` in `RELEASE_CONTRACT_JSON`.
+        "kernel_capacity_warn" => Some("inspect_storage"),
+        "kernel_lagging" => Some("inspect_kernel_projector"),
         _ => None,
     }
 }
@@ -222,8 +219,7 @@ impl DaemonResult {
     }
 }
 
-// -------------------------------------------------------------------------
-// -------------------------------------------------------------------------
+// Command-line parsing.
 
 enum Command {
     Version,
@@ -337,9 +333,7 @@ fn generation_failure(error: &GenerationError) -> (&'static str, &'static str) {
     }
 }
 
-///
-/// Pre-commit rejections report the on-disk lifecycle state.
-/// classifies them.
+/// Observes on-disk lifecycle state after a pre-commit rejection.
 fn unchanged_state() -> &'static str {
     match probe() {
         Ok(observed) => probe_state(observed.state),
@@ -357,7 +351,7 @@ fn probe_state(state: LifecycleState) -> &'static str {
     }
 }
 
-///
+/// Maps an unsupported state schema to its observed lifecycle state and closed reason.
 fn quarantined_observation(observed: &LifecycleProbe) -> Option<(&'static str, &'static str)> {
     if observed.reason != mc_host::UNSUPPORTED_STATE_SCHEMA_REASON {
         return None;
@@ -368,8 +362,7 @@ fn quarantined_observation(observed: &LifecycleProbe) -> Option<(&'static str, &
     ))
 }
 
-// -------------------------------------------------------------------------
-// -------------------------------------------------------------------------
+// Lifecycle observation helpers.
 
 fn probe() -> Result<LifecycleProbe, InstanceError> {
     mc_host::probe_lifecycle(None, &ProbeFreshness::default())
@@ -471,9 +464,7 @@ fn publication_daemon_ver(observed: &LifecycleProbe) -> Option<String> {
         .map(|publication| publication.daemon_ver.clone())
 }
 
-///
-/// `evaluateDaemonCompatibility` in
-/// `packages/plugin/src/shared/mc-host-lifecycle/compatibility.ts`, whose
+/// Applies the same strict semantic-version shape and half-open range used by `evaluateDaemonCompatibility` in `packages/plugin/src/shared/mc-host-lifecycle/compatibility.ts`.
 fn daemon_version_compatible(daemon_ver: &str) -> bool {
     fn triple(version: &str) -> Option<[u64; 3]> {
         fn component(part: &str) -> Option<u64> {
@@ -513,11 +504,9 @@ fn daemon_version_compatible(daemon_ver: &str) -> bool {
 // probe
 // -------------------------------------------------------------------------
 
-/// `cmd_probe` observes the daemon without creating an instance.
-/// `running` with a contract-conforming publication is `healthy` (ok:true).
-/// `cmd_probe` does not dial a connection, so `proof` and readiness remain null.
-/// `cmd_probe` reports `versions.daemon` only as publication diagnostics.
+/// Observes the daemon without creating an instance or opening a connection.
 ///
+/// `running` with a contract-conforming publication is `healthy` with `ok:true`. Proof and readiness remain null. `versions.daemon` is untrusted publication diagnostics.
 fn cmd_probe() -> DaemonResult {
     let command = "status";
     let observed = match probe() {
@@ -547,7 +536,7 @@ fn cmd_probe() -> DaemonResult {
 // start
 // -------------------------------------------------------------------------
 
-/// authenticated-transport readiness.
+/// Result of resolving, spawning, publishing, and authenticating a successor.
 struct StartOutcome {
     ok: bool,
     start_committed: bool,
@@ -557,7 +546,7 @@ struct StartOutcome {
     generation_check: Option<(&'static str, &'static str)>,
 }
 
-///
+/// Generation input that is either unresolved or validated before a committed stop.
 enum SuccessorGeneration<'a> {
     Resolve {
         payload_dir: Option<&'a Path>,
@@ -574,7 +563,7 @@ fn start_phase(
     launcher_envelope: serve::PreparedLauncherEnvelope,
     stop_committed: bool,
 ) -> StartOutcome {
-    // failing.
+    // Resolution failure means no generation passed validation.
     let unresolved = |state: &'static str, reason: &'static str| StartOutcome {
         ok: false,
         start_committed: false,
@@ -613,7 +602,6 @@ fn start_phase(
     // Generation resolution can outlast `outer` on slow storage.
     // Spawning after `outer` expires would return `startup_timeout` while allowing a daemon to start later.
     // Refusing the spawn prevents a daemon from starting after `startup_timeout` is returned.
-    // passes.
     //
     // After a committed stop, spawning is the only path that restores service.
     // After a committed stop, `outer` may expire without preventing the successor spawn.
@@ -730,7 +718,6 @@ fn preflight_generation(
     }
     match payload_dir {
         // A quarantined or insecure store fails staging before any mutation.
-        // beforehand.
         Some(dir) => {
             let payload = payload_sources(dir, payload_manifest_digest)?;
             // A source byte mismatch must fail before the irreversible stop.
@@ -786,15 +773,17 @@ fn generation_identity_matches(
     Ok(())
 }
 
+/// Validated generation identity and optional open launcher descriptor.
 ///
-/// When present, `launcher` is an open verified `ck-mc-host` descriptor bound to the generation digest.
+/// When present, `launcher` is bound to the generation digest.
 struct ResolvedGeneration {
     digest: String,
     launcher: Option<std::os::fd::OwnedFd>,
 }
 
+/// Opens the production launcher from a validated generation.
 ///
-///
+/// Unqualified development manifests may use current executable only when the test override permits it.
 fn generation_launcher(
     validated: &mc_host::generation::ValidatedGeneration,
 ) -> Result<Option<std::os::fd::OwnedFd>, (&'static str, &'static str)> {
@@ -820,6 +809,7 @@ fn generation_launcher(
         .map_err(|_| ("stopped", "native_payload_invalid"))
 }
 
+/// Resolves and validates a staged generation for the current build target.
 ///
 /// `payload_manifest_digest` requires the resolved generation to have been staged from that digest; a mismatch returns `native_payload_invalid`.
 fn resolve_generation(
@@ -849,7 +839,6 @@ fn resolve_generation(
                 target: target.to_owned(),
                 release_contract_sha256: release_contract::RELEASE_CONTRACT_SHA256.to_owned(),
                 // The `unqualified-dev-manifest` value identifies an unqualified dev/test payload; it is not a placeholder hash.
-                // production payload.
                 inputs_lock_sha256: payload.inputs_lock_sha256,
                 source_payload_manifest_sha256: payload_manifest_digest
                     .unwrap_or("unqualified-dev-manifest")
@@ -1294,14 +1283,12 @@ fn stop_phase(
     match runtime.shutdown(&publication, outer) {
         Ok(()) => {}
         Err("authentication_failed") => return (false, Err(("running", "authentication_failed"))),
-        // After an in-flight frame times out, the function waits for teardown and lets the probe determine whether the host committed it.
-        // After an in-flight frame times out, the function waits for teardown and lets the probe determine whether the host committed it.
+        // After an in-flight frame times out, probe determines whether the host committed it.
         Err("shutdown_outcome_unknown") => commit_uncertain = true,
         // An unresolved response-in-flight attempt requires a commit probe.
         Err(_) => return (false, Err(("running", "lifecycle_busy"))),
     }
-    // After acknowledgement or an unresolved in-flight request, the function waits for teardown and lets the probe determine whether the host committed it.
-    // After acknowledgement or an unresolved in-flight request, the function waits for teardown and lets the probe determine whether the host committed it.
+    // After acknowledgement or an unresolved in-flight request, probe determines whether the host committed it.
     let deadline = phase_deadline(outer, phase_cap(STOP_TEARDOWN));
     loop {
         match probe() {
@@ -1314,7 +1301,6 @@ fn stop_phase(
         }
         if Instant::now() >= deadline {
             if commit_uncertain {
-                // If the request was never acknowledged, teardown observation determines whether it committed.
                 // If the request was never acknowledged, teardown observation determines whether it committed.
                 return match probe().map(|observed| observed.state) {
                     // The daemon is still running; the shutdown did not take effect.
@@ -1378,7 +1364,6 @@ fn cmd_stop() -> DaemonResult {
             "lifecycle_busy",
         ),
         LifecycleState::Running => match stop_phase(&runtime, outer) {
-            // `align_versions`.
             (_, Ok(())) => match serve::clear_active_selection() {
                 Err("unsupported active harness selection schema") => {
                     DaemonResult::new(command, false, "wedged", "unsupported_state_schema")
@@ -1697,14 +1682,28 @@ mod tests {
                 "remediation mismatch for {id}"
             );
         }
+        let warn_remediations = contract["cli"]["reasons"]["warn_remediations"]
+            .as_object()
+            .expect("warn remediations");
         for id in contract["cli"]["reasons"]["non_failing"]
             .as_array()
             .expect("non-failing reasons")
         {
-            let reason: &'static str =
-                Box::leak(id.as_str().expect("reason").to_owned().into_boxed_str());
-            assert_eq!(remediation_for(reason), None);
+            let id = id.as_str().expect("reason");
+            let expected = warn_remediations
+                .get(id)
+                .and_then(serde_json::Value::as_str);
+            let reason: &'static str = Box::leak(id.to_owned().into_boxed_str());
+            assert_eq!(
+                remediation_for(reason),
+                expected,
+                "remediation mismatch for {id}"
+            );
         }
+        assert_eq!(
+            remediation_for("kernel_lagging"),
+            Some("inspect_kernel_projector")
+        );
     }
 
     #[test]

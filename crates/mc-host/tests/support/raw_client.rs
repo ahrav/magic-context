@@ -146,10 +146,16 @@ pub struct RawFrame {
 }
 
 impl RawFrame {
+    /// # Panics
+    ///
+    /// Panics when `body` is not valid JSON.
     pub fn json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body).expect("frame body is JSON")
     }
 
+    /// # Panics
+    ///
+    /// Panics when the body is not JSON or `code` is absent or not a string.
     pub fn error_code(&self) -> String {
         self.json()["code"]
             .as_str()
@@ -280,6 +286,11 @@ pub fn header(len: u32, ty: u8, flags: u8, channel: u16, epoch: u32, corr: u64) 
     out
 }
 
+/// Leaves `body` empty because the fixed header carries only its declared length.
+///
+/// # Panics
+///
+/// Panics unless `bytes` contains exactly [`HEADER_LEN`] bytes.
 pub fn decode_header(bytes: &[u8]) -> RawFrame {
     assert_eq!(bytes.len(), HEADER_LEN, "header must be 21 bytes");
     RawFrame {
@@ -420,6 +431,8 @@ impl RawClient {
         self.stream
     }
 
+    /// Ring-backed sends wait until the bridge publishes every complete frame in `bytes`.
+    /// Setup-only clients write the bytes directly to their Unix stream.
     pub async fn send_raw(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         let Some(raw_tx) = &self.raw_tx else {
             return self.stream.write_all(bytes).await;
@@ -566,6 +579,11 @@ impl RawClient {
         }
     }
 
+    /// Returns earlier frames in wire order when a non-ping frame reaches `corr`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shared budget expires or any frame read fails.
     pub async fn frames_until_corr(
         &mut self,
         corr: u64,

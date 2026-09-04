@@ -1,4 +1,4 @@
-//! KTD2-KTD4).
+//! Host lifecycle records, process fences, probes, and shutdown coordination.
 //!
 //! State is derived from lock ownership plus incarnation-fenced evidence.
 //! The publication PID is never consulted, signaled, or used for cleanup;
@@ -38,8 +38,10 @@ pub const TRANSACTION_LOCK_NAME: &str = "transaction.lock";
 /// `LIFETIME_LOCK_NAME` names the coordination file used for the daemon's lifetime flock.
 pub const LIFETIME_LOCK_NAME: &str = "lifetime.lock";
 
+/// Length of a lowercase hexadecimal payload manifest digest.
 pub const PAYLOAD_MANIFEST_DIGEST_LEN: usize = 64;
 
+/// Returns whether `digest` is exactly 64 lowercase hexadecimal ASCII bytes.
 pub fn is_canonical_payload_digest(digest: &str) -> bool {
     digest.len() == PAYLOAD_MANIFEST_DIGEST_LEN
         && digest
@@ -65,8 +67,8 @@ pub fn lifecycle_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, I
     Ok(base.join("lifecycle"))
 }
 
-/// The function accepts only owner-only, single-link regular files.
-/// The function normalizes the validated descriptor's mode to 0600 instead of chmodding the path.
+/// Accepts only owner-owned, single-link regular files.
+/// Normalizes the validated descriptor's mode to 0600 through the descriptor, not through an
 /// attacker-selected path.
 fn open_coordination_lock_create(
     data_dir_override: Option<&Path>,
@@ -192,7 +194,7 @@ impl LifetimeLock {
 /// An absent coordination root or lock file reports free because supported deployments never rename or unlink the coordination names.
 /// Supported deployments must not rename `.mc-host-coordination` while a daemon is live.
 /// Renaming `.mc-host-coordination` under a live daemon makes the probe report free.
-/// descriptor drops.
+/// The shared probe lock releases when its descriptor drops.
 fn lifetime_lock_free(data_dir_override: Option<&Path>) -> Result<bool, InstanceError> {
     let Some((fd, path)) = open_coordination_lock_probe(data_dir_override, LIFETIME_LOCK_NAME)?
     else {
@@ -239,6 +241,7 @@ pub(crate) fn quarantined_record_present(
     Ok(matches!(decode_record(&bytes), RecordDecode::UnknownSchema))
 }
 
+/// Phase persisted in a schema-1 lifecycle record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecyclePhase {
     Starting,
@@ -354,8 +357,10 @@ fn now_ms() -> u64 {
 }
 
 impl InstanceGuard {
-    /// directory inode.
+    /// Atomically writes `phase` and this guard's incarnation identifiers to the runtime directory.
     ///
+    /// Returns an error when the owner-only record cannot be persisted. Serialization cannot panic
+    /// because `WireRecord` contains only infallible JSON value types.
     pub fn write_lifecycle_record(&self, phase: LifecyclePhase) -> Result<(), InstanceError> {
         let record = WireRecord {
             schema: 1,
@@ -377,8 +382,9 @@ impl InstanceGuard {
         .map(|_stat| ())
     }
 
+    /// Records the stopping phase, then removes this incarnation's publication.
     ///
-    ///
+    /// Record-write failure does not prevent publication removal.
     pub fn begin_stopping(&mut self) {
         let _ = self.write_lifecycle_record(LifecyclePhase::Stopping);
         self.remove_publication();
@@ -461,7 +467,6 @@ impl LifecycleTransactionLock {
     /// `acquire_shared` never creates the coordination root or lock file.
     /// `Ok(None)` means no coordination root exists or a mutator outlasted the bounded wait.
     /// The probe proceeds on evidence alone and relies on its bounded reread loop.
-    /// reread loop.
     ///
     /// The wait uses the same bounded retry that mutators use against a probe's shared lock.
     /// Retrying lets the probe acquire the shared lock after a mutator releases it.
@@ -491,7 +496,6 @@ impl LifecycleTransactionLock {
 /// Transaction-lock holders capture the anchor and mutate through its retained descriptors.
 /// Transaction-lock holders must call [`verify`] before reporting a named-namespace result.
 /// A holder must abort if a captured name resolves to a different identity.
-///
 ///
 /// [`verify`]: NamespaceAnchor::verify
 pub struct NamespaceAnchor {
@@ -776,7 +780,6 @@ fn instance_lock_free(dir: &OwnedFd, dir_path: &Path) -> Result<bool, InstanceEr
 /// A valid publication must satisfy the contract discovery accepts.
 /// A publication no conforming client accepts cannot establish a running host.
 /// `None` classifies a held lock with a `LifecycleState::Running` record as `LifecycleState::Wedged`.
-/// than `running`.
 fn publication_summary(bytes: &[u8]) -> Option<PublicationSummary> {
     let info: ConnectionInfo = serde_json::from_slice(bytes).ok()?;
     info.validate().ok()?;
@@ -800,7 +803,6 @@ fn publication_summary(bytes: &[u8]) -> Option<PublicationSummary> {
 /// The probe blocks synchronously and creates nothing.
 /// The probe does not change permissions, unlink files, or signal PIDs.
 /// Async callers must use `spawn_blocking` because re-sampling may sleep the thread.
-/// `spawn_blocking`.
 pub fn probe_lifecycle(
     data_dir_override: Option<&Path>,
     freshness: &ProbeFreshness,
@@ -812,7 +814,6 @@ pub fn probe_lifecycle(
     // The record write fsyncs, but the window is not instantaneous.
     // The probe re-samples `ABSENT_RECORD_GRACE` times before classifying the holder as `wedged`.
     // A genuinely record-less holder classifies as `wedged` after the last attempt.
-    // attempt.
     const ABSENT_RECORD_GRACE: usize = 2;
     // The daemon acquires the lifetime fence before the runtime lock and releases it afterward.
     // A probe can observe exactly one lock held while a daemon acquires or releases the fences.
@@ -906,7 +907,7 @@ pub fn probe_lifecycle(
     }
 }
 
-/// A credible timestamp lies within `window` of now, in either direction:
+/// Returns whether the timestamp lies within `window` of now, in either direction.
 fn timestamp_fresh(written_at_ms: u64, window: Duration) -> bool {
     let now = now_ms();
     let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
@@ -1032,7 +1033,9 @@ fn classify(
     }
 }
 
-/// requester.
+/// Serializes shutdown ownership so one requester sends the acknowledged response.
+///
+/// Waiters observe reopen and commit transitions through [`ShutdownLatch::changed`].
 pub struct ShutdownLatch {
     phase: Mutex<LatchPhase>,
     changed: tokio::sync::Notify,
@@ -1046,14 +1049,18 @@ enum LatchPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result of attempting to own shutdown response delivery.
 pub enum LatchDecision {
-    /// response.
+    /// Caller owns response delivery until it commits or reopens the latch.
     Owner,
+    /// Another caller owns response delivery.
     Wait,
+    /// Response acknowledgement committed shutdown permanently.
     Committed,
 }
 
 impl ShutdownLatch {
+    /// Creates an open latch with no response owner.
     pub fn new() -> Self {
         Self {
             phase: Mutex::new(LatchPhase::Open),
@@ -1061,6 +1068,11 @@ impl ShutdownLatch {
         }
     }
 
+    /// Claims an open latch or reports its in-flight or committed state.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a previous owner poisoned the internal mutex.
     pub fn try_own(&self) -> LatchDecision {
         let mut phase = self.phase.lock().expect("latch lock");
         match *phase {
@@ -1073,6 +1085,9 @@ impl ShutdownLatch {
         }
     }
 
+    /// Releases in-flight ownership and wakes waiters.
+    ///
+    /// A committed latch remains committed. Panics when the internal mutex is poisoned.
     pub fn reopen(&self) {
         let mut phase = self.phase.lock().expect("latch lock");
         if *phase == LatchPhase::ResponseInFlight {
@@ -1082,11 +1097,15 @@ impl ShutdownLatch {
         self.changed.notify_waiters();
     }
 
+    /// Commits shutdown ownership permanently and wakes waiters.
+    ///
+    /// Panics when the internal mutex is poisoned.
     pub fn commit(&self) {
         *self.phase.lock().expect("latch lock") = LatchPhase::Committed;
         self.changed.notify_waiters();
     }
 
+    /// Returns a future notified by the next reopen or commit transition.
     pub fn changed(&self) -> tokio::sync::futures::Notified<'_> {
         self.changed.notified()
     }
@@ -1098,6 +1117,10 @@ impl Default for ShutdownLatch {
     }
 }
 
+/// Commits shutdown only after response acknowledgement.
+///
+/// Dropping an unacknowledged guard reopens the latch. Acknowledgement commits the latch and
+/// cancels the shutdown token.
 pub struct CommitOnAck {
     latch: std::sync::Arc<ShutdownLatch>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -1105,6 +1128,7 @@ pub struct CommitOnAck {
 }
 
 impl CommitOnAck {
+    /// Binds an in-flight shutdown response to its latch and cancellation token.
     pub fn new(
         latch: std::sync::Arc<ShutdownLatch>,
         shutdown: tokio_util::sync::CancellationToken,
@@ -1116,6 +1140,7 @@ impl CommitOnAck {
         }
     }
 
+    /// Commits the latch and cancels shutdown.
     pub fn acknowledge(mut self) {
         self.acknowledged = true;
         self.latch.commit();
@@ -1776,6 +1801,7 @@ mod tests {
             .expect("the pre-poll notification must not be lost");
     }
 
+    /// Runs a potentially blocking test operation within a fixed budget.
     ///
     /// A thread blocked in `openat` on a writer-less FIFO cannot be cancelled or joined.
     /// A timeout must terminate the process because a blocked FIFO-open thread cannot be joined.

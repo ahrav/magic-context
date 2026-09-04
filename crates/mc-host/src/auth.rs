@@ -1,4 +1,10 @@
-use std::{error::Error, fmt, future::Future, io, time::Duration};
+//! Length-prefixed JSON authentication for setup streams.
+//!
+//! Client and server prove possession of the connection key with fresh nonces. One
+//! absolute deadline covers every read, write, and failure teardown. Authentication
+//! does not authorize the client-supplied role.
+
+use std::{fmt, future::Future, io, time::Duration};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -13,14 +19,19 @@ pub use mc_shm_transport::setup_auth::{
     CLIENT_AUTH_DOMAIN, DEFAULT_CLIENT_ROLE, NONCE_LEN, PROOF_LEN, SERVER_PROOF_DOMAIN,
 };
 
+/// Maximum JSON body length, in bytes, accepted by the authentication framing.
 pub const MAX_AUTH_MESSAGE_LEN: u32 = mc_shm_transport::setup_auth::MAX_AUTH_MESSAGE_LEN as u32;
 
+/// First handshake message sent by the client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientHello {
+    /// Fresh client nonce included in both directional proofs.
     pub client_nonce: [u8; NONCE_LEN],
+    /// Untrusted compatibility label. The server must not use it for authorization.
     pub role: String,
 }
 
+/// Server identity and key-possession proof.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerProof {
     pub daemon_id: [u8; DAEMON_ID_LEN],
@@ -42,8 +53,10 @@ impl fmt::Debug for ServerProof {
     }
 }
 
+/// Final client key-possession proof.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientAuth {
+    /// HMAC-derived proof. Debug formatting always redacts this value.
     pub client_auth: [u8; PROOF_LEN],
 }
 
@@ -56,7 +69,7 @@ impl fmt::Debug for ClientAuth {
     }
 }
 
-///
+/// Successful server-side authentication of connection-key possession.
 ///
 /// `ClientHello.role` is client-asserted and unverified.
 /// `ClientHello.role` is discarded because any peer holding the key can claim any role.
@@ -65,6 +78,7 @@ impl fmt::Debug for ClientAuth {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authenticated;
 
+/// Wire stage attached to I/O, framing, and timeout errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthStage {
     ClientHello,
@@ -72,50 +86,61 @@ pub enum AuthStage {
     ClientAuth,
 }
 
-#[derive(Debug)]
+/// Authentication, framing, or deadline failure.
+#[derive(Debug, thiserror::Error)]
 pub enum AuthError {
-    Io {
-        stage: AuthStage,
-        source: io::Error,
-    },
+    #[error("auth {stage:?} I/O error: {source}")]
+    Io { stage: AuthStage, source: io::Error },
+    #[error("auth {stage:?} timed out after {deadline:?}")]
     Timeout {
         stage: AuthStage,
         deadline: Duration,
     },
+    #[error("auth {stage:?} ended early: expected {expected} bytes, got {actual}")]
     UnexpectedEof {
         stage: AuthStage,
         expected: usize,
         actual: usize,
     },
+    #[error("auth {stage:?} message length {len} exceeds hard cap {max}")]
     MessageTooLarge {
         stage: AuthStage,
         len: u32,
         max: u32,
     },
+    #[error("auth {stage:?} JSON encode error: {source}")]
     JsonEncode {
         stage: AuthStage,
         source: serde_json::Error,
     },
+    #[error("auth {stage:?} JSON decode error: {source}")]
     JsonDecode {
         stage: AuthStage,
         source: serde_json::Error,
     },
     /// `InvalidDeadline` reports a total that cannot form an absolute deadline.
-    InvalidDeadline {
-        total: Duration,
-    },
+    #[error("auth deadline {total:?} is not a representable instant")]
+    InvalidDeadline { total: Duration },
+    #[error("auth random generation failed: {0}")]
     Random(getrandom::Error),
-    KeyTooShort {
-        len: usize,
-        min: usize,
-    },
+    #[error("auth key is too short: {len} bytes, need at least {min}")]
+    KeyTooShort { len: usize, min: usize },
+    #[error("invalid server auth proof")]
     InvalidServerProof,
+    #[error("server daemon_id did not match connection file")]
     DaemonIdMismatch,
     /// `DaemonVerMismatch` reports a `daemon_ver` that differs from the connection-file snapshot.
+    #[error("server daemon_ver did not match connection file")]
     DaemonVerMismatch,
+    #[error("invalid client auth proof")]
     InvalidClientAuth,
 }
 
+/// Computes the protocol proof for one domain and handshake transcript.
+///
+/// `domain` separates client proofs from server proofs. Both nonces, daemon version,
+/// and daemon identity are bound into the result. This function does not validate key
+/// length; handshake entry points reject keys shorter than [`MIN_KEY_LEN`].
 pub fn compute_proof(
     key: &[u8],
     domain: &str,
@@ -171,9 +196,9 @@ impl Deadline {
     }
 }
 
+/// Shuts down a failed stream within the unused handshake budget.
 ///
 /// Teardown shares the handshake deadline, so it cannot extend the handshake budget.
-///
 async fn teardown_failed_handshake<S>(stream: &mut S, deadline: Deadline)
 where
     S: AsyncWrite + Unpin,
@@ -181,6 +206,11 @@ where
     let _ = time::timeout(deadline.remaining_or_zero(), stream.shutdown()).await;
 }
 
+/// Authenticates a client and returns only after its proof verifies.
+///
+/// The total `deadline` covers all framing I/O and failure teardown.
+/// The function rejects short keys, malformed or oversized JSON frames, invalid client proofs, entropy failures, I/O failures, and elapsed or unrepresentable deadlines.
+/// A handshake that fails after deadline construction attempts to shut down the stream before returning, while an unrepresentable `deadline` returns before the stream is touched. It does not panic.
 pub async fn authenticate_server<S>(
     stream: &mut S,
     key: &[u8],
@@ -251,11 +281,19 @@ where
     Ok(Authenticated)
 }
 
+/// Server identity established by a successful client-side handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAuthenticated {
+    /// Authenticated daemon version matching the connection-file snapshot.
     pub daemon_ver: String,
 }
 
+/// Authenticates the server described by `conn` and sends the client proof.
+///
+/// The server proof is checked before daemon identity and version comparisons. No
+/// client proof is sent when any check fails. The total `deadline` covers all framing
+/// I/O and failure teardown. Errors include short keys, malformed or oversized frames,
+/// proof or metadata mismatch, entropy or I/O failure, and deadline failure.
 pub async fn authenticate_client<S>(
     stream: &mut S,
     conn: &ConnectionInfo,
@@ -352,9 +390,7 @@ fn random_nonce() -> Result<[u8; NONCE_LEN], AuthError> {
     Ok(nonce)
 }
 
-///
-///
-///
+/// Compares fixed-size proofs without data-dependent early exit.
 fn constant_time_eq(expected: &[u8; PROOF_LEN], actual: &[u8; PROOF_LEN]) -> bool {
     expected.as_slice().ct_eq(actual.as_slice()).into()
 }
@@ -522,70 +558,39 @@ enum DeadlineIoError {
     UnexpectedEof { actual: usize },
 }
 
-impl fmt::Display for AuthError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io { stage, source } => write!(f, "auth {stage:?} I/O error: {source}"),
-            Self::Timeout { stage, deadline } => {
-                write!(f, "auth {stage:?} timed out after {deadline:?}")
-            }
-            Self::UnexpectedEof {
-                stage,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "auth {stage:?} ended early: expected {expected} bytes, got {actual}"
-            ),
-            Self::MessageTooLarge { stage, len, max } => write!(
-                f,
-                "auth {stage:?} message length {len} exceeds hard cap {max}"
-            ),
-            Self::JsonEncode { stage, source } => {
-                write!(f, "auth {stage:?} JSON encode error: {source}")
-            }
-            Self::JsonDecode { stage, source } => {
-                write!(f, "auth {stage:?} JSON decode error: {source}")
-            }
-            Self::Random(source) => write!(f, "auth random generation failed: {source}"),
-            Self::InvalidDeadline { total } => {
-                write!(f, "auth deadline {total:?} is not a representable instant")
-            }
-            Self::KeyTooShort { len, min } => {
-                write!(f, "auth key is too short: {len} bytes, need at least {min}")
-            }
-            Self::InvalidServerProof => write!(f, "invalid server auth proof"),
-            Self::DaemonIdMismatch => write!(f, "server daemon_id did not match connection file"),
-            Self::DaemonVerMismatch => {
-                write!(f, "server daemon_ver did not match connection file")
-            }
-            Self::InvalidClientAuth => write!(f, "invalid client auth proof"),
-        }
-    }
-}
-
-impl Error for AuthError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            Self::JsonEncode { source, .. } | Self::JsonDecode { source, .. } => Some(source),
-            Self::Random(_) => None,
-            Self::Timeout { .. }
-            | Self::UnexpectedEof { .. }
-            | Self::MessageTooLarge { .. }
-            | Self::KeyTooShort { .. }
-            | Self::InvalidServerProof
-            | Self::DaemonIdMismatch
-            | Self::DaemonVerMismatch
-            | Self::InvalidDeadline { .. }
-            | Self::InvalidClientAuth => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_variants_with_a_named_source_field_report_a_source() {
+        let io = AuthError::Io {
+            stage: AuthStage::ClientHello,
+            source: io::Error::other("io"),
+        };
+        assert!(
+            std::error::Error::source(&io).is_some(),
+            "Io names its wrapped error `source`, so it must stay in the chain"
+        );
+
+        let decode = AuthError::JsonDecode {
+            stage: AuthStage::ClientHello,
+            source: serde_json::from_str::<u8>("{").expect_err("malformed json"),
+        };
+        assert!(
+            std::error::Error::source(&decode).is_some(),
+            "JsonDecode names its wrapped error `source`, so it must stay in the chain"
+        );
+
+        let timeout = AuthError::Timeout {
+            stage: AuthStage::ClientHello,
+            deadline: Duration::from_secs(1),
+        };
+        assert!(
+            std::error::Error::source(&timeout).is_none(),
+            "Timeout wraps nothing and must report no source"
+        );
+    }
 
     #[test]
     fn proof_debug_output_never_carries_the_proof_bytes() {

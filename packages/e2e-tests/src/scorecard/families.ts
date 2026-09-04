@@ -13,10 +13,11 @@ import {
     reasonCode,
     type LaneId,
     type MetricSlotId,
+    type MetricUnit,
     type ScoreFamilyId,
     type SecondaryMetricKey,
 } from "./policy";
-import { estimateId, type FamilyEstimateRow, type MetricSlot, type MetricUnit, type ScoreFamilySection, type UtilitySection } from "./report-contract";
+import { estimateId, type FamilyEstimateRow, type MetricSlot, type ScoreFamilySection, type UtilitySection } from "./report-contract";
 
 /** The incident-pool family whose cases compare the same scenario across harnesses. */
 export const PARITY_FAMILY_ID = "fam-parity-harness-gaps";

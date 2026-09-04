@@ -1,3 +1,4 @@
+//! Parses authenticated control requests and serializes control responses.
 //!
 //! Byte limits are enforced before handler callbacks, route reservation, and filesystem work.
 //! The bearer key, not metadata, grants authority.
@@ -7,18 +8,30 @@ use std::path::PathBuf;
 
 use crate::handler::{ManifestSnapshot, RouteClass, RouteIdentity, RouteTarget, TargetKind};
 
+/// Error code for malformed control requests.
 pub const CODE_INVALID_CONTROL_REQUEST: &str = "invalid_control_request";
+/// Error code for control operations this host does not implement.
 pub const CODE_UNSUPPORTED_OPERATION: &str = "unsupported_operation";
+/// Error code for module IDs absent from the target index.
 pub const CODE_UNKNOWN_MODULE: &str = "unknown_module";
+/// Error code for known modules that do not serve the requested target kind.
 pub const CODE_TARGET_UNAVAILABLE: &str = "target_unavailable";
+/// Error code for channel IDs the host does not own.
 pub const CODE_UNKNOWN_CHANNEL: &str = "unknown_channel";
+/// Error code for work rejected by host capacity limits.
 pub const CODE_SERVER_BUSY: &str = "server_busy";
+/// Error code for work cancelled before completion.
 pub const CODE_CANCELLED: &str = "cancelled";
+/// Error code for host failures without a more specific protocol code.
 pub const CODE_INTERNAL_ERROR: &str = "internal_error";
 
+/// Operation name that opens a routed channel.
 pub const OP_ROUTE_OPEN: &str = "route.open";
+/// Operation name that lists the host catalog.
 pub const OP_CATALOG_LIST: &str = "catalog.list";
+/// Operation name that requests graceful host shutdown.
 pub const OP_HOST_SHUTDOWN: &str = "host.shutdown";
+/// Operation name that reads sanitized host health.
 pub const OP_HOST_STATUS: &str = "host.status";
 
 /// `TargetIndex` restricts `route.open` targets to listed `(module, kind)`
@@ -66,20 +79,30 @@ const MAX_CONTROL_DEPTH: usize = MAX_ADMISSION_FACTS_DEPTH + 1;
 /// The direct-linked profile cannot change catalog content at runtime, so the generation is always 1.
 pub const CATALOG_GENERATION: u64 = 1;
 
+/// Validated action produced from a channel-0 request.
 #[derive(Debug, PartialEq)]
 pub enum ControlAction {
+    /// Lists all modules or one optional module ID.
     CatalogList {
+        /// Module ID to select, or `None` for the full catalog.
         module_id_filter: Option<String>,
     },
+    /// Opens a route to a catalog target under authenticated caller identity.
     RouteOpen {
+        /// Module and role selected from the target index.
         target: RouteTarget,
+        /// Project, harness, session, and optional consumer identity.
         identity: RouteIdentity,
     },
+    /// Requests graceful host shutdown.
     HostShutdown,
+    /// Requests sanitized host health.
     HostStatus,
     /// Semantic rejection with a trustworthy correlation; one terminal.
     Reject {
+        /// Machine-readable error category.
         code: &'static str,
+        /// Human-readable error detail.
         message: String,
     },
 }
@@ -362,6 +385,7 @@ pub(crate) fn value_depth(value: &serde_json::Value) -> usize {
     }
 }
 
+/// Stores bounded catalog serializations for allocation-free request reuse.
 ///
 /// An absent filter returns `full`; an unmatched filter returns `empty`.
 pub struct CatalogCache {
@@ -387,6 +411,7 @@ impl CatalogCache {
         })
     }
 
+    /// Returns the full, matching module, or shared empty catalog body.
     pub fn body(&self, module_id_filter: Option<&str>) -> &[u8] {
         let Some(filter) = module_id_filter else {
             return &self.full;
@@ -398,6 +423,7 @@ impl CatalogCache {
             .unwrap_or(&self.empty)
     }
 
+    /// Returns bytes retained by module IDs and all serialized bodies.
     pub fn resident_len(&self) -> usize {
         self.full.len()
             + self.empty.len()
@@ -492,6 +518,7 @@ enum ClientControlResponse {
     },
 }
 
+/// Serializes a successful `route.open` response.
 pub fn route_open_response_json(channel: u16, epoch: u32) -> Vec<u8> {
     serde_json::to_vec(&ClientControlResponse::RouteOpen {
         route_channel: channel,
@@ -500,10 +527,80 @@ pub fn route_open_response_json(channel: u16, epoch: u32) -> Vec<u8> {
     .expect("route response serialization cannot fail")
 }
 
+/// Passes the kernel health block through field by field. Each field is
+/// re-emitted only when it has the declared type and range; an invalid field
+/// is dropped while the rest of the block survives, and a block without a
+/// recognizable `kernel_state` is dropped whole so the CLI renders `unknown`.
+/// The wire protocol permits `unavailable_reason` only when `kernel_state` is
+/// `unavailable`.
+fn sanitize_kernel_block(raw: &serde_json::Value) -> Option<serde_json::Value> {
+    // Largest integer exactly representable by an IEEE 754 double.
+    const MAX_COUNTER: u64 = 1 << 53;
+    let raw = raw.as_object()?;
+    let state = raw
+        .get("kernel_state")
+        .and_then(serde_json::Value::as_str)?;
+    if !matches!(state, "ready" | "starting" | "unavailable") {
+        return None;
+    }
+    let mut block = serde_json::Map::new();
+    block.insert(
+        "kernel_state".to_owned(),
+        serde_json::Value::String(state.to_owned()),
+    );
+    if let Some(reason) = raw
+        .get("unavailable_reason")
+        .and_then(serde_json::Value::as_str)
+        .filter(|reason| {
+            state == "unavailable" && matches!(*reason, "store_unavailable" | "store_unsupported")
+        })
+    {
+        block.insert(
+            "unavailable_reason".to_owned(),
+            serde_json::Value::String(reason.to_owned()),
+        );
+    }
+    // `null` is a declared value only for the sample time and the two lag
+    // fields; on any other counter it is a type error and is dropped, so a
+    // consumer's `=== 0` or numeric test never sees a null in its place.
+    for (name, nullable) in [
+        ("sampled_at_ms", true),
+        ("core_file_bytes", false),
+        ("artifact_usage_bytes", false),
+        ("artifact_cap_bytes", false),
+        ("outbox_position_lag", true),
+        ("oldest_unconsumed_age_ms", true),
+        ("retained_outbox_rows", false),
+        ("required_consumer_count", false),
+    ] {
+        match raw.get(name) {
+            Some(serde_json::Value::Null) if nullable => {
+                block.insert(name.to_owned(), serde_json::Value::Null);
+            }
+            Some(value) => {
+                if let Some(value) = value.as_u64().filter(|value| *value <= MAX_COUNTER) {
+                    block.insert(name.to_owned(), serde_json::Value::from(value));
+                }
+            }
+            None => {}
+        }
+    }
+    for name in ["core_file_warn", "artifact_warn", "lag_threshold_tripped"] {
+        if let Some(value) = raw.get(name).and_then(serde_json::Value::as_bool) {
+            block.insert(name.to_owned(), serde_json::Value::Bool(value));
+        }
+    }
+    Some(serde_json::Value::Object(block))
+}
+
+/// Returns the fixed successful `host.shutdown` response.
 pub fn host_shutdown_response_json() -> Vec<u8> {
     br#"{"op":"host.shutdown"}"#.to_vec()
 }
 
+/// Serializes host health with only allowlisted component metrics.
+///
+/// Handler detail is omitted because it may contain sensitive failure text.
 pub fn host_status_response_json(
     report: &crate::handler::HealthReport,
     shared_memory: serde_json::Value,
@@ -590,6 +687,13 @@ pub fn host_status_response_json(
                     }
                 }
             }
+            if let Some(kernel) = component
+                .get("metrics")
+                .and_then(|metrics| metrics.get("kernel"))
+                .and_then(sanitize_kernel_block)
+            {
+                sanitized_metrics.insert("kernel".to_owned(), kernel);
+            }
         }
         components.insert(
             module.to_owned(),
@@ -614,6 +718,7 @@ pub(crate) mod strict_json {
     use serde_json::Value;
     use std::fmt;
 
+    /// Parses one JSON value and rejects trailing bytes or duplicate object keys.
     pub fn parse(bytes: &[u8]) -> Result<Value, ParseError> {
         let mut deserializer = serde_json::Deserializer::from_slice(bytes);
         let value = StrictValue
@@ -623,9 +728,11 @@ pub(crate) mod strict_json {
         Ok(value)
     }
 
+    /// Opaque malformed-control-JSON error.
     pub struct ParseError;
 
     impl ParseError {
+        /// Returns the stable client-facing parse failure message.
         pub fn as_str(&self) -> &'static str {
             "malformed control JSON"
         }
@@ -1091,6 +1198,101 @@ mod tests {
             .contains("secret detail"),
             "handler detail is tainted and never exposed"
         );
+    }
+
+    #[test]
+    fn status_passes_valid_kernel_fields_and_drops_invalid_ones() {
+        let report = |kernel: serde_json::Value| crate::handler::HealthReport {
+            status: crate::handler::HealthStatus::Ok,
+            detail: None,
+            metrics: Some(serde_json::json!({
+                "components": {
+                    "magic-context": {
+                        "status": "ok",
+                        "metrics": { "storage_state": "ready", "kernel": kernel }
+                    }
+                }
+            })),
+        };
+        let kernel_of = |report: &crate::handler::HealthReport| -> serde_json::Value {
+            let response: serde_json::Value = serde_json::from_slice(&host_status_response_json(
+                report,
+                serde_json::json!({"state": "healthy"}),
+            ))
+            .expect("status JSON");
+            response["metrics"]["components"]["magic-context"]["metrics"]["kernel"].clone()
+        };
+
+        let full = kernel_of(&report(serde_json::json!({
+            "kernel_state": "ready",
+            "sampled_at_ms": 1_700_000_000_000_u64,
+            "core_file_bytes": 4096,
+            "core_file_warn": false,
+            "artifact_usage_bytes": 10,
+            "artifact_cap_bytes": 100,
+            "artifact_warn": false,
+            "outbox_position_lag": 3,
+            "oldest_unconsumed_age_ms": null,
+            "retained_outbox_rows": 8,
+            "required_consumer_count": 1,
+            "lag_threshold_tripped": true,
+            "extra_field": "dropped",
+        })));
+        assert_eq!(full["kernel_state"], "ready");
+        assert_eq!(full["outbox_position_lag"], 3);
+        assert_eq!(full["oldest_unconsumed_age_ms"], serde_json::Value::Null);
+        assert_eq!(full["lag_threshold_tripped"], true);
+        assert!(full.get("extra_field").is_none());
+        assert!(full.get("unavailable_reason").is_none());
+
+        // Out-of-range and mistyped fields vanish; the block and its state stay.
+        let partial = kernel_of(&report(serde_json::json!({
+            "kernel_state": "unavailable",
+            "unavailable_reason": "store_unsupported",
+            "core_file_bytes": -1,
+            "artifact_usage_bytes": "many",
+            "retained_outbox_rows": 1_u64 << 60,
+            "lag_threshold_tripped": "yes",
+        })));
+        assert_eq!(partial["kernel_state"], "unavailable");
+        assert_eq!(partial["unavailable_reason"], "store_unsupported");
+        assert!(partial.get("core_file_bytes").is_none());
+        assert!(partial.get("artifact_usage_bytes").is_none());
+        assert!(partial.get("retained_outbox_rows").is_none());
+        assert!(partial.get("lag_threshold_tripped").is_none());
+
+        // `null` survives only on the three nullable fields.
+        let nulls = kernel_of(&report(serde_json::json!({
+            "kernel_state": "ready",
+            "sampled_at_ms": null,
+            "outbox_position_lag": null,
+            "oldest_unconsumed_age_ms": null,
+            "core_file_bytes": null,
+            "required_consumer_count": null,
+        })));
+        assert_eq!(nulls["sampled_at_ms"], serde_json::Value::Null);
+        assert_eq!(nulls["outbox_position_lag"], serde_json::Value::Null);
+        assert_eq!(nulls["oldest_unconsumed_age_ms"], serde_json::Value::Null);
+        assert!(nulls.get("core_file_bytes").is_none());
+        assert!(nulls.get("required_consumer_count").is_none());
+
+        // A contradictory `unavailable_reason` is dropped; other fields remain.
+        for state in ["ready", "starting"] {
+            let contradictory = kernel_of(&report(serde_json::json!({
+                "kernel_state": state,
+                "unavailable_reason": "store_unavailable",
+                "retained_outbox_rows": 2,
+            })));
+            assert_eq!(contradictory["kernel_state"], state);
+            assert!(contradictory.get("unavailable_reason").is_none());
+            assert_eq!(contradictory["retained_outbox_rows"], 2);
+        }
+
+        // No recognizable state: no block at all.
+        let missing = kernel_of(&report(serde_json::json!({ "kernel_state": "broken" })));
+        assert!(missing.is_null());
+        let absent = kernel_of(&report(serde_json::json!(7)));
+        assert!(absent.is_null());
     }
 
     #[test]

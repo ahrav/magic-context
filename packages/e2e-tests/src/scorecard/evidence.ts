@@ -1,23 +1,26 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
     canonicalFingerprint,
     readCanonicalJsonFile,
 } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { scanForSensitiveContent } from "../../../plugin/scripts/retrieval-benchmark/privacy";
-import { parseReport as parseRetrievalReport, type BenchmarkReport } from "../../../plugin/scripts/retrieval-benchmark/report";
+import {
+    computeReportStatus as computeRetrievalReportStatus,
+    parseReport as parseRetrievalReport,
+    type BenchmarkReport,
+} from "../../../plugin/scripts/retrieval-benchmark/report";
 import { parseRunReport as parseDreamerRunReport, type DreamerEvalRunReport } from "../dreamer-eval/contract";
 import { parseLaneReport as parseHistorianReport, type LaneReport as HistorianReport } from "../historian-eval/scorer";
 import { parseIncidentReport, type IncidentPoolReport } from "../incident-pool/report";
 import { parseMetamorphicReport, type MetamorphicReport } from "../metamorphic-eval/report";
-import { parsePairedDeltaPolicy } from "../paired-delta/contract";
+import { PairedDeltaContractError, parsePairedDeltaPolicy } from "../paired-delta/contract";
 import { parsePairedDeltaReport, type PairedDeltaReport } from "../paired-delta/report";
 import { HoldoutContractError, parsePolicyOwnerDocument } from "../prospective-holdout/contract";
 import { loadFreeze, loadPolicyDocuments } from "../prospective-holdout/freeze";
+import { pairedFactsFingerprint } from "../prospective-holdout/report";
 import {
     LANE_IDS,
-    SCORECARD_POLICY_OWNER,
-    SECONDARY_SLOT_SOURCES,
     ScorecardContractError,
     array,
     parseScorecardPolicy,
@@ -123,38 +126,85 @@ function observedIdentity(parsed: ParsedLane): LaneIdentity | null {
 function runIncompleteReasons(parsed: ParsedLane): string[] {
     switch (parsed.lane) {
         case "paired-delta": {
-            const summary = parsed.report.body.runSummary;
-            return summary.status === "completed" && summary.evidenceComplete ? [] : ["run-incomplete"];
+            // Without a calibration, `evidenceComplete` records pool-sizing validity and says nothing about whether
+            // enough families were analyzable, so the estimator's own sufficiency verdict is required alongside it.
+            const { runSummary, analysis } = parsed.report.body;
+            return runSummary.status === "completed" && runSummary.evidenceComplete && analysis.evidenceSufficient ? [] : ["run-incomplete"];
         }
         case "historian":
             return parsed.report.aggregate.errors > 0 ? ["run-incomplete"] : [];
-        case "metamorphic":
-            return parsed.report.tierInvalidReason === null ? [] : ["run-incomplete"];
+        case "metamorphic": {
+            // A pair that threw, failed admission, was never scored, or whose role scored ERROR is one the run did not
+            // finish, and so is a scenario whose coverage records a violation; a scored pair whose verdict is FAIL or
+            // whose invariants failed is a result.
+            const { tierInvalidReason, entries, coverage } = parsed.report;
+            const finished = (entry: MetamorphicReport["entries"][number]): boolean =>
+                entry.kind === "scored" && entry.baselineScore.verdict !== "ERROR" && entry.derivativeScore.verdict !== "ERROR";
+            const complete = tierInvalidReason === null && entries.length > 0 && entries.every(finished)
+                && coverage.every((row) => row.violations.length === 0);
+            return complete ? [] : ["run-incomplete"];
+        }
         case "dreamer":
             return parsed.report.length > 0 && parsed.report.every((run) => run.status !== "ERROR") ? [] : ["run-incomplete"];
         case "incident":
             return parsed.report.evaluation_complete ? [] : ["run-incomplete"];
-        case "retrieval":
-            return parsed.report.status === "complete" ? [] : ["run-incomplete"];
+        case "retrieval": {
+            // The declared status is recomputed from the archived rows. The manifest's expected query ids are not
+            // archived with the report, so a missing expected query is the one `incomplete` cause not recoverable here.
+            const { scenarios, attempts } = parsed.report.evidence;
+            const recomputed = computeRetrievalReportStatus({ expectedQueryIds: [], scenarios, attempts });
+            return parsed.report.status === "complete" && recomputed === "complete" && scenarios.length > 0 ? [] : ["run-incomplete"];
+        }
     }
 }
 
-function pairedDeltaBindingReasons(report: PairedDeltaReport, policy: ScorecardPolicy): string[] {
-    return report.body.policyFingerprint === policy.pairedDeltaPolicyFingerprint ? [] : ["policy-binding-mismatch"];
+/** A report whose own rows the lane's contract would refuse is a schema mismatch, however its declared status reads. */
+function contradictionReasons(parsed: ParsedLane): string[] {
+    if (parsed.lane !== "retrieval") return [];
+    const { scenarios, attempts } = parsed.report.evidence;
+    return computeRetrievalReportStatus({ expectedQueryIds: [], scenarios, attempts }) === "invalid" ? ["report-parse-failed"] : [];
 }
 
-/** Every pre-registered run setting the paired-delta report can show is compared here; a difference is a pre-registration mismatch, not a schema problem. */
+/** The live paired-delta lane analyses its own rollouts and binds the empty prospective pair set. */
+const LIVE_PAIRED_FACTS_FINGERPRINT = pairedFactsFingerprint([]);
+
+/**
+ * Each lane's report must come from that lane's live producer. The metamorphic producer resolves a system tuple
+ * before it scores, while the raw-output scoring seam publishes none; the paired-delta producer binds the empty
+ * pair set, while a prospective comparison binds the pairs it compared. The historian parser already refuses
+ * raw-output scores itself.
+ */
+function producerReasons(parsed: ParsedLane): string[] {
+    switch (parsed.lane) {
+        case "metamorphic":
+            return parsed.report.system === null ? ["producer-mismatch"] : [];
+        case "paired-delta":
+            return parsed.report.body.analysis.pairedFactsFingerprint === LIVE_PAIRED_FACTS_FINGERPRINT ? [] : ["producer-mismatch"];
+        default:
+            return [];
+    }
+}
+
+/** The report's binding fields must name the paired-delta policy the scorecard policy pinned, and that policy's pool. */
+function pairedDeltaBindingReasons(report: PairedDeltaReport, policy: ScorecardPolicy, pairedDeltaPolicy: PairedDeltaPolicyView): string[] {
+    const bound = report.body.policyFingerprint === policy.pairedDeltaPolicyFingerprint
+        && report.body.poolManifestFingerprint === pairedDeltaPolicy.poolManifestFingerprint;
+    return bound ? [] : ["policy-binding-mismatch"];
+}
+
+/** A difference in a pre-registered run setting is a pre-registration mismatch, not a schema problem. */
 function pairedDeltaConformanceReasons(report: PairedDeltaReport, policy: ScorecardPolicy, pairedDeltaPolicy: PairedDeltaPolicyView): string[] {
     const body = report.body;
-    const mismatched = body.analysis.endpoints.every((estimate) => estimate.endpoint !== policy.primaryEndpoint)
-        || policy.secondaryMetricSlots.some((slot) => {
-            const source = SECONDARY_SLOT_SOURCES[slot]!;
-            return body.secondaryMetrics[source.metric][source.arm] === undefined;
-        })
-        || body.analysis.bootstrapResamples !== policy.statisticalComparison.bootstrapResamples
+    // The live runner pins the model it runs as the snapshot id, so the snapshot must name a model the policy pre-registered.
+    const mismatched = body.analysis.bootstrapResamples !== policy.statisticalComparison.bootstrapResamples
+        || body.analysis.minimumAnalyzableFamilyCount !== pairedDeltaPolicy.minimumAnalyzableFamilyCount
+        || !pairedDeltaPolicy.modelMatrix.some((model) => model.modelId === body.pinnedSnapshotId)
+        // The runner plans one coordinate per selected scenario per replicate, so the plan is a whole number of replicate sets.
+        || body.runSummary.plannedCoordinates % pairedDeltaPolicy.replicateCount !== 0
         || (body.runSummary.calibrationFingerprint !== null) !== (policy.statisticalComparison.noiseFloorSource === "calibration")
         || body.runSummary.spentUsd > policy.releaseCostBudgetUsd
         || canonicalFingerprint(pairedDeltaPolicy.modelMatrix) !== canonicalFingerprint(policy.modelMatrix)
+        || pairedDeltaPolicy.bootstrapResamples !== policy.statisticalComparison.bootstrapResamples
         || pairedDeltaPolicy.replicateCount !== policy.replicateCount
         || pairedDeltaPolicy.releaseCostBudgetUsd !== policy.releaseCostBudgetUsd;
     return mismatched ? ["pre-registration-mismatch"] : [];
@@ -167,6 +217,9 @@ function identityReasons(identity: LaneIdentity | null, required: RequiredLane):
 }
 
 interface PairedDeltaPolicyView {
+    poolManifestFingerprint: string;
+    minimumAnalyzableFamilyCount: number;
+    bootstrapResamples: number;
     modelMatrix: ScorecardPolicy["modelMatrix"];
     replicateCount: number;
     releaseCostBudgetUsd: number;
@@ -174,43 +227,85 @@ interface PairedDeltaPolicyView {
 
 function loadPairedDeltaPolicy(path: string, expectedFingerprint: string): PairedDeltaPolicyView {
     const raw = readCanonicalJsonFile(path, (code) => new ScorecardContractError([`paired-delta-policy: ${code}`]));
-    const document = parsePolicyOwnerDocument(raw, "magic-context-x4l.14");
-    if (document.status !== "ready" || document.policyFingerprint !== expectedFingerprint) {
-        throw new ScorecardContractError(["scorecard: paired-delta-policy-binding-mismatch"]);
+    if (scanForSensitiveContent(raw).length > 0) throw new ScorecardContractError(["paired-delta-policy: privacy-rejected"]);
+    let policy: ReturnType<typeof parsePairedDeltaPolicy>;
+    try {
+        const document = parsePolicyOwnerDocument(raw, "magic-context-x4l.14");
+        if (document.status !== "ready" || document.policyFingerprint !== expectedFingerprint) {
+            throw new ScorecardContractError(["scorecard: paired-delta-policy-binding-mismatch"]);
+        }
+        policy = parsePairedDeltaPolicy(document.policy);
+    } catch (error) {
+        if (error instanceof HoldoutContractError || error instanceof PairedDeltaContractError) {
+            throw new ScorecardContractError(["paired-delta-policy: parse-failed", ...error.diagnostics]);
+        }
+        throw error;
     }
-    const policy = parsePairedDeltaPolicy(document.policy);
-    return { modelMatrix: policy.modelMatrix, replicateCount: policy.replicateCount, releaseCostBudgetUsd: policy.costBudgetUsd.release };
+    return {
+        poolManifestFingerprint: policy.poolManifestFingerprint,
+        minimumAnalyzableFamilyCount: policy.minimumAnalyzableFamilyCount,
+        bootstrapResamples: policy.bootstrapResamples,
+        modelMatrix: policy.modelMatrix,
+        replicateCount: policy.replicateCount,
+        releaseCostBudgetUsd: policy.costBudgetUsd.release,
+    };
 }
 
-function readLaneArtifact(path: string): { kind: "missing" } | { kind: "unparseable" } | { kind: "json"; raw: unknown } {
-    if (!existsSync(path)) return { kind: "missing" };
+type JsonArtifact = { kind: "missing" } | { kind: "unparseable" } | { kind: "non-canonical" } | { kind: "json"; raw: unknown };
+
+/** The two indentations the repository's publishers write: `publishJsonAtomically` (four) and the runners' direct writes (two). */
+const PUBLISHER_INDENTS = [2, 4] as const;
+
+/**
+ * A published report must be the bytes one of the repository's publishers writes for its parsed value. Any other
+ * byte sequence, such as a duplicate member that `JSON.parse` silently drops, would carry content the privacy scan
+ * and the fingerprint never see, so it is refused rather than read. An absent file is a lane outcome. Any other read
+ * failure is an infrastructure fault, which must not read as a behavioral failure of the lane, so it aborts the
+ * bundle under the module's own error class.
+ */
+function readJsonArtifact(path: string): JsonArtifact {
+    let text: string;
     try {
-        return { kind: "json", raw: JSON.parse(readFileSync(path, "utf8")) as unknown };
+        text = readFileSync(path, "utf8");
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") return { kind: "missing" };
+        throw new ScorecardContractError([`artifact: unreadable-${(code ?? "unknown").toLowerCase()}`]);
+    }
+    let raw: unknown;
+    try {
+        raw = JSON.parse(text) as unknown;
     } catch {
         return { kind: "unparseable" };
     }
+    if (!PUBLISHER_INDENTS.some((indent) => `${JSON.stringify(raw, null, indent)}\n` === text)) return { kind: "non-canonical" };
+    return { kind: "json", raw };
 }
 
 function loadLane(required: RequiredLane, policy: ScorecardPolicy, pairedDeltaPolicy: PairedDeltaPolicyView, artifactsDir: string): LaneEvidence {
     const lane = required.lane;
-    const artifact = readLaneArtifact(join(artifactsDir, laneArtifactName(lane)));
-    if (artifact.kind === "missing") return { lane, status: "missing", reportFingerprint: null, identity: null, diagnostics: ["artifact-missing"], report: null };
-    if (artifact.kind === "unparseable") return { lane, status: "schema-mismatch", reportFingerprint: null, identity: null, diagnostics: ["artifact-invalid-json"], report: null };
-    if (scanForSensitiveContent(artifact.raw).length > 0) {
-        return { lane, status: "schema-mismatch", reportFingerprint: null, identity: null, diagnostics: ["privacy-rejected"], report: null };
-    }
+    const rejected = (status: LaneStatus, diagnostics: string[], reportFingerprint: string | null = null, identity: LaneIdentity | null = null): LaneEvidence =>
+        ({ lane, status, reportFingerprint, identity, diagnostics, report: null });
+    const artifact = readJsonArtifact(join(artifactsDir, laneArtifactName(lane)));
+    if (artifact.kind === "missing") return rejected("missing", ["artifact-missing"]);
+    if (artifact.kind === "unparseable") return rejected("schema-mismatch", ["artifact-invalid-json"]);
+    if (artifact.kind === "non-canonical") return rejected("schema-mismatch", ["artifact-non-canonical"]);
+    if (scanForSensitiveContent(artifact.raw).length > 0) return rejected("schema-mismatch", ["privacy-rejected"]);
+    // A value that round-tripped through `JSON.stringify` has nothing `canonicalFingerprint` refuses.
     const reportFingerprint = canonicalFingerprint(artifact.raw);
     let parsed: ParsedLane;
     try {
         parsed = parseLane(lane, artifact.raw);
     } catch {
-        return { lane, status: "schema-mismatch", reportFingerprint, identity: null, diagnostics: ["report-parse-failed"], report: null };
+        return rejected("schema-mismatch", ["report-parse-failed"], reportFingerprint);
     }
     const identity = observedIdentity(parsed);
-    const bindingReasons = parsed.lane === "paired-delta" ? pairedDeltaBindingReasons(parsed.report, policy) : [];
-    if (bindingReasons.length > 0) {
-        return { lane, status: "schema-mismatch", reportFingerprint, identity, diagnostics: bindingReasons, report: null };
-    }
+    const rejectedReasons = [
+        ...contradictionReasons(parsed),
+        ...producerReasons(parsed),
+        ...(parsed.lane === "paired-delta" ? pairedDeltaBindingReasons(parsed.report, policy, pairedDeltaPolicy) : []),
+    ];
+    if (rejectedReasons.length > 0) return rejected("schema-mismatch", rejectedReasons, reportFingerprint, identity);
     const diagnostics = [
         ...runIncompleteReasons(parsed),
         ...(parsed.lane === "paired-delta" ? pairedDeltaConformanceReasons(parsed.report, policy, pairedDeltaPolicy) : []),
@@ -224,16 +319,14 @@ function loadBaseline(policy: ScorecardPolicy, path: string | null): BaselineEvi
     if (expected === null) return { status: "absent", reportFingerprint: null, report: null, diagnostics: [] };
     const mismatch = (code: string): BaselineEvidence => ({ status: "schema-mismatch", reportFingerprint: null, report: null, diagnostics: [reasonCode(code)] });
     if (path === null) return mismatch("baseline-path-missing");
-    let raw: unknown;
-    try {
-        raw = readCanonicalJsonFile(path, (code) => new ScorecardContractError([code]));
-    } catch (error) {
-        return mismatch(`baseline-${error instanceof ScorecardContractError ? error.diagnostics[0]! : "unreadable"}`);
-    }
-    if (scanForSensitiveContent(raw).length > 0) return mismatch("baseline-privacy-rejected");
+    const artifact = readJsonArtifact(path);
+    if (artifact.kind === "missing") return mismatch("baseline-unreadable");
+    if (artifact.kind === "unparseable") return mismatch("baseline-invalid-json");
+    if (artifact.kind === "non-canonical") return mismatch("baseline-non-canonical");
     let report: ScorecardReport;
+    if (scanForSensitiveContent(artifact.raw).length > 0) return mismatch("baseline-privacy-rejected");
     try {
-        report = parseScorecardReport(raw);
+        report = parseScorecardReport(artifact.raw);
     } catch {
         return mismatch("baseline-parse-failed");
     }
@@ -255,9 +348,9 @@ export function loadEvidenceBundle(sources: EvidenceSources): ScorecardEvidenceB
         if (error instanceof HoldoutContractError) throw new ScorecardContractError(["scorecard: policy-not-frozen", ...error.diagnostics]);
         throw error;
     }
-    if (policyDocuments.scorecard.owner !== SCORECARD_POLICY_OWNER || policyDocuments.scorecard.policyFingerprint === null) {
-        throw new ScorecardContractError(["scorecard: policy-not-frozen"]);
-    }
+    // `loadFreeze` has already refused a pending scorecard policy, so this only narrows the type.
+    const policyFingerprint = policyDocuments.scorecard.policyFingerprint;
+    if (policyFingerprint === null) throw new ScorecardContractError(["scorecard: policy-not-frozen"]);
     const policy = parseScorecardPolicy(policyDocuments.scorecard.policy);
     const pairedDeltaPolicy = loadPairedDeltaPolicy(sources.pairedDeltaPolicyPath, policy.pairedDeltaPolicyFingerprint);
     const lanes = LANE_IDS.map((lane) => {
@@ -267,7 +360,7 @@ export function loadEvidenceBundle(sources: EvidenceSources): ScorecardEvidenceB
     return {
         freezeManifestFingerprint,
         policy,
-        policyFingerprint: policyDocuments.scorecard.policyFingerprint,
+        policyFingerprint,
         lanes,
         baseline: loadBaseline(policy, sources.baselinePath),
         limitations: policy.requiredLanes

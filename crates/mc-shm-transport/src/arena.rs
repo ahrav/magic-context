@@ -1,22 +1,27 @@
 use std::fmt;
 
-/// Maximum legal wire-v2 body size.
+/// Maximum legal wire-v2 body size in bytes.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-/// Minimum payload capacity for each logical direction.
+/// Minimum payload capacity in bytes for each logical direction.
 pub const MIN_ARENA_BYTES: usize = MAX_FRAME_BYTES;
 
 /// Failure while planning a FIFO arena reservation.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum ArenaError {
     /// Arena cannot hold one legal maximum frame.
+    #[error("arena capacity is below the protocol minimum")]
     BelowMinimumCapacity,
     /// Requested frame exceeds the wire limit.
+    #[error("frame exceeds the protocol maximum")]
     FrameTooLarge,
     /// Absolute cursors are malformed or wrapped.
+    #[error("arena cursor is invalid")]
     InvalidCursor,
     /// Current FIFO hold leaves insufficient contiguous logical capacity.
+    #[error("arena capacity is exhausted")]
     Exhausted,
     /// Offset or length arithmetic overflowed.
+    #[error("arena arithmetic overflow")]
     ArithmeticOverflow,
 }
 
@@ -25,20 +30,6 @@ impl fmt::Debug for ArenaError {
         fmt::Display::fmt(self, formatter)
     }
 }
-
-impl fmt::Display for ArenaError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::BelowMinimumCapacity => "arena capacity is below the protocol minimum",
-            Self::FrameTooLarge => "frame exceeds the protocol maximum",
-            Self::InvalidCursor => "arena cursor is invalid",
-            Self::Exhausted => "arena capacity is exhausted",
-            Self::ArithmeticOverflow => "arena arithmetic overflow",
-        })
-    }
-}
-
-impl std::error::Error for ArenaError {}
 
 /// One offset-and-length region within an arena.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -86,6 +77,16 @@ pub struct SpanPlan {
 
 impl SpanPlan {
     /// Plans a FIFO reservation from monotonic write and reclaim cursors.
+    ///
+    /// The returned plan contains one span, or two spans when the reservation
+    /// wraps at `capacity`. `write - reclaimed` is the currently held byte
+    /// count. Cursors are absolute byte positions and must not wrap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for capacity below [`MIN_ARENA_BYTES`], length above
+    /// [`MAX_FRAME_BYTES`], reversed or over-capacity cursors, insufficient
+    /// free bytes, or checked arithmetic failure.
     pub fn reserve(
         capacity: usize,
         write: u64,
@@ -127,7 +128,16 @@ impl SpanPlan {
         })
     }
 
-    /// Returns same allocation shortened to exact committed body length.
+    /// Returns the same allocation with body spans shortened to `exact_len` bytes.
+    ///
+    /// Reserved allocation length stays unchanged so FIFO reclamation still
+    /// accounts for any uncommitted tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArenaError::FrameTooLarge`] when `exact_len` exceeds the
+    /// reservation, or [`ArenaError::ArithmeticOverflow`] when it cannot fit
+    /// the internal `u64` representation.
     pub fn prefix(self, exact_len: usize) -> Result<Self, ArenaError> {
         let exact_len = u64::try_from(exact_len).map_err(|_| ArenaError::ArithmeticOverflow)?;
         if exact_len > self.allocation_len {
@@ -161,7 +171,11 @@ impl SpanPlan {
         self.span_count
     }
 
-    /// Returns one body span.
+    /// Returns one body span when `index` is below the plan's span count.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` is outside fixed two-span storage.
     pub fn span(self, index: usize) -> Option<ArenaSpan> {
         (index < usize::from(self.span_count)).then_some(self.spans[index])
     }
@@ -201,6 +215,8 @@ pub struct ArenaCounts {
 
 impl ArenaCounts {
     /// Checks exact byte conservation against arena capacity.
+    ///
+    /// Returns `false` if summing any category overflows `u64`.
     pub fn conserves(self, capacity: u64) -> bool {
         [
             self.free,

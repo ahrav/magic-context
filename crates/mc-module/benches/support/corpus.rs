@@ -12,8 +12,10 @@ use mc_store::{
 };
 use serde_json::json;
 
+/// Default nonzero seed used by benchmark corpus generators.
 pub const CORPUS_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
+/// Content shape used to exercise tokenizer and serialization hot paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentClass {
     Prose,
@@ -25,6 +27,7 @@ pub enum ContentClass {
 }
 
 impl ContentClass {
+    /// Returns the stable label used in benchmark cell names.
     pub fn label(self) -> &'static str {
         match self {
             Self::Prose => "prose",
@@ -36,13 +39,18 @@ impl ContentClass {
     }
 }
 
+/// Deterministic xorshift64* generator for corpus variation.
+///
+/// This generator is reproducible, not cryptographically secure.
 pub struct Rng(u64);
 
 impl Rng {
+    /// Creates a generator, mapping seed zero to one to avoid the absorbing state.
     pub fn new(seed: u64) -> Self {
         Self(seed.max(1))
     }
 
+    /// Advances the generator and returns the next 64-bit value.
     pub fn next(&mut self) -> u64 {
         // xorshift64* — deterministic, dependency-free.
         let mut x = self.0;
@@ -53,6 +61,11 @@ impl Rng {
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
+    /// Selects one item with modulo reduction.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `items` is empty.
     pub fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         &items[(self.next() as usize) % items.len()]
     }
@@ -94,9 +107,11 @@ const IDENTIFIERS: &[&str] = &[
     "drain_latch",
 ];
 
-/// Text of at least `target_bytes` built from class fragments, varied by `rng`
-/// so no two messages are byte-identical (unique ids defeat accidental
-/// memoization anywhere in the pipeline).
+/// Builds exactly `target_bytes` of UTF-8 text from class-specific fragments.
+///
+/// `Mixed` selects one concrete class per call. Generator-derived identifiers
+/// vary messages and prevent accidental content-identity memoization. Truncation
+/// always retreats to a character boundary.
 pub fn text(class: ContentClass, target_bytes: usize, rng: &mut Rng) -> String {
     let mut out = String::with_capacity(target_bytes + 128);
     let class = match class {
@@ -159,12 +174,13 @@ fn truncate_at_char_boundary(mut s: String, max: usize) -> String {
     s
 }
 
-/// A session-shaped ingress array: repeating user → assistant → tool_call →
-/// tool_result turns, `payload_bytes` of class content per message.
+/// Builds a session-shaped ingress array in user, assistant, tool-call, and
+/// tool-result order.
 ///
-/// The `tool_call` `command` argument is capped at 256 bytes.
-/// A `payload_bytes` above that leaves three full-size messages per four.
-/// Cell labels name `payload_bytes`, not the resulting tokenized volume.
+/// Ordinals start at one and message IDs are `m{ordinal}`. Each text-bearing
+/// message contains `payload_bytes` bytes. Tool-call command input is capped at
+/// 256 bytes, so larger payload sizes leave three full-size messages per group
+/// of four. Cell labels describe payload bytes, not token count.
 pub fn messages(
     class: ContentClass,
     count: usize,

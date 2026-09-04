@@ -6,12 +6,11 @@
  * Raw per-scenario samples make aggregates recomputable.
  * `evidenceDigest` hashes the whole report, including evidence.
  *
- * The candidate pool is the versioned unjudged top-K artifact consumed by `magic-context-u51`.
- * `magic-context-u51` keeps unjudged results visible without treating them as negative labels.
+ * The candidate pool is the versioned unjudged top-K artifact the distractor-judging pipeline consumes.
+ * Unjudged results stay visible in the pool and are never treated as negative labels.
  *
  * Incomplete or incompatible evidence cannot produce a pass.
  * `passEligibility` is the only pass gate this module exports and fails closed.
- * closed.
  */
 
 import { z } from "zod";

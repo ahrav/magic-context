@@ -351,8 +351,7 @@ async fn saturated_request_capacity_returns_server_busy_without_dispatch() {
     host.shutdown_gracefully().await;
 }
 
-/// Cancel and completion race on one settlement object; exactly one terminal may reach the wire.
-/// Cancel and completion race on one settlement object; exactly one terminal may reach the wire.
+/// Cancel and completion race on one settlement object; exactly one terminal reaches the wire.
 #[tokio::test]
 async fn cancel_and_completion_settle_exactly_once() {
     let host = TestHost::start().await;
@@ -696,9 +695,8 @@ async fn oversized_handler_output_cannot_corrupt_framing() {
         )
         .await
         .expect("send");
-    // An oversized stream item settles the request with an error terminal; a later unary response cannot reach the client.
-    // The handler's later unary response loses to the error terminal that settled the correlation.
-    // The client cannot observe a truncated-but-successful stream.
+    // An oversized stream item settles the correlation with an error terminal.
+    // Later handler output cannot reach the client as a truncated successful stream.
     let frame = client.frame_within(BUDGET).await.expect("bounded terminal");
     assert_eq!(frame.corr, corr);
     assert_eq!(frame.error_code(), "internal_error");
@@ -927,8 +925,6 @@ async fn concurrent_requests_never_interleave_frame_bytes() {
             .expect("send unary");
     }
 
-    // A clean frame decode requires non-interleaved socket writes.
-    // No two frames' bytes interleave on the socket.
     let mut settled = HashSet::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while settled.len() < expected.len() {

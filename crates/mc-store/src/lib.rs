@@ -14,10 +14,9 @@
 #![forbid(unsafe_code)]
 
 pub mod claim_mirror;
-pub mod kernel;
-pub mod sqlite_runtime;
 
 use cortexkit_cache_core::{CoreState, DurabilityClass, FrozenUnit};
+use cortexkit_store::GuardedConn;
 use cortexkit_store::{open_sqlite, Migration, SqliteStore, StoreError};
 use cortexkit_store_types::StorageDescriptor;
 use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
@@ -33,9 +32,7 @@ use mc_core::redaction::{
     reject_secret_text, reject_transaction_secret_text, Detection, Redaction, RedactionErrorKind,
     DETECTOR_ID,
 };
-use rusqlite::{
-    functions::FunctionFlags, params, types::Value as SqlValue, OptionalExtension, Transaction,
-};
+use rusqlite::{functions::FunctionFlags, params, types::Value as SqlValue, OptionalExtension};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -48,6 +45,7 @@ use std::sync::{
 };
 use std::time::Instant;
 
+/// Provider extras retain provider-scoped fields outside the typed CK wire model.
 pub type ProviderExtras = BTreeMap<String, BTreeMap<String, Value>>;
 
 static NEXT_TAG_CACHE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
@@ -155,6 +153,7 @@ impl Serialize for CkWireMessage {
 }
 
 impl CkWireMessage {
+    /// Builds a typed message without retained ingress JSON.
     pub fn from_parts(
         role: impl Into<String>,
         content: Vec<CkWireBlock>,
@@ -172,6 +171,7 @@ impl CkWireMessage {
         }
     }
 
+    /// Builds a synthetic user message containing one text block.
     pub fn synthetic_user_text(text: impl Into<String>) -> Self {
         Self::from_parts(
             "user",
@@ -185,6 +185,7 @@ impl CkWireMessage {
         )
     }
 
+    /// Drops retained ingress JSON so serialization uses typed fields.
     pub fn mark_modified(&mut self) {
         self.original = None;
     }
@@ -246,6 +247,7 @@ impl Serialize for CkWireBlock {
 }
 
 impl CkWireBlock {
+    /// Builds a typed block without provider extras or retained ingress JSON.
     pub fn bare(kind: CkKind) -> Self {
         Self {
             kind,
@@ -254,6 +256,7 @@ impl CkWireBlock {
         }
     }
 
+    /// Builds a typed block with provider extras and no retained ingress JSON.
     pub fn with_provider_extras(kind: CkKind, provider_extras: ProviderExtras) -> Self {
         Self {
             kind,
@@ -1487,7 +1490,7 @@ fn refuse_pre_cutover_store(inner: &SqliteStore) -> Result<(), McStoreError> {
 /// companions. The authority predicate is repeated on every statement so a binding is
 /// harmless until its domain is actually MODULE-owned.
 fn normalize_authority_note_route_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     context_store_uuid: &str,
     project: &str,
     route_project_root: &str,
@@ -1880,9 +1883,11 @@ pub struct HistorianPublishRequest<'a> {
 
 /// Typed publish failures. CAS and state mismatches are deliberately separate so a
 /// caller can tell "another writer already committed" from "this producer is stale."
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HistorianPublishError {
+    #[error("store: {0}")]
     Store(McStoreError),
+    #[error("publish CAS conflict: expected {expected:?}, found {found}{reason_suffix}", reason_suffix = historian_publish_reason_suffix(reason))]
     CasConflict {
         expected: Option<u64>,
         found: u64,
@@ -1892,70 +1897,33 @@ pub enum HistorianPublishError {
     /// Distinct from CasConflict so callers can abandon the run WITHOUT arming a
     /// model-failure cooldown: a fence rejection is a fast local race, not a
     /// producer failure, and an immediate retry with a fresh snapshot is valid.
-    FenceRejected {
-        reason: String,
-    },
+    #[error("publication fence rejected: {reason}")]
+    FenceRejected { reason: String },
     /// An appended historian compartment intersects an already durable range. This
     /// is a publish rejection rather than a SQLite failure so callers can abandon the
     /// stale firing and leave the session immediately reusable.
+    #[error("historian compartment {incoming_start_message}..={incoming_end_message} overlaps existing sequence {existing_sequence}")]
     CompartmentOverlap {
         existing_sequence: i64,
         incoming_start_message: i64,
         incoming_end_message: i64,
     },
+    #[error("historian publish state mismatch: expected seq {} run {} fingerprint {}, found {:?}", .expected.firing_seq, .expected.producer_run_id, .expected.chunk_fingerprint, found)]
     StateMismatch {
         expected: Box<HistorianPublishPredicate>,
         found: Box<HistorianDurableState>,
     },
-    InvalidState {
-        state: String,
-    },
+    #[error("historian publish invalid state: {state}")]
+    InvalidState { state: String },
+    #[error("serde: {0}")]
     Serde(String),
 }
 
-impl std::fmt::Display for HistorianPublishError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HistorianPublishError::Store(e) => write!(f, "store: {e}"),
-            HistorianPublishError::FenceRejected { reason } => {
-                write!(f, "publication fence rejected: {reason}")
-            }
-            HistorianPublishError::CompartmentOverlap {
-                existing_sequence,
-                incoming_start_message,
-                incoming_end_message,
-            } => write!(
-                f,
-                "historian compartment {incoming_start_message}..={incoming_end_message} overlaps existing sequence {existing_sequence}"
-            ),
-            HistorianPublishError::CasConflict {
-                expected,
-                found,
-                reason,
-            } => {
-                if let Some(reason) = reason {
-                    write!(
-                        f,
-                        "publish CAS conflict: expected {expected:?}, found {found}: {reason}"
-                    )
-                } else {
-                    write!(f, "publish CAS conflict: expected {expected:?}, found {found}")
-                }
-            }
-            HistorianPublishError::StateMismatch { expected, found } => write!(
-                f,
-                "historian publish state mismatch: expected seq {} run {} fingerprint {}, found {:?}",
-                expected.firing_seq, expected.producer_run_id, expected.chunk_fingerprint, found
-            ),
-            HistorianPublishError::InvalidState { state } => {
-                write!(f, "historian publish invalid state: {state}")
-            }
-            HistorianPublishError::Serde(e) => write!(f, "serde: {e}"),
-        }
-    }
+fn historian_publish_reason_suffix(reason: &Option<String>) -> String {
+    reason
+        .as_deref()
+        .map_or_else(String::new, |reason| format!(": {reason}"))
 }
-
-impl std::error::Error for HistorianPublishError {}
 
 impl From<McStoreError> for HistorianPublishError {
     fn from(e: McStoreError) -> Self {
@@ -2972,7 +2940,7 @@ enum WriteDisposition<T> {
 }
 
 struct ActiveWriteTransaction<'tx> {
-    tx: &'tx Transaction<'tx>,
+    tx: &'tx GuardedConn<'tx>,
     prepared: std::cell::RefCell<PreparedWrite>,
 }
 
@@ -3238,7 +3206,7 @@ impl PreparedWrite {
 }
 
 impl ActiveWriteTransaction<'_> {
-    fn tx(&self) -> &Transaction<'_> {
+    fn tx(&self) -> &GuardedConn<'_> {
         self.tx
     }
 
@@ -3432,7 +3400,7 @@ fn persisted_detection_labels(detections: &[Detection]) -> Vec<&str> {
 
 const MAX_PERSISTED_DETECTION_LABELS: usize = 64;
 
-fn opaque_sqlite_id(tx: &Transaction<'_>) -> rusqlite::Result<String> {
+fn opaque_sqlite_id(tx: &GuardedConn<'_>) -> rusqlite::Result<String> {
     tx.prepare_cached("SELECT lower(hex(randomblob(16)))")?
         .query_row([], |row| row.get(0))
 }
@@ -3443,7 +3411,7 @@ fn opaque_sqlite_id(tx: &Transaction<'_>) -> rusqlite::Result<String> {
 /// callers retire owners one row at a time inside loops, so the cost per retirement would
 /// grow with every scan the store has ever recorded.
 fn prune_retired_active_scan_audit(
-    tx: &Transaction<'_>,
+    tx: &GuardedConn<'_>,
     retired_scans: &[(String, String)],
     owner_scope_id: &str,
 ) -> rusqlite::Result<()> {
@@ -3488,7 +3456,7 @@ fn prune_retired_active_scan_audit(
 /// Retires the domain owners in one scope, optionally narrowed to an owner kind and key,
 /// then prunes only the audit rows those owners held.
 fn retire_active_scan_domain_owners(
-    tx: &Transaction<'_>,
+    tx: &GuardedConn<'_>,
     scope_kind: &str,
     scope_key: &str,
     owner_kind: Option<&str>,
@@ -3539,7 +3507,7 @@ fn retire_active_scan_domain_owners(
 }
 
 fn retire_active_scan_domain_owner(
-    tx: &Transaction<'_>,
+    tx: &GuardedConn<'_>,
     scope_kind: &str,
     scope_key: &str,
     owner_kind: &str,
@@ -3549,7 +3517,7 @@ fn retire_active_scan_domain_owner(
 }
 
 fn retire_active_scan_owner_kind(
-    tx: &Transaction<'_>,
+    tx: &GuardedConn<'_>,
     scope_kind: &str,
     scope_key: &str,
     owner_kind: &str,
@@ -3558,7 +3526,7 @@ fn retire_active_scan_owner_kind(
 }
 
 fn retire_active_scan_scope(
-    tx: &Transaction<'_>,
+    tx: &GuardedConn<'_>,
     scope_kind: &str,
     scope_key: &str,
 ) -> rusqlite::Result<()> {
@@ -4959,12 +4927,17 @@ pub enum StateImportPreflight {
     Duplicate { imported: usize },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StateImportValidationError {
+    #[error("compartment seq must be strictly increasing: {current} followed {previous}")]
     SeqNotIncreasing { previous: i64, current: i64 },
+    #[error("compartment {sequence} has start_message after end_message")]
     RangeInvalid { sequence: i64 },
+    #[error("compartment {current} overlaps or precedes compartment {previous}")]
     RangesOverlap { previous: i64, current: i64 },
+    #[error("compartment {sequence} has an empty p1")]
     P1Empty { sequence: i64 },
+    #[error("compartment {sequence} end_message_id is not a parseable mid#idx")]
     EndMessageIdInvalid { sequence: i64 },
 }
 
@@ -4980,20 +4953,29 @@ impl StateImportValidationError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum StateImportError {
+    #[error("store: {0}")]
     Store(McStoreError),
+    #[error("session already has durable state")]
     SessionNotEmpty,
+    #[error("{}: {}", .0.code(), .0)]
     Validation(StateImportValidationError),
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ModuleStateSyncError {
+    #[error("store: {0}")]
     Store(McStoreError),
+    #[error("shadow generation mismatch: expected {expected}, found {found}")]
     GenerationMismatch { expected: u64, found: u64 },
+    #[error("authority seq mismatch: expected {expected}, found {found}")]
     AuthoritySeqMismatch { expected: u64, found: u64 },
+    #[error("historian compartment sync busy: {}", phase.as_str())]
     HistorianBusy { phase: HistorianPhase },
+    #[error("invalid seed boundary {declared:?}: {detail}")]
     InvalidSeedBoundary { declared: String, detail: String },
+    #[error("serde: {0}")]
     Serde(String),
 }
 
@@ -5151,41 +5133,39 @@ fn prepare_state_sync(
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum McStoreError {
+    #[error("store: {0}")]
     Store(StoreError),
+    #[error("durable text rejected: {0:?}")]
     Redaction(RedactionErrorKind),
     /// `store.db` carries `mc_cache` history older than the consolidated
     /// bootstrap, so this binary cannot adopt it and does not migrate it.
+    #[error("module store predates the claims cutover: store.db records mc_cache schema v{recorded_version}, and this binary composes v{bootstrap_version} from an empty schema. It is not migrated or reinterpreted. Stop every Magic Context process, move or delete store.db (and its -wal/-shm siblings) to let this binary compose a new one; project memory lives in context.db and is unaffected.")]
     PreCutoverModuleStore {
         recorded_version: u32,
         bootstrap_version: u32,
     },
     /// The on-disk row_version moved under us (a concurrent writer committed first).
     /// The caller re-loads and re-steps.
-    CasConflict {
-        expected: Option<u64>,
-        found: u64,
-    },
+    #[error("cas conflict: expected {expected:?}, found {found}")]
+    CasConflict { expected: Option<u64>, found: u64 },
     /// An authority transition was requested from the wrong durable state.
-    AuthorityStateMismatch {
-        expected: String,
-        found: String,
-    },
+    #[error("authority state mismatch: expected {expected}, found {found}")]
+    AuthorityStateMismatch { expected: String, found: String },
     /// A caller used a stale authority generation after another transition committed.
-    AuthorityGenerationMismatch {
-        expected: u64,
-        found: u64,
-    },
+    #[error("authority generation mismatch: expected {expected}, found {found}")]
+    AuthorityGenerationMismatch { expected: u64, found: u64 },
     /// The module feed advanced after a drain captured its replay bound.
-    AuthorityFeedHeadAdvanced {
-        captured: i64,
-        found: i64,
-    },
+    #[error(
+        "authority feed head advanced after drain capture: captured {captured}, found {found}"
+    )]
+    AuthorityFeedHeadAdvanced { captured: i64, found: i64 },
+    #[error("serde: {0}")]
     Serde(String),
-    MemoryDuplicateContent {
-        id: i64,
-    },
+    #[error("memory content already exists as ID {id}")]
+    MemoryDuplicateContent { id: i64 },
+    #[error("note {id} CAS conflict: expected {expected_status}@{expected_version}, found {found_status}@{found_version}")]
     NoteCasConflict {
         id: i64,
         expected_status: String,
@@ -5193,11 +5173,10 @@ pub enum McStoreError {
         found_status: String,
         found_version: i64,
     },
-    NoteOwnershipMismatch {
-        id: i64,
-        project: String,
-    },
+    #[error("note {id} is not owned by project {project}")]
+    NoteOwnershipMismatch { id: i64, project: String },
     /// An append would overlap a durable compartment range for the same session.
+    #[error("compartment {incoming_start_message}..={incoming_end_message} overlaps existing sequence {existing_sequence}")]
     CompartmentRangeOverlap {
         existing_sequence: i64,
         incoming_start_message: i64,
@@ -5205,148 +5184,41 @@ pub enum McStoreError {
     },
     /// A facade route bound to an authority-managed identity attempted to write
     /// using filesystem-path transport vocabulary instead of the domain identity.
+    #[error("{domain} facade route {route_project_root} is authority-managed as {authority_project}, but the write used {write_project}")]
     FacadeProjectVocabularyMismatch {
         route_project_root: String,
         authority_project: String,
         write_project: String,
         domain: String,
     },
+    #[error("invalid claim intent: {0}")]
     ClaimIntentInvalid(String),
+    #[error("claim command identity {producer}/{operation_key} was reused with a different request digest")]
     ClaimIntentIdentityConflict {
         producer: String,
         operation_key: String,
     },
+    #[error("claim intent {field} mismatch: expected {expected}, found {found}")]
     ClaimIntentBindingMismatch {
         field: &'static str,
         expected: String,
         found: String,
     },
-    ClaimIntentAuthorityFrozen {
-        state: String,
-    },
+    #[error("claim intent writes are frozen during authority state {state}")]
+    ClaimIntentAuthorityFrozen { state: String },
     /// The bound daemon route resolves to no memories authority row.
+    #[error("claim intent route has no memories authority; refusing to stage")]
     ClaimIntentRouteNotManaged,
+    #[error("claim intent {producer}/{operation_key} was not found")]
     ClaimIntentNotFound {
         producer: String,
         operation_key: String,
     },
-    ClaimIntentTransition {
-        expected: String,
-        found: String,
-    },
-    ClaimIntentResetBlocked {
-        unresolved: usize,
-    },
+    #[error("claim intent state mismatch: expected {expected}, found {found}")]
+    ClaimIntentTransition { expected: String, found: String },
+    #[error("store rebuild refused while {unresolved} claim intents remain unresolved")]
+    ClaimIntentResetBlocked { unresolved: usize },
 }
-
-impl std::fmt::Display for McStoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            McStoreError::Store(e) => write!(f, "store: {e}"),
-            McStoreError::Redaction(kind) => write!(f, "durable text rejected: {kind:?}"),
-            McStoreError::PreCutoverModuleStore {
-                recorded_version,
-                bootstrap_version,
-            } => write!(
-                f,
-                "module store predates the claims cutover: store.db records mc_cache schema v{recorded_version}, and this binary composes v{bootstrap_version} from an empty schema. \
-                 It is not migrated or reinterpreted. Stop every Magic Context process, move or delete store.db (and its -wal/-shm siblings) to let this binary compose a new one; \
-                 project memory lives in context.db and is unaffected."
-            ),
-            McStoreError::CasConflict { expected, found } => {
-                write!(f, "cas conflict: expected {expected:?}, found {found}")
-            }
-            McStoreError::AuthorityStateMismatch { expected, found } => {
-                write!(
-                    f,
-                    "authority state mismatch: expected {expected}, found {found}"
-                )
-            }
-            McStoreError::AuthorityGenerationMismatch { expected, found } => {
-                write!(
-                    f,
-                    "authority generation mismatch: expected {expected}, found {found}"
-                )
-            }
-            McStoreError::AuthorityFeedHeadAdvanced { captured, found } => write!(
-                f,
-                "authority feed head advanced after drain capture: captured {captured}, found {found}"
-            ),
-            McStoreError::Serde(e) => write!(f, "serde: {e}"),
-            McStoreError::MemoryDuplicateContent { id } => {
-                write!(f, "memory content already exists as ID {id}")
-            }
-            McStoreError::NoteCasConflict {
-                id,
-                expected_status,
-                expected_version,
-                found_status,
-                found_version,
-            } => write!(
-                f,
-                "note {id} CAS conflict: expected {expected_status}@{expected_version}, found {found_status}@{found_version}"
-            ),
-            McStoreError::NoteOwnershipMismatch { id, project } => {
-                write!(f, "note {id} is not owned by project {project}")
-            }
-            McStoreError::CompartmentRangeOverlap {
-                existing_sequence,
-                incoming_start_message,
-                incoming_end_message,
-            } => write!(
-                f,
-                "compartment {incoming_start_message}..={incoming_end_message} overlaps existing sequence {existing_sequence}"
-            ),
-            McStoreError::FacadeProjectVocabularyMismatch {
-                route_project_root,
-                authority_project,
-                write_project,
-                domain,
-            } => write!(
-                f,
-                "{domain} facade route {route_project_root} is authority-managed as {authority_project}, but the write used {write_project}"
-            ),
-            McStoreError::ClaimIntentInvalid(reason) => {
-                write!(f, "invalid claim intent: {reason}")
-            }
-            McStoreError::ClaimIntentIdentityConflict {
-                producer,
-                operation_key,
-            } => write!(
-                f,
-                "claim command identity {producer}/{operation_key} was reused with a different request digest"
-            ),
-            McStoreError::ClaimIntentBindingMismatch {
-                field,
-                expected,
-                found,
-            } => write!(
-                f,
-                "claim intent {field} mismatch: expected {expected}, found {found}"
-            ),
-            McStoreError::ClaimIntentAuthorityFrozen { state } => {
-                write!(f, "claim intent writes are frozen during authority state {state}")
-            }
-            McStoreError::ClaimIntentRouteNotManaged => write!(
-                f,
-                "claim intent route has no memories authority; refusing to stage"
-            ),
-            McStoreError::ClaimIntentNotFound {
-                producer,
-                operation_key,
-            } => write!(f, "claim intent {producer}/{operation_key} was not found"),
-            McStoreError::ClaimIntentTransition { expected, found } => write!(
-                f,
-                "claim intent state mismatch: expected {expected}, found {found}"
-            ),
-            McStoreError::ClaimIntentResetBlocked { unresolved } => write!(
-                f,
-                "store rebuild refused while {unresolved} claim intents remain unresolved"
-            ),
-        }
-    }
-}
-impl std::error::Error for McStoreError {}
 
 impl From<mc_core::redaction::RedactionError> for McStoreError {
     fn from(error: mc_core::redaction::RedactionError) -> Self {
@@ -5369,48 +5241,6 @@ impl From<StoreError> for McStoreError {
     }
 }
 
-impl std::fmt::Display for StateImportValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SeqNotIncreasing { previous, current } => write!(
-                f,
-                "compartment seq must be strictly increasing: {current} followed {previous}"
-            ),
-            Self::RangeInvalid { sequence } => {
-                write!(
-                    f,
-                    "compartment {sequence} has start_message after end_message"
-                )
-            }
-            Self::RangesOverlap { previous, current } => write!(
-                f,
-                "compartment {current} overlaps or precedes compartment {previous}"
-            ),
-            Self::P1Empty { sequence } => {
-                write!(f, "compartment {sequence} has an empty p1")
-            }
-            Self::EndMessageIdInvalid { sequence } => write!(
-                f,
-                "compartment {sequence} end_message_id is not a parseable mid#idx"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for StateImportValidationError {}
-
-impl std::fmt::Display for StateImportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Store(error) => write!(f, "store: {error}"),
-            Self::SessionNotEmpty => write!(f, "session already has durable state"),
-            Self::Validation(error) => write!(f, "{}: {error}", error.code()),
-        }
-    }
-}
-
-impl std::error::Error for StateImportError {}
-
 impl From<McStoreError> for StateImportError {
     fn from(error: McStoreError) -> Self {
         Self::Store(error)
@@ -5422,31 +5252,6 @@ impl From<StoreError> for StateImportError {
         Self::Store(McStoreError::Store(error))
     }
 }
-
-impl std::fmt::Display for ModuleStateSyncError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ModuleStateSyncError::Store(e) => write!(f, "store: {e}"),
-            ModuleStateSyncError::GenerationMismatch { expected, found } => write!(
-                f,
-                "shadow generation mismatch: expected {expected}, found {found}"
-            ),
-            ModuleStateSyncError::AuthoritySeqMismatch { expected, found } => write!(
-                f,
-                "authority seq mismatch: expected {expected}, found {found}"
-            ),
-            ModuleStateSyncError::HistorianBusy { phase } => {
-                write!(f, "historian compartment sync busy: {}", phase.as_str())
-            }
-            ModuleStateSyncError::InvalidSeedBoundary { declared, detail } => {
-                write!(f, "invalid seed boundary {declared:?}: {detail}")
-            }
-            ModuleStateSyncError::Serde(e) => write!(f, "serde: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for ModuleStateSyncError {}
 
 impl From<McStoreError> for ModuleStateSyncError {
     fn from(e: McStoreError) -> Self {
@@ -5785,31 +5590,16 @@ fn validate_claim_result_json(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum AuthorityTransitionError {
+    #[error("expected state {expected}, found {found}")]
     State { expected: String, found: String },
+    #[error("expected generation {expected}, found {found}")]
     Generation { expected: u64, found: u64 },
+    #[error("drain coordinator token mismatch or missing")]
     CoordinatorToken,
+    #[error("drain coordinator lease expired")]
     CoordinatorLeaseExpired,
-}
-
-impl std::fmt::Display for AuthorityTransitionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::State { expected, found } => {
-                write!(f, "expected state {expected}, found {found}")
-            }
-            Self::Generation { expected, found } => {
-                write!(f, "expected generation {expected}, found {found}")
-            }
-            Self::CoordinatorToken => {
-                write!(f, "drain coordinator token mismatch or missing")
-            }
-            Self::CoordinatorLeaseExpired => {
-                write!(f, "drain coordinator lease expired")
-            }
-        }
-    }
 }
 
 fn mint_coordinator_token(lease: &str, lease_expires_at: i64, generation: u64) -> String {
@@ -5825,8 +5615,6 @@ fn mint_coordinator_token(lease: &str, lease_expires_at: i64, generation: u64) -
         )
     )
 }
-
-impl std::error::Error for AuthorityTransitionError {}
 
 fn map_authority_sql_error(error: StoreError) -> McStoreError {
     // cortexkit-store intentionally erases driver-specific errors at its connection
@@ -5877,7 +5665,7 @@ fn validate_authority_domain(domain: &str) -> Result<(), McStoreError> {
 /// executes the same mutation and the stored binding only proves what was true
 /// when the row was written.
 fn claim_intent_stage_fence(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     route_project_root: &str,
     binding: &ClaimIntentBinding,
 ) -> rusqlite::Result<Option<ClaimIntentTxnOutcome>> {
@@ -5923,7 +5711,7 @@ fn claim_intent_stage_fence(
 }
 
 fn authority_for_route_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     route_project_root: &str,
     domain: &str,
 ) -> rusqlite::Result<Option<(String, String, u64)>> {
@@ -5948,7 +5736,7 @@ fn authority_for_route_tx(
 }
 
 fn set_claim_intent_transition_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     database_incarnation_id: &str,
     authority_generation: u64,
     transition_state: &str,
@@ -6071,10 +5859,7 @@ pub fn validate_state_import_compartments(
     Ok(())
 }
 
-fn session_has_durable_state(
-    conn: &rusqlite::Connection,
-    session_id: &str,
-) -> rusqlite::Result<bool> {
+fn session_has_durable_state(conn: &GuardedConn<'_>, session_id: &str) -> rusqlite::Result<bool> {
     let exists: i64 = conn
         .prepare_cached(
             "SELECT EXISTS(
@@ -6218,7 +6003,7 @@ pub enum FacadeMutationOutcome {
 /// Transaction-scoped ports used by the module facade. Every method operates on the transaction
 /// owned by `with_facade_command`, so the mutation and its response ledger row commit together.
 pub struct FacadeMutationTxn<'a> {
-    tx: &'a rusqlite::Transaction<'a>,
+    tx: &'a GuardedConn<'a>,
     audit: &'a std::cell::RefCell<PreparedWrite>,
     redaction_failure: &'a std::cell::Cell<Option<RedactionErrorKind>>,
 }
@@ -6582,7 +6367,7 @@ fn materialize_strip_seed_units(
 /// funnels through here so the upsert and the outcome cannot drift.
 #[allow(clippy::too_many_arguments)]
 fn commit_lineage_disposition(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     target_key: &str,
     now_ms: i64,
     target_core: CoreState,
@@ -6662,7 +6447,7 @@ impl McStore {
         let facade_route_scope = Arc::clone(&facade_authority_scope);
         // Register before migrations: migrations create triggers that call these functions,
         // and the same connection must expose them before the first guarded write is possible.
-        inner.with_conn(move |conn| {
+        inner.with_conn_unfenced(move |conn| {
             conn.create_scalar_function(
                 "mc_note_caller_project",
                 0,
@@ -6780,7 +6565,7 @@ impl McStore {
         // Per-pass statements run through prepare_cached; the rusqlite default cache
         // holds 16 statements, which the hot set alone exceeds. 128 keeps every hot
         // shape resident without meaningful memory cost.
-        inner.with_conn(|conn| {
+        inner.with_conn_unfenced(|conn| {
             conn.set_prepared_statement_cache_capacity(128);
             Ok(())
         })?;
@@ -6813,7 +6598,7 @@ impl McStore {
         const THIRTY_DAYS_MS: i64 = 30 * 24 * 60 * 60 * 1000;
         let now_ms = current_time_ms();
         self.inner
-            .with_conn(|conn| {
+            .with_conn_fenced(|conn| {
                 // Cache rows are retained across session teardown, so row existence is not
                 // activity. Prune lineage only when both the root observation and its cache
                 // activity watermark are older than the inactivity window. This keeps active
@@ -7141,7 +6926,7 @@ impl McStore {
                 }
             }
         }
-        self.inner.with_conn(|conn| {
+        self.inner.with_conn_fenced(|conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO mc_cache_state (session_id, row_version, core_state, meta)
                  VALUES (?1, 0, '', '')",
@@ -7392,7 +7177,7 @@ impl McStore {
     fn with_note_conn_fenced<T>(
         &self,
         caller_project: &str,
-        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
+        operation: impl FnOnce(&GuardedConn<'_>) -> rusqlite::Result<T>,
     ) -> Result<T, McStoreError> {
         let caller_project = caller_project.to_string();
         let caller_scope = Arc::clone(&self.note_caller_project);
@@ -7562,8 +7347,13 @@ impl McStore {
             }
             retire_active_scan_scope(tx, "session", session_id)?;
             let tables = {
+                // The fence and version tables belong to the store backend; the callback
+                // scope refuses to touch them and they hold no session rows.
                 let mut stmt = tx.prepare_cached(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                    "SELECT name FROM sqlite_master
+                      WHERE type = 'table'
+                        AND name NOT LIKE 'sqlite_%'
+                        AND name NOT LIKE 'cortexkit_%'",
                 )?;
                 let rows = stmt
                     .query_map([], |row| row.get::<_, String>(0))?
@@ -7573,15 +7363,12 @@ impl McStore {
             let mut deleted = 0usize;
             for table in tables {
                 let quoted = format!("\"{}\"", table.replace('"', "\"\""));
-                let has_session_id = {
-                    // Not prepare_cached: the SQL text embeds the table name, so
-                    // each entry is one-shot and would only churn the LRU cache.
-                    let mut stmt = tx.prepare(&format!("PRAGMA table_info({quoted})"))?;
-                    let columns = stmt
-                        .query_map([], |row| row.get::<_, String>(1))?
-                        .collect::<Result<Vec<_>, _>>()?;
-                    columns.into_iter().any(|column| column == "session_id")
-                };
+                // Not prepare_cached: the SQL text is one-shot per table.
+                let has_session_id: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'session_id')",
+                    params![table],
+                    |row| row.get(0),
+                )?;
                 if has_session_id {
                     deleted = deleted.saturating_add(if table == "mc_notes" {
                         tx.execute(
@@ -7650,7 +7437,7 @@ impl McStore {
         after_state_read: impl FnOnce(),
     ) -> Result<TransformSnapshot, McStoreError> {
         let snapshot = self.inner.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = conn;
             let cache_state_started_at = Instant::now();
             let state = transaction
                 .query_row(CACHE_STATE_FULL_SELECT, params![session_id], |row| {
@@ -7752,7 +7539,6 @@ impl McStore {
                 .optional()?
                 .map(|ordinal| ordinal.max(0) as u64);
             let overlay_frontier_ms = overlay_frontier_started_at.elapsed().as_secs_f64() * 1_000.0;
-            transaction.commit()?;
             Ok(TransformSnapshot {
                 loaded,
                 temporal_marks,
@@ -7778,7 +7564,7 @@ impl McStore {
         compartment_page: Option<(i64, usize)>,
     ) -> Result<SessionStatusSnapshot, McStoreError> {
         let snapshot = self.inner.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = conn;
             let state = transaction
                 .query_row(CACHE_STATE_FULL_SELECT, params![session_id], |row| {
                     Ok((
@@ -7889,7 +7675,6 @@ impl McStore {
                 pass_trace,
                 compartment_page,
             };
-            transaction.commit()?;
             Ok(snapshot)
         })?;
         Ok(snapshot)
@@ -8759,7 +8544,7 @@ impl McStore {
     /// writes. Production tag changes use the fenced transform transaction instead.
     #[cfg(any(test, feature = "test-support"))]
     pub fn execute_tag_sql_for_test(&self, sql: &str) -> Result<(), McStoreError> {
-        self.inner.with_conn(|conn| {
+        self.inner.with_conn_unfenced(|conn| {
             conn.execute_batch(sql)?;
             Ok(())
         })?;
@@ -11582,7 +11367,7 @@ impl McStore {
     ) -> Result<M1RevisionSnapshot, McStoreError> {
         self.inner
             .with_conn(|conn| {
-                let transaction = conn.unchecked_transaction()?;
+                let transaction = conn;
                 let max_compartment_seq = transaction.query_row(
                     "SELECT COALESCE(MAX(sequence), 0) FROM mc_compartments WHERE session_id = ?1",
                     params![session_id],
@@ -11593,7 +11378,6 @@ impl McStore {
                     params![note_project_path],
                     |row| row.get(0),
                 )?;
-                transaction.commit()?;
                 Ok(M1RevisionSnapshot {
                     max_compartment_seq,
                     note_status_version,
@@ -15363,7 +15147,7 @@ impl McStore {
 }
 
 fn write_seed_compartment_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     session_id: &str,
     c: &StoredCompartment,
     overwrite_existing: bool,
@@ -15424,7 +15208,7 @@ fn write_seed_compartment_tx(
 }
 
 fn replace_workspace_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     project_path: &str,
     workspace: Option<&ModuleWorkspaceRow>,
 ) -> rusqlite::Result<()> {
@@ -15463,7 +15247,7 @@ fn replace_workspace_tx(
 }
 
 fn replace_authority_user_profile_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     profile_lines: &[String],
 ) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM mc_user_memories", [])?;
@@ -15479,7 +15263,7 @@ fn replace_authority_user_profile_tx(
 }
 
 fn insert_compartment_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     session_id: &str,
     sequence: i64,
     c: &StoredCompartment,
@@ -15515,7 +15299,7 @@ fn insert_compartment_tx(
 }
 
 fn insert_historian_events_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     session_id: &str,
     events: &[HistorianEventCandidate],
 ) -> rusqlite::Result<()> {
@@ -15616,7 +15400,7 @@ fn historian_side_channel_pending_items(
 }
 
 fn enqueue_historian_side_channels_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     session_id: &str,
     items: &[HistorianSideChannelPendingItem],
 ) -> rusqlite::Result<()> {
@@ -15642,7 +15426,7 @@ fn enqueue_historian_side_channels_tx(
 }
 
 fn mark_historian_side_channel_delivered_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     row: &HistorianSideChannelOutboxRow,
     now_ms: i64,
 ) -> rusqlite::Result<()> {
@@ -15669,7 +15453,7 @@ fn mark_historian_side_channel_delivered_tx(
 }
 
 fn insert_historian_primer_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     candidate: &HistorianPrimerCandidate,
 ) -> rusqlite::Result<()> {
     let question = candidate.question.trim();
@@ -15713,7 +15497,7 @@ fn insert_historian_primer_tx(
 }
 
 fn insert_historian_user_observation_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     candidate: &HistorianUserMemoryCandidate,
 ) -> rusqlite::Result<()> {
     let content = candidate.content.trim();
@@ -15736,7 +15520,7 @@ fn insert_historian_user_observation_tx(
 }
 
 fn append_compartments_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     session_id: &str,
     compartments: &[StoredCompartment],
 ) -> rusqlite::Result<AppendCompartmentsTxnOutcome> {
@@ -15786,10 +15570,7 @@ fn append_compartments_tx(
     Ok(AppendCompartmentsTxnOutcome::Appended)
 }
 
-fn next_compartment_sequence_tx(
-    tx: &rusqlite::Transaction<'_>,
-    session_id: &str,
-) -> rusqlite::Result<i64> {
+fn next_compartment_sequence_tx(tx: &GuardedConn<'_>, session_id: &str) -> rusqlite::Result<i64> {
     tx.query_row(
         "SELECT COALESCE(MAX(sequence), 0) + 1 FROM mc_compartments WHERE session_id = ?1",
         params![session_id],
@@ -15798,7 +15579,7 @@ fn next_compartment_sequence_tx(
 }
 
 fn insert_chunk_transcripts_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     session_id: &str,
     first_sequence: i64,
     compartments: &[StoredCompartment],
@@ -15844,10 +15625,7 @@ fn insert_chunk_transcripts_tx(
     evict_chunk_transcripts_tx(tx, session_id)
 }
 
-fn evict_chunk_transcripts_tx(
-    tx: &rusqlite::Transaction<'_>,
-    session_id: &str,
-) -> rusqlite::Result<()> {
+fn evict_chunk_transcripts_tx(tx: &GuardedConn<'_>, session_id: &str) -> rusqlite::Result<()> {
     let empty_transcript = compress_transcript("").unwrap_or_default();
     loop {
         let total: i64 = tx.query_row(
@@ -16072,7 +15850,7 @@ fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
     })
 }
 
-fn load_note_tx(tx: &rusqlite::Transaction<'_>, id: i64) -> rusqlite::Result<StoredNote> {
+fn load_note_tx(tx: &GuardedConn<'_>, id: i64) -> rusqlite::Result<StoredNote> {
     tx.query_row(
         &format!("SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes WHERE id = ?1"),
         params![id],
@@ -16085,7 +15863,7 @@ fn load_note_tx(tx: &rusqlite::Transaction<'_>, id: i64) -> rusqlite::Result<Sto
 /// already-trimmed, non-empty note text (each caller validates it against
 /// its own error type).
 fn insert_note_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     input: &NoteInput<'_>,
     prepared: &PreparedNoteFields,
 ) -> rusqlite::Result<StoredNote> {
@@ -16111,7 +15889,7 @@ fn insert_note_tx(
 /// condition starts the note `pending` (awaiting compile); otherwise it is
 /// immediately `active`.
 fn insert_project_note_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     input: &NoteWriteInput<'_>,
     prepared: &PreparedNoteFields,
 ) -> rusqlite::Result<StoredNote> {
@@ -16148,7 +15926,7 @@ fn insert_project_note_tx(
 /// method and the facade command path.
 #[allow(clippy::too_many_arguments)]
 fn update_note_cas_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     project_path: &str,
     note_id: i64,
     expected_status: &str,
@@ -16256,7 +16034,7 @@ fn update_note_cas_tx(
 /// carries the caller's session), `None` relies on the caller's own
 /// session-scoped precheck.
 fn dismiss_note_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     audit: &std::cell::RefCell<PreparedWrite>,
     project_path: &str,
     session_id: Option<&str>,
@@ -16423,7 +16201,7 @@ fn note_eval_kind_response(kind: &str) -> String {
 /// A MODULE row wins over stale twins under other context store UUIDs, matching
 /// `module_authority_for_project`; otherwise the lowest UUID reports current state.
 fn note_eval_authority_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     project: &str,
 ) -> rusqlite::Result<Option<(i64, i64, String)>> {
     tx.query_row(
@@ -16439,7 +16217,7 @@ fn note_eval_authority_tx(
 }
 
 fn note_eval_module_authority_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     project: &str,
 ) -> rusqlite::Result<Option<(i64, i64)>> {
     Ok(note_eval_authority_tx(tx, project)?
@@ -16448,7 +16226,7 @@ fn note_eval_module_authority_tx(
 }
 
 fn load_note_eval_claim_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     project: &str,
     claim_id: &str,
 ) -> rusqlite::Result<Option<NoteEvalClaimRow>> {
@@ -16464,7 +16242,7 @@ fn load_note_eval_claim_tx(
 }
 
 fn mark_note_eval_claim_terminal_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     project: &str,
     claim_id: &str,
     kind: &str,
@@ -16484,7 +16262,7 @@ fn mark_note_eval_claim_terminal_tx(
 /// Terminally fence active claims so in-flight evaluations lose their completion
 /// instead of surfacing stale work. `note_id = None` fences the whole project.
 fn fence_active_note_claims_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     project: &str,
     note_id: Option<i64>,
     kind: &str,
@@ -16511,7 +16289,7 @@ fn fence_active_note_claims_tx(
 /// `NOTE_EVAL_TERMINAL_RETENTION_MS`). Tombstoned rows replay as `Expired`;
 /// they no longer count against either cap.
 fn collect_note_eval_ledgers_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     project: &str,
     now_ms: i64,
 ) -> rusqlite::Result<()> {
@@ -17063,7 +16841,7 @@ impl McStore {
                         });
                     }
                 }
-                let stale = |tx: &rusqlite::Transaction<'_>| -> rusqlite::Result<_> {
+                let stale = |tx: &GuardedConn<'_>| -> rusqlite::Result<_> {
                     mark_note_eval_claim_terminal_tx(
                         tx,
                         project,
@@ -17309,7 +17087,7 @@ impl McStore {
 /// out, so replaying a claim with its original near-expiry lease would let the
 /// lease lapse mid-execution and force the billable phase to run again.
 fn rebind_note_eval_claim_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &GuardedConn<'_>,
     project: &str,
     mut claim: NoteEvalClaim,
     acquisition_id: &str,
@@ -17376,10 +17154,7 @@ pub fn note_check_digest(
     format!("{:x}", hasher.finalize())
 }
 
-fn repair_note_artifacts_tx(
-    tx: &rusqlite::Transaction<'_>,
-    project_path: &str,
-) -> rusqlite::Result<usize> {
+fn repair_note_artifacts_tx(tx: &GuardedConn<'_>, project_path: &str) -> rusqlite::Result<usize> {
     struct Candidate {
         id: i64,
         surface_condition: Option<String>,
@@ -17808,7 +17583,7 @@ mod tests {
         // would orphan the row, so a replay preserves the stored bytes.
         store
             .inner
-            .with_conn(|conn| {
+            .with_conn_unfenced(|conn| {
                 conn.execute(
                     "INSERT INTO mc_cache_state
                          (session_id, row_version, core_state, meta, last_activity_at)
@@ -17879,7 +17654,7 @@ mod tests {
         // the row without removing the identity from storage.
         store
             .inner
-            .with_conn(|conn| {
+            .with_conn_unfenced(|conn| {
                 conn.execute(
                     "INSERT INTO mc_cache_state
                          (session_id, row_version, core_state, meta, last_activity_at)
@@ -18037,7 +17812,7 @@ mod tests {
         let meta = serde_json::to_string(&ModuleMeta::default()).unwrap();
         store
             .inner
-            .with_conn(|conn| {
+            .with_conn_unfenced(|conn| {
                 conn.execute(
                     "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta)
                      VALUES (?1, ?2, ?3, ?4)",
@@ -18271,7 +18046,7 @@ mod tests {
         commit_root("deleted", None, 1);
         store
             .inner
-            .with_conn(|conn| {
+            .with_conn_unfenced(|conn| {
                 conn.execute(
                     "DELETE FROM mc_cache_state WHERE session_id = 'deleted'",
                     [],
@@ -18407,7 +18182,7 @@ mod tests {
             .unwrap();
         store
             .inner
-            .with_conn(|conn| {
+            .with_conn_unfenced(|conn| {
                 conn.execute(
                     "INSERT INTO mc_transform_session_roots
                          (session_id, project_root, observed_at)
@@ -18860,7 +18635,7 @@ mod tests {
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         store
             .inner
-            .with_conn(|conn| {
+            .with_conn_unfenced(|conn| {
                 conn.execute_batch(
                     "CREATE TRIGGER fail_pending_agent_drop
                      BEFORE INSERT ON pending_agent_drops
@@ -18887,7 +18662,7 @@ mod tests {
 
         store
             .inner
-            .with_conn(|conn| {
+            .with_conn_unfenced(|conn| {
                 conn.execute_batch("DROP TRIGGER fail_pending_agent_drop")?;
                 Ok(())
             })
@@ -22140,7 +21915,7 @@ mod tests {
             .unwrap();
         store
             .inner
-            .with_conn(|conn| {
+            .with_conn_unfenced(|conn| {
                 conn.execute(
                     "UPDATE mc_notes SET check_failure_count = 3, check_network_failure_count = 2,
                         check_quarantined_until = 9, check_compiled_at = 8,
@@ -22458,7 +22233,7 @@ mod tests {
         );
         store
             .inner
-            .with_conn(|conn| {
+            .with_conn_unfenced(|conn| {
                 for (id, hash) in [(good.id, good_hash.as_str()), (bad.id, "forged")] {
                     conn.execute(
                         "UPDATE mc_notes SET compiled_check = 'check-code', manifest_json = ?2,
@@ -23236,7 +23011,7 @@ mod tests {
         // its completion flag to exercise it against this row.
         store
             .inner
-            .with_conn(|conn| {
+            .with_conn_unfenced(|conn| {
                 conn.execute(
                     "UPDATE mc_notes SET compiled_check = 'legacy body', manifest_json = '{}',
                         check_hash = NULL, check_status = 'compiled',
@@ -23818,7 +23593,7 @@ mod shadow_tests {
         };
         store
             .inner
-            .with_conn(|conn| {
+            .with_conn_unfenced(|conn| {
                 conn.execute(
                     "INSERT INTO mc_cache_state
                          (session_id, row_version, core_state, meta, last_activity_at)
@@ -24573,7 +24348,7 @@ mod lineage_descent_tests {
             .unwrap();
         store
             .inner
-            .with_conn(|conn| {
+            .with_conn_unfenced(|conn| {
                 conn.execute(
                     "UPDATE mc_notes SET content = 'password=legacy-note-secret' WHERE id = ?1",
                     [source_note.id],

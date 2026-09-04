@@ -1,7 +1,7 @@
 import { compareCodeUnits } from "../code-unit-order";
 import type { RawRegretLadder } from "../paired-delta/report";
 import { laneEvidence, type BaselineEvidence, type ScorecardEvidenceBundle } from "./evidence";
-import { estimateId, type AdverseRow, type BaselineStatus, type DeltaRow, type FamilyEstimateRow } from "./report-contract";
+import { estimateId, estimateKey, type AdverseRow, type BaselineStatus, type DeltaRow, type FamilyEstimateRow } from "./report-contract";
 
 export interface BaselineEstimates {
     status: BaselineStatus;
@@ -18,15 +18,12 @@ export interface Comparison {
     limitations: string[];
 }
 
-function estimateKey(row: Pick<FamilyEstimateRow, "endpoint" | "familyId">): string {
-    return JSON.stringify([row.endpoint, row.familyId]);
-}
-
 function compareRow(current: FamilyEstimateRow, baseline: FamilyEstimateRow): DeltaRow {
     return {
         endpoint: current.endpoint,
         familyId: current.familyId,
         status: "compared",
+        baselinePointEstimate: baseline.pointEstimate,
         delta: current.pointEstimate - baseline.pointEstimate,
         interval: {
             lower: current.interval.lower - baseline.pointEstimate,
@@ -48,18 +45,21 @@ function adverseRow(row: Extract<DeltaRow, { status: "compared" }>): AdverseRow 
     };
 }
 
-function familyMissingRow(familyId: string): AdverseRow {
-    return { familyId, endpoint: null, kind: "family-missing", noiseLabel: null, delta: null, interval: null, blocking: true };
+function familyMissingRow(baseline: FamilyEstimateRow): AdverseRow {
+    return { familyId: baseline.familyId, endpoint: baseline.endpoint, kind: "family-missing", noiseLabel: null, delta: null, interval: null, blocking: true };
 }
 
+/** The report contract requires adverse rows ordered by `(familyId, endpoint, kind)`. */
 function compareAdverseRows(left: AdverseRow, right: AdverseRow): number {
-    return compareCodeUnits(left.familyId, right.familyId) || compareCodeUnits(left.endpoint ?? "", right.endpoint ?? "");
+    return compareCodeUnits(left.familyId, right.familyId)
+        || compareCodeUnits(left.endpoint, right.endpoint)
+        || compareCodeUnits(left.kind, right.kind);
 }
 
 /**
  * Pairs every current `(endpoint, estimate family)` estimate with the baseline scorecard's row for
- * the same key. A pair whose shifted interval lies wholly below zero is adverse; an estimate family
- * the baseline carried but the current release does not is a blocking `family-missing` row.
+ * the same key. A pair whose shifted interval lies wholly below zero is adverse; a key the baseline
+ * carried but the current release does not is a blocking `family-missing` row.
  */
 export function compareWithBaseline(current: readonly FamilyEstimateRow[], baseline: BaselineEstimates): Comparison {
     if (baseline.status !== "present") {
@@ -76,12 +76,11 @@ export function compareWithBaseline(current: readonly FamilyEstimateRow[], basel
             ? { endpoint: row.endpoint, familyId: row.familyId, status: "no-baseline", value: row.pointEstimate }
             : compareRow(row, matched);
     });
-    const currentFamilies = new Set(current.map((row) => row.familyId));
-    const missingFamilies = [...new Set(baseline.familyEstimates.map((row) => row.familyId))]
-        .filter((familyId) => !currentFamilies.has(familyId));
+    const currentKeys = new Set(current.map(estimateKey));
+    const missing = baseline.familyEstimates.filter((row) => !currentKeys.has(estimateKey(row)));
     const adverseDeltas = [
         ...deltas.filter((row): row is Extract<DeltaRow, { status: "compared" }> => row.status === "compared" && row.interval.upper < 0).map(adverseRow),
-        ...missingFamilies.map(familyMissingRow),
+        ...missing.map(familyMissingRow),
     ].sort(compareAdverseRows);
     return {
         deltas,

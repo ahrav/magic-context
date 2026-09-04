@@ -212,18 +212,7 @@ export class DreamerEvalContractError extends Error {
 }
 
 const primitives = makeContractPrimitives(DreamerEvalContractError);
-const { fail, record, exact, string, staticId, enumeration, array, integer, unique } = primitives;
-
-function boolean(value: unknown, label: string): boolean {
-    if (typeof value !== "boolean") fail(`${label}: boolean-invalid`);
-    return value as boolean;
-}
-
-function boundedInteger(value: unknown, label: string, minimum: number, maximum: number): number {
-    const parsed = integer(value, label, minimum);
-    if (parsed > maximum) fail(`${label}: integer-invalid`);
-    return parsed;
-}
+const { fail, record, exact, string, staticId, enumeration, array, integer, boundedInteger, boolean, unique } = primitives;
 
 /**
  */

@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-///
-/// `MAX_WIRE_BODY_BYTES` mirrors `mc_host::MAX_FRAME_BODY_LEN` so output preparation and frame admission use the same limit.
+/// Maximum body size shared with host frame admission.
 pub const MAX_WIRE_BODY_BYTES: usize = mc_host::MAX_FRAME_BODY_LEN as usize;
 
 #[derive(Clone)]
@@ -33,7 +32,6 @@ enum PreparedSegmentSource {
     Served(crate::transform::ServedMessage),
 }
 
-/// PreparedSegment represents one immutable encoded transform message.
 #[derive(Clone)]
 pub struct PreparedSegment {
     source: PreparedSegmentSource,
@@ -84,8 +82,7 @@ impl fmt::Debug for PreparedSegment {
 }
 
 impl PreparedOutput {
-    ///
-    /// Measurement serializes JSON without retaining encoded bytes so large bodies remain within the host reservation.
+    /// JSON measurement does not retain encoded bytes because it precedes host memory reservation.
     pub fn json(value: Value) -> Self {
         Self {
             source: PreparedSource::Json(Arc::new(value)),
@@ -123,7 +120,6 @@ impl PreparedOutput {
     /// Measures this immutable source exactly before output reservation.
     ///
     /// JSON measurement does not retain encoded bytes because it precedes the host's resident-byte reservation.
-    /// short body.
     pub fn measure(&self) -> Result<MeasuredOutput<'_>, PreparedOutputError> {
         let (source, len) = match &self.source {
             PreparedSource::Json(value) => {
@@ -256,53 +252,20 @@ impl MeasuredOutput<'_> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PreparedOutputError {
+    #[error("prepared body length {len} exceeds wire cap {max}")]
     BodyTooLarge { len: usize, max: usize },
+    #[error("prepared body length overflowed")]
     LengthOverflow,
+    #[error("transform envelope must contain a null ck_messages field")]
     InvalidTransformEnvelope,
-    Serialize(serde_json::Error),
-    Write(io::Error),
+    #[error("prepared JSON serialization failed: {0}")]
+    Serialize(#[source] serde_json::Error),
+    #[error("prepared body write failed: {0}")]
+    Write(#[from] io::Error),
+    #[error("prepared body length mismatch: measured {measured}, wrote {written}")]
     LengthMismatch { measured: usize, written: usize },
-}
-
-impl fmt::Display for PreparedOutputError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BodyTooLarge { len, max } => {
-                write!(f, "prepared body length {len} exceeds wire cap {max}")
-            }
-            Self::LengthOverflow => f.write_str("prepared body length overflowed"),
-            Self::InvalidTransformEnvelope => {
-                f.write_str("transform envelope must contain a null ck_messages field")
-            }
-            Self::Serialize(error) => write!(f, "prepared JSON serialization failed: {error}"),
-            Self::Write(error) => write!(f, "prepared body write failed: {error}"),
-            Self::LengthMismatch { measured, written } => write!(
-                f,
-                "prepared body length mismatch: measured {measured}, wrote {written}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PreparedOutputError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Serialize(error) => Some(error),
-            Self::Write(error) => Some(error),
-            Self::BodyTooLarge { .. }
-            | Self::LengthOverflow
-            | Self::InvalidTransformEnvelope
-            | Self::LengthMismatch { .. } => None,
-        }
-    }
-}
-
-impl From<io::Error> for PreparedOutputError {
-    fn from(error: io::Error) -> Self {
-        Self::Write(error)
-    }
 }
 
 fn checked_body_len(
@@ -325,7 +288,6 @@ fn checked_body_len(
 
 /// Measures a JSON value's exact encoded length without retaining the bytes.
 ///
-/// Serialization stops when encoded output exceeds `MAX_WIRE_BODY_BYTES`.
 /// Serialization stops when encoded output exceeds `MAX_WIRE_BODY_BYTES`.
 fn measure_json(value: &Value) -> Result<usize, PreparedOutputError> {
     let mut writer = CountingWriter::default();
@@ -405,7 +367,7 @@ enum CountFailure {
     TooLarge(usize),
 }
 
-/// CountingWriter rejects writes that exceed MAX_WIRE_BODY_BYTES.
+/// Serialization stops when encoded output exceeds `MAX_WIRE_BODY_BYTES`.
 #[derive(Default)]
 struct CountingWriter {
     len: usize,

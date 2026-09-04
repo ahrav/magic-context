@@ -320,8 +320,6 @@ async fn a_planted_symlink_at_the_record_name_is_replaced_not_followed() {
 }
 
 /// `deny(unsafe_code)` permits the scoped `allow(unsafe_code)` required for the `pre_exec` hook that arms `PR_SET_PDEATHSIG` so harness children die with a crashed host.
-/// `deny(unsafe_code)` permits the scoped `allow(unsafe_code)` required for the `pre_exec` hook that arms `PR_SET_PDEATHSIG` so harness children die with a crashed host.
-/// `deny(unsafe_code)` permits the scoped `allow(unsafe_code)` required for the `pre_exec` hook that arms `PR_SET_PDEATHSIG` so harness children die with a crashed host.
 ///
 /// `forbid(unsafe_code)` cannot be overridden within the crate.
 #[test]
@@ -375,9 +373,6 @@ fn exactly_one_unsafe_escape_hatch_exists_in_the_crate() {
     );
 }
 
-/// The coordination fences are owner-only regular files in an owner-only
-/// Coordination fences remain present while the host serves.
-/// Host teardown never unlinks coordination fences.
 #[tokio::test]
 async fn coordination_locks_are_owner_only_and_survive_teardown() {
     let data_root = tempfile::tempdir().expect("temp root");
@@ -407,8 +402,6 @@ async fn coordination_locks_are_owner_only_and_survive_teardown() {
     }
 }
 
-/// An unknown lifecycle schema at the record name blocks startup without
-/// An unknown lifecycle schema leaves quarantined bytes uninterpreted, unmigrated, and unchanged.
 #[tokio::test]
 async fn startup_refuses_to_overwrite_an_unknown_lifecycle_schema() {
     let data_root = tempfile::tempdir().expect("temp root");

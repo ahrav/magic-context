@@ -22,9 +22,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::UnixStream;
 use tokio::time::{timeout_at, Instant};
 
+/// Maximum JSON body length, excluding the four-byte length prefix.
 pub const MAX_SETUP_MESSAGE_LEN: usize = 16 * 1024;
+/// Number of file descriptors required by the current ring descriptor schema.
 pub const RING_DESCRIPTOR_COUNT: usize = mc_shm_transport::descriptor::SETUP_DESCRIPTOR_COUNT;
 
+/// Replaces only an owner-controlled stale socket, then binds a mode-`0600` listener.
+///
+/// Existing non-sockets, sockets owned by another user, and sockets with broader permissions
+/// are left in place and return [`io::ErrorKind::PermissionDenied`].
+/// Every step names the path rather than a descriptor, so the permission guarantee holds only while no process with write access to the parent directory replaces the occupant between the check, unlink, bind, and permission change.
 pub(crate) fn bind_owner_only(path: &Path) -> io::Result<tokio::net::UnixListener> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -85,51 +92,38 @@ pub enum PeerClose {
     ProtocolError,
 }
 
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum SetupError {
-    Io(io::Error),
+    #[error("setup socket I/O failed")]
+    Io(#[from] io::Error),
+    #[error("setup socket deadline expired")]
     Timeout,
+    #[error("setup socket message exceeds its bound")]
     MessageTooLarge,
+    #[error("setup socket message is invalid")]
     InvalidMessage,
+    #[error("setup socket identity does not match")]
     InvalidIdentity,
+    #[error("setup socket activation token does not match")]
     InvalidActivation,
+    #[error("setup socket descriptor transfer is incomplete")]
     MissingDescriptors,
+    #[error("setup socket transferred unexpected descriptors")]
     DuplicateDescriptors,
+    #[error("setup socket ancillary data was truncated")]
     TruncatedAncillary,
 }
 
-impl From<io::Error> for SetupError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl std::fmt::Display for SetupError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Io(_) => "setup socket I/O failed",
-            Self::Timeout => "setup socket deadline expired",
-            Self::MessageTooLarge => "setup socket message exceeds its bound",
-            Self::InvalidMessage => "setup socket message is invalid",
-            Self::InvalidIdentity => "setup socket identity does not match",
-            Self::InvalidActivation => "setup socket activation token does not match",
-            Self::MissingDescriptors => "setup socket descriptor transfer is incomplete",
-            Self::DuplicateDescriptors => "setup socket transferred unexpected descriptors",
-            Self::TruncatedAncillary => "setup socket ancillary data was truncated",
-        })
-    }
-}
-
-impl std::error::Error for SetupError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            _ => None,
-        }
-    }
-}
-
-/// Sends one fixed six-descriptor grant in one `SCM_RIGHTS` message.
+/// Sends one length-prefixed grant with the fixed descriptor set in one `SCM_RIGHTS` message.
+///
+/// The first `sendmsg` carries every descriptor. Remaining payload bytes, if any, use the same
+/// absolute deadline.
+///
+/// # Errors
+///
+/// Returns [`SetupError::Timeout`] when readiness or writing exceeds `deadline`. Serialization,
+/// I/O, zero-length writes, and ancillary-buffer failures map to their corresponding
+/// [`SetupError`] variants.
 pub async fn send_grant(
     stream: &mut UnixStream,
     grant: &GrantMessage,
@@ -175,7 +169,16 @@ pub async fn send_grant(
     Ok(())
 }
 
-/// Receives one grant and exactly six close-on-exec descriptors.
+/// Receives one length-prefixed grant and exactly the required close-on-exec descriptors.
+///
+/// The initial `recvmsg` may contain only a prefix of the JSON message. The function completes
+/// that message from the byte stream without accepting bytes from a following message.
+///
+/// # Errors
+///
+/// Returns a descriptor-count or ancillary-truncation error unless exactly
+/// [`RING_DESCRIPTOR_COUNT`] descriptors arrive. Framing, JSON, deadline, and I/O failures map
+/// to their corresponding [`SetupError`] variants.
 pub async fn receive_grant(
     stream: &mut UnixStream,
     deadline: Instant,
@@ -231,7 +234,16 @@ pub async fn receive_grant(
     Ok((value, descriptors))
 }
 
-/// Performs current-format activation and commit on the control-only socket.
+/// Sends a grant, authenticates its activation response, then commits the setup exchange.
+///
+/// One deadline covers the entire grant, activation, and commit sequence. The activation token
+/// is compared in constant time after wire-version and descriptor-schema validation.
+///
+/// # Errors
+///
+/// Returns [`SetupError::InvalidIdentity`] for version or schema mismatch,
+/// [`SetupError::InvalidActivation`] for token mismatch, and [`SetupError::InvalidMessage`] for
+/// an out-of-order message. Transport and deadline failures propagate.
 pub async fn activate_server(
     stream: &mut UnixStream,
     descriptors: &[OwnedFd; RING_DESCRIPTOR_COUNT],
@@ -282,7 +294,16 @@ pub async fn activate_server(
     }
 }
 
-/// Receives, validates, and commits the sole current ring on a client setup socket.
+/// Receives, validates, and commits the current ring on a client setup socket.
+///
+/// Descriptors are returned only after both activation and commit acknowledgements succeed.
+/// One deadline covers the complete exchange.
+///
+/// # Errors
+///
+/// Returns [`SetupError::InvalidIdentity`] for an unsupported wire version or descriptor schema,
+/// [`SetupError::InvalidMessage`] for an unexpected acknowledgement, and propagates grant,
+/// transport, and deadline failures.
 pub async fn activate_client(
     stream: &mut UnixStream,
     timeout: Duration,
@@ -332,7 +353,10 @@ pub(crate) fn encoded_goodbye() -> Result<Vec<u8>, SetupError> {
     encode_message(&ClientMessage::Goodbye)
 }
 
-/// Waits for the only legal post-commit setup message or peer EOF.
+/// Waits without a deadline for post-commit goodbye, EOF, or a protocol violation.
+///
+/// An exact `goodbye` message returns [`PeerClose::Goodbye`]. EOF before a complete message
+/// returns [`PeerClose::UnexpectedEof`]. Every other result returns [`PeerClose::ProtocolError`].
 pub async fn observe_peer(stream: &mut UnixStream) -> PeerClose {
     match read_message_unbounded(stream).await {
         Ok(ClientMessage::Goodbye) => PeerClose::Goodbye,

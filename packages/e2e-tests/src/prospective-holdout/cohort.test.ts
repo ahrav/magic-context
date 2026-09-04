@@ -23,7 +23,7 @@ import { deadPid, H1, H2, H3, sanitizedIntakeFixture, frozenEventFixture } from 
 
 const key = new TextEncoder().encode("c".repeat(32));
 
-/** Found by prefix rather than by asking for a path: `lockSidelinePath` allocates a fresh suffix on each call, so calling it after a takeover names a directory the takeover never used and reports it absent whatever the takeover left behind. commentlint: allow(JUDGE) */
+/** Found by prefix rather than by asking for a path: `lockSidelinePath` allocates a fresh suffix on each call, so calling it after a takeover names a directory the takeover never used and reports it absent whatever the takeover left behind. */
 function remainingSidelines(lock: string): string[] {
     const prefix = basename(lockSidelinePrefix(lock));
     return readdirSync(dirname(lock)).filter((entry) => entry.startsWith(prefix));
@@ -342,14 +342,14 @@ describe("cohort store lock", () => {
         const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
         const lock = seedLock(root, { pid: process.pid, nonce: "live-holder", acquiredAt: Date.now() });
         try {
-            /** The mtime is aged past the lease because a holder of this lock runs for minutes, which is what makes the recordless fallback reachable while the claim is still live. commentlint: allow(JUDGE) */
+            /** The mtime is aged past the lease because a holder of this lock runs for minutes, which is what makes the recordless fallback reachable while the claim is still live. */
             const orphaned = new Date(Date.now() - 600_000);
             utimesSync(lock, orphaned, orphaned);
             chmodSync(join(lock, LOCK_OWNER_FILE), 0o000);
 
             expect(lockAbandoned(lock)).toBeNull();
 
-            /** Forced past the verdict, takeover still refuses: its own verification read fails the same way, so it cannot confirm the recordless claim it was handed. commentlint: allow(JUDGE) */
+            /** Forced past the verdict, takeover still refuses: its own verification read fails the same way, so it cannot confirm the recordless claim it was handed. */
             takeOverLock(lock, { owner: null });
             expect(existsSync(lock)).toBe(true);
             expect(remainingSidelines(lock)).toEqual([]);

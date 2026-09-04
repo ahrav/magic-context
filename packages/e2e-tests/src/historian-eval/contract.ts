@@ -235,10 +235,12 @@ function boundedAnswer(value: string, label: string): string {
     return value;
 }
 
+/** Rejects answers containing reply-envelope tags or equal to `NO_INJECTED_GOLD_CLAIM`; `parseProbeVerdicts` treats that marker as unmatchable. */
 function envelopeSafeAnswer(value: string, label: string): string {
     if (value.includes("</answer>") || value.includes("<answer>")) {
         fail(`${label}: answer-envelope-delimiter`);
     }
+    if (value === NO_INJECTED_GOLD_CLAIM) fail(`${label}: reserved-marker`);
     return value;
 }
 
@@ -261,6 +263,9 @@ export const MAX_PROBE_ANSWER_CHARS = MAX_PREDICATE_VALUE_CHARS;
 
 /* */
 export const PROBE_CHOICE_SEPARATOR = " | ";
+
+/** The expectation a claim-id verdict publishes when no matching gold claim was injected, so no answer can pass. */
+export const NO_INJECTED_GOLD_CLAIM = "<no injected gold claim>";
 
 /**
  * Freeze lint uses `MAX_PADDING_TURNS` to determine whether recipe padding can clear its protected tail.
@@ -337,6 +342,9 @@ function parseProbe(raw: unknown, label: string): Probe {
             envelopeSafeAnswer(string(value.goldAnswer, `${label}.goldAnswer`), `${label}.goldAnswer`),
             `${label}.goldAnswer`,
         );
+        // A claim-id verdict publishes its candidate ids joined by this separator, and the archived verdict does not
+        // record its answer type, so an exact answer must not be mistakable for a joined id list.
+        if (goldAnswer.includes(PROBE_CHOICE_SEPARATOR)) fail(`${label}.goldAnswer: choice-separator`);
         // Questions must not state their own answers because the model can answer without injected memory or session history.
         //
         // Claim-id answers are runtime IDs and cannot appear in authored questions.

@@ -932,7 +932,6 @@ async fn a_child_shutdown_failure_makes_the_host_incarnation_non_graceful() {
 }
 
 /// The child panics during health probing; the composite reports the fault instead of unwinding into the host's fatal path.
-/// The composite reports a child health-probe panic instead of unwinding into the host's fatal path.
 struct PanickingHealthChild {
     id: &'static str,
     health_entered: Arc<AtomicBool>,
@@ -997,7 +996,6 @@ async fn a_panicking_broca_health_reports_failing_without_skipping_other_childre
     );
 
     // The composite continues polling other children after Broca's health probe panics.
-    // severity.
     secondary.set_health(HealthStatus::Degraded, "synapse degraded");
     let report = composite.health().await;
     assert_eq!(

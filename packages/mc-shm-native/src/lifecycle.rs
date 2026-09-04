@@ -1,3 +1,5 @@
+//! Environment-cleanup hook for native lifecycle markers.
+
 use std::path::PathBuf;
 
 use napi::{Env, Result};

@@ -1,9 +1,10 @@
-//! `ck-mc-host start` and `restart` use this module to spawn detached daemons.
+//! Spawns detached daemons for `ck-mc-host start` and `restart`.
 //!
-//! `fork`, session separation, stdio redirection, descriptor closure, and fd-based `fexecve` re-exec live here so `mc-host` can deny unsafe code.
-//! `#![deny(unsafe_code)]`.
-//!
-//! Production re-execs the selected staged generation's retained verified launcher descriptor; launcher-less dev fixtures re-exec the running test executable.
+//! This module contains `fork`, session separation, stdio redirection, descriptor
+//! closure, and descriptor-based re-exec so `mc-host` can deny unsafe code.
+//! Production re-execs the retained launcher descriptor for the selected staged
+//! generation. Debug test fixtures may re-exec the running test executable only
+//! when `CK_MC_HOST_TEST_ALLOW_SELF_EXEC=1`.
 #![allow(unsafe_code)]
 
 use std::ffi::CString;
@@ -28,7 +29,10 @@ fn cvt(ret: libc::c_int, what: &'static str) -> Result<libc::c_int, SpawnError> 
     }
 }
 
-/// owner-only mode.
+/// Opens an owner-only regular log file without following links.
+///
+/// Existing files must have one link, belong to the effective user, and grant no
+/// group or other permissions. The returned descriptor has mode `0o600`.
 fn open_log(log_path: &Path) -> Result<OwnedFd, SpawnError> {
     let file = OpenOptions::new()
         .append(true)
@@ -56,6 +60,7 @@ fn open_log(log_path: &Path) -> Result<OwnedFd, SpawnError> {
     Ok(OwnedFd::from(file))
 }
 
+/// Moves a child-side descriptor above the standard streams.
 ///
 /// `relocate_above_stderr` moves every child-side source above fd 2 because `dup2` overwrites sources at fds 0–2.
 fn relocate_above_stderr(fd: OwnedFd) -> Result<OwnedFd, SpawnError> {
@@ -92,10 +97,19 @@ fn close_fallback_ceiling() -> libc::c_int {
     soft.clamp(FLOOR, CLAMP) as libc::c_int
 }
 
-/// Spawns a detached `ck-mc-host serve` daemon and writes the bounded startup envelope to its stdin pipe.
-/// validation.
+/// Spawns a detached `ck-mc-host serve` daemon and writes `envelope` to its
+/// standard-input pipe.
 ///
-/// A successful return proves only spawn issuance; callers must wait for publication evidence, not the child PID.
+/// `envelope` must not exceed [`MAX_ENVELOPE_BYTES`]. Production callers must
+/// supply a retained verified launcher descriptor. A successful return proves
+/// only spawn issuance; callers must wait for publication evidence rather than
+/// treating the child PID as readiness.
+///
+/// # Errors
+///
+/// Returns [`SpawnError`] when validation, descriptor setup, `fork`, or envelope
+/// delivery fails. Child setup and exec failures occur after return and are
+/// reported through missing publication or daemon logs.
 pub fn spawn_detached(
     log_path: &Path,
     envelope: &[u8],
