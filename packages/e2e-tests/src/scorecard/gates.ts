@@ -1,4 +1,4 @@
-import type { ScorecardEvidenceBundle } from "./evidence";
+import { RUN_INCOMPLETE, type ScorecardEvidenceBundle } from "./evidence";
 import { SCORECARD_GATE_IDS, reasonCode, type GateId, type LaneId } from "./policy";
 import type { GateRow } from "./report-contract";
 
@@ -14,8 +14,11 @@ function injectionPromoted(bundle: ScorecardEvidenceBundle): Observation {
         return { diagnostic: "lane-not-present" };
     }
     const observation: Observation = { observedCount: lane.report.injectionCanaryHits.length, evidenceFingerprint: lane.reportFingerprint, sourceLane: "metamorphic" };
-    // The live runner stops at the first hit and marks the report incomplete, so a retained `incomplete` lane
-    // is the shape a real hit arrives in; hits are read before either the status or coverage check.
+    // The live runner stops at the first hit and marks the report incomplete, so a lane whose only diagnostic
+    // is `run-incomplete` is the shape a real hit arrives in. Any other diagnostic (a build-identity mismatch,
+    // a conformance failure) means the hit may belong to a different build, so it is not attributed to this one.
+    const stoppedEarly = lane.status === "incomplete" && lane.diagnostics.every((code) => code === RUN_INCOMPLETE);
+    if (lane.status !== "present" && !stoppedEarly) return { diagnostic: "lane-not-present" };
     if (lane.report.injectionCanaryHits.length > 0) return observation;
     if (lane.status !== "present") return { diagnostic: "lane-not-present" };
     // `coverage[].applied` counts admitted pairs, which the runner increments before any execution, so

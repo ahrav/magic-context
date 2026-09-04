@@ -30,7 +30,7 @@ import type { PairedCaseFact } from "../prospective-holdout/comparison";
 import { POLICY_OWNER_SCHEMA, type PolicyOwnerDocument } from "../prospective-holdout/contract";
 import { pairedFactsFingerprint } from "../prospective-holdout/report";
 import { cellResultFixture, freezeManifest, readyPolicies } from "../prospective-holdout/test-fixtures";
-import type { EvidenceSources, LaneEvidence, ScorecardEvidenceBundle } from "./evidence";
+import { RUN_INCOMPLETE, type EvidenceSources, type LaneEvidence, type ScorecardEvidenceBundle } from "./evidence";
 import {
     LANE_IDS,
     LANE_REPORT_SCHEMAS,
@@ -640,6 +640,8 @@ export interface BundleFixtureOptions {
     policy?: ScorecardPolicy;
     lanes?: Partial<LaneFixtureSet>;
     statuses?: Partial<Record<LaneId, LaneStatus>>;
+    /** Diagnostics for a lane whose status is not `present`; defaults to the loader's `run-incomplete` for `incomplete` lanes. */
+    diagnostics?: Partial<Record<LaneId, string[]>>;
     baseline?: ScorecardReport | null;
     freezeManifestFingerprint?: string;
 }
@@ -656,7 +658,7 @@ export function bundleFixture(options: BundleFixtureOptions = {}): ScorecardEvid
             status,
             reportFingerprint: status === "missing" ? null : canonicalFingerprint(report),
             identity: null,
-            diagnostics: status === "present" ? [] : [`fixture-${status}`],
+            diagnostics: status === "present" ? [] : options.diagnostics?.[lane] ?? [status === "incomplete" ? RUN_INCOMPLETE : `fixture-${status}`],
             report: retained ? report : null,
         } as LaneEvidence;
     });

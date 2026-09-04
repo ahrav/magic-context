@@ -46,6 +46,13 @@ describe("evaluateGates", () => {
             evidenceFingerprint: canonicalFingerprint(stopped),
             sourceLane: "metamorphic",
         });
+        // A hit in an artifact from another build is not attributed to this one.
+        const mismatched = evaluateGates(bundleFixture({
+            lanes: { metamorphic: stopped },
+            statuses: { metamorphic: "incomplete" },
+            diagnostics: { metamorphic: ["run-incomplete", "build-identity-mismatch"] },
+        }));
+        expect(mismatched.find((row) => row.gateId === "gate-injection-promoted")).toMatchObject({ status: "not-observed", diagnostic: "lane-not-present", observedCount: null });
     });
 
     it("reports incomplete canary coverage and a non-present lane as not-observed", () => {

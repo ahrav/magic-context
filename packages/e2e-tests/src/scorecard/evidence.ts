@@ -122,6 +122,9 @@ function observedIdentity(parsed: ParsedLane): LaneIdentity | null {
     }
 }
 
+/** The one diagnostic `runIncompleteReasons` emits; a lane whose diagnostics are exactly this ran on the right build but stopped early. */
+export const RUN_INCOMPLETE = "run-incomplete";
+
 /** Reason codes for a parsed report whose own run summary says the run did not finish. Empty when the lane completed. */
 function runIncompleteReasons(parsed: ParsedLane): string[] {
     switch (parsed.lane) {
@@ -129,10 +132,10 @@ function runIncompleteReasons(parsed: ParsedLane): string[] {
             // Without a calibration, `evidenceComplete` records pool-sizing validity and says nothing about whether
             // enough families were analyzable, so the estimator's own sufficiency verdict is required alongside it.
             const { runSummary, analysis } = parsed.report.body;
-            return runSummary.status === "completed" && runSummary.evidenceComplete && analysis.evidenceSufficient ? [] : ["run-incomplete"];
+            return runSummary.status === "completed" && runSummary.evidenceComplete && analysis.evidenceSufficient ? [] : [RUN_INCOMPLETE];
         }
         case "historian":
-            return parsed.report.aggregate.errors > 0 ? ["run-incomplete"] : [];
+            return parsed.report.aggregate.errors > 0 ? [RUN_INCOMPLETE] : [];
         case "metamorphic": {
             // A pair that threw, failed admission, was never scored, or whose role scored ERROR is one the run did not
             // finish, and so is a scenario whose coverage records a violation; a scored pair whose verdict is FAIL or
@@ -142,18 +145,18 @@ function runIncompleteReasons(parsed: ParsedLane): string[] {
                 entry.kind === "scored" && entry.baselineScore.verdict !== "ERROR" && entry.derivativeScore.verdict !== "ERROR";
             const complete = tierInvalidReason === null && entries.length > 0 && entries.every(finished)
                 && coverage.every((row) => row.violations.length === 0);
-            return complete ? [] : ["run-incomplete"];
+            return complete ? [] : [RUN_INCOMPLETE];
         }
         case "dreamer":
-            return parsed.report.length > 0 && parsed.report.every((run) => run.status !== "ERROR") ? [] : ["run-incomplete"];
+            return parsed.report.length > 0 && parsed.report.every((run) => run.status !== "ERROR") ? [] : [RUN_INCOMPLETE];
         case "incident":
-            return parsed.report.evaluation_complete ? [] : ["run-incomplete"];
+            return parsed.report.evaluation_complete ? [] : [RUN_INCOMPLETE];
         case "retrieval": {
             // The declared status is recomputed from the archived rows. The manifest's expected query ids are not
             // archived with the report, so a missing expected query is the one `incomplete` cause not recoverable here.
             const { scenarios, attempts } = parsed.report.evidence;
             const recomputed = computeRetrievalReportStatus({ expectedQueryIds: [], scenarios, attempts });
-            return parsed.report.status === "complete" && recomputed === "complete" && scenarios.length > 0 ? [] : ["run-incomplete"];
+            return parsed.report.status === "complete" && recomputed === "complete" && scenarios.length > 0 ? [] : [RUN_INCOMPLETE];
         }
     }
 }
