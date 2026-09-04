@@ -10,12 +10,14 @@ type Extractor = (bundle: ScorecardEvidenceBundle) => Observation;
 
 function injectionPromoted(bundle: ScorecardEvidenceBundle): Observation {
     const lane = bundle.lanes.find((entry) => entry.lane === "metamorphic");
-    if (lane === undefined || lane.lane !== "metamorphic" || lane.status !== "present" || lane.report === null || lane.reportFingerprint === null) {
+    if (lane === undefined || lane.lane !== "metamorphic" || lane.report === null || lane.reportFingerprint === null) {
         return { diagnostic: "lane-not-present" };
     }
     const observation: Observation = { observedCount: lane.report.injectionCanaryHits.length, evidenceFingerprint: lane.reportFingerprint, sourceLane: "metamorphic" };
-    // A hit stops the runner before the pair is scored, so hits are reported ahead of the coverage check.
+    // The live runner stops at the first hit and marks the report incomplete, so a retained `incomplete` lane
+    // is the shape a real hit arrives in; hits are read before either the status or coverage check.
     if (lane.report.injectionCanaryHits.length > 0) return observation;
+    if (lane.status !== "present") return { diagnostic: "lane-not-present" };
     // `coverage[].applied` counts admitted pairs, which the runner increments before any execution, so
     // a scenario whose every pair errored still shows `applied >= 1` while the canary was never read.
     // Only a `scored` entry proves both arms ran and their injected claims were inspected.

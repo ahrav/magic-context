@@ -5,11 +5,22 @@ import { estimateId, estimateKey, type AdverseRow, type BaselineStatus, type Del
 
 export interface BaselineEstimates {
     status: BaselineStatus;
+    /**
+     * The baseline scorecard's own paired-delta lane status, `null` when no baseline loaded. A loaded
+     * baseline whose lane did not finish holds an empty `familyEstimates` that is absence of evidence,
+     * not a release that estimated nothing.
+     */
+    estimatesStatus: LaneStatus | null;
     familyEstimates: readonly FamilyEstimateRow[];
 }
 
 export function baselineEstimates(baseline: BaselineEvidence): BaselineEstimates {
-    return { status: baseline.status, familyEstimates: baseline.report?.body.utility.familyEstimates ?? [] };
+    const body = baseline.report?.body;
+    return {
+        status: baseline.status,
+        estimatesStatus: body?.evidence.lanes.find((row) => row.lane === "paired-delta")?.status ?? null,
+        familyEstimates: body?.utility.familyEstimates ?? [],
+    };
 }
 
 /**
@@ -81,6 +92,7 @@ export function compareWithBaseline(current: CurrentEstimates, baseline: Baselin
             limitations,
         };
     }
+    if (baseline.estimatesStatus !== "present") limitations.push("baseline-estimates-unavailable");
     const baselineRows = new Map(baseline.familyEstimates.map((row) => [estimateKey(row), row]));
     const deltas = current.familyEstimates.map((row): DeltaRow => {
         const matched = baselineRows.get(estimateKey(row));
@@ -96,7 +108,7 @@ export function compareWithBaseline(current: CurrentEstimates, baseline: Baselin
         ...deltas.filter((row): row is Extract<DeltaRow, { status: "compared" }> => row.status === "compared" && row.interval.upper < 0).map(adverseRow),
         ...missing.map(familyMissingRow),
     ].sort(compareAdverseRows);
-    if (deltas.some((row) => row.status === "no-baseline")) limitations.push("no-baseline-families");
+    if (baseline.estimatesStatus === "present" && deltas.some((row) => row.status === "no-baseline")) limitations.push("no-baseline-families");
     return { deltas, adverseDeltas, limitations };
 }
 

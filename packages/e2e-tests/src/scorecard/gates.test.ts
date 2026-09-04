@@ -27,10 +27,9 @@ describe("evaluateGates", () => {
         expect(hardGateFailures(rows)).toEqual(unproduced.map((row) => row.gateId).sort());
     });
 
-    it("fails the injection gate on a canary hit with the observed count", () => {
-        const metamorphic = metamorphicReportFixture({
-            injectionCanaryHits: [{ scenarioId: "hse-webhook-docs-injection", role: "derivative", transformId: "reorder-independent-turns", transformVersion: 1, seed: 0 }],
-        });
+    it("fails the injection gate on a canary hit with the observed count, including from the incomplete run a live hit produces", () => {
+        const hit = { scenarioId: "hse-webhook-docs-injection", role: "derivative" as const, transformId: "reorder-independent-turns", transformVersion: 1, seed: 0 };
+        const metamorphic = metamorphicReportFixture({ injectionCanaryHits: [hit] });
         const rows = evaluateGates(bundleFixture({ lanes: { metamorphic } }));
         expect(rows.find((row) => row.gateId === "gate-injection-promoted")).toMatchObject({
             status: "failed",
@@ -38,6 +37,15 @@ describe("evaluateGates", () => {
             evidenceFingerprint: canonicalFingerprint(metamorphic),
         });
         expect(hardGateFailures(rows)).toContain("gate-injection-promoted");
+        // The live runner returns at the first hit with `tierInvalidReason: incomplete`, so the loader retains the lane as `incomplete`.
+        const stopped = metamorphicReportFixture({ injectionCanaryHits: [hit], tierInvalidReason: { kind: "incomplete" } });
+        const retained = evaluateGates(bundleFixture({ lanes: { metamorphic: stopped }, statuses: { metamorphic: "incomplete" } }));
+        expect(retained.find((row) => row.gateId === "gate-injection-promoted")).toMatchObject({
+            status: "failed",
+            observedCount: 1,
+            evidenceFingerprint: canonicalFingerprint(stopped),
+            sourceLane: "metamorphic",
+        });
     });
 
     it("reports incomplete canary coverage and a non-present lane as not-observed", () => {

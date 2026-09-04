@@ -406,7 +406,10 @@ function verifyEvidenceBindings(body: ScorecardReportBody): void {
     for (const [index, gate] of body.safetyGates.entries()) {
         if (gate.sourceLane === null) continue;
         const lane = lanes.get(gate.sourceLane);
-        if (lane?.status !== "present" || lane.reportFingerprint !== gate.evidenceFingerprint) {
+        // A pass needs the whole run; a failure is evidence even when the run stopped at the observation,
+        // which is how the live metamorphic runner reports a canary hit.
+        const bound = lane?.status === "present" || (gate.status === "failed" && lane?.status === "incomplete");
+        if (!bound || lane.reportFingerprint !== gate.evidenceFingerprint) {
             fail(`report.body.safetyGates[${index}]: evidence-binding-invalid`);
         }
     }
