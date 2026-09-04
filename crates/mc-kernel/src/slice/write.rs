@@ -16,6 +16,7 @@ use crate::object_write::{
     set_successor,
 };
 use crate::redaction::{identity, redact, redact_lossy, RedactedField};
+use crate::CachedSql;
 use crate::{KernelError, Sensitivity};
 
 struct RedactedDecision {
@@ -159,7 +160,7 @@ impl Envelope<'_> {
         let object = load_live_decision_object(self.tx, &decision_id.text)?;
         let ordinal = self
             .tx
-            .query_row(
+            .query_row_cached(
                 "SELECT COALESCE(MAX(event_ordinal),0)+1
                  FROM decision_events WHERE decision_id=?1",
                 [&decision_id.text],
@@ -171,7 +172,7 @@ impl Envelope<'_> {
         })
         .map_err(|_| KernelError::InvalidInput)?;
         self.tx
-            .execute(
+            .execute_cached(
                 "INSERT INTO decision_events(
                      decision_id,event_ordinal,commit_seq,event_kind,event_payload,evidence_id,
                      recorded_at
@@ -656,7 +657,7 @@ fn insert_decision(
         rationale: &spec.payload.rationale.text,
     })
     .map_err(|_| KernelError::InvalidInput)?;
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO decisions(
              decision_id,object_id,proposition_id,scope_id,anchor_id,evidence_id,decision_kind,
              decision_payload,created_commit_seq,sensitivity_class
@@ -729,7 +730,7 @@ fn insert_observation(
             .map(|value| value.text.as_str()),
     })
     .map_err(|_| KernelError::InvalidInput)?;
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO observations(
              observation_id,object_id,proposition_id,scope_id,anchor_id,evidence_id,
              observation_kind,observation_payload,observed_at,created_commit_seq,sensitivity_class
@@ -757,7 +758,7 @@ fn insert_observation(
         commit_seq,
     )?;
     for dependency in &spec.dependencies {
-        tx.execute(
+        tx.execute_cached(
             "INSERT INTO observation_dependencies(
                  observation_id,dependency_object_id,dependency_kind,dependency_payload
              ) VALUES (?1,?2,?3,?4)",
@@ -804,7 +805,7 @@ fn require_optional_live(
 }
 
 fn require_live_decision_object(tx: &Transaction<'_>, object_id: &str) -> Result<(), KernelError> {
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT 1
          FROM decisions d
          JOIN object_registry r ON r.object_id=d.object_id
@@ -826,7 +827,7 @@ fn require_live(
     value: &str,
 ) -> Result<(), KernelError> {
     let sql = format!("SELECT 1 FROM {table} WHERE {column}=?1 AND invalidated_commit_seq IS NULL");
-    tx.query_row(&sql, [value], |_| Ok(()))
+    tx.query_row_cached(&sql, [value], |_| Ok(()))
         .optional()
         .map_err(crate::map_sqlite)?
         .ok_or(KernelError::NotFound)
@@ -836,7 +837,7 @@ fn load_live_decision_object(
     tx: &Transaction<'_>,
     decision_id: &str,
 ) -> Result<ObjectRow, KernelError> {
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT r.object_id,r.object_kind,r.domain_id,r.source_kind,r.source_id,
                 r.source_revision,r.created_commit_seq,r.sensitivity_class
          FROM decisions d JOIN object_registry r ON r.object_id=d.object_id
@@ -855,7 +856,7 @@ fn load_live_decision_by_object(
     tx: &Transaction<'_>,
     object_id: &str,
 ) -> Result<Option<(ObjectRow, String)>, KernelError> {
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT r.object_id,r.object_kind,r.domain_id,r.source_kind,r.source_id,
                 r.source_revision,r.created_commit_seq,r.sensitivity_class,d.decision_id
          FROM decisions d JOIN object_registry r ON r.object_id=d.object_id
@@ -873,7 +874,7 @@ fn load_live_typed_object(
     object_id: &str,
     object_kind: &str,
 ) -> Result<ObjectRow, KernelError> {
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT object_id,object_kind,domain_id,source_kind,source_id,source_revision,
                 created_commit_seq,sensitivity_class
          FROM object_registry

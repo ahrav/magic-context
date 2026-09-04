@@ -4,6 +4,8 @@ use mc_core::redaction::{
 };
 use rusqlite::{params, Transaction};
 
+use crate::CachedSql;
+
 use super::{map_sqlite, KernelError};
 
 /// Redacted durable text and its detection metadata.
@@ -81,7 +83,7 @@ pub(super) fn record(
     commit_seq: Option<i64>,
 ) -> Result<(), KernelError> {
     for (ordinal, detection) in field.detections.iter().enumerate() {
-        tx.execute(
+        tx.execute_cached(
             "INSERT INTO durable_text_redactions(
                  owner_kind,owner_id,field_name,detection_ordinal,detector_id,secret_type,
                  source_utf8_offset,source_utf8_length,commit_seq
@@ -105,7 +107,7 @@ pub(super) fn record(
 
 /// A rewrite under a reused owner id collides with `(owner_kind,owner_id,field_name,detection_ordinal)` unless prior rows are cleared first.
 pub(super) fn clear_owner_kind(tx: &Transaction<'_>, owner_kind: &str) -> Result<(), KernelError> {
-    tx.execute(
+    tx.execute_cached(
         "DELETE FROM durable_text_redactions WHERE owner_kind=?1",
         [owner_kind],
     )
@@ -119,7 +121,7 @@ pub(super) fn clear_owner(
     owner_kind: &str,
     owner_id: &str,
 ) -> Result<(), KernelError> {
-    tx.execute(
+    tx.execute_cached(
         "DELETE FROM durable_text_redactions WHERE owner_kind=?1 AND owner_id=?2",
         [owner_kind, owner_id],
     )
