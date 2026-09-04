@@ -6,7 +6,7 @@
 use mc_host::RouteHandle;
 use mc_kernel::{
     ArtifactDestination, ArtifactEgressFacts, ArtifactEligibility, EligibilityDeniedReason,
-    KernelError, KernelStore, Sensitivity,
+    KernelError, KernelStore, Sensitivity, SurfaceVisibility,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -126,8 +126,14 @@ fn evaluate(
     // Only a live, unsuperseded owner vouches. A retired or replaced object's
     // registry row still carries its scope and citation, so a candidate
     // retracted after selection would otherwise still be dispatched.
+    // `kernel.read` serves none of a hidden owner's rows either.
+    let served = candidate
+        .served
+        .is_some_and(|served| served.visibility != SurfaceVisibility::Hidden);
     let owner = candidate.state.as_ref().filter(|state| {
-        state.object.invalidated_commit_seq.is_none() && state.object.superseded_by.is_none()
+        served
+            && state.object.invalidated_commit_seq.is_none()
+            && state.object.superseded_by.is_none()
     });
     // Without the citation check any own-project object id would authorize
     // any digest.

@@ -64,6 +64,12 @@ pub const MAX_PENDING_UPLOADS: usize = 4;
 /// Declared bytes staged across every route; every pending upload may be at
 /// the allowance at once.
 pub const MAX_STAGED_BYTES: u64 = UPLOAD_ALLOWANCE_BYTES * MAX_PENDING_UPLOADS as u64;
+/// Working bytes finishes hold beside their staged pages. A finish assembles
+/// the payload as one buffer while its pages stay resident for a retry, and
+/// the kernel holds a redacted copy of a UTF-8 payload while it prepares the
+/// artifact. Every finish occupies a pending slot, so at most
+/// [`MAX_PENDING_UPLOADS`] run at once, each at the allowance.
+pub const FINISH_WORKING_BYTES_MAX: u64 = 2 * MAX_STAGED_BYTES;
 /// Uploads are evicted after this idle interval.
 pub const UPLOAD_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 const MAX_UPLOAD_ID_BYTES: usize = 128;

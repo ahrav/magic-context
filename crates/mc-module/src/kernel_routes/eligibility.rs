@@ -122,10 +122,11 @@ fn parse_destination(value: &str) -> Option<ArtifactDestination> {
 ///
 /// The sensitivity judged is the one the serving view folds onto the object
 /// from its admission history, since that is the class a read handed the
-/// caller; an object no admission decision serves has an unknown class and is
-/// refused for a remote destination. A secret object is refused for every
-/// destination and a non-normal object for a remote one, whether or not the
-/// candidate cites an artifact.
+/// caller; the registry class stands in when no admission decision serves the
+/// object. A secret object is refused for every destination and a non-normal
+/// object for a remote one, whether or not the candidate cites an artifact.
+/// An object no read serves, hidden by admission or never admitted, is
+/// refused as `Hidden`.
 fn judge(
     store: &KernelStore,
     filter: &mut ScopeFilter,
@@ -148,20 +149,17 @@ fn judge(
     if !filter.matches(state.scope_id.as_deref(), &mut stored_terms(store))? {
         return Ok(Verdict::WrongScope);
     }
-    let sensitive = match facts.served.map(|served| served.sensitivity) {
-        Some(Sensitivity::Secret) => true,
-        Some(sensitivity) => {
-            destination == ArtifactDestination::Remote && sensitivity != Sensitivity::Normal
-        }
-        None => destination == ArtifactDestination::Remote,
-    };
-    if sensitive {
+    let sensitivity = facts
+        .served
+        .map_or(state.object.sensitivity, |served| served.sensitivity);
+    if sensitivity == Sensitivity::Secret
+        || (destination == ArtifactDestination::Remote && sensitivity != Sensitivity::Normal)
+    {
         return Ok(Verdict::ProviderSensitive);
     }
-    // `kernel.read` no longer serves a hidden object; dispatch must not either.
     if facts
         .served
-        .is_some_and(|served| served.visibility == SurfaceVisibility::Hidden)
+        .is_none_or(|served| served.visibility == SurfaceVisibility::Hidden)
     {
         return Ok(Verdict::Hidden);
     }

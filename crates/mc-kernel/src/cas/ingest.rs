@@ -132,9 +132,11 @@ impl PreparedArtifact {
 
         let (payload_redaction, bytes, inspected) = match std::str::from_utf8(&request.payload) {
             Ok(text) => {
-                let redaction = redact_payload(text, MAX_PAYLOAD_DETECTIONS)
+                let mut redaction = redact_payload(text, MAX_PAYLOAD_DETECTIONS)
                     .map_err(|error| ArtifactError::new(scan_failure(error)))?;
-                let bytes = redaction.text.as_bytes().to_vec();
+                // The redacted text becomes the stored bytes without a copy;
+                // only its detections are needed afterwards.
+                let bytes = std::mem::take(&mut redaction.text).into_bytes();
                 (redaction, bytes, true)
             }
             Err(_) => {
@@ -184,7 +186,9 @@ impl PreparedArtifact {
         let digest = format!("{:x}", Sha256::digest(&bytes));
         let artifact_reference = format!("objects/{}/{}", &digest[..2], &digest[2..]);
         let redaction_metadata = detection_metadata(&payload_redaction.detections)?;
-        request.payload.clear();
+        // `clear` would keep the allocation; the payload's bytes now live in
+        // `bytes` and the original buffer is released.
+        request.payload = Vec::new();
 
         Ok(Self {
             request,

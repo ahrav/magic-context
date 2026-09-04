@@ -1497,6 +1497,53 @@ async fn eligibility_verdicts_cover_every_class_and_cache_per_incarnation_and_ti
 }
 
 #[tokio::test]
+async fn an_unadmitted_object_is_hidden_and_an_unadmitted_secret_is_provider_sensitive() {
+    let daemon = Daemon::start().await;
+    let store = daemon.store();
+    seed_domain(&store);
+    daemon
+        .commit("create", vec![insert_decision(1)], vec![])
+        .await;
+    let scope_id = daemon.project_scope_id().await;
+    // Written under the project's scope with no admission decision: no read
+    // serves either, and one carries a secret class in the registry.
+    store
+        .commit(intent("unadmitted"), |envelope| {
+            envelope.insert_decision(store_decision(1, &scope_id, "unadmitted-lineage"))?;
+            let mut secret = store_decision(2, &scope_id, "unadmitted-lineage");
+            secret.sensitivity = Sensitivity::Secret;
+            envelope.insert_decision(secret)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    for destination in ["local", "remote"] {
+        let response = daemon
+            .call(
+                daemon.route,
+                eligibility_request(
+                    &daemon.project,
+                    destination,
+                    vec![
+                        json!({"object_id": "store-decision-object-1", "source_revision": 1}),
+                        json!({"object_id": "store-decision-object-2", "source_revision": 1}),
+                    ],
+                ),
+            )
+            .await;
+        assert_eq!(
+            verdicts(&response),
+            [
+                ("store-decision-object-1", "hidden"),
+                ("store-decision-object-2", "provider_sensitive"),
+            ]
+            .map(|(id, verdict)| (id.to_string(), verdict.to_string())),
+            "destination {destination}"
+        );
+    }
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_replayed_ingest_that_tightens_classification_is_not_served_from_the_cache() {
     let daemon = Daemon::start().await;
     let store = daemon.store();
@@ -2179,6 +2226,43 @@ async fn egress_gate_requires_the_owning_object_to_be_live_and_unsuperseded() {
         refused("wrong_scope")
     );
     assert_eq!(recorder.requests(), 2);
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn egress_gate_requires_the_owning_object_to_be_served() {
+    let daemon = Daemon::start().await;
+    let [normal, _, _] = egress_fixture(&daemon).await;
+    let recorder = Recorder(std::sync::atomic::AtomicUsize::new(0));
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-1")
+            .await,
+        json!("allowed")
+    );
+    assert_eq!(recorder.requests(), 1);
+
+    // A contradicted owner stays live and unsuperseded but no read serves it.
+    daemon
+        .store()
+        .commit(intent("contradict-owner"), |envelope| {
+            envelope.record_admission(admission(
+                "decision-object-1",
+                EventKind::Contradict,
+                None,
+                (SourceClass::ModelInference, TaintClass::AssistantInference),
+            ))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert!(is_live(&daemon.store(), "decision-object-1"));
+    assert_eq!(
+        daemon
+            .egress(&recorder, &normal, "remote", "normal", "decision-object-1")
+            .await,
+        refused("wrong_scope")
+    );
+    assert_eq!(recorder.requests(), 1);
     daemon.handler.shutdown().await.unwrap();
 }
 
