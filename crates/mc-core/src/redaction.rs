@@ -289,25 +289,18 @@ impl Redactor {
         text: &str,
     ) -> Result<bool, RedactionError> {
         let mut start = 0usize;
-        let mut end = 0usize;
         loop {
-            let filled = char_floor(text, start.saturating_add(MAX_REDACTABLE_BYTES));
-            if filled == end && end < text.len() {
-                let window = window(text, start, end)?;
-                if !scan.findings(window, start, false)?.is_empty() {
-                    return Ok(true);
-                }
-                start += window_advance(window);
-                continue;
+            let end = char_floor(text, start.saturating_add(MAX_REDACTABLE_BYTES));
+            let is_last = end == text.len();
+            let window = window(text, start, end)?;
+            if !scan.findings(window, start, is_last)?.is_empty() {
+                return Ok(true);
             }
-            end = filled;
-            if end >= text.len() {
-                break;
+            if is_last {
+                return Ok(false);
             }
+            start += window_advance(window);
         }
-        Ok(!scan
-            .findings(window(text, start, end)?, start, true)?
-            .is_empty())
     }
 }
 
