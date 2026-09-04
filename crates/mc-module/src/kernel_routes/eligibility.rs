@@ -7,8 +7,8 @@ use std::collections::{HashMap, VecDeque};
 use mc_core::claim_operation::is_lower_hex;
 use mc_host::RouteHandle;
 use mc_kernel::{
-    ArtifactDestination, ArtifactEligibility, EgressCandidate, KernelError, KernelStore,
-    Sensitivity, SurfaceVisibility,
+    ArtifactDestination, ArtifactEligibility, EgressCandidate, EgressSnapshot, KernelError,
+    KernelStore, Sensitivity, SurfaceVisibility,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -177,28 +177,18 @@ struct BatchResponse {
     cache_hits: usize,
 }
 
-fn evaluate(
+fn cache_keys(
     store: &KernelStore,
-    coordinator: &KernelOpenCoordinator,
-    project: &ProjectBinding,
+    project_scope_id: &str,
     destination: ArtifactDestination,
     candidates: &[Candidate],
-) -> Result<BatchResponse, KernelError> {
-    let named: Vec<(String, Option<String>)> = candidates
-        .iter()
-        .map(|candidate| {
-            (
-                candidate.object_id.clone(),
-                candidate.artifact_digest.clone(),
-            )
-        })
-        .collect();
-    let (snapshot, facts) = store.egress_candidates(&named, destination)?;
+    snapshot: EgressSnapshot,
+) -> Option<Vec<CacheKey>> {
     // Without a classification generation the snapshot has no cache identity:
     // nothing is looked up and nothing is stored.
-    let keys: Option<Vec<CacheKey>> = snapshot.classification_generation.map(|generation| {
-        let lease_epoch = store.lease_epoch();
-        let project_scope_id = project.scope_id();
+    let generation = snapshot.classification_generation?;
+    let lease_epoch = store.lease_epoch();
+    Some(
         candidates
             .iter()
             .map(|candidate| CacheKey {
@@ -209,30 +199,97 @@ fn evaluate(
                 source_revision: candidate.source_revision,
                 artifact_digest: candidate.artifact_digest.clone(),
                 destination,
-                project_scope_id: project_scope_id.clone(),
+                project_scope_id: project_scope_id.to_string(),
             })
-            .collect()
-    });
+            .collect(),
+    )
+}
+
+fn lookup(
+    coordinator: &KernelOpenCoordinator,
+    keys: Option<&[CacheKey]>,
+    len: usize,
+) -> Vec<Option<Verdict>> {
     // `judge` reads SQLite, so the cache guard is held only for the lookups
     // and then again for the inserts, never across a judgement.
-    let cached: Vec<Option<Verdict>> = match &keys {
+    match keys {
         Some(keys) => {
             let cache = coordinator.eligibility_cache();
             keys.iter().map(|key| cache.get(key)).collect()
         }
-        None => vec![None; candidates.len()],
+        None => vec![None; len],
+    }
+}
+
+fn named(
+    candidates: &[Candidate],
+    indices: impl Iterator<Item = usize>,
+) -> Vec<(String, Option<String>)> {
+    indices
+        .map(|index| {
+            (
+                candidates[index].object_id.clone(),
+                candidates[index].artifact_digest.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Looks the cache up before touching the registry, so a batch whose verdicts
+/// are all cached costs one snapshot read. The facts for the misses are read
+/// at whatever state the store has by then; when a commit or a classification
+/// merge moved it in between, the hits were judged against an older state
+/// than the misses, so the batch is redone at the facts' snapshot with every
+/// candidate's facts in hand.
+fn evaluate(
+    store: &KernelStore,
+    coordinator: &KernelOpenCoordinator,
+    project: &ProjectBinding,
+    destination: ArtifactDestination,
+    candidates: &[Candidate],
+) -> Result<BatchResponse, KernelError> {
+    let project_scope_id = project.scope_id();
+    let snapshot = store.egress_snapshot()?;
+    let keys = cache_keys(store, &project_scope_id, destination, candidates, snapshot);
+    let cached = lookup(coordinator, keys.as_deref(), candidates.len());
+    let misses: Vec<usize> = (0..candidates.len())
+        .filter(|&index| cached[index].is_none())
+        .collect();
+    let (facts_snapshot, miss_facts) = if misses.is_empty() {
+        (snapshot, Vec::new())
+    } else {
+        store.egress_candidates(&named(candidates, misses.iter().copied()), destination)?
+    };
+    let (snapshot, keys, cached, facts) = if facts_snapshot == snapshot {
+        let mut facts: Vec<Option<EgressCandidate>> = (0..candidates.len()).map(|_| None).collect();
+        for (index, candidate_facts) in misses.into_iter().zip(miss_facts) {
+            facts[index] = Some(candidate_facts);
+        }
+        (snapshot, keys, cached, facts)
+    } else {
+        let (snapshot, facts) =
+            store.egress_candidates(&named(candidates, 0..candidates.len()), destination)?;
+        let keys = cache_keys(store, &project_scope_id, destination, candidates, snapshot);
+        let cached = lookup(coordinator, keys.as_deref(), candidates.len());
+        (
+            snapshot,
+            keys,
+            cached,
+            facts.into_iter().map(Some).collect(),
+        )
     };
     let cache_hits = cached.iter().filter(|hit| hit.is_some()).count();
     let mut filter = ScopeFilter::new(project);
     let mut verdicts = Vec::with_capacity(candidates.len());
     let mut fresh: Vec<(CacheKey, Verdict)> = Vec::new();
     let mut keys = keys.map(Vec::into_iter);
-    for ((candidate, facts), cached) in candidates.iter().zip(&facts).zip(cached) {
+    for ((candidate, facts), cached) in candidates.iter().zip(facts).zip(cached) {
         let key = keys.as_mut().and_then(Iterator::next);
         let verdict = match cached {
             Some(verdict) => verdict,
             None => {
-                let verdict = judge(store, &mut filter, candidate, facts, destination)?;
+                let facts = facts.expect("a cache miss carries its facts");
+                let verdict = judge(store, &mut filter, candidate, &facts, destination)?;
                 if let Some(key) = key {
                     fresh.push((key, verdict));
                 }
