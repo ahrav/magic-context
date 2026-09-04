@@ -1369,44 +1369,66 @@ fn token_check(state: &ObjectState, known_as_of: i64) -> TokenCheck {
     TokenCheck::Unchanged
 }
 
+fn object_state_sql(where_clause: &str) -> String {
+    format!(
+        "SELECT {OBJECT_ROW_COLUMNS},
+                COALESCE(dec.scope_id,obs.scope_id),
+                (SELECT MAX(commit_seq) FROM change_event c WHERE c.object_id=o.object_id),
+                em.artifact_digest
+         FROM object_registry o
+         LEFT JOIN decisions dec ON dec.object_id=o.object_id
+         LEFT JOIN observations obs ON obs.object_id=o.object_id
+         LEFT JOIN evidence_meta em
+                ON em.evidence_id=COALESCE(dec.evidence_id,obs.evidence_id)
+               AND em.invalidated_commit_seq IS NULL
+         WHERE {where_clause}"
+    )
+}
+
+fn object_state_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectState> {
+    Ok(ObjectState {
+        object: object_row_from(row)?,
+        scope_id: row.get(10)?,
+        latest_change_commit_seq: row.get(11)?,
+        artifact_digest: row.get(12)?,
+    })
+}
+
 /// Decisions and observations are the object kinds that carry a scope and an
 /// evidence citation; every other kind reads `None` for both.
 pub(super) fn load_object_state(
     tx: &Transaction<'_>,
     object_id: &str,
 ) -> Result<Option<ObjectState>, KernelError> {
-    // `SQL` embeds only `OBJECT_ROW_COLUMNS`, so its value is identical on
-    // every call. A per-call `format!` would allocate a string only to hash it
-    // against the same `prepare_cached` entry every time.
-    static SQL: LazyLock<String> = LazyLock::new(|| {
-        format!(
-            "SELECT {OBJECT_ROW_COLUMNS},
-                    COALESCE(dec.scope_id,obs.scope_id),
-                    (SELECT MAX(commit_seq) FROM change_event c WHERE c.object_id=o.object_id),
-                    em.artifact_digest
-             FROM object_registry o
-             LEFT JOIN decisions dec ON dec.object_id=o.object_id
-             LEFT JOIN observations obs ON obs.object_id=o.object_id
-             LEFT JOIN evidence_meta em
-                    ON em.evidence_id=COALESCE(dec.evidence_id,obs.evidence_id)
-                   AND em.invalidated_commit_seq IS NULL
-             WHERE o.object_id=?1"
-        )
-    });
+    // The query text embeds only constants, so it is identical on every call.
+    // A per-call `format!` would allocate a string only to hash it against the
+    // same `prepare_cached` entry every time.
+    static SQL: LazyLock<String> = LazyLock::new(|| object_state_sql("o.object_id=?1"));
     tx.prepare_cached(SQL.as_str())
         .and_then(|mut statement| {
             statement
-                .query_row([object_id], |row| {
-                    Ok(ObjectState {
-                        object: object_row_from(row)?,
-                        scope_id: row.get(10)?,
-                        latest_change_commit_seq: row.get(11)?,
-                        artifact_digest: row.get(12)?,
-                    })
-                })
+                .query_row([object_id], object_state_from)
                 .optional()
         })
         .map_err(map_sqlite)
+}
+
+/// The states of every object named in `ids`, a JSON array of object ids,
+/// keyed by object id; ids the registry has never seen are absent.
+pub(super) fn load_object_states(
+    tx: &Transaction<'_>,
+    ids: &str,
+) -> Result<HashMap<String, ObjectState>, KernelError> {
+    static SQL: LazyLock<String> =
+        LazyLock::new(|| object_state_sql("o.object_id IN (SELECT value FROM json_each(?1))"));
+    let mut statement = tx.prepare_cached(SQL.as_str()).map_err(map_sqlite)?;
+    let states = statement
+        .query_map([ids], object_state_from)
+        .map_err(map_sqlite)?
+        .map(|state| state.map(|state| (state.object.object_id.clone(), state)))
+        .collect::<rusqlite::Result<HashMap<_, _>>>()
+        .map_err(map_sqlite)?;
+    Ok(states)
 }
 
 fn load_object(tx: &Transaction<'_>, object_id: &str) -> Result<Option<ObjectRow>, KernelError> {

@@ -643,6 +643,55 @@ fn egress_facts_carry_the_eligibility_verdict_and_the_stored_class() {
     );
 }
 
+/// Repeated object ids and digests must produce the same per-candidate
+/// results as one read per candidate, in candidate order.
+#[test]
+fn egress_candidates_line_up_by_index_when_ids_and_digests_repeat() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let normal = store
+        .ingest_artifact(request("normal", b"public".to_vec()))
+        .unwrap();
+    let mut sensitive_request = request("sensitive", b"private".to_vec());
+    sensitive_request.asserted_sensitivity = Sensitivity::Sensitive;
+    let sensitive = store.ingest_artifact(sensitive_request).unwrap();
+    let unknown_digest = "a".repeat(64);
+    let normal_object = "evidence-object-normal".to_string();
+    let sensitive_object = "evidence-object-sensitive".to_string();
+
+    // "never-written" has no registry row; `unknown_digest` has no artifact.
+    let candidates: Vec<(String, Option<String>)> = vec![
+        (normal_object.clone(), Some(normal.digest.clone())),
+        (sensitive_object.clone(), Some(sensitive.digest.clone())),
+        (normal_object.clone(), Some(sensitive.digest.clone())),
+        ("never-written".to_string(), Some(normal.digest.clone())),
+        (sensitive_object, None),
+        ("never-written".to_string(), Some(unknown_digest.clone())),
+        (normal_object, Some(unknown_digest)),
+    ];
+
+    for &destination in ArtifactDestination::ALL {
+        let (snapshot, batch) = store.egress_candidates(&candidates, destination).unwrap();
+        assert_eq!(batch.len(), candidates.len(), "{destination:?}");
+        for (index, candidate) in candidates.iter().enumerate() {
+            let (single_snapshot, single) = store
+                .egress_candidates(std::slice::from_ref(candidate), destination)
+                .unwrap();
+            assert_eq!(single_snapshot, snapshot, "{destination:?} #{index}");
+            assert_eq!(batch[index], single[0], "{destination:?} #{index}");
+        }
+        assert_eq!(batch[0].state, batch[2].state, "{destination:?}");
+        assert!(batch[0].state.is_some(), "{destination:?}");
+        assert_eq!(batch[0].artifact, batch[3].artifact, "{destination:?}");
+        assert_eq!(batch[1].artifact, batch[2].artifact, "{destination:?}");
+        assert_eq!(batch[5].artifact, batch[6].artifact, "{destination:?}");
+        assert_ne!(batch[0].artifact, batch[1].artifact, "{destination:?}");
+        assert!(batch[3].state.is_none(), "{destination:?}");
+        assert!(batch[4].artifact.is_none(), "{destination:?}");
+    }
+}
+
 #[test]
 fn commit_failure_cleans_reference_and_errors_never_leak_payload() {
     let root = tempfile::tempdir().unwrap();

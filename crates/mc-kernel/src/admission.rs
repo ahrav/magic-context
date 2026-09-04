@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 
 use super::cas::{ArtifactDestination, ArtifactEgressFacts};
 use super::envelope::{
-    load_object_state, object_row_from, DomainSpec, Envelope, ObjectRow, ObjectState,
+    load_object_states, object_row_from, DomainSpec, Envelope, ObjectRow, ObjectState,
     PendingChange, OBJECT_ROW_COLUMNS,
 };
 use super::object_write;
@@ -2229,7 +2229,7 @@ impl KernelStore {
         let generation_before = self.classification_generation.load(Ordering::SeqCst);
         let (tip, candidates) = self.read_snapshot(0, |tx| {
             let tip = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
                     [],
                     |row| row.get::<_, i64>(0),
@@ -2249,19 +2249,28 @@ impl KernelStore {
                         )
                     })
                     .collect();
+            // One registry read for the batch, and one egress-facts read per
+            // distinct digest, instead of one of each per candidate.
+            let states = load_object_states(tx, &ids)?;
+            let mut artifacts: HashMap<&str, ArtifactEgressFacts> = HashMap::new();
             candidates
                 .iter()
                 .map(|(object_id, digest)| {
-                    let state = load_object_state(tx, object_id)?;
+                    let state = states.get(object_id.as_str()).cloned();
                     let served = served.get(object_id).copied();
                     let artifact = match digest {
                         Some(digest) if !crate::cas::is_artifact_digest(digest) => {
                             return Err(KernelError::InvalidInput);
                         }
-                        Some(digest) => Some(
-                            crate::cas::egress_facts_tx(tx, digest, destination)
-                                .map_err(map_sqlite)?,
-                        ),
+                        Some(digest) => Some(match artifacts.get(digest.as_str()) {
+                            Some(facts) => *facts,
+                            None => {
+                                let facts = crate::cas::egress_facts_tx(tx, digest, destination)
+                                    .map_err(map_sqlite)?;
+                                artifacts.insert(digest.as_str(), facts);
+                                facts
+                            }
+                        }),
                         None => None,
                     };
                     Ok(EgressCandidate {
