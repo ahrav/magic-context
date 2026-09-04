@@ -222,8 +222,7 @@ export class FakeKernel {
                 return { state: { kind: "invalid", reason: "already_exists" } };
             }
         }
-        const seq = this.nextSeq();
-        // The daemon applies one envelope atomically: every operation is validated against pre-envelope state before any mutation, and `invalidating` rejects a second supersede or retire of a target an earlier operation in the envelope already invalidates. commentlint: allow(JUDGE)
+        // The daemon applies one envelope atomically: every operation is validated against pre-envelope state before any mutation, and `invalidating` rejects a second supersede or retire of a target an earlier operation in the envelope already invalidates. The commit sequence is allocated only after validation so a rejected envelope does not advance the snapshot. commentlint: allow(JUDGE)
         const invalidating = new Set<string>();
         for (const operation of operations) {
             if (operation.op === "insert_decision") continue;
@@ -266,6 +265,7 @@ export class FakeKernel {
                 return { state: { kind: "invalid", reason: "invalid_input" } };
             }
         }
+        const seq = this.nextSeq();
         const insert = (spec: Record<string, unknown>): void => {
             const objectId = spec.object_id as string;
             if (!this.objects.has(objectId)) {

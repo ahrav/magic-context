@@ -400,12 +400,15 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
             }
             const found = read.rows.filter((row) => wanted.includes(row.object.object_id));
             const foundIds = new Set(found.map((row) => row.object.object_id));
+            const notFound = wanted.filter((id) => !foundIds.has(id));
+            // A truncated read cannot prove absent ids are missing — they can live beyond the daemon's row cap — so those ids report as unresolved rather than missing. commentlint: allow(JUDGE)
             return JSON.stringify({
                 action,
                 knownAsOf: read.knownAsOf,
                 memories: found.map(memoryView),
-                missingObjectIds: wanted.filter((id) => !foundIds.has(id)),
-                ...(read.truncated ? { truncated: true } : {}),
+                ...(read.truncated
+                    ? { truncated: true, missingObjectIds: [], unresolvedObjectIds: notFound }
+                    : { missingObjectIds: notFound }),
             });
         }
         const category = args.category?.trim();
@@ -472,7 +475,10 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         const target = requireTarget(args);
         const read = await readMemoryRows(client, signal);
         if (!read.ok) return renderCtxMemoryStateText(read.state, [target]);
-        const replayed = redeliveredSuccessor(args, identity, read.rows, [target]);
+        // A truncated read cannot prove the target retired, so recovery only runs on a complete snapshot. commentlint: allow(JUDGE)
+        const replayed = read.truncated
+            ? null
+            : redeliveredSuccessor(args, identity, read.rows, [target]);
         if (replayed) return renderReplayedOutcome(action, replayed, read.knownAsOf);
         const predecessors = requireVisible(read.rows, [target]);
         const merged = revisionArgs(args, predecessors);
@@ -508,7 +514,9 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
     }
     const read = await readMemoryRows(client, signal);
     if (!read.ok) return renderCtxMemoryStateText(read.state, targets);
-    const replayed = redeliveredSuccessor(args, identity, read.rows, targets);
+    const replayed = read.truncated
+        ? null
+        : redeliveredSuccessor(args, identity, read.rows, targets);
     if (replayed) return renderReplayedOutcome(action, replayed, read.knownAsOf);
     const predecessors = requireVisible(read.rows, targets);
     const predecessorCategory = requireMergeableCategory(predecessors);
