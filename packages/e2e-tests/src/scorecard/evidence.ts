@@ -168,6 +168,7 @@ function pairedDeltaConformanceReasons(report: PairedDeltaReport, policy: Scorec
         || (body.runSummary.calibrationFingerprint !== null) !== (policy.statisticalComparison.noiseFloorSource === "calibration")
         || body.runSummary.spentUsd > policy.releaseCostBudgetUsd
         || canonicalFingerprint(pairedDeltaPolicy.modelMatrix) !== canonicalFingerprint(policy.modelMatrix)
+        || pairedDeltaPolicy.bootstrapResamples !== policy.statisticalComparison.bootstrapResamples
         || pairedDeltaPolicy.replicateCount !== policy.replicateCount
         || pairedDeltaPolicy.releaseCostBudgetUsd !== policy.releaseCostBudgetUsd;
     return mismatched ? ["pre-registration-mismatch"] : [];
@@ -182,6 +183,7 @@ function identityReasons(identity: LaneIdentity | null, required: RequiredLane):
 interface PairedDeltaPolicyView {
     poolManifestFingerprint: string;
     minimumAnalyzableFamilyCount: number;
+    bootstrapResamples: number;
     modelMatrix: ScorecardPolicy["modelMatrix"];
     replicateCount: number;
     releaseCostBudgetUsd: number;
@@ -198,6 +200,7 @@ function loadPairedDeltaPolicy(path: string, expectedFingerprint: string): Paire
     return {
         poolManifestFingerprint: policy.poolManifestFingerprint,
         minimumAnalyzableFamilyCount: policy.minimumAnalyzableFamilyCount,
+        bootstrapResamples: policy.bootstrapResamples,
         modelMatrix: policy.modelMatrix,
         replicateCount: policy.replicateCount,
         releaseCostBudgetUsd: policy.costBudgetUsd.release,

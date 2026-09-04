@@ -154,6 +154,9 @@ describe("loadEvidenceBundle", () => {
         expect(laneEvidence(overBudget, "paired-delta")).toMatchObject({ status: "incomplete", diagnostics: ["pre-registration-mismatch"] });
         const wrongResamples = loadEvidenceBundle(tree({ lanes: { "paired-delta": pairedDeltaReportFixture({ bootstrapResamples: 2500 }) } }));
         expect(laneEvidence(wrongResamples, "paired-delta").status).toBe("incomplete");
+        // The scorecard policy and the pinned paired-delta policy must agree on the resample count the runner takes from the latter.
+        const disagreeing = loadEvidenceBundle(tree({ policy: policyFixture({ statisticalComparison: { bootstrapResamples: 2500, noiseFloorSource: "none" } }) }));
+        expect(laneEvidence(disagreeing, "paired-delta")).toMatchObject({ status: "incomplete", diagnostics: ["pre-registration-mismatch"] });
         const noiseSource = loadEvidenceBundle(tree({ policy: policyFixture({ statisticalComparison: { bootstrapResamples: 2000, noiseFloorSource: "calibration" } }) }));
         expect(laneEvidence(noiseSource, "paired-delta").status).toBe("incomplete");
         const missingSecondary = loadEvidenceBundle(tree({ policy: policyFixture({ secondaryMetricSlots: ["final-attempt-tokens-mc-on", "invalid-success-rate-mc-off"] }) }));
