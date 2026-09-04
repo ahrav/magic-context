@@ -61,6 +61,7 @@ export interface KernelClientConfig {
 }
 
 interface SharedKernelState {
+    module: McHostModuleTransport;
     transport: KernelTransport;
     tokens: TokenCache;
     /** The set orders project roots from least to most recently resolved and bounds per-project token buckets. */
@@ -69,6 +70,9 @@ interface SharedKernelState {
 
 /** Cap on project roots whose token buckets the shared cache retains per connection file; resolving a client past the cap evicts the least-recently-resolved root's tokens. commentlint: allow(JUDGE) */
 export const MAX_TOKEN_CACHE_PROJECTS = 32;
+
+/** Cap on connection files whose shared transports the process retains: a long-lived host that `/cd`s across projects with distinct `connection_file` values would otherwise accumulate one live transport — socket, token cache, route cache — per daemon configuration forever. Eviction disconnects the transport; a client resolved before the eviction fails its next call and re-resolves against a fresh shared state. commentlint: allow(JUDGE) */
+export const MAX_CONNECTION_FILE_STATES = 8;
 
 /** Every kernel operation resolves a client for its project root first; client resolution order therefore tracks token-cache access order. commentlint: allow(JUDGE) */
 function touchTokenProject(shared: SharedKernelState, projectRoot: string): void {
@@ -87,13 +91,26 @@ const sharedByConnectionFile = new Map<string, SharedKernelState>();
 function sharedState(connectionFile: string | undefined): SharedKernelState {
     const key = connectionFile ?? "";
     let shared = sharedByConnectionFile.get(key);
-    if (!shared) {
-        shared = {
-            transport: createKernelTransport(new McHostModuleTransport(connectionFile)),
-            tokens: new TokenCache(),
-            tokenProjectOrder: new Set(),
-        };
+    if (shared) {
+        // Map insertion order doubles as recency order, so a hit re-inserts its entry.
+        sharedByConnectionFile.delete(key);
         sharedByConnectionFile.set(key, shared);
+        return shared;
+    }
+    const module = new McHostModuleTransport(connectionFile);
+    shared = {
+        module,
+        transport: createKernelTransport(module),
+        tokens: new TokenCache(),
+        tokenProjectOrder: new Set(),
+    };
+    sharedByConnectionFile.set(key, shared);
+    while (sharedByConnectionFile.size > MAX_CONNECTION_FILE_STATES) {
+        const oldestKey: string | undefined = sharedByConnectionFile.keys().next().value;
+        if (oldestKey === undefined) break;
+        const evicted = sharedByConnectionFile.get(oldestKey);
+        sharedByConnectionFile.delete(oldestKey);
+        evicted?.module.disconnect();
     }
     return shared;
 }

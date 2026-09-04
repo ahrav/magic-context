@@ -319,9 +319,20 @@ export async function runAutoSearchHint(args: {
 
     const existing = getAutoSearchHintDecisions(db, sessionId);
     const existingForMessage = existing.find((decision) => decision.messageId === userMsgId);
-    if (existingForMessage) {
+    // A memory-backed hint decision never replays, and the message it belongs to can be transformed again after a restart or retry reconstructs it; returning here would lose the hint permanently instead of running the promised fresh search. Only the final-message and stacked-augmentation guards below may still withhold it. commentlint: allow(JUDGE)
+    const rerunForMessage =
+        existingForMessage !== undefined &&
+        existingForMessage.decision === "hint" &&
+        !autoSearchHintReplayable(existingForMessage);
+    if (existingForMessage && !rerunForMessage) {
         replayHintIfEligible(existingForMessage);
         return AUTO_SEARCH_OK;
+    }
+    if (rerunForMessage) {
+        sessionLog(
+            sessionId,
+            `auto-search: persisted memory-backed hint for ${userMsgId} cannot replay — running a fresh search`,
+        );
     }
 
     // The transform creates hints only for the final message because mutating an earlier message invalidates cached later messages.
@@ -464,8 +475,8 @@ export async function runAutoSearchHint(args: {
         sessionLog(sessionId, `auto-search: CAS exhausted for ${userMsgId}; skipping wire append`);
         return { ok: false, kind: "cas-exhaustion" };
     }
-    if (outcome.kind === "appended") {
-        // A fresh delivery appends directly because a memory-backed decision bypasses replay; later passes cannot re-serve it. commentlint: allow(JUDGE)
+    if (outcome.kind === "appended" || rerunForMessage) {
+        // A fresh delivery appends directly because a memory-backed decision bypasses replay; a rerun for an existing memory-backed decision appends the freshly searched hint the append answered "already-present" for. commentlint: allow(JUDGE)
         appendReminderToUserMessageById(messages, userMsgId, payload);
     } else {
         replayHintIfEligible(outcome.decision);

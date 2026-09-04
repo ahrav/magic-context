@@ -14,6 +14,7 @@ import {
     readProjectMemoryCurrentState,
     resolveProjectIdsForIdentities,
 } from "../../features/magic-context/memory/storage-claim-current-state";
+import { listAllPublicClaimIds } from "../../features/magic-context/memory/storage-claims";
 import { CLAIM_MEMORY_LIFECYCLE_STATES } from "../../features/magic-context/storage-claim-memory-schema";
 import { CLAIM_POLICY_VERSION } from "../../features/magic-context/storage-claim-policy-schema";
 import {
@@ -383,10 +384,15 @@ export async function importClaimLaneMemories(args: {
         );
         return "deferred";
     }
+    // Reconciliation may touch only rows the importer derivably created: a revise or merge of an imported row writes a successor under an identity-derived id that no claim maps to, and retiring it would destroy a user's edit. The universe spans every project and lifecycle state so a removed member's imports stay reachable. commentlint: allow(JUDGE)
+    const derivableImportIds = new Set(
+        listAllPublicClaimIds(db).map((publicId) => importedObjectId(publicId, projectRoot)),
+    );
     const revocable = existing.rows.filter(
         (row) =>
             row.object.domain_id === CTX_MEMORY_DOMAIN_ID &&
             row.object.source_id === CLAIM_LANE_IMPORT_SOURCE_ID &&
+            derivableImportIds.has(row.object.object_id) &&
             !authorizedIds.has(row.object.object_id) &&
             !ownImportIds.has(row.object.object_id),
     );

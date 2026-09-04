@@ -285,7 +285,7 @@ describe("runAutoSearchHintForPi", () => {
 		},
 	);
 
-	it("a delivered kernel anti-memory warning appends once and never replays", async () => {
+	it("a delivered kernel anti-memory warning re-serves through a fresh search, never a stored replay", async () => {
 		const db = createTestDb();
 		const prompt = "please explain how the historian decides when to run";
 		const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
@@ -320,6 +320,7 @@ describe("runAutoSearchHintForPi", () => {
 			if (decision?.decision !== "hint") return;
 			expect(decision.memoryFragments?.length).toBe(1);
 
+			// A reconstructed message re-runs the search: the live row re-delivers the warning freshly instead of replaying stored text.
 			const replayMessages = [userMessage(prompt, 1)];
 			await runAutoSearchHintForPi({
 				sessionId: "ses-auto",
@@ -327,7 +328,20 @@ describe("runAutoSearchHintForPi", () => {
 				messages: replayMessages,
 				options,
 			});
-			expect(textOf(replayMessages[0])).not.toContain("<ctx-search-hint>");
+			expect(textOf(replayMessages[0])).toContain("Previously rejected");
+
+			// Archiving the row makes the fresh search find nothing; the stored decision must not resurrect it.
+			fake.kernel.objects.forEach((object) => {
+				object.invalidated_commit_seq = 1;
+			});
+			const archivedMessages = [userMessage(prompt, 1)];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages: archivedMessages,
+				options,
+			});
+			expect(textOf(archivedMessages[0])).not.toContain("<ctx-search-hint>");
 		} finally {
 			spy.mockRestore();
 			closeQuietly(db);

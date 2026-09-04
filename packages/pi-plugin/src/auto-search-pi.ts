@@ -223,9 +223,20 @@ export async function runAutoSearchHintForPi(args: {
 	const existingForMessage = existing.find(
 		(decision) => decision.messageId === userMsgId,
 	);
-	if (existingForMessage) {
+	// A memory-backed hint decision never replays, and the message it belongs to can be transformed again after a restart or retry reconstructs it; returning here would lose the hint permanently instead of running the promised fresh search. commentlint: allow(JUDGE)
+	const rerunForMessage =
+		existingForMessage !== undefined &&
+		existingForMessage.decision === "hint" &&
+		!autoSearchHintReplayable(existingForMessage);
+	if (existingForMessage && !rerunForMessage) {
 		replayHintIfEligible(existingForMessage);
 		return messages;
+	}
+	if (rerunForMessage) {
+		sessionLog(
+			sessionId,
+			`auto-search: persisted memory-backed hint for ${userMsgId} cannot replay — running a fresh search`,
+		);
 	}
 	if (strictResolutionFailed) {
 		sessionLog(
@@ -375,8 +386,8 @@ export async function runAutoSearchHintForPi(args: {
 		memoryFragments,
 	});
 	if (!outcome.ok) return messages;
-	if (outcome.kind === "appended") {
-		// A fresh delivery appends directly because a memory-backed decision bypasses replay; later passes cannot re-serve it. commentlint: allow(JUDGE)
+	if (outcome.kind === "appended" || rerunForMessage) {
+		// A fresh delivery appends directly because a memory-backed decision bypasses replay; a rerun for an existing memory-backed decision appends the freshly searched hint the append answered "already-present" for. commentlint: allow(JUDGE)
 		appendHintToUserMessage(userMsg, payload);
 	} else {
 		replayHintIfEligible(outcome.decision);

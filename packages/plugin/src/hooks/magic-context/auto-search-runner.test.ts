@@ -1279,7 +1279,7 @@ describe("executeAutoSearchDelivery", () => {
         }
     });
 
-    test("a delivered kernel anti-memory warning appends once and never replays", async () => {
+    test("a delivered kernel anti-memory warning re-serves through a fresh search, never a stored replay", async () => {
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
         const kernel = new FakeKernel();
         const prompt = "please explain how the historian decides when to run";
@@ -1320,6 +1320,8 @@ describe("executeAutoSearchDelivery", () => {
             expect(decision.memoryFragments?.length).toBe(1);
             expect(autoSearchHintReplayable(decision)).toBe(false);
 
+            // A reconstructed message re-runs the search: the live row re-delivers the warning freshly instead of replaying stored text.
+            const readsBefore = transport.methods().filter((m) => m === "kernel.read").length;
             const replayMessages = [makeUserMsg("u-warn", prompt)];
             expect(
                 await runAutoSearchHint({
@@ -1329,7 +1331,25 @@ describe("executeAutoSearchDelivery", () => {
                     options,
                 }),
             ).toEqual({ ok: true });
-            expect(findUserPromptText(replayMessages[0])).not.toContain("<ctx-search-hint>");
+            expect(findUserPromptText(replayMessages[0])).toContain("Previously rejected");
+            expect(transport.methods().filter((m) => m === "kernel.read").length).toBeGreaterThan(
+                readsBefore,
+            );
+
+            // Archiving the row makes the fresh search find nothing; the stored decision must not resurrect it.
+            kernel.objects.forEach((object) => {
+                object.invalidated_commit_seq = 1;
+            });
+            const archivedMessages = [makeUserMsg("u-warn", prompt)];
+            expect(
+                await runAutoSearchHint({
+                    sessionId: "s-warn",
+                    db,
+                    messages: archivedMessages,
+                    options,
+                }),
+            ).toEqual({ ok: true });
+            expect(findUserPromptText(archivedMessages[0])).not.toContain("<ctx-search-hint>");
         } finally {
             spy.mockRestore();
         }

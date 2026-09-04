@@ -1126,6 +1126,11 @@ export class McHostModuleTransport {
         return this.connectionFile;
     }
 
+    /** Tears down the live connection, its routes, and cached capabilities so an owner evicting this transport does not strand a socket, channel poller, or ring mappings for the process lifetime. A later call on this instance redials. commentlint: allow(JUDGE) */
+    disconnect(): void {
+        this.invalidateConnection();
+    }
+
     canDemandStart(): boolean {
         return this.connectionOrigin === "managed-default" && this.demandStart !== undefined;
     }
