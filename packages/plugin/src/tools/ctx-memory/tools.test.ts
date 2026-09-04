@@ -82,6 +82,52 @@ describe("ctx_memory without a daemon", () => {
             "Error: Memory is disabled by configuration (memory.enabled = false).",
         );
     });
+
+    test("an aborted tool call answers the cancelled text without committing", async () => {
+        const tool = harness();
+        const controller = new AbortController();
+        controller.abort();
+        const text = (await tool.definition.execute(
+            createArgs("never lands") as never,
+            {
+                sessionID: SESSION,
+                directory: ROOT,
+                callID: "call-abort",
+                agent: "primary",
+                abort: controller.signal,
+            } as never,
+        )) as string;
+        expect(text).toBe("Error: The memory request was cancelled before it completed.");
+        expect(tool.kernel.objects.size).toBe(0);
+    });
+
+    test("cancellation between the read and the commit never sends the mutation", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        const tool = harness(kernel);
+        const controller = new AbortController();
+        const call = tool.transport.call.bind(tool.transport);
+        // The abort lands after the archive's visibility read is served; the
+        // client's pre-send gate keeps the commit envelope off the wire.
+        tool.transport.call = async (args) => {
+            const reply = await call(args);
+            if (args.method === "kernel.read") controller.abort();
+            return reply;
+        };
+        const text = (await tool.definition.execute(
+            { action: "archive", objectId: "mem_a" } as never,
+            {
+                sessionID: SESSION,
+                directory: ROOT,
+                callID: "call-abort-late",
+                agent: "primary",
+                abort: controller.signal,
+            } as never,
+        )) as string;
+        expect(text).toBe("Error: The memory request was cancelled before it completed.");
+        expect(tool.transport.methods()).toEqual(["kernel.read"]);
+        expect(kernel.objects.get("mem_a")?.invalidated_commit_seq).toBeNull();
+    });
 });
 
 describe("ctx_memory create and revise through the cached token", () => {

@@ -136,7 +136,7 @@ export function createCtxMemoryTool(
 			? `${CTX_MEMORY_DESCRIPTION}\n- list is enabled in this maintenance session.`
 			: CTX_MEMORY_DESCRIPTION,
 		parameters: ParamsSchema,
-		async execute(toolCallId, rawParams, _signal, _onUpdate, ctx) {
+		async execute(toolCallId, rawParams, signal, _onUpdate, ctx) {
 			try {
 				let params = rawParams as CtxMemoryParams & CtxMemoryArgs;
 				params = unwrapImitatedReducedArgs(params, ["action"], {
@@ -209,6 +209,7 @@ export function createCtxMemoryTool(
 						? CTX_MEMORY_PI_DREAMER_ACTOR
 						: CTX_MEMORY_PI_ACTOR,
 					...(dreamerAllowed ? { sourceKind: "dreamer" as const } : {}),
+					...(signal ? { signal } : {}),
 				});
 				return text.startsWith("Error:") ? err(text) : ok(text);
 			} catch (error) {

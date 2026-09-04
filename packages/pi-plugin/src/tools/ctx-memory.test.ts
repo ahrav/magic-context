@@ -126,6 +126,31 @@ describe("Pi ctx_memory create", () => {
 			tool.close();
 		}
 	});
+
+	it("an aborted tool call answers cancelled without committing", async () => {
+		const tool = harness();
+		try {
+			const controller = new AbortController();
+			controller.abort();
+			const result = await tool.tool.execute(
+				"call-abort",
+				createArgs("never lands") as never,
+				controller.signal,
+				undefined,
+				{
+					cwd: CWD,
+					sessionManager: { getSessionId: () => SESSION },
+				} as never,
+			);
+			expect(result.isError).toBe(true);
+			expect(textOf(result)).toBe(
+				"Error: The memory request was cancelled before it completed.",
+			);
+			expect(tool.kernel.objects.size).toBe(0);
+		} finally {
+			tool.close();
+		}
+	});
 });
 
 describe("Pi ctx_memory revise", () => {

@@ -252,12 +252,19 @@ export interface ExecuteCtxMemoryArgs {
     actor: string;
     /** The source kind `create` commits under; replacements inherit the predecessor's kind. */
     sourceKind?: SourceKind;
+    /** The host tool call's abort signal, forwarded into every daemon read and commit. */
+    signal?: AbortSignal;
 }
 
 async function readMemoryRows(
     client: KernelClient,
+    signal?: AbortSignal,
 ): Promise<{ ok: true; rows: ReadRow[]; knownAsOf: number } | { ok: false; state: MemoryState }> {
-    const read = await client.read({ surface: "explicit_search", gated: false });
+    const read = await client.read({
+        surface: "explicit_search",
+        gated: false,
+        ...(signal ? { signal } : {}),
+    });
     if (!isAvailable(read)) return { ok: false, state: read.state };
     return { ok: true, rows: read.rows.filter(isMemoryDecisionRow), knownAsOf: read.known_as_of };
 }
@@ -309,13 +316,18 @@ function withAntiMemoryExpiry(args: CtxMemoryArgs): CtxMemoryArgs {
 }
 
 export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<string> {
-    const { client, action, identity, actor, sourceKind } = input;
+    const { client, action, identity, actor, sourceKind, signal } = input;
     const args = withAntiMemoryExpiry(input.args);
     const operationId = operationIdOf(identity);
-    const mutation: MutationArgs = { actor, operationId, cause: identity.toolCallId };
+    const mutation: MutationArgs = {
+        actor,
+        operationId,
+        cause: identity.toolCallId,
+        ...(signal ? { signal } : {}),
+    };
 
     if (action === "get" || action === "list") {
-        const read = await readMemoryRows(client);
+        const read = await readMemoryRows(client, signal);
         if (!read.ok) return renderCtxMemoryStateText(read.state, []);
         if (action === "get") {
             const wanted = uniqueIds(args.objectIds);
@@ -362,7 +374,7 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
 
     if (action === "archive") {
         const target = requireTarget(args);
-        const read = await readMemoryRows(client);
+        const read = await readMemoryRows(client, signal);
         if (!read.ok) return renderCtxMemoryStateText(read.state, [target]);
         requireVisible(read.rows, [target]);
         return renderCommit(
@@ -371,6 +383,7 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
                 actor,
                 operationId,
                 cause: archiveCause(identity, args.reason),
+                ...(signal ? { signal } : {}),
             }),
             [target],
         );
@@ -378,7 +391,7 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
 
     if (action === "revise") {
         const target = requireTarget(args);
-        const read = await readMemoryRows(client);
+        const read = await readMemoryRows(client, signal);
         if (!read.ok) return renderCtxMemoryStateText(read.state, [target]);
         const predecessors = requireVisible(read.rows, [target]);
         const merged = revisionArgs(args, predecessors);
@@ -407,7 +420,7 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
     if (targets.length < 2) {
         throw new ClaimOperationInputError("merge requires at least two objectIds");
     }
-    const read = await readMemoryRows(client);
+    const read = await readMemoryRows(client, signal);
     if (!read.ok) return renderCtxMemoryStateText(read.state, targets);
     const predecessors = requireVisible(read.rows, targets);
     const predecessorCategory = requireMergeableCategory(predecessors);

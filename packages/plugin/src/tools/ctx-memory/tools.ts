@@ -145,6 +145,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     ...(toolContext.agent === DREAMER_AGENT
                         ? { sourceKind: "dreamer" as const }
                         : {}),
+                    ...(toolContext.abort ? { signal: toolContext.abort } : {}),
                 });
             } catch (error) {
                 if (error instanceof ClaimOperationInputError) {
