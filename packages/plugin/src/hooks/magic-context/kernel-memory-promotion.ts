@@ -6,9 +6,10 @@ import type {
 } from "../../features/magic-context/memory/promotion";
 import {
     type DecisionSpecInput,
+    deriveObjectId,
     isAvailable,
     type KernelClient,
-    sha256Hex,
+    MAX_READ_OBJECT_IDS,
     stateKey,
 } from "../../shared/kernel-client";
 import { sessionLog } from "../../shared/logger";
@@ -21,8 +22,7 @@ export const HISTORIAN_SOURCE_ID = "historian";
 
 /** Ids derive from the claim's public identity and the checkout root: the claim lane hands a re-emitted fact its existing `publicClaimId`, so every run resolves the same fact to the same object instead of minting a run-keyed twin. commentlint: allow(JUDGE) */
 function derivedId(prefix: string, projectRoot: string, publicClaimId: string): string {
-    const seed = [HISTORIAN_SOURCE_ID, projectRoot, publicClaimId, prefix].join("\u001f");
-    return `${prefix}_${sha256Hex(seed).slice(0, 32)}`;
+    return deriveObjectId(prefix, HISTORIAN_SOURCE_ID, projectRoot, publicClaimId, prefix);
 }
 
 export function promotedObjectId(publicClaimId: string, projectRoot: string): string {
@@ -94,12 +94,23 @@ async function commitPromotedFacts(args: {
         deferred(stateKey(existing.state), specs.length);
         return;
     }
-    // Facts already live in the kernel — under the claim-stable id or, for
-    // rows written before ids were claim-stable, under the same (kind,
-    // summary) — are excluded so the envelope never re-inserts an existing
-    // object id, which would fail the whole commit.
-    const present = new Set(existing.rows.map((row) => row.object.object_id));
+    // Facts already live under the same (kind, summary) — rows the claim-lane importer holds under its own derived ids — are excluded by content. The snapshot serves only this content check; id presence resolves through the targeted reads below because the snapshot is capped. commentlint: allow(JUDGE)
     const presentContent = liveMemoryContentKeys(existing.rows);
+    // A targeted read reaches a claim-stable id past the daemon's row cap.
+    const present = new Set<string>();
+    const ids = specs.map((spec) => spec.object_id);
+    for (let start = 0; start < ids.length; start += MAX_READ_OBJECT_IDS) {
+        const read = await args.client.read({
+            surface: MEMORY_READ_SURFACE,
+            gated: false,
+            objectIds: ids.slice(start, start + MAX_READ_OBJECT_IDS),
+        });
+        if (!isAvailable(read)) {
+            deferred(stateKey(read.state), specs.length);
+            return;
+        }
+        for (const row of read.rows) present.add(row.object.object_id);
+    }
     const pending = specs.filter(
         (spec) =>
             !present.has(spec.object_id) &&
@@ -112,19 +123,31 @@ async function commitPromotedFacts(args: {
         );
         return;
     }
-    const result = await args.client.commit({
-        actor: `agent:${args.identity.producer}`,
-        operationId: `${args.identity.runId}\u001f${args.identity.batchId}`,
-        cause: `historian promotion ${args.identity.runId}/${args.identity.batchId}`,
-        sourceKind: "model",
-        operations: pending.map((spec) => ({ op: "insert_decision" as const, spec })),
-    });
-    if (!isAvailable(result)) {
-        deferred(stateKey(result.state), pending.length);
-        return;
+    // One commit per fact, keyed by the claim-stable object id so a rerun of the batch replays each fact. An id the reads could not see — retired, or written by a concurrent promotion — answers `already_exists` for that fact alone instead of aborting the rest of the batch. commentlint: allow(JUDGE)
+    let promoted = 0;
+    let alreadyPromoted = 0;
+    for (const spec of pending) {
+        const result = await args.client.commit({
+            actor: `agent:${args.identity.producer}`,
+            operationId: `${args.identity.runId}\u001f${args.identity.batchId}\u001f${spec.object_id}`,
+            cause: `historian promotion ${args.identity.runId}/${args.identity.batchId}`,
+            sourceKind: "model",
+            operations: [{ op: "insert_decision" as const, spec }],
+        });
+        if (!isAvailable(result)) {
+            if (result.state.kind === "invalid" && result.state.reason === "already_exists") {
+                alreadyPromoted += 1;
+                continue;
+            }
+            deferred(stateKey(result.state), pending.length - promoted - alreadyPromoted);
+            return;
+        }
+        promoted += 1;
     }
     sessionLog(
         args.sessionId,
-        `historian promoted ${pending.length} fact(s) to the kernel${result.receipt.replayed ? " (replayed)" : ""}`,
+        `historian promoted ${promoted} fact(s) to the kernel; ${
+            specs.length - pending.length + alreadyPromoted
+        } already present`,
     );
 }

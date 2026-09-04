@@ -45,7 +45,11 @@ import {
     hasStackedAugmentation,
     unifiedSearchWithTimeout,
 } from "./auto-search-shared";
-import { MEMORY_READ_SURFACE, withholdLaggingMemory } from "./kernel-memory-render";
+import {
+    MEMORY_READ_SURFACE,
+    withholdLaggingMemory,
+    withoutSensitiveRows,
+} from "./kernel-memory-render";
 import { hasMeaningfulUserText } from "./read-session-formatting";
 import { appendReminderToUserMessageById } from "./transform-message-helpers";
 import type { MessageLike } from "./transform-operations";
@@ -126,6 +130,11 @@ function emptyReason(
     return "memory-unavailable";
 }
 
+/** The `explicit_search` surface serves `sensitive` rows and answers `stale` under lag; this automatic consumer re-imposes the daemon's auto-surface rules — withhold a lagging snapshot, drop `sensitive` rows — before any row is scored. Both steps are idempotent, and an injection snapshot that already passed through them re-sanitizes to itself. commentlint: allow(JUDGE) */
+function automaticSurfaceMemoryView(snapshot: KernelMemorySnapshot): KernelMemorySnapshot {
+    return withoutSensitiveRows(withholdLaggingMemory(snapshot));
+}
+
 export async function executeAutoSearchDelivery(args: {
     db: Database;
     sessionId: string;
@@ -135,6 +144,8 @@ export async function executeAutoSearchDelivery(args: {
     scoreThreshold: number;
     /** Serves the `memory` source; absent when memory is disabled or the `memory` source is not requested. */
     kernelClient?: KernelClient;
+    /** The gated `explicit_search` injection read taken earlier in the same pass; when present, the `memory` source consumes it and issues no `kernel.read`. The injection read shares this path's surface, gating, and withholding, and the value substitutes for the RPC. commentlint: allow(JUDGE) */
+    memorySnapshot?: KernelMemorySnapshot;
     timeoutMs?: number;
     /** The reference clock defaults to the live clock for hint-age wording.
      * */
@@ -145,6 +156,7 @@ export async function executeAutoSearchDelivery(args: {
     const sources: readonly SearchSource[] = args.searchOptions.sources ?? AUTO_SEARCH_SOURCES;
     const memoryRequested = sources.includes("memory");
     const kernelClient = memoryRequested ? args.kernelClient : undefined;
+    const memorySnapshot = memoryRequested ? args.memorySnapshot : undefined;
     const limit = args.searchOptions.limit ?? AUTO_SEARCH_RESULT_LIMIT;
     let timed: { results: UnifiedSearchResult[]; memory: KernelMemorySnapshot | null } | null;
     try {
@@ -155,29 +167,21 @@ export async function executeAutoSearchDelivery(args: {
             args.prompt,
             { ...args.searchOptions, sources: localSources(sources) },
             args.timeoutMs ?? AUTO_SEARCH_TIMEOUT_MS,
-            kernelClient
-                ? async (signal, deadlineMs) => {
-                      const snapshot = withholdLaggingMemory(
-                          kernelMemorySnapshotFrom(
-                              await kernelClient.read({
-                                  surface: MEMORY_READ_SURFACE,
-                                  gated: true,
-                                  signal,
-                                  deadlineMs,
-                              }),
-                          ),
-                      );
-                      // The `explicit_search` surface serves `sensitive` rows; this
-                      // automatic consumer re-imposes the daemon's auto-surface
-                      // sensitivity rule before any row is scored. commentlint: allow(JUDGE)
-                      return {
-                          ...snapshot,
-                          rows: snapshot.rows.filter(
-                              (row) => row.object.sensitivity !== "sensitive",
-                          ),
-                      };
-                  }
-                : undefined,
+            memorySnapshot !== undefined
+                ? async () => automaticSurfaceMemoryView(memorySnapshot)
+                : kernelClient
+                  ? async (signal, deadlineMs) =>
+                        automaticSurfaceMemoryView(
+                            kernelMemorySnapshotFrom(
+                                await kernelClient.read({
+                                    surface: MEMORY_READ_SURFACE,
+                                    gated: true,
+                                    signal,
+                                    deadlineMs,
+                                }),
+                            ),
+                        )
+                  : undefined,
         );
     } catch (error) {
         return { status: "incomplete", kind: "search-failure", error };
@@ -227,6 +231,8 @@ export interface AutoSearchRunnerOptions {
     ensureProjectRegistered?: (directory: string, db: Database) => Promise<void>;
     /** Serves the `memory` source; absent when no daemon transport exists. */
     kernelClient?: KernelClientResolver;
+    /** The pass's injection memory snapshot; the delivery consumes it instead of re-reading. */
+    memorySnapshot?: KernelMemorySnapshot;
     memoryEnabled?: boolean;
     embeddingEnabled?: boolean;
     gitCommitsEnabled?: boolean;
@@ -384,6 +390,9 @@ export async function runAutoSearchHint(args: {
                           sessionId,
                           projectRoot: resolveProjectRootDirectory(options.directory),
                       }),
+                      ...(options.memorySnapshot === undefined
+                          ? {}
+                          : { memorySnapshot: options.memorySnapshot }),
                   }
                 : {}),
         });

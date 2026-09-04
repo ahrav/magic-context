@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { McHostCallError } from "../mc-host-client/errors";
 import {
     type DecisionSpecInput,
+    deriveObjectId,
     deriveOperationKey,
     deriveRequestDigest,
     isAvailable,
@@ -409,6 +410,14 @@ describe("KernelClient mutations", () => {
         expect(deriveOperationKey({ ...parts, operationId: "session-1\u001fcall-1" })).not.toBe(
             deriveOperationKey({ ...parts, operationId: "session-2\u001fcall-1" }),
         );
+    });
+
+    test("deriveObjectId joins the fields under the unit separator and pins byte-for-byte", () => {
+        // The literal detects changes to hash inputs, separator, field order, or slice.
+        expect(deriveObjectId("mem", "a", "b")).toBe("mem_f04cdced9736a69da6103f08a4daaf8c");
+        expect(deriveObjectId("dec", "a", "b")).toBe("dec_f04cdced9736a69da6103f08a4daaf8c");
+        expect(deriveObjectId("mem", "a\u001fb")).toBe(deriveObjectId("mem", "a", "b"));
+        expect(deriveObjectId("mem", "a", "b")).not.toBe(deriveObjectId("mem", "b", "a"));
     });
 
     test("create sends one insert_decision under a derived intent", async () => {

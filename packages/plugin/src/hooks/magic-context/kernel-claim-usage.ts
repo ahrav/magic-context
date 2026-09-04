@@ -2,6 +2,7 @@
  * The claim lane records explicit-search retrieval telemetry for matching kernel hits: a hit resolves to a lane row through the derived object ids the claim-lane importer and the historian promotion write under, and the Dreamer's curate pass reads the lane's `retrieval_count` as its keep signal. A kernel-only row (one `ctx_memory` created directly) has no lane row and records nothing. commentlint: allow(JUDGE)
  */
 
+// biome-ignore lint/style/noRestrictedImports: `recordClaimUsage` only writes usage counters — it bumps lane `retrieval_count` for delivered kernel hits and serves no lane content onto the memory path, which is the read the ban exists to prevent. commentlint: allow(JUDGE)
 import { recordClaimUsage } from "../../features/magic-context/memory/storage-claim-operations";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";

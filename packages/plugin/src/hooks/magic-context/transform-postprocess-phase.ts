@@ -1683,6 +1683,8 @@ export async function runPostTransformPhase(
                     projectPath: args.projectPath,
                     ensureProjectRegistered: args.autoSearch.ensureProjectRegistered,
                     kernelClient: args.autoSearch.kernelClient,
+                    // `memorySnapshot` prevents a second `kernel.read` for the same snapshot.
+                    ...(args.m0M1 === undefined ? {} : { memorySnapshot: args.m0M1.memory }),
                 },
             });
             if (!autoSearchOutcome.ok) {

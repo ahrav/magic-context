@@ -2672,6 +2672,8 @@ export function registerPiContextHandler(
 							projectPath: projectIdentity,
 							directory: projectDirectory,
 							kernelClient: options.kernelClient,
+							// `memorySnapshot` prevents a second `kernel.read` for the same snapshot.
+							...(memory === null ? {} : { memorySnapshot: memory }),
 						},
 					});
 				} catch (err) {

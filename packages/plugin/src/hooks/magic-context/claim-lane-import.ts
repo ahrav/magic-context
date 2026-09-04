@@ -17,6 +17,7 @@ import {
 import { CLAIM_POLICY_VERSION } from "../../features/magic-context/storage-claim-policy-schema";
 import {
     type DecisionSpecInput,
+    deriveObjectId,
     isAvailable,
     type KernelClient,
     type ReadRow,
@@ -160,7 +161,7 @@ export function listClaimLaneMemories(
 
 /** Stable across runs so a partial import resumes; the root keeps ids distinct across kernel scopes because object ids are unique store-wide. commentlint: allow(JUDGE) */
 export function importedObjectId(publicClaimId: string, projectRoot: string): string {
-    return `mem_${sha256Hex(`${CLAIM_LANE_IMPORT_SOURCE_ID}\u001f${projectRoot}\u001f${publicClaimId}`).slice(0, 32)}`;
+    return deriveObjectId("mem", CLAIM_LANE_IMPORT_SOURCE_ID, projectRoot, publicClaimId);
 }
 
 /** The lane keeps anti-memory expiry in a column while kernel read surfaces read it from the rendered "Expires at:" line, so the imported summary re-renders the lane payload with the lane's expiry. Content that does not parse as an anti-memory payload imports verbatim instead of aborting the lane. commentlint: allow(JUDGE) */
@@ -193,7 +194,13 @@ export function claimLaneImportSpec(
     projectRoot: string,
 ): DecisionSpecInput {
     return {
-        decision_id: `dec_${sha256Hex(`${CLAIM_LANE_IMPORT_SOURCE_ID}\u001f${projectRoot}\u001f${claim.publicClaimId}\u001f${claim.revisionLocator}`).slice(0, 32)}`,
+        decision_id: deriveObjectId(
+            "dec",
+            CLAIM_LANE_IMPORT_SOURCE_ID,
+            projectRoot,
+            claim.publicClaimId,
+            claim.revisionLocator,
+        ),
         object_id: importedObjectId(claim.publicClaimId, projectRoot),
         domain_id: CTX_MEMORY_DOMAIN_ID,
         decision_kind: claim.category,

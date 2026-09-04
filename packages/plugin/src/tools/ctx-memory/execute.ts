@@ -17,6 +17,7 @@ import { ANTI_MEMORY_CATEGORY } from "../../features/magic-context/memory/consta
 import {
     type CommitResult,
     type DecisionSpecInput,
+    deriveObjectId,
     isAvailable,
     isMemoryDecisionRow,
     type KernelClient,
@@ -29,7 +30,6 @@ import {
     SENSITIVITIES,
     type Sensitivity,
     type SourceKind,
-    sha256Hex,
 } from "../../shared/kernel-client";
 import { DEFAULT_SEARCH_LIMIT, GET_MAX_CLAIMS, MERGE_MAX_TARGETS } from "./constants";
 import type { CtxMemoryAction, CtxMemoryArgs } from "./types";
@@ -100,7 +100,7 @@ export interface CtxMemoryWriteIdentity {
  * instead of minting a second object.
  */
 function derivedId(prefix: string, identity: CtxMemoryWriteIdentity, index: number): string {
-    return `${prefix}_${sha256Hex(`${identity.sessionId}\u001f${identity.toolCallId}\u001f${prefix}\u001f${index}`).slice(0, 32)}`;
+    return deriveObjectId(prefix, identity.sessionId, identity.toolCallId, prefix, `${index}`);
 }
 
 function contentOf(args: CtxMemoryArgs): string {
@@ -333,16 +333,12 @@ function withAntiMemoryExpiry(args: CtxMemoryArgs): CtxMemoryArgs {
     return { ...args, antiMemory: { ...args.antiMemory, expiresAt } };
 }
 
-/** Replay recovery answers "already applied" only when the request's content matches the row this identity already wrote: a caller-supplied summary must equal the stored one byte for byte, an anti-memory must re-render to the stored payload under the stored expiry, and a caller-supplied category or reason must equal the stored decision kind or rationale, so changed content still surfaces the daemon's `operation_key_reused` rejection. commentlint: allow(JUDGE) */
+/** The create replay probe answers "already applied" only when the stored row equals the spec this request derives on its own: the derived category and rationale (empty when omitted) must equal the stored decision kind and rationale, a caller-supplied summary must equal the stored one byte for byte, and an anti-memory must re-render to the stored payload under the stored expiry — the one field a generated expiry legitimately drifts on — so any other changed content surfaces the daemon's `operation_key_reused` rejection. commentlint: allow(JUDGE) */
 function replayMatchesRow(args: CtxMemoryArgs, row: ReadRow): boolean {
     const decision = row.decision;
     if (!decision) return false;
-    const category = args.category?.trim();
-    if (category !== undefined && category !== "" && decision.decision_kind !== category) {
-        return false;
-    }
-    const reason = args.reason?.trim();
-    if (reason !== undefined && decision.payload.rationale !== reason) return false;
+    if (decision.decision_kind !== (args.category?.trim() ?? "")) return false;
+    if (decision.payload.rationale !== (args.reason?.trim() ?? "")) return false;
     if (args.antiMemory) {
         try {
             const stored = parseAntiMemoryContent(decision.payload.summary);
@@ -355,8 +351,24 @@ function replayMatchesRow(args: CtxMemoryArgs, row: ReadRow): boolean {
             return false;
         }
     }
-    if (args.content !== undefined) return decision.payload.summary === args.content.trim();
-    return true;
+    if (args.content === undefined) return false;
+    return decision.payload.summary === args.content.trim();
+}
+
+/** The revise and merge replay probe requires every payload field explicitly: an omitted category, content, or reason inherits from the retired predecessors, which no read serves, so the reconstructed spec is unverifiable — the probe answers no match and the ordinary path surfaces the mismatch instead of a false "already applied". commentlint: allow(JUDGE) */
+function replayMatchesSuccessor(args: CtxMemoryArgs, row: ReadRow): boolean {
+    const decision = row.decision;
+    if (!decision) return false;
+    const category = args.category?.trim();
+    if (!category || decision.decision_kind !== category) return false;
+    if (args.reason === undefined || decision.payload.rationale !== args.reason.trim()) {
+        return false;
+    }
+    if (args.antiMemory) {
+        return renderAntiMemoryContent(args.antiMemory) === decision.payload.summary;
+    }
+    if (args.content === undefined) return false;
+    return decision.payload.summary === args.content.trim();
 }
 
 /** The row a redelivered revise or merge already wrote: the successor id derives from the write identity, and a committed request retired every one of its targets, so recovery requires all named targets gone. A redelivery naming a still-visible target differs from what committed and keeps the ordinary visibility error. commentlint: allow(JUDGE) */
@@ -369,7 +381,7 @@ function redeliveredSuccessor(
     const present = new Set(rows.map((row) => row.object.object_id));
     if (targets.some((id) => present.has(id))) return null;
     const successor = rows.find((row) => row.object.object_id === derivedId("mem", identity, 0));
-    if (!successor || !replayMatchesRow(args, successor)) return null;
+    if (!successor || !replayMatchesSuccessor(args, successor)) return null;
     return successor;
 }
 

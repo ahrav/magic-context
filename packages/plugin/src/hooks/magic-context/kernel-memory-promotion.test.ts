@@ -10,7 +10,11 @@ import { KernelClient } from "../../shared/kernel-client";
 import { FakeKernel, FakeKernelTransport } from "../../shared/kernel-client-testing/fake-kernel";
 import type { Database } from "../../shared/sqlite";
 import { claimLaneImportDone, importClaimLaneMemories } from "./claim-lane-import";
-import { commitPromotedFactsToKernel, promotedFactSpecs } from "./kernel-memory-promotion";
+import {
+    commitPromotedFactsToKernel,
+    promotedFactSpecs,
+    promotedObjectId,
+} from "./kernel-memory-promotion";
 
 const PROJECT = "git:promotion-project";
 const ROOT = "/repo";
@@ -70,6 +74,25 @@ function harness() {
 }
 
 describe("historian kernel promotion", () => {
+    test("promoted ids pin to the persisted derivation byte-for-byte", () => {
+        // The literals detect changes to hash inputs, separator, field order, or slice.
+        const spec = promotedFactSpecs(
+            [
+                {
+                    publicClaimId: "mcm_pin",
+                    revisionLocator: "r1",
+                    contentDigest: "digest-pin",
+                    content: "Pinned fact.",
+                    category: "ARCHITECTURE",
+                },
+            ],
+            "/repo",
+        )[0];
+        expect(promotedObjectId("mcm_pin", "/repo")).toBe("mem_fa26be213982c28e37c9eac41d06a870");
+        expect(spec?.object_id).toBe("mem_fa26be213982c28e37c9eac41d06a870");
+        expect(spec?.decision_id).toBe("dec_4dbc914cedf5dba70a8c2e17f33c1745");
+    });
+
     test("specs derive claim-stable ids and skip refs without a category or content", () => {
         const refs = [ref("PROJECT_RULES", "a"), ref("", "b"), ref("CONFIG_VALUES", "")];
         const first = promotedFactSpecs(refs, ROOT);
@@ -168,6 +191,55 @@ describe("historian kernel promotion", () => {
         });
         expect(kernel.liveRows()).toHaveLength(0);
         expect(transport.calls).toHaveLength(0);
+    });
+
+    test("a pre-existing derived id skips that fact alone and the rest of the batch lands", async () => {
+        const { db, kernel, client } = harness();
+        // The done marker is set first so a deferred answer would be visible as a reset.
+        expect(
+            await importClaimLaneMemories({
+                db,
+                client,
+                projectPath: PROJECT,
+                projectRoot: ROOT,
+                sessionId: "s1",
+            }),
+        ).toBe("done");
+        const refs = [
+            ref("PROJECT_RULES", "fact one"),
+            ref("PROJECT_RULES", "fact two"),
+            ref("PROJECT_RULES", "fact three"),
+        ];
+        // Fact two's derived id occupies the registry as a retired row: no read
+        // serves it, and its re-insert answers `already_exists`.
+        kernel.seedDecision({
+            object_id: promotedObjectId(refs[1]?.publicClaimId ?? "", ROOT),
+            decision_kind: "PROJECT_RULES",
+            summary: "fact two",
+            source_id: "historian",
+            source_kind: "model",
+        });
+        await client.archive(promotedObjectId(refs[1]?.publicClaimId ?? "", ROOT), {
+            actor: "user:test",
+            operationId: "archive-fact-two",
+            cause: "test archive",
+        });
+        expect(kernel.liveRows()).toHaveLength(0);
+        await commitPromotedFactsToKernel({
+            client,
+            db,
+            projectPath: PROJECT,
+            projectRoot: ROOT,
+            sessionId: "s1",
+            refs,
+            identity,
+        });
+        const summaries = kernel
+            .liveRows()
+            .map((row) => row.decision?.payload.summary)
+            .sort();
+        expect(summaries).toEqual(["fact one", "fact three"]);
+        expect(claimLaneImportDone(db, PROJECT, ROOT)).toBe(true);
     });
 
     test("a non-available answer resets the import marker and a later importer run lands the fact", async () => {

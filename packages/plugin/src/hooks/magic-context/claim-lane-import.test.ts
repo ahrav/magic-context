@@ -5,6 +5,7 @@ import {
 } from "../../features/magic-context/memory/anti-memory-content";
 import { ANTI_MEMORY_CATEGORY } from "../../features/magic-context/memory/constants";
 import { createAntiMemory } from "../../features/magic-context/memory/storage-anti-memory";
+import type { ProjectMemoryClaimSnapshot } from "../../features/magic-context/memory/storage-claim-current-state";
 import { createProjectMemoryClaim } from "../../features/magic-context/memory/storage-claim-operations";
 import { ensureProject } from "../../features/magic-context/memory/storage-claims";
 import { createDirectTestDatabase } from "../../features/magic-context/test-database";
@@ -15,6 +16,7 @@ import {
     CLAIM_LANE_IMPORT_SOURCE_ID,
     claimLaneImportDone,
     claimLaneImportGeneration,
+    claimLaneImportSpec,
     importClaimLaneMemories,
     importedObjectId,
     listClaimLaneMemories,
@@ -127,6 +129,28 @@ function harness() {
 }
 
 describe("claim-lane import", () => {
+    test("import ids pin to the persisted derivation byte-for-byte", () => {
+        // The literals detect changes to hash inputs, separator, field order, or slice.
+        expect(importedObjectId("mcm_pin", "/repo/import")).toBe(
+            "mem_a201d8e364d57f41b5ed9ca59a8f2778",
+        );
+        const spec = claimLaneImportSpec(
+            {
+                publicClaimId: "mcm_pin",
+                revisionLocator: "r7",
+                revision: 3,
+                content: "Pinned fact.",
+                category: "ARCHITECTURE",
+                expiresAt: null,
+                policy: { policyVersion: 1, autoEligible: true },
+                dispositions: { stale: false, disputed: false, superseded: false },
+            } as unknown as ProjectMemoryClaimSnapshot,
+            "/repo/import",
+        );
+        expect(spec.object_id).toBe("mem_a201d8e364d57f41b5ed9ca59a8f2778");
+        expect(spec.decision_id).toBe("dec_c259cef51f44577ff776328cbc32a4c4");
+    });
+
     test("lists only the project's own active claims", () => {
         const { db } = harness();
         seedClaim(db, PROJECT, "a", "Own claim A.");

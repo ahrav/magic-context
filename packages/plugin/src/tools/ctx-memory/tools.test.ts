@@ -132,6 +132,19 @@ describe("ctx_memory without a daemon", () => {
 });
 
 describe("ctx_memory create and revise through the cached token", () => {
+    test("write ids pin to the session and tool-call derivation byte-for-byte", async () => {
+        // The literals detect changes to hash inputs, separator, field order, or slice.
+        const tool = harness();
+        const created = parseJson<CommitJson>(
+            await tool.execute(createArgs("Pinned derivation."), "call-pin-id"),
+        );
+        expect(created.objectId).toBe("mem_eb23fc2e926e16c6b2fbb47e96cd5615");
+        const commit = tool.transport.calls[0]?.body as {
+            operations: Array<{ spec: { decision_id: string } }>;
+        };
+        expect(commit.operations[0]?.spec.decision_id).toBe("dec_021727e5fc3f540175b4a9c91f9dcc55");
+    });
+
     test("create then revise by object id issues one read for the token and supersedes", async () => {
         const tool = harness();
         const created = parseJson<CommitJson>(
@@ -221,6 +234,48 @@ describe("ctx_memory create and revise through the cached token", () => {
             "Error: The operation key was reused with a different request digest.",
         );
         expect(tool.kernel.liveRows()).toHaveLength(1);
+    });
+
+    test("a redelivered revise repeating every explicit field replays as already applied", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        const tool = harness(kernel);
+        const args = {
+            action: "revise",
+            objectId: "mem_a",
+            category: "ARCHITECTURE",
+            content: "A, revised.",
+            reason: "clarified",
+        };
+        const first = parseJson<CommitJson>(await tool.execute(args, "call-revise-redeliver"));
+        expect(first.outcome).toBe("applied");
+        const second = parseJson<CommitJson>(await tool.execute(args, "call-revise-redeliver"));
+        expect(second).toMatchObject({
+            outcome: "already applied",
+            objectId: first.objectId,
+        });
+        expect(kernel.liveRows()).toHaveLength(1);
+    });
+
+    test("a redelivered revise omitting the content the original supplied errors instead of replaying", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        const tool = harness(kernel);
+        const first = parseJson<CommitJson>(
+            await tool.execute(
+                { action: "revise", objectId: "mem_a", content: "A, revised." },
+                "call-revise-omit",
+            ),
+        );
+        expect(first.outcome).toBe("applied");
+        // An omitted-content retry would inherit the retired predecessor's summary, which differs from the committed revision, so the probe must not answer "already applied" for it. commentlint: allow(JUDGE)
+        const text = await tool.execute(
+            { action: "revise", objectId: "mem_a" },
+            "call-revise-omit",
+        );
+        expect(text).toBe("Error: memory not found or not visible from this project: mem_a");
+        expect(kernel.liveRows()).toHaveLength(1);
+        expect(kernel.liveRows()[0]?.decision?.payload.summary).toBe("A, revised.");
     });
 
     test("an omitted-expiry anti-memory create redelivered across a day boundary replays", async () => {

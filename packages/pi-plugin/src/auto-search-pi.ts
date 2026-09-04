@@ -60,7 +60,10 @@ import {
 	AUTO_SEARCH_TIMEOUT_MS,
 	hasStackedAugmentation,
 } from "@magic-context/core/hooks/magic-context/auto-search-shared";
-import type { KernelClientResolver } from "@magic-context/core/shared/kernel-client";
+import type {
+	KernelClientResolver,
+	KernelMemorySnapshot,
+} from "@magic-context/core/shared/kernel-client";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 
@@ -84,6 +87,8 @@ export interface PiAutoSearchOptions {
 	directory?: string;
 	/** Serves the `memory` source; absent when no daemon transport exists. */
 	kernelClient?: KernelClientResolver;
+	/** The pass's injection memory snapshot; the delivery consumes it instead of re-reading. */
+	memorySnapshot?: KernelMemorySnapshot;
 }
 
 const DEFAULT_SCORE_THRESHOLD = 0.55;
@@ -305,6 +310,9 @@ export async function runAutoSearchHintForPi(args: {
 							sessionId,
 							projectRoot: resolveProjectRootDirectory(options.directory),
 						}),
+						...(options.memorySnapshot === undefined
+							? {}
+							: { memorySnapshot: options.memorySnapshot }),
 					}
 				: {}),
 		});

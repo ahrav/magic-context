@@ -63,6 +63,23 @@ export interface KernelClientConfig {
 interface SharedKernelState {
     transport: KernelTransport;
     tokens: TokenCache;
+    /** The set orders project roots from least to most recently resolved and bounds per-project token buckets. */
+    tokenProjectOrder: Set<string>;
+}
+
+/** Cap on project roots whose token buckets the shared cache retains per connection file; resolving a client past the cap evicts the least-recently-resolved root's tokens. commentlint: allow(JUDGE) */
+export const MAX_TOKEN_CACHE_PROJECTS = 32;
+
+/** Every kernel operation resolves a client for its project root first; client resolution order therefore tracks token-cache access order. commentlint: allow(JUDGE) */
+function touchTokenProject(shared: SharedKernelState, projectRoot: string): void {
+    shared.tokenProjectOrder.delete(projectRoot);
+    shared.tokenProjectOrder.add(projectRoot);
+    while (shared.tokenProjectOrder.size > MAX_TOKEN_CACHE_PROJECTS) {
+        const oldest: string | undefined = shared.tokenProjectOrder.values().next().value;
+        if (oldest === undefined) break;
+        shared.tokenProjectOrder.delete(oldest);
+        shared.tokens.dropProject(oldest);
+    }
 }
 
 const sharedByConnectionFile = new Map<string, SharedKernelState>();
@@ -74,6 +91,7 @@ function sharedState(connectionFile: string | undefined): SharedKernelState {
         shared = {
             transport: createKernelTransport(new McHostModuleTransport(connectionFile)),
             tokens: new TokenCache(),
+            tokenProjectOrder: new Set(),
         };
         sharedByConnectionFile.set(key, shared);
     }
@@ -84,7 +102,7 @@ export interface CreateKernelClientArgs {
     sessionId: string;
     projectRoot: string;
     config: KernelClientConfig;
-    /** Replaces the shared module transport; tests pass a fake here. */
+    /** Replaces the shared module transport and opts out of the shared token cache: a token's `known_as_of` is a position in one daemon's event sequence, and tokens minted against one transport's daemon are not valid against another's. Without an explicit `tokens`, each call gets a fresh cache; pass `tokens` to keep mutation-token continuity across clients on the same transport. commentlint: allow(JUDGE) */
     transport?: KernelTransport;
     tokens?: TokenCache;
 }
@@ -96,6 +114,9 @@ export interface CreateKernelClientArgs {
  */
 export function createKernelClient(args: CreateKernelClientArgs): KernelClient {
     const shared = args.transport ? null : sharedState(args.config.subc?.connection_file);
+    if (shared && args.tokens === undefined) {
+        touchTokenProject(shared, args.projectRoot);
+    }
     return new KernelClient({
         transport: args.transport ?? (shared as SharedKernelState).transport,
         tokens: args.tokens ?? shared?.tokens ?? new TokenCache(),

@@ -5,6 +5,7 @@ export {
     type CommitOperation,
     type CommitResult,
     type DecisionSpecInput,
+    deriveObjectId,
     deriveOperationKey,
     deriveRequestDigest,
     type IntentArgs,

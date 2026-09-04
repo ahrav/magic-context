@@ -162,6 +162,11 @@ export function sha256Hex(input: string | Uint8Array): string {
     return createHash("sha256").update(input).digest("hex");
 }
 
+/** Stores persist ids minted here, so the separator, field order, and 32-hex slice are frozen byte-for-byte: the same inputs always resolve to the same id. commentlint: allow(JUDGE) */
+export function deriveObjectId(prefix: string, ...fields: readonly string[]): string {
+    return `${prefix}_${sha256Hex(fields.join(OPERATION_KEY_SEPARATOR)).slice(0, 32)}`;
+}
+
 export function deriveRequestDigest(operations: readonly CommitOperation[]): string {
     // The JSON round-trip drops explicitly-undefined keys so a spec built by spread and a spec that omits the field hash identically; `stableStringify` then fixes key order. commentlint: allow(JUDGE)
     return sha256Hex(stableStringify(JSON.parse(JSON.stringify(operations))));
