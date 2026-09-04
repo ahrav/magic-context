@@ -14055,11 +14055,10 @@ struct RequestMethodProbe {
 
 impl RequestMethodProbe {
     fn is_transform_class(&self) -> bool {
-        let named = |value: &Option<String>, name: &str| value.as_deref() == Some(name);
         // Dispatch reads `method` and falls back to `kind`, so the class is
-        // read the same way.
+        // read the same way; a `kind` beside a `method` names nothing.
         let route = self.method.as_deref().or(self.kind.as_deref());
-        named(&self.kind, "transform")
+        route == Some("transform")
             // The state-sync path uses the transform-class ceiling because one row can exceed the facade cap.
             || route == Some("state_sync")
             // One base64 artifact page carries up to 16 MiB decoded.
@@ -17247,6 +17246,12 @@ mod tests {
             enforce_request_byte_cap(&pad("kernel.artifact.ingest.begin", "method", two_mib))
                 .is_err()
         );
+        // A `kind` beside a `method` does not widen the cap: dispatch ignores it.
+        let widened = format!(
+            "{{\"method\":\"kernel.artifact.ingest.begin\",\"kind\":\"transform\",\"pad\":\"{}\"}}",
+            "x".repeat(two_mib)
+        );
+        assert!(enforce_request_byte_cap(widened.as_bytes()).is_err());
         // Oversized facade bodies reject at 1 MiB.
         assert!(enforce_request_byte_cap(&pad("ctx_memory", "method", two_mib)).is_err());
         // Unparseable oversized bodies reject conservatively.

@@ -284,11 +284,12 @@ impl UploadCoordinator {
         now: Instant,
     ) -> Result<BeginOutcome, BeginRejection> {
         self.evict_stale(now);
-        if let Some(existing) = self.uploads.get(&route) {
+        if let Some(existing) = self.uploads.get_mut(&route) {
             // A `begin` that reuses the id but changes the declaration is a
             // new upload: resuming it would ingest the retained pages under
             // the earlier request's evidence id, class, and retention.
             if existing.declares_same(&upload) {
+                existing.last_activity = now;
                 return Ok(BeginOutcome::Resumed(existing.progress()));
             }
             self.take(route);
@@ -1168,9 +1169,18 @@ mod tests {
         let second = began + Duration::from_secs(70);
         started(uploads.begin(route(2), upload_at("v", 4, 1, b"", second), second));
         assert_eq!(uploads.budget().pending, 2);
-        let third = later + Duration::from_secs(60);
+        // A resume is activity too.
+        let resumed = later + Duration::from_secs(50);
+        assert!(matches!(
+            uploads.begin(route(1), upload_at("u", 6, 3, b"abcdef", resumed), resumed),
+            Ok(BeginOutcome::Resumed(_))
+        ));
+        let third = resumed + Duration::from_secs(59);
         started(uploads.begin(route(3), upload_at("w", 4, 1, b"", third), third));
         assert_eq!(uploads.budget().pending, 2);
+        assert!(uploads.accepts_page(route(1), "u", 1).is_ok());
+        let fourth = resumed + Duration::from_secs(60);
+        started(uploads.begin(route(4), upload_at("x", 4, 1, b"", fourth), fourth));
         assert_eq!(
             uploads.accepts_page(route(1), "u", 1),
             Err(InvalidReason::UploadNotFound)
