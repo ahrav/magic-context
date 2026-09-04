@@ -20,7 +20,6 @@ import { HoldoutContractError, parsePolicyOwnerDocument } from "../prospective-h
 import { loadFreeze, loadPolicyDocuments } from "../prospective-holdout/freeze";
 import {
     LANE_IDS,
-    SCORECARD_POLICY_OWNER,
     ScorecardContractError,
     array,
     parseScorecardPolicy,
@@ -241,29 +240,27 @@ function scannedFingerprint(raw: unknown): string | null {
 
 function loadLane(required: RequiredLane, policy: ScorecardPolicy, pairedDeltaPolicy: PairedDeltaPolicyView, artifactsDir: string): LaneEvidence {
     const lane = required.lane;
-    const rejected = (status: LaneStatus, diagnostic: string, reportFingerprint: string | null = null): LaneEvidence =>
-        ({ lane, status, reportFingerprint, identity: null, diagnostics: [diagnostic], report: null });
+    const rejected = (status: LaneStatus, diagnostics: string[], reportFingerprint: string | null = null, identity: LaneIdentity | null = null): LaneEvidence =>
+        ({ lane, status, reportFingerprint, identity, diagnostics, report: null });
     const artifact = readJsonArtifact(join(artifactsDir, laneArtifactName(lane)));
-    if (artifact.kind === "missing") return rejected("missing", "artifact-missing");
-    if (artifact.kind === "unparseable") return rejected("schema-mismatch", "artifact-invalid-json");
+    if (artifact.kind === "missing") return rejected("missing", ["artifact-missing"]);
+    if (artifact.kind === "unparseable") return rejected("schema-mismatch", ["artifact-invalid-json"]);
     let reportFingerprint: string | null;
     try {
         reportFingerprint = scannedFingerprint(artifact.raw);
     } catch {
-        return rejected("schema-mismatch", "artifact-invalid-json");
+        return rejected("schema-mismatch", ["artifact-invalid-json"]);
     }
-    if (reportFingerprint === null) return rejected("schema-mismatch", "privacy-rejected");
+    if (reportFingerprint === null) return rejected("schema-mismatch", ["privacy-rejected"]);
     let parsed: ParsedLane;
     try {
         parsed = parseLane(lane, artifact.raw);
     } catch {
-        return rejected("schema-mismatch", "report-parse-failed", reportFingerprint);
+        return rejected("schema-mismatch", ["report-parse-failed"], reportFingerprint);
     }
     const identity = observedIdentity(parsed);
     const bindingReasons = parsed.lane === "paired-delta" ? pairedDeltaBindingReasons(parsed.report, policy, pairedDeltaPolicy) : [];
-    if (bindingReasons.length > 0) {
-        return { lane, status: "schema-mismatch", reportFingerprint, identity, diagnostics: bindingReasons, report: null };
-    }
+    if (bindingReasons.length > 0) return rejected("schema-mismatch", bindingReasons, reportFingerprint, identity);
     const diagnostics = [
         ...runIncompleteReasons(parsed),
         ...(parsed.lane === "paired-delta" ? pairedDeltaConformanceReasons(parsed.report, policy, pairedDeltaPolicy) : []),
@@ -305,9 +302,9 @@ export function loadEvidenceBundle(sources: EvidenceSources): ScorecardEvidenceB
         if (error instanceof HoldoutContractError) throw new ScorecardContractError(["scorecard: policy-not-frozen", ...error.diagnostics]);
         throw error;
     }
-    if (policyDocuments.scorecard.owner !== SCORECARD_POLICY_OWNER || policyDocuments.scorecard.policyFingerprint === null) {
-        throw new ScorecardContractError(["scorecard: policy-not-frozen"]);
-    }
+    // `loadFreeze` has already refused a pending scorecard policy, so this only narrows the type.
+    const policyFingerprint = policyDocuments.scorecard.policyFingerprint;
+    if (policyFingerprint === null) throw new ScorecardContractError(["scorecard: policy-not-frozen"]);
     const policy = parseScorecardPolicy(policyDocuments.scorecard.policy);
     const pairedDeltaPolicy = loadPairedDeltaPolicy(sources.pairedDeltaPolicyPath, policy.pairedDeltaPolicyFingerprint);
     const lanes = LANE_IDS.map((lane) => {
@@ -317,7 +314,7 @@ export function loadEvidenceBundle(sources: EvidenceSources): ScorecardEvidenceB
     return {
         freezeManifestFingerprint,
         policy,
-        policyFingerprint: policyDocuments.scorecard.policyFingerprint,
+        policyFingerprint,
         lanes,
         baseline: loadBaseline(policy, sources.baselinePath),
         limitations: policy.requiredLanes

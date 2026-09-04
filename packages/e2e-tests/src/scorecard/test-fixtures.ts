@@ -150,7 +150,7 @@ export interface PairedDeltaFixtureOptions {
     pinnedSnapshotId?: string;
     /** Declared alongside a policy document whose own minimum matches it, or the builder refuses the report. */
     minimumAnalyzableFamilyCount?: number;
-    /** Per-family valid-success deltas applied at both primary endpoints. */
+    /** Per-family valid-success deltas at `mc-on-vs-mc-off`; the compaction endpoint sits 0.02 below each so the two are distinguishable. */
     familyDeltas?: Readonly<Record<string, number>>;
     noiseFloors?: readonly FamilyNoiseFloor[];
     runSummary?: Partial<PairedDeltaReport["body"]["runSummary"]>;
@@ -166,9 +166,9 @@ export function pairedDeltaReportFixture(options: PairedDeltaFixtureOptions = {}
     const analysis = estimateFamilyDeltas({
         observations: Object.entries(familyDeltas).flatMap(([familyId, delta]) => [
             { coordinateId: `${familyId}:0`, familyId, endpoint: "mc-on-vs-mc-off" as const, delta, runHealth: "completed" as const },
-            { coordinateId: `${familyId}:0`, familyId, endpoint: "mc-on-vs-compaction" as const, delta, runHealth: "completed" as const },
+            { coordinateId: `${familyId}:0`, familyId, endpoint: "mc-on-vs-compaction" as const, delta: delta - 0.02, runHealth: "completed" as const },
             { coordinateId: `${familyId}:1`, familyId, endpoint: "mc-on-vs-mc-off" as const, delta: delta - 0.05, runHealth: "completed" as const },
-            { coordinateId: `${familyId}:1`, familyId, endpoint: "mc-on-vs-compaction" as const, delta: delta - 0.05, runHealth: "completed" as const },
+            { coordinateId: `${familyId}:1`, familyId, endpoint: "mc-on-vs-compaction" as const, delta: delta - 0.07, runHealth: "completed" as const },
             { coordinateId: `${familyId}:0`, familyId, endpoint: "retrieval" as const, delta: 0.1, runHealth: "completed" as const },
         ]),
         minimumAnalyzableFamilyCount: options.minimumAnalyzableFamilyCount ?? 2,

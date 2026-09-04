@@ -2,6 +2,7 @@ import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmar
 import type { Interval, NoiseComparison, PrimaryEndpoint } from "../paired-delta/estimator";
 import { PRIMARY_ENDPOINTS } from "../paired-delta/estimator";
 import type { RawRegretLadder } from "../paired-delta/report";
+import { tupleKey } from "../paired-delta/tuple-key";
 import {
     GATE_ID_RE,
     LANE_IDS,
@@ -424,7 +425,7 @@ function parseEvidenceRow(raw: unknown, index: number): EvidenceRow {
 }
 
 export function estimateKey(row: { endpoint: PrimaryEndpoint; familyId: string }): string {
-    return JSON.stringify([row.endpoint, row.familyId]);
+    return tupleKey(row.endpoint, row.familyId);
 }
 
 /** Whether every row and slot the policy requires supports promotion. Recomputed by the parser so a report cannot claim what its own rows deny. */
