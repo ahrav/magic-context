@@ -127,6 +127,16 @@ export interface EvidenceRow {
     diagnostics: string[];
 }
 
+export const RUN_INCOMPLETE = "run-incomplete";
+
+/**
+ * A retained incomplete report is evidence for this scorecard only when it stopped early on this target.
+ * A build-identity or conformance diagnostic means it may describe another target, so it is excluded.
+ */
+export function interruptedOnThisTarget(lane: Pick<EvidenceRow, "status" | "diagnostics">): boolean {
+    return lane.status === "incomplete" && lane.diagnostics.every((code) => code === RUN_INCOMPLETE);
+}
+
 export interface ScorecardReportBody {
     /** The policy terms the outcome depends on are restated here so a reader can recompute it from the report alone. */
     target: {
@@ -408,7 +418,7 @@ function verifyEvidenceBindings(body: ScorecardReportBody): void {
         const lane = lanes.get(gate.sourceLane);
         // A pass needs the whole run; a failure is evidence even when the run stopped at the observation,
         // which is how the live metamorphic runner reports a canary hit.
-        const bound = lane?.status === "present" || (gate.status === "failed" && lane?.status === "incomplete");
+        const bound = lane !== undefined && (lane.status === "present" || (gate.status === "failed" && interruptedOnThisTarget(lane)));
         if (!bound || lane.reportFingerprint !== gate.evidenceFingerprint) {
             fail(`report.body.safetyGates[${index}]: evidence-binding-invalid`);
         }
@@ -416,9 +426,9 @@ function verifyEvidenceBindings(body: ScorecardReportBody): void {
     for (const family of familySections(body)) {
         for (const [index, slot] of family.slots.entries()) {
             if (slot.status !== "measured") continue;
-            // Reliability slots read run-health counts from a lane that did not finish, so `incomplete` also sources a measurement.
+            // Reliability slots read run-health counts from a lane that did not finish, so an interrupted lane also sources a measurement.
             const lane = lanes.get(slot.sourceLane);
-            const parsed = lane?.status === "present" || lane?.status === "incomplete";
+            const parsed = lane !== undefined && (lane.status === "present" || interruptedOnThisTarget(lane));
             if (!parsed || lane.reportFingerprint !== slot.sourceFingerprint) {
                 fail(`report.body.${family.family}.slots[${index}]: evidence-binding-invalid`);
             }

@@ -1,6 +1,6 @@
-import { interruptedOnThisTarget, type ScorecardEvidenceBundle } from "./evidence";
+import type { ScorecardEvidenceBundle } from "./evidence";
 import { SCORECARD_GATE_IDS, reasonCode, type GateId, type LaneId } from "./policy";
-import type { GateRow } from "./report-contract";
+import { interruptedOnThisTarget, type GateRow } from "./report-contract";
 
 type Observation =
     | { observedCount: number; evidenceFingerprint: string; sourceLane: LaneId }

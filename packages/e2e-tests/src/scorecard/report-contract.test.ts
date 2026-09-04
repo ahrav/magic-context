@@ -229,6 +229,11 @@ describe("parseScorecardReport", () => {
             body.outcome.mandatoryEvidenceComplete = false;
         });
         expect(parseScorecardReport(stoppedAtHit).body.safetyGates[INJECTION]).toMatchObject({ status: "failed", observedCount: 1, sourceLane: "metamorphic" });
+        // An incomplete lane retained with an identity diagnostic may describe another build, so a failed gate cannot bind to it.
+        const otherTarget = edited(stoppedAtHit, (body) => {
+            body.evidence.lanes[LANE_IDS.indexOf("metamorphic")]!.diagnostics = ["run-incomplete", "build-identity-mismatch"];
+        });
+        expect(() => parseScorecardReport(otherTarget)).toThrow(/safetyGates\[2\]: evidence-binding-invalid/);
     });
 
     it("requires the gate row shape its status tags", () => {
@@ -276,6 +281,8 @@ describe("parseScorecardReport", () => {
             body.outcome.mandatoryEvidenceComplete = false;
         });
         expect(parseScorecardReport(incompleteSource).body.outcome.mandatoryEvidenceComplete).toBe(false);
+        const mismatchedSource = edited(incompleteSource, (body) => { body.evidence.lanes[LANE_IDS.indexOf("paired-delta")]!.diagnostics = ["pre-registration-mismatch"]; });
+        expect(() => parseScorecardReport(mismatchedSource)).toThrow(/utility.slots\[0\]: evidence-binding-invalid/);
         const rejectedSource = edited(incompleteSource, (body) => { body.evidence.lanes[LANE_IDS.indexOf("paired-delta")]!.status = "schema-mismatch"; });
         expect(() => parseScorecardReport(rejectedSource)).toThrow(/utility.slots\[0\]: evidence-binding-invalid/);
         const count = edited(presentLanes, (body) => {

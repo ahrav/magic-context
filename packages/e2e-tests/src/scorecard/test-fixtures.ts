@@ -30,7 +30,7 @@ import type { PairedCaseFact } from "../prospective-holdout/comparison";
 import { POLICY_OWNER_SCHEMA, type PolicyOwnerDocument } from "../prospective-holdout/contract";
 import { pairedFactsFingerprint } from "../prospective-holdout/report";
 import { cellResultFixture, freezeManifest, readyPolicies } from "../prospective-holdout/test-fixtures";
-import { RUN_INCOMPLETE, type EvidenceSources, type LaneEvidence, type ScorecardEvidenceBundle } from "./evidence";
+import type { EvidenceSources, LaneEvidence, ScorecardEvidenceBundle } from "./evidence";
 import {
     LANE_IDS,
     LANE_REPORT_SCHEMAS,
@@ -45,6 +45,7 @@ import {
     type ScorecardPolicy,
 } from "./policy";
 import {
+    RUN_INCOMPLETE,
     SCORECARD_REPORT_SCHEMA,
     deriveOutcome,
     type LaneStatus,

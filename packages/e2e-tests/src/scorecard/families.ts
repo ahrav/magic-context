@@ -5,7 +5,7 @@ import type { DreamerEvalRunReport } from "../dreamer-eval/contract";
 import type { LaneReport as HistorianReport } from "../historian-eval/scorer";
 import type { IncidentPoolReport } from "../incident-pool/report";
 import type { PairedDeltaReport } from "../paired-delta/report";
-import { interruptedOnThisTarget, laneEvidence, type LaneReports, type ScorecardEvidenceBundle } from "./evidence";
+import { laneEvidence, type LaneReports, type ScorecardEvidenceBundle } from "./evidence";
 import {
     PRIMARY_ENDPOINT_SLOTS,
     SECONDARY_SLOT_SOURCES,
@@ -17,7 +17,7 @@ import {
     type ScoreFamilyId,
     type SecondaryMetricKey,
 } from "./policy";
-import { estimateId, type FamilyEstimateRow, type MetricSlot, type ScoreFamilySection, type UtilitySection } from "./report-contract";
+import { estimateId, interruptedOnThisTarget, type FamilyEstimateRow, type MetricSlot, type ScoreFamilySection, type UtilitySection } from "./report-contract";
 
 const SECONDARY_UNITS: Readonly<Record<SecondaryMetricKey, MetricUnit>> = {
     invalidSuccessRateByArm: "ratio",
