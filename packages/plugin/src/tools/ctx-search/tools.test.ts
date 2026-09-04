@@ -627,6 +627,47 @@ describe("createCtxSearchTools", () => {
         }
     });
 
+    it("notes disabled memory on a mixed-source request instead of silently skipping the kernel lane", async () => {
+        const harness = kernelHarness();
+        const searchSpy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
+        try {
+            const tools = createCtxSearchTools({
+                db,
+                kernelClient: harness.kernelClient,
+                resolveProjectPath: () => "git:repo-project",
+                memoryEnabled: false,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+            const memoryOnly = await tools.ctx_search.execute(
+                { query: "anything", sources: ["memory"] },
+                toolContext(),
+            );
+            expect(memoryOnly).toBe(
+                "Error: Memory is disabled by configuration (memory.enabled = false).",
+            );
+            expect(searchSpy).not.toHaveBeenCalled();
+
+            const mixed = await tools.ctx_search.execute(
+                { query: "anything", sources: ["memory", "message"] },
+                toolContext(),
+            );
+            expect(mixed).toStartWith(
+                "Memory: Memory is disabled by configuration (memory.enabled = false).",
+            );
+            expect(mixed).toContain("No results found");
+            expect(searchSpy).toHaveBeenCalledTimes(1);
+            const options = searchSpy.mock.calls[0]?.[4] as { sources?: string[] };
+            expect(options.sources).toEqual(["message"]);
+            expect(harness.transport.calls).toHaveLength(0);
+
+            const implicit = await tools.ctx_search.execute({ query: "anything" }, toolContext());
+            expect(implicit).not.toStartWith("Memory:");
+        } finally {
+            searchSpy.mockRestore();
+        }
+    });
+
     it("answers unavailable without a daemon and never reads the local claim tables", async () => {
         const harness = kernelHarness();
         harness.transport.fileExists = false;

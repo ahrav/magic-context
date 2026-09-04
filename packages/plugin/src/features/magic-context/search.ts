@@ -231,6 +231,8 @@ export interface AntiMemorySearchResult {
     rejectedStrategy: string;
     rejectionReason: string;
     saferAlternative: string | null;
+    /** Decision rationale served alongside the anti-memory summary; lexical ranking scores it, so renderers that show ranked text include it. */
+    rationale?: string;
     matchType: "exact" | "lexical" | "semantic";
     policyLabel?: string;
 }

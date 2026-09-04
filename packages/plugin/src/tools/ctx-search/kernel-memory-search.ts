@@ -164,6 +164,8 @@ export function memoryResultFromRow(
                 payload?.rejectionReason ??
                 "stored anti-memory payload is unparseable; the approach stays rejected",
             saferAlternative: payload?.saferAlternative ?? null,
+            // `rowText` ranks the rationale, so the warning carries it too; a hit matched only in the rationale would otherwise display none of the matched terms and read as unrelated. commentlint: allow(JUDGE)
+            ...(decision.payload.rationale ? { rationale: decision.payload.rationale } : {}),
             matchType,
             ...(row.labeled ? { policyLabel: "labeled" } : {}),
         };

@@ -92,6 +92,36 @@ describe("memoryResultFromRow", () => {
         expect(result.claimId).toBe(-1);
     });
 
+    test("an anti-memory row carries its decision rationale; an empty rationale stays absent", () => {
+        const summary = renderAntiMemoryContent({
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            rejectionReason: "it creates split ownership",
+        });
+        const withRationale = memoryResultFromRow(
+            readRow({
+                objectId: OBJECT_A,
+                decisionKind: ANTI_MEMORY_CATEGORY,
+                summary,
+                rationale: "the nonce handshake stalls under load",
+            }),
+            0.5,
+            "lexical",
+        );
+        expect(withRationale.source).toBe("anti_memory");
+        if (withRationale.source !== "anti_memory") return;
+        expect(withRationale.rationale).toBe("the nonce handshake stalls under load");
+
+        const withoutRationale = memoryResultFromRow(
+            readRow({ objectId: OBJECT_B, decisionKind: ANTI_MEMORY_CATEGORY, summary }),
+            0.5,
+            "lexical",
+        );
+        expect(withoutRationale.source).toBe("anti_memory");
+        if (withoutRationale.source !== "anti_memory") return;
+        expect(withoutRationale.rationale).toBeUndefined();
+    });
+
     test("an ordinary decision row keeps the memory shape", () => {
         const row = readRow({
             objectId: OBJECT_A,
@@ -134,6 +164,26 @@ describe("searchKernelMemoryRows match labeling and domain fence", () => {
         expect(hits?.map((hit) => [hit.source, hit.matchType])).toEqual([
             ["anti_memory", "lexical"],
         ]);
+    });
+
+    test("an anti-memory matched only through its rationale surfaces with that rationale", () => {
+        const rows = [
+            readRow({
+                objectId: OBJECT_A,
+                decisionKind: ANTI_MEMORY_CATEGORY,
+                summary: renderAntiMemoryContent({
+                    trigger: "session caching",
+                    rejectedStrategy: "Redis",
+                    rejectionReason: "it creates split ownership",
+                }),
+                rationale: "the nonce handshake stalls under load",
+            }),
+        ];
+        const hits = searchKernelMemoryRows({ rows, query: "nonce handshake", limit: 5 });
+        expect(hits?.map((hit) => hit.source)).toEqual(["anti_memory"]);
+        const hit = hits?.[0];
+        if (hit?.source !== "anti_memory") return;
+        expect(hit.rationale).toBe("the nonce handshake stalls under load");
     });
 
     test("a decision row outside the memory domain never matches", () => {

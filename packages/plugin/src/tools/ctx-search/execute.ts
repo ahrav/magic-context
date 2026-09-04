@@ -163,11 +163,17 @@ export async function executeCtxSearch(
     );
     let memoryNote: string | undefined;
     let memoryResults: UnifiedSearchResult[] = [];
-    if (!memoryEnabled && memoryOnly) {
-        return {
-            status: "invalid",
-            text: `Error: ${renderToolStateText(disabled())}`,
-        };
+    if (!memoryEnabled) {
+        if (memoryOnly) {
+            return {
+                status: "invalid",
+                text: `Error: ${renderToolStateText(disabled())}`,
+            };
+        }
+        // A mixed request that names `memory` keeps its local sources; the note reports the skipped kernel lane so local results do not pass as a searched memory source.
+        if (requestedSources?.includes("memory")) {
+            memoryNote = `Memory: ${renderToolStateText(disabled())}`;
+        }
     }
     // The local search and kernel read are independent except for object-id queries, so starting both concurrently pays the slower round-trip instead of their sum. commentlint: allow(JUDGE)
     const startLocalSearch = () =>
