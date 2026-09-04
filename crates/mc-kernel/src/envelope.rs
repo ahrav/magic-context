@@ -10,6 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use super::admission::{AdmissionKey, StoredAdmission};
@@ -1373,8 +1374,11 @@ pub(super) fn load_object_state(
     tx: &Transaction<'_>,
     object_id: &str,
 ) -> Result<Option<ObjectState>, KernelError> {
-    tx.query_row(
-        &format!(
+    // `SQL` embeds only `OBJECT_ROW_COLUMNS`, so its value is identical on
+    // every call. A per-call `format!` would allocate a string only to hash it
+    // against the same `prepare_cached` entry every time.
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        format!(
             "SELECT {OBJECT_ROW_COLUMNS},
                     COALESCE(dec.scope_id,obs.scope_id),
                     (SELECT MAX(commit_seq) FROM change_event c WHERE c.object_id=o.object_id),
@@ -1386,19 +1390,22 @@ pub(super) fn load_object_state(
                     ON em.evidence_id=COALESCE(dec.evidence_id,obs.evidence_id)
                    AND em.invalidated_commit_seq IS NULL
              WHERE o.object_id=?1"
-        ),
-        [object_id],
-        |row| {
-            Ok(ObjectState {
-                object: object_row_from(row)?,
-                scope_id: row.get(10)?,
-                latest_change_commit_seq: row.get(11)?,
-                artifact_digest: row.get(12)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(map_sqlite)
+        )
+    });
+    tx.prepare_cached(SQL.as_str())
+        .and_then(|mut statement| {
+            statement
+                .query_row([object_id], |row| {
+                    Ok(ObjectState {
+                        object: object_row_from(row)?,
+                        scope_id: row.get(10)?,
+                        latest_change_commit_seq: row.get(11)?,
+                        artifact_digest: row.get(12)?,
+                    })
+                })
+                .optional()
+        })
+        .map_err(map_sqlite)
 }
 
 fn load_object(tx: &Transaction<'_>, object_id: &str) -> Result<Option<ObjectRow>, KernelError> {

@@ -118,11 +118,8 @@ pub(crate) fn egress_facts_tx(
     destination: ArtifactDestination,
 ) -> rusqlite::Result<ArtifactEgressFacts> {
     let tombstoned = tx
-        .query_row(
-            "SELECT 1 FROM artifact_purge_tombstones WHERE artifact_digest=?1",
-            [digest],
-            |_| Ok(()),
-        )
+        .prepare_cached("SELECT 1 FROM artifact_purge_tombstones WHERE artifact_digest=?1")?
+        .query_row([digest], |_| Ok(()))
         .optional()?
         .is_some();
     if tombstoned {
@@ -131,7 +128,7 @@ pub(crate) fn egress_facts_tx(
             stored_class: None,
         });
     }
-    let mut statement = tx.prepare(
+    let mut statement = tx.prepare_cached(
         "SELECT sensitivity_class,provider_egress_class FROM evidence_meta
          WHERE artifact_digest=?1 AND invalidated_commit_seq IS NULL",
     )?;
