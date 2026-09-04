@@ -179,7 +179,7 @@ struct BatchResponse {
 
 fn cache_keys(
     store: &KernelStore,
-    project_scope_id: &str,
+    project: &ProjectBinding,
     destination: ArtifactDestination,
     candidates: &[Candidate],
     snapshot: EgressSnapshot,
@@ -188,6 +188,7 @@ fn cache_keys(
     // nothing is looked up and nothing is stored.
     let generation = snapshot.classification_generation?;
     let lease_epoch = store.lease_epoch();
+    let project_scope_id = project.scope_id();
     Some(
         candidates
             .iter()
@@ -199,7 +200,7 @@ fn cache_keys(
                 source_revision: candidate.source_revision,
                 artifact_digest: candidate.artifact_digest.clone(),
                 destination,
-                project_scope_id: project_scope_id.to_string(),
+                project_scope_id: project_scope_id.clone(),
             })
             .collect(),
     )
@@ -248,9 +249,8 @@ fn evaluate(
     destination: ArtifactDestination,
     candidates: &[Candidate],
 ) -> Result<BatchResponse, KernelError> {
-    let project_scope_id = project.scope_id();
     let snapshot = store.egress_snapshot()?;
-    let keys = cache_keys(store, &project_scope_id, destination, candidates, snapshot);
+    let keys = cache_keys(store, project, destination, candidates, snapshot);
     let cached = lookup(coordinator, keys.as_deref(), candidates.len());
     let misses: Vec<usize> = (0..candidates.len())
         .filter(|&index| cached[index].is_none())
@@ -267,9 +267,12 @@ fn evaluate(
         }
         (snapshot, keys, cached, facts)
     } else {
-        let (snapshot, facts) =
-            store.egress_candidates(&named(candidates, 0..candidates.len()), destination)?;
-        let keys = cache_keys(store, &project_scope_id, destination, candidates, snapshot);
+        let (snapshot, facts) = if misses.len() == candidates.len() {
+            (facts_snapshot, miss_facts)
+        } else {
+            store.egress_candidates(&named(candidates, 0..candidates.len()), destination)?
+        };
+        let keys = cache_keys(store, project, destination, candidates, snapshot);
         let cached = lookup(coordinator, keys.as_deref(), candidates.len());
         (
             snapshot,
