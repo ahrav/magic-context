@@ -1,11 +1,13 @@
-//! Echo host support: one handler that echoes every request body, plus an
-//! in-process host runner for tests that need a live ring endpoint without
-//! a child process.
+//! Test support for a handler that echoes request bytes and preserves the binary flag.
+//!
+//! [`InProcessHost`] runs a live ring endpoint on a dedicated thread and shuts it down
+//! on drop. Startup waits up to 20 seconds for connection-file publication.
 
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
+/// Test handler exposing one module-managed, pure `echo` tool.
 pub struct EchoHandler;
 
 pub const ECHO_MODULE_ID: &str = "perf-echo";
@@ -68,6 +70,7 @@ impl mc_host::McHostHandler for EchoHandler {
     async fn shutdown(&self) {}
 }
 
+/// Live in-process host whose drop requests shutdown and joins its runtime thread.
 pub struct InProcessHost {
     pub publication: PathBuf,
     shutdown: mc_host::CancellationToken,
@@ -75,6 +78,11 @@ pub struct InProcessHost {
 }
 
 impl InProcessHost {
+    /// Starts an echo host rooted at `data_dir` and waits for its publication file.
+    ///
+    /// Panics when the runtime directory cannot be resolved, Tokio runtime creation
+    /// fails, or publication does not appear within 20 seconds. Host task errors do
+    /// not propagate through this helper.
     pub fn start(data_dir: &Path) -> Self {
         let publication = mc_host::runtime_dir_path(Some(data_dir))
             .expect("runtime dir")

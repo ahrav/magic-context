@@ -1,6 +1,6 @@
-//!
-//! The covered sparse-but-ordered prefix is REPLACED by two frozen synthesized-region blocks
-//! m0 is a cumulative baseline frozen between HARD folds; m1 is a volatile delta re-rendered on SOFT.
+//! The transform replaces the covered, ordered prefix with two frozen synthesized-region blocks.
+//! `m0` is a cumulative baseline frozen between HARD folds. `m1` is a volatile delta rendered on
+//! SOFT passes.
 //! The live tail after the coverage watermark is carried verbatim.
 //!
 //! mc-module renders and splices; mc-core classifies; cortexkit-cache-core freezes supplied units.
@@ -497,8 +497,8 @@ thread_local! {
 /// One tail-reduction decision: the target tail item and the byte-complete reduced
 /// payload that replaces its bytes (`[dropped N]`, or a `filePath + region-hint +
 /// [dropped N]` skeleton). The payload is captured at FREEZE and is authoritative
-/// thereafter — never re-read for an already-frozen target (a moving recent-window
-/// re-derive must not flip the bytes).
+/// thereafter. It is never re-read for an already-frozen target because a moving recent-window
+/// derivation must not change frozen bytes.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ReductionDecision {
     pub target_id: String,
@@ -1037,6 +1037,7 @@ pub struct HostDirectives {
     pub channel2_nudge: Option<Channel2NudgeDirective>,
 }
 
+/// Per-stage pass timings in milliseconds and operation counters.
 ///
 /// The count fields describe the final pass state used to build the served response.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -1234,8 +1235,10 @@ fn record_token_cache_delta(
     timings.tokenize_bytes = now.tokenized_bytes.saturating_sub(start.tokenized_bytes) as usize;
 }
 
-/// Render the one-line, greppable timing record emitted after the response splice.
+/// Renders the one-line timing record emitted after the response splice.
 ///
+/// Floating-point timing fields use milliseconds. Session whitespace is replaced with underscores;
+/// an empty session renders as `-`.
 pub fn format_pass_timing_line(
     session_id: &str,
     timings: &TransformTimings,
@@ -1677,67 +1680,40 @@ struct Channel1NudgeInputs<'a, 'ctx> {
     protected_tags: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TransformError {
+    #[error("store: {0}")]
     Store(McStoreError),
+    #[error("live-source ordinals not strictly increasing")]
     OrdinalViolation,
+    #[error("non-synthetic item used a reserved mc_* id")]
     ReservedId,
+    #[error("unknown frozen-set shape: {0}")]
     UnknownShape(&'static str),
+    #[error("decider re-supplied an already-frozen reduction target with different bytes")]
     ReductionConflict,
+    #[error("{0}")]
     CoverageGap(String),
+    #[error("search: {0}")]
     Search(String),
+    #[error("ck wire: {0}")]
     CkWire(CkWireError),
+    #[error("duplicate flattened block id: {0}")]
     DuplicateBlockId(String),
+    #[error("CK message block identity drift for mid {0}")]
     IdentityDrift(String),
+    #[error("synthetic todo anchor mid {0} is missing from the live tail")]
     SyntheticTodoAnchorMissing(String),
+    #[error("frozen reduction target vanished while its message is live: {0}")]
     FrozenRedTargetVanish(String),
+    #[error("minted boundary not present: {0}")]
     BoundaryNotPresent(String),
+    #[error("compartment boundary ordinal mismatch: {0}")]
     BoundaryOrdinalMismatch(String),
-    /// ordinal-continuation rules.
+    /// Lineage descent violated anchor, epoch, or ordinal-continuation rules.
+    #[error("lineage protocol error: {0}")]
     LineageProtocol(String),
 }
-
-impl std::fmt::Display for TransformError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TransformError::Store(e) => write!(f, "store: {e}"),
-            TransformError::OrdinalViolation => {
-                write!(f, "live-source ordinals not strictly increasing")
-            }
-            TransformError::ReservedId => write!(f, "non-synthetic item used a reserved mc_* id"),
-            TransformError::UnknownShape(m) => write!(f, "unknown frozen-set shape: {m}"),
-            TransformError::ReductionConflict => write!(
-                f,
-                "decider re-supplied an already-frozen reduction target with different bytes"
-            ),
-            TransformError::CoverageGap(m) => write!(f, "{m}"),
-            TransformError::Search(m) => write!(f, "search: {m}"),
-            TransformError::CkWire(e) => write!(f, "ck wire: {e}"),
-            TransformError::DuplicateBlockId(id) => write!(f, "duplicate flattened block id: {id}"),
-            TransformError::IdentityDrift(mid) => {
-                write!(f, "CK message block identity drift for mid {mid}")
-            }
-            TransformError::SyntheticTodoAnchorMissing(mid) => write!(
-                f,
-                "synthetic todo anchor mid {mid} is missing from the live tail"
-            ),
-            TransformError::FrozenRedTargetVanish(id) => {
-                write!(
-                    f,
-                    "frozen reduction target vanished while its message is live: {id}"
-                )
-            }
-            TransformError::BoundaryNotPresent(m) => {
-                write!(f, "minted boundary not present: {m}")
-            }
-            TransformError::BoundaryOrdinalMismatch(m) => {
-                write!(f, "compartment boundary ordinal mismatch: {m}")
-            }
-            TransformError::LineageProtocol(m) => write!(f, "lineage protocol error: {m}"),
-        }
-    }
-}
-impl std::error::Error for TransformError {}
 
 impl From<CkWireError> for TransformError {
     fn from(e: CkWireError) -> Self {
@@ -1799,9 +1775,9 @@ fn claim_mirror_read_outcome<T>(
     }
 }
 
-/// read at.
+/// Reads claim data only when the mirror remains at the caller's snapshot vector across both reads.
 ///
-/// `Ok(None)` means no claim data applies.
+/// `Ok(None)` means no claim data applies or the mirror changed during the read.
 fn claim_snapshot_for_context(
     store: &McStore,
     ctx: &ProducerContext<'_>,
@@ -6341,7 +6317,7 @@ fn red_unit_with_tag_policy(
     unit
 }
 
-/// Return TransformError::ReductionConflict.
+/// Rejects a decision that changes payload bytes for an already-frozen target.
 fn validate_reduction_monotonicity(
     core: &CoreState,
     reductions: &[ReductionDecision],
@@ -7002,7 +6978,7 @@ fn reanchor_kept_synthetic_todo_if_folded_or_shrunk(
     Ok(())
 }
 
-///
+/// Cached tag baseline for one store generation.
 #[derive(Debug, Clone)]
 struct TagBaselineCacheEntry {
     store_namespace: u64,
@@ -7188,7 +7164,7 @@ struct TagMintWork {
     tokenized_bytes: usize,
 }
 
-///
+/// Memoized tag-mint frontier inputs and result.
 #[derive(Debug, Clone, Default)]
 struct TagMintFrontierMemo {
     block_keys: Vec<[u8; 32]>,
@@ -7855,6 +7831,7 @@ fn strip_tag_prefix(value: &str, tag_number: i64) -> &str {
     value.strip_prefix(&tag_prefix(tag_number)).unwrap_or(value)
 }
 
+/// Removes leading tag imitations outside inline-code spans.
 ///
 /// Lines inside an already-open inline-code span remain unchanged.
 /// The strip pass removes a `§N§` token only when whitespace, ASCII punctuation, or end of input follows it.
@@ -10095,7 +10072,7 @@ impl RendererTransitionShapes {
     }
 }
 
-/// transform.
+/// Detects historical frozen shapes that require a one-time renderer transition.
 fn renderer_transition_shapes(
     projection: &FlatProjection,
     frozen_units: &[FrozenUnit],
@@ -11574,12 +11551,12 @@ fn latest_assistant_message_mutation_exempt_mid(
         .map(|message| message.mid.as_str())
 }
 
-///
+/// Reports whether the request provider accepts empty content.
 pub(crate) fn request_accepts_empty_content(req: &TransformRequest) -> bool {
     req.provider_id.as_deref() == Some("anthropic")
 }
 
-///
+/// Returns the frozen tag cutoff only for a bust pass and a supported serializer profile.
 fn reasoning_clear_cutoff_with_tags(
     req: &TransformRequest,
     profile: Option<SerializerProfile>,
@@ -11603,8 +11580,9 @@ fn reasoning_clear_cutoff_with_tags(
     }
 }
 
+/// Replaces eligible historical native reasoning with empty sentinels.
 ///
-/// finished.
+/// The newest assistant remains unchanged. The return value counts replaced native parts.
 #[cfg(test)]
 pub(crate) fn clear_served_native_reasoning(
     profile: SerializerProfile,

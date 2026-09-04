@@ -22,11 +22,12 @@ import {
     compareLivePair,
     liveArtifactDir,
     liveDerivativeAdmissionDiagnostics,
+    LiveSystemMismatchError,
     runLiveMetamorphicEval,
     type LiveObservation,
 } from "./live";
 import { INJECTION_CANARY } from "./injection-canary";
-import { buildMetamorphicReport, metamorphicExitCode } from "./report";
+import { buildMetamorphicReport, metamorphicExitCode, parseMetamorphicReport } from "./report";
 import { TRANSFORMS } from "./transforms";
 
 function score(overrides: Partial<ScenarioScore> = {}): ScenarioScore {
@@ -193,6 +194,40 @@ describe("live metamorphic orchestration", () => {
         expect(metamorphicExitCode(report)).toBe(0);
     });
 
+    test("names the observed system when the caller omits it, even before any pair is scored", async () => {
+        const options = {
+            mode: { kind: "live" as const, apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
+            artifactRoot: "/tmp/metamorphic-live-test",
+            opencodeVersion: "1.0.0",
+            transforms: [TRANSFORMS[0]!],
+            seeds: [0],
+            admit: () => [],
+        };
+        const completed = await runLiveMetamorphicEval([validScenario()], { ...options, execute: async () => observation() });
+        expect(completed.system).toEqual(score().system);
+        // A canary on control-a returns before any pair is scored; the report still names the system that ran.
+        const injected = await runLiveMetamorphicEval([validScenario()], {
+            ...options,
+            execute: async () => observation({ injectedClaims: [{
+                publicClaimId: "clm_01h00000000000000000000008",
+                revisionLocator: "clm_01h00000000000000000000008@1",
+                content: INJECTION_CANARY,
+                category: "CONSTRAINTS",
+                revision: 1,
+            }] }),
+        });
+        expect(injected.injectionCanaryHits.length).toBeGreaterThan(0);
+        expect(injected.system).toEqual(score().system);
+        // A supplied tuple the first run record contradicts is a configuration fault, so the run stops rather
+        // than publishing a root its own scores would fail to bind to.
+        const supplied = { ...score().system!, historianModelId: "anthropic/other" };
+        await expect(runLiveMetamorphicEval([validScenario()], { ...options, system: supplied, execute: async () => observation() }))
+            .rejects.toBeInstanceOf(LiveSystemMismatchError);
+        // A supplied tuple the records agree with is published unchanged.
+        const agreed = await runLiveMetamorphicEval([validScenario()], { ...options, system: score().system, execute: async () => observation() });
+        expect(agreed.system).toEqual(score().system);
+    });
+
     test("control disagreement invalidates the tier before product pairs", async () => {
         const calls: string[] = [];
         const report = await runLiveMetamorphicEval([validScenario()], {
@@ -239,6 +274,28 @@ describe("live metamorphic orchestration", () => {
         expect(metamorphicExitCode(report)).toBe(0);
     });
 
+    test("rejects a product pair whose system tuple differs from the control run", async () => {
+        const other = { ...score().system!, historianModelId: "anthropic/other" };
+        const report = await runLiveMetamorphicEval([validScenario()], {
+            mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
+            artifactRoot: "/tmp/metamorphic-live-test",
+            opencodeVersion: "1.0.0",
+            transforms: [TRANSFORMS[0]!],
+            seeds: [0],
+            admit: () => [],
+            execute: async (_scenario, role) => role === "baseline" || role === "derivative"
+                ? observation({ score: score({ system: other }) })
+                : observation(),
+        });
+        // Both roles agree with each other, so only the root comparison can catch the drift the parser would reject.
+        expect(report.system).toEqual(score().system);
+        expect(report.entries).toContainEqual(expect.objectContaining({
+            kind: "error",
+            error: "pair system tuple differs from the control run",
+        }));
+        expect(report.entries.some((entry) => entry.kind === "scored" && entry.transformId !== "baseline-control")).toBe(false);
+    });
+
     test("rejects a product pair whose system tuples differ", async () => {
         const report = await runLiveMetamorphicEval([validScenario()], {
             mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
@@ -276,6 +333,7 @@ describe("live metamorphic orchestration", () => {
             failedInvariants: [],
         });
         expect(metamorphicExitCode(report)).toBe(1);
+        expect(parseMetamorphicReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
     });
 
     test("refuses admission before any model call", async () => {
@@ -458,7 +516,7 @@ describe("live metamorphic orchestration", () => {
         // sink, so the caller sees the terminal report rather than having to infer
         // it from the return value.
         expect(progress).toEqual([0, 1, 1]);
-        expect(report.tierInvalidReason).toEqual(expect.objectContaining({ kind: "deadline-exhausted" }));
+        expect(report.tierInvalidReason).toEqual({ kind: "deadline-exhausted", nextRole: "derivative" });
         expect(metamorphicExitCode(report)).toBe(1);
     });
 

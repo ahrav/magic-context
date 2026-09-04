@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-store"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "cortexkit-lease",
  "cortexkit-store-types",
@@ -1981,6 +1981,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "thiserror",
 ]
 
 [[package]]
@@ -2001,8 +2002,30 @@ dependencies = [
  "sha2",
  "subtle",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "mc-kernel"
+version = "0.1.0"
+dependencies = [
+ "cortexkit-lease",
+ "criterion",
+ "gix",
+ "mc-core",
+ "mc-kernel",
+ "mc-secret-scanner",
+ "proptest",
+ "rusqlite",
+ "rustix",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -2010,7 +2033,9 @@ name = "mc-module"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
+ "arc-swap",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "chrono-tz",
  "cortexkit-lease",
@@ -2021,15 +2046,19 @@ dependencies = [
  "libc",
  "mc-core",
  "mc-host",
+ "mc-kernel",
+ "mc-module",
  "mc-store",
  "mc-tokenizer",
  "memchr",
  "proptest",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-util",
 ]
@@ -2049,6 +2078,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "sha2",
+ "thiserror",
 ]
 
 [[package]]
@@ -2077,6 +2107,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "thiserror",
 ]
 
 [[package]]
@@ -2101,6 +2132,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]

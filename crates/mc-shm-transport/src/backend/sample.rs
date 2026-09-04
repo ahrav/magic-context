@@ -15,9 +15,10 @@ use crate::descriptor::{
     DescriptorError, Incarnation, ReleaseIdentity, DESCRIPTOR_SCHEMA_VERSION, WIRE_V2_HEADER_BYTES,
 };
 
-///
+/// Serialized prefix size in bytes: schema, wire header, incarnation, lane, sequence, and body length.
 pub const SAMPLE_PREFIX_BYTES: usize = 2 + WIRE_V2_HEADER_BYTES + 16 + 4 + 8 + 8;
 
+/// `SamplePrefix` stores fixed fields copied from an untrusted serialized sample prefix.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SamplePrefix {
     schema: u16,
@@ -27,8 +28,10 @@ pub struct SamplePrefix {
 }
 
 impl SamplePrefix {
+    /// Copies fixed-size fields without retaining payload bytes.
     ///
-    /// `validate` checks the declared body against the full allocation length.
+    /// Returns `Truncated` when fewer than `SAMPLE_PREFIX_BYTES` bytes are available. Semantic
+    /// checks, including schema, identity, header, and body bounds, are deferred to `validate`.
     pub fn snapshot(payload: &[u8]) -> Result<Self, DescriptorError> {
         let prefix: &[u8; SAMPLE_PREFIX_BYTES] = payload
             .get(..SAMPLE_PREFIX_BYTES)
@@ -61,14 +64,17 @@ impl SamplePrefix {
         })
     }
 
+    /// Returns the release identity copied from the serialized prefix.
     pub const fn identity(&self) -> ReleaseIdentity {
         self.identity
     }
 
+    /// `allocation_len` includes the prefix, declared body, and any capacity slack.
     ///
-    /// `allocation_len` includes both the declared body and any capacity slack.
-    /// The declared body must fit within `allocation_len`.
-    /// Capacity slack stays outside the returned range.
+    /// Validation requires the current schema, nonzero matching identity fields, a body no larger
+    /// than `MAX_FRAME_BYTES`, and a version-2 wire header whose length equals `body_len`. The
+    /// declared body must fit within `allocation_len`; capacity slack stays outside the returned
+    /// range. Checked conversion and addition report `Overflow`.
     pub fn validate(
         &self,
         allocation_len: usize,
@@ -121,6 +127,7 @@ impl std::fmt::Debug for SamplePrefix {
     }
 }
 
+/// `ValidatedSample` stores identity and body length accepted by [`SamplePrefix::validate`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ValidatedSample {
     identity: ReleaseIdentity,
@@ -128,6 +135,7 @@ pub struct ValidatedSample {
 }
 
 impl ValidatedSample {
+    /// Returns the release identity validated against the caller's expected identity.
     pub const fn identity(&self) -> ReleaseIdentity {
         self.identity
     }

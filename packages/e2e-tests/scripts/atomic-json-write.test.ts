@@ -37,7 +37,7 @@ describe("writeJsonAtomically", () => {
         });
     });
 
-    /** Each call stages in its own directory, so a concurrent writer cannot delete another's staged bytes on its way out. commentlint: allow(JUDGE) */
+    /** Each call stages in its own directory, so a concurrent writer cannot delete another's staged bytes on its way out. */
     it("does not reuse a staging path between calls", () => {
         withRoot((root) => {
             const destination = join(root, "out.json");
@@ -54,7 +54,7 @@ describe("writeJsonAtomically", () => {
         });
     });
 
-    /** A pre-existing sibling named like the old fixed staging path is now irrelevant, and must not be consumed or deleted. commentlint: allow(JUDGE) */
+    /** A pre-existing sibling named like the old fixed staging path is now irrelevant, and must not be consumed or deleted. */
     it("ignores an unrelated sibling file next to the destination", () => {
         withRoot((root) => {
             const destination = join(root, "out.json");
@@ -66,7 +66,7 @@ describe("writeJsonAtomically", () => {
         });
     });
 
-    /** rename replaces the link itself rather than writing through it, so the target keeps its contents. commentlint: allow(JUDGE) */
+    /** rename replaces the link itself rather than writing through it, so the target keeps its contents. */
     it("replaces a destination symlink without touching its target", () => {
         withRoot((root) => {
             const destination = join(root, "out.json");
@@ -80,7 +80,7 @@ describe("writeJsonAtomically", () => {
         });
     });
 
-    /** A signal that skips `finally` skips an exit hook too, so the reclaim has to happen on a later publish. commentlint: allow(JUDGE) */
+    /** A signal that skips `finally` skips an exit hook too, so the reclaim has to happen on a later publish. */
     it("reclaims an orphaned staging directory once it is stale", () => {
         withRoot((root) => {
             const destination = join(root, "out.json");
@@ -94,7 +94,7 @@ describe("writeJsonAtomically", () => {
         });
     });
 
-    /** A live writer's directory is seconds old; sweeping it would recreate the collision the private directory prevents. commentlint: allow(JUDGE) */
+    /** A live writer's directory is seconds old; sweeping it would recreate the collision the private directory prevents. */
     it("leaves a fresh staging directory alone", () => {
         withRoot((root) => {
             const destination = join(root, "out.json");

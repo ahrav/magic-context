@@ -185,7 +185,7 @@ describe("isCredentialBearingConfigKey", () => {
             "passwordValue2",
             "clientSecretHeader3",
             "APIKEYVALUE2",
-            /** The Rails-style compound ends in `base`, so neither the `key` branch nor a peeled descriptor reaches the credential inside it. commentlint: allow(JUDGE) */
+            /** The Rails-style compound ends in `base`, so neither the `key` branch nor a peeled descriptor reaches the credential inside it. */
             "secretKeyBase",
             "SECRET_KEY_BASE",
             "jwtSecretKeyBase",
@@ -203,7 +203,7 @@ describe("isCredentialBearingConfigKey", () => {
             "idealTokens",
             "baseURL",
             "models",
-            /** The `secretkeybase` compound is matched whole, so an ordinary `base` tail stays benign. commentlint: allow(JUDGE) */
+            /** The `secretkeybase` compound is matched whole, so an ordinary `base` tail stays benign. */
             "apiBaseUrl",
             "codebase",
             "database",

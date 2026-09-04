@@ -19,6 +19,7 @@ rusqlite = { workspace = true, features = ["backup", "functions", "hooks"] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 sha2 = { workspace = true }
 gix = { workspace = true }
 semver = { workspace = true }
@@ -39,11 +40,3 @@ gix = { workspace = true }
 proptest = "1"
 tempfile = "3"
 criterion = "=0.8.2"
-
-[[bench]]
-name = "anchor_resolution"
-harness = false
-
-[[bench]]
-name = "scope_algebra"
-harness = false

@@ -355,6 +355,13 @@ struct CompiledLimitPattern {
     provenance: ContextLimitProvenance,
 }
 
+/// Parses a cache TTL as bare milliseconds or an integer followed by `s`, `m`,
+/// or `h`. `never` maps to `u64::MAX`; numeric overflow saturates at that value.
+///
+/// # Errors
+///
+/// Returns [`CacheTtlParseError`] for empty text, unsupported units, or non-digit
+/// numeric components.
 pub fn parse_cache_ttl(ttl: &str) -> Result<u64, CacheTtlParseError> {
     let normalized = ttl.trim();
     if normalized.eq_ignore_ascii_case("never") {
@@ -399,6 +406,9 @@ pub fn ttl_hard_expired(now_ms: u64, last_response_time_ms: u64, ttl_ms: u64) ->
     last_response_time_ms > 0 && now_ms.saturating_sub(last_response_time_ms) > ttl_ms
 }
 
+/// Resolves an execute threshold as a percentage. A positive token threshold
+/// overrides percentage configuration when a positive context limit is known.
+/// Results are capped at [`MAX_EXECUTE_THRESHOLD_PERCENTAGE`].
 pub fn resolve_execute_threshold(
     config: &ExecuteThresholdConfig,
     model_key: Option<&str>,
@@ -598,6 +608,9 @@ pub fn extract_error_message(error: &serde_json::Value) -> String {
     }
 }
 
+/// Detects known provider context-overflow text and extracts the first plausible
+/// token limit. Pattern order defines both the diagnostic match and limit
+/// provenance when more than one pattern matches.
 pub fn detect_overflow(error_text: &str) -> OverflowDetection {
     if error_text.is_empty() {
         return OverflowDetection {
@@ -661,6 +674,9 @@ pub fn parse_reported_limit(message: &str) -> Option<ReportedContextLimit> {
     None
 }
 
+/// Produces one deterministic scheduler outcome from caller-supplied state and
+/// Unix-millisecond time. The caller must persist returned latch and deferred
+/// intent state before the next decision.
 pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
     let effective_context_limit = inputs.context_limit.or_else(|| {
         if inputs.usage.percentage > 0.0 && inputs.usage.input_tokens > 0.0 {

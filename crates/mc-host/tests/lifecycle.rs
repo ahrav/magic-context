@@ -1076,8 +1076,7 @@ async fn delayed_lifecycle_callback_runs_shutdown_once_before_successor_starts()
     successor.shutdown_gracefully().await;
 }
 
-/// The instance lock remains held until the blocked shutdown callback completes.
-/// The instance lock refuses a successor until the blocked shutdown callback completes.
+/// Keeps successor startup blocked until the shutdown callback completes.
 async fn assert_lock_released_only_after_shutdown_callback(
     handler: &TestHandler,
     data_root: &std::path::Path,
@@ -1120,9 +1119,7 @@ async fn assert_lock_released_only_after_shutdown_callback(
     }
 }
 
-/// Only `shutdown` stops and drains component-owned work.
-/// The instance lock must remain held until `shutdown` drains component-owned work.
-/// beside it.
+/// Aborting `run` leaves cleanup responsible for handler work and lock release.
 #[tokio::test]
 async fn an_abandoned_run_future_runs_the_shutdown_callback_before_lock_release() {
     let data_root = tempfile::tempdir().expect("temp root");
@@ -1168,10 +1165,7 @@ async fn an_abandoned_run_future_runs_the_shutdown_callback_before_lock_release(
     successor.shutdown_gracefully().await;
 }
 
-/// A shutdown request during initialization aborts initialization and reaps the handler before releasing the instance lock.
-/// The detached reaper invokes the handler shutdown callback before releasing the instance lock.
-/// Interrupted initialization can hand work to component-owned trackers.
-/// Only `shutdown` drains work held by component-owned trackers.
+/// Shutdown during initialization invokes handler cleanup before lock release.
 #[tokio::test]
 async fn shutdown_during_initialization_runs_the_shutdown_callback_before_lock_release() {
     let data_root = tempfile::tempdir().expect("temp root");
@@ -1203,8 +1197,7 @@ async fn shutdown_during_initialization_runs_the_shutdown_callback_before_lock_r
     successor.shutdown_gracefully().await;
 }
 
-/// The initialize-deadline path uses the shutdown-during-init reaper.
-/// The initialize-deadline reaper invokes the shutdown callback before releasing the instance lock.
+/// Initialize-deadline cleanup invokes handler shutdown before lock release.
 #[tokio::test]
 async fn initialization_deadline_expiry_runs_the_shutdown_callback_before_lock_release() {
     let data_root = tempfile::tempdir().expect("temp root");
@@ -1234,10 +1227,7 @@ async fn initialization_deadline_expiry_runs_the_shutdown_callback_before_lock_r
     successor.shutdown_gracefully().await;
 }
 
-/// An initialization failure still invokes the handler shutdown callback.
-/// If a composite's secondary initialization fails, its primary may already have initialized.
-/// Only the shutdown callback stops work initialized by the composite's primary.
-/// `run` awaits the shutdown callback, so returning from `run` cannot release the instance lock while handler-owned work remains live.
+/// Initialization failure waits for handler shutdown before releasing the instance lock.
 #[tokio::test]
 async fn a_failed_initialization_runs_the_shutdown_callback_before_lock_release() {
     let data_root = tempfile::tempdir().expect("temp root");
@@ -1335,10 +1325,7 @@ async fn aborting_failed_initialization_cleanup_retains_lock_until_shutdown_stop
     successor.shutdown_gracefully().await;
 }
 
-/// A setup failure after successful initialization invokes the handler shutdown callback.
-/// After publication succeeds, later setup failures invoke the handler shutdown callback.
-/// An initialized handler can hold stores or background work that only its shutdown callback stops.
-/// Only the shutdown callback stops the initialized handler's stores and background work.
+/// Post-initialization setup failure stops handler work before lock release.
 #[tokio::test]
 async fn a_publication_failure_runs_the_shutdown_callback_before_lock_release() {
     let data_root = tempfile::tempdir().expect("temp root");
@@ -1376,9 +1363,7 @@ async fn a_publication_failure_runs_the_shutdown_callback_before_lock_release() 
     );
 }
 
-/// An authenticated `host.shutdown` fully observes its correlated success response before Goodbye/EOF.
-/// The host stops gracefully after sending the shutdown response.
-/// runtime directory holds neither publication nor lifecycle record.
+/// Authenticated shutdown responds before Goodbye and removes runtime records.
 #[tokio::test]
 async fn host_shutdown_commits_after_the_full_response_and_stops_gracefully() {
     let host = TestHost::start().await;
@@ -1417,8 +1402,7 @@ async fn host_shutdown_commits_after_the_full_response_and_stops_gracefully() {
     assert!(!record.exists(), "lifecycle record removed under the lock");
 }
 
-/// Two racing `host.shutdown` connections receive one parseable response per correlation.
-/// Each racing request receives one parseable response, and the host cancels once.
+/// Racing shutdown requests settle independently while handler shutdown runs once.
 #[tokio::test]
 async fn concurrent_shutdown_requests_each_settle_exactly_once() {
     // Hold the winning response between ring publication and its completion
@@ -1489,8 +1473,7 @@ async fn concurrent_shutdown_requests_each_settle_exactly_once() {
     );
 }
 
-/// A requester that disconnects after sending `host.shutdown` cannot prevent a later authenticated requester from completing the stop.
-/// An already-stopping host or a later authenticated requester completes the stop.
+/// Requester disconnect cannot strand an authenticated shutdown attempt.
 #[tokio::test]
 async fn a_dying_requester_cannot_strand_the_stop() {
     let host = TestHost::start().await;
@@ -1500,7 +1483,6 @@ async fn a_dying_requester_cannot_strand_the_stop() {
         .await
         .expect("send shutdown");
     // An abrupt-close response write either commits the stop or reopens the latch.
-    // reopen ownership.
     drop(first);
     tokio::time::sleep(Duration::from_millis(50)).await;
 

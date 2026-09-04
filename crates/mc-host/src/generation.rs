@@ -53,33 +53,20 @@ const CAPACITY_RESERVE_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Each `GenerationError` variant maps to exactly one closed v1 reason.
 /// Callers must not derive externally visible classifications finer than the bounded static detail.
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum GenerationError {
     /// `InsufficientStorage` leaves trusted selectors unchanged and removes the owned temp after preflight failure or post-preflight `ENOSPC`.
+    #[error("insufficient storage for staging")]
     InsufficientStorage,
     /// `NativePayloadInvalid` leaves `current` unchanged and selects no other generation after validation, staging-identity, exchange-repair, or checked-arithmetic failure.
-    NativePayloadInvalid {
-        detail: &'static str,
-    },
+    #[error("native payload invalid: {detail}")]
+    NativePayloadInvalid { detail: &'static str },
     /// `UnsupportedStateSchema` preserves and quarantines a profile or manifest with an unknown schema, then aborts the requested mutation or selection.
+    #[error("unsupported persisted state schema")]
     UnsupportedStateSchema,
+    #[error("{0}")]
     Instance(InstanceError),
 }
-
-impl std::fmt::Display for GenerationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InsufficientStorage => write!(f, "insufficient storage for staging"),
-            Self::NativePayloadInvalid { detail } => {
-                write!(f, "native payload invalid: {detail}")
-            }
-            Self::UnsupportedStateSchema => write!(f, "unsupported persisted state schema"),
-            Self::Instance(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for GenerationError {}
 
 impl From<InstanceError> for GenerationError {
     fn from(err: InstanceError) -> Self {
@@ -104,8 +91,10 @@ fn fsync_preserving_storage<Fd: rustix::fd::AsFd>(
     })
 }
 
+/// Returns whether an I/O error reports exhausted filesystem space or quota.
 ///
-/// `statvfs` cannot detect per-user quota exhaustion because it reports filesystem free blocks, not the caller's remaining quota.
+/// `statvfs` cannot predict per-user quota exhaustion because it reports
+/// filesystem free blocks, not the caller's remaining quota.
 fn is_storage_exhausted(err: &std::io::Error) -> bool {
     matches!(
         err.raw_os_error(),
@@ -145,10 +134,16 @@ pub struct GenerationManifest {
 }
 
 impl GenerationManifest {
+    /// Serializes fields in declaration order for hashing and persistence.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if serialization of this fixed data model fails.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("manifest serialization cannot fail")
     }
 
+    /// Returns the lowercase SHA-256 digest of [`Self::canonical_bytes`].
     pub fn digest(&self) -> String {
         hex(&sha2::Sha256::digest(self.canonical_bytes()))
     }
@@ -483,10 +478,16 @@ impl GenerationStore {
         }))
     }
 
+    /// Returns the lifecycle store root used to open this descriptor-backed store.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Reads and validates the current-profile selector without selecting a fallback.
+    ///
+    /// Unknown schemas return [`CurrentProfile::Quarantined`]. Malformed JSON,
+    /// insecure file metadata, and noncanonical digests return
+    /// [`GenerationError::NativePayloadInvalid`].
     pub fn read_current(&self) -> Result<CurrentProfile, GenerationError> {
         let fd = match openat(
             &self.root_fd,
@@ -589,6 +590,10 @@ impl GenerationStore {
         Ok(manifest)
     }
 
+    /// Returns bytes available to an unprivileged caller on the generations filesystem.
+    ///
+    /// The value saturates on multiplication overflow. Filesystem query failures
+    /// return [`GenerationError::NativePayloadInvalid`].
     pub fn available_bytes(&self) -> Result<u64, GenerationError> {
         let stat =
             rustix::fs::fstatvfs(&self.generations_fd).map_err(|_| invalid("statvfs failed"))?;
@@ -1184,8 +1189,9 @@ fn remove_tree(parent: &OwnedFd, name: &str) -> Result<(), GenerationError> {
     Ok(())
 }
 
+/// Enumerates UTF-8 entry names from an already-open directory.
 ///
-/// fdopendir enumerates the already-open directory, preventing pathname replacement from changing the listing.
+/// `fdopendir` enumerates the already-open directory, preventing pathname replacement from changing the listing.
 /// Unlike a `/proc/self/fd` round-trip, `fdopendir` needs no procfs.
 /// `fdopendir` uses the lifecycle root's validation path on every supported platform, not only Linux.
 /// `read_dir_names` excludes `.` and `..` so callers cannot delete the listed directory or its parent.
@@ -1210,6 +1216,16 @@ fn read_dir_names(dir: &OwnedFd) -> Result<Vec<String>, GenerationError> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn wrapping_an_instance_error_reports_no_source() {
+        let wrapped = GenerationError::Instance(InstanceError::AlreadyRunning);
+        assert!(
+            std::error::Error::source(&wrapped).is_none(),
+            "Instance renders the inner error through Display and reports no source, \
+             so callers must not depend on the chain to reach it"
+        );
+    }
 
     fn store_at(root: &Path) -> GenerationStore {
         GenerationStore::open(Some(root)).expect("open store")

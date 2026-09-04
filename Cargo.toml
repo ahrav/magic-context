@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mc-core", "crates/mc-secret-scanner", "crates/mc-store", "crates/mc-host", "crates/mc-module", "crates/mc-tokenizer", "crates/mc-shm-transport", "packages/mc-shm-native"]
+members = ["crates/mc-core", "crates/mc-secret-scanner", "crates/mc-kernel", "crates/mc-store", "crates/mc-host", "crates/mc-module", "crates/mc-tokenizer", "crates/mc-shm-transport", "packages/mc-shm-native"]
 # Exclude docs/evidence/subc-surface-probe because it uses published subc crates from crates.io rather than sibling sources.
 # Exclude crates/mc-shm-transport/fuzz because it declares its own [workspace].
 exclude = ["docs/evidence/subc-surface-probe", "crates/mc-shm-transport/fuzz"]
@@ -8,7 +8,7 @@ exclude = ["docs/evidence/subc-surface-probe", "crates/mc-shm-transport/fuzz"]
 [workspace.dependencies]
 # alfonso-core arrangement.
 cortexkit-cache-core = { version = "0.2.0", path = "../commons/crates/cortexkit-cache-core" }
-cortexkit-store = { version = "0.3.0", path = "../commons/crates/cortexkit-store" }
+cortexkit-store = { version = "0.3.2", path = "../commons/crates/cortexkit-store" }
 cortexkit-store-types = { version = "0.1.1", path = "../commons/crates/cortexkit-store-types" }
 cortexkit-lease = { version = "0.3.0", path = "../commons/crates/cortexkit-lease" }
 
@@ -16,9 +16,11 @@ cortexkit-lease = { version = "0.3.0", path = "../commons/crates/cortexkit-lease
 mc-core = { path = "crates/mc-core" }
 mc-secret-scanner = { path = "crates/mc-secret-scanner" }
 mc-store = { path = "crates/mc-store" }
+mc-kernel = { path = "crates/mc-kernel" }
 
 # Pin rusqlite to cortexkit-store's version and features so Connection and Transaction types unify across with_conn.
 serde = { version = "1", features = ["derive", "rc"] }
+thiserror = "2.0.20"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 # 0.39 bundles SQLite 3.51.3, including the complete WAL-reset race fix

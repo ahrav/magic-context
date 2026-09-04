@@ -1,10 +1,10 @@
-//! The registry owns route lifecycles process-wide.
+//! Process-wide route lifecycle registry.
 //!
-//! The linked handler keys bindings by `u16` channel alone, so channels are process-global.
-//! The registry, not a connection task, owns every provisional and published route.
-//! The registry owns each route from reservation through route-gone.
-//! Registry ownership prevents a dying connection from stranding membership lookups.
-//! membership lookups.
+//! The linked handler keys bindings by `u16` channel alone, so channels are
+//! process-global. The registry owns each route from reservation through
+//! route-gone. One mutex linearizes reservation, publication, dispatch
+//! admission, and close ownership, preventing a dying connection from
+//! stranding membership lookups.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -15,6 +15,9 @@ use tokio_util::task::TaskTracker;
 use crate::connection::GenerationCore;
 use crate::handler::{RouteClass, RouteHandle};
 
+/// Owns channel allocation and route state across all connections.
+///
+/// A poisoned registry mutex causes methods that acquire it to panic.
 pub struct RouteRegistry {
     inner: Mutex<Inner>,
     max_routes: usize,
@@ -62,16 +65,16 @@ enum OccState {
     Closing,
 }
 
+/// Assigns cleanup ownership after a close request.
 pub enum CloseDecision {
-    /// The close owner aborts tasks, waits on `tracker`, runs route-gone, and calls `RouteRegistry::finalize_close`.
-    /// [`RouteRegistry::finalize_close`].
+    /// Caller owns cleanup: abort tasks, wait on `tracker`, run route-gone, then
+    /// call [`RouteRegistry::finalize_close`].
     Owner {
         gen: Arc<GenerationCore>,
         aborts: Vec<tokio::task::AbortHandle>,
         tracker: TaskTracker,
     },
-    /// The bind task observes `close_requested` and performs cleanup.
-    /// cleanup.
+    /// Bind task observes `close_requested` and performs cleanup.
     DeferredToBind,
     /// Unknown, stale, or already-closing route: idempotent no-op.
     AlreadyGone,
@@ -87,6 +90,7 @@ pub enum BindInstall {
 }
 
 impl RouteRegistry {
+    /// Creates an accepting registry with capacity `max_routes`.
     pub fn new(max_routes: usize) -> Self {
         Self {
             inner: Mutex::new(Inner {
@@ -199,7 +203,9 @@ impl RouteRegistry {
         self.inner.lock().expect("registry lock").accepting = false;
     }
 
-    /// generation.
+    /// Begins closing every route owned by generation `gen_id`.
+    ///
+    /// Returned handles follow hash-map iteration order and have no stable ordering.
     pub fn begin_close_generation(&self, gen_id: u64) -> Vec<(RouteHandle, CloseDecision)> {
         self.routes_of_generation(gen_id)
             .into_iter()
@@ -207,6 +213,7 @@ impl RouteRegistry {
             .collect()
     }
 
+    /// Begins an idempotent close without checking generation ownership.
     pub fn begin_close(&self, handle: RouteHandle) -> CloseDecision {
         self.begin_close_for(handle, None)
     }
@@ -254,6 +261,9 @@ impl RouteRegistry {
         }
     }
 
+    /// Releases `handle` after its close owner finishes cleanup.
+    ///
+    /// Missing and stale handles are idempotent no-ops.
     pub fn finalize_close(&self, handle: RouteHandle) {
         let mut inner = self.inner.lock().expect("registry lock");
         let Some(slot) = inner.slots.get_mut(&handle.channel) else {
@@ -328,6 +338,7 @@ impl RouteRegistry {
             .collect()
     }
 
+    /// Returns every occupied route in unspecified order.
     pub fn all_routes(&self) -> Vec<RouteHandle> {
         let inner = self.inner.lock().expect("registry lock");
         inner
@@ -359,9 +370,11 @@ impl RouteRegistry {
         true
     }
 
-    /// Forced shutdown aborts registered dispatch tasks and invokes the supplied callback.
-    /// Binding routes remain close-requested because their abort-exempt bind wrapper owns the exactly-once route-gone.
-    /// Completing a bind against a finalized slot panics the registry.
+    /// Claims settled routes for forced shutdown.
+    ///
+    /// Returned routes are in unspecified order. Binding routes remain
+    /// close-requested because their abort-exempt bind wrapper owns exactly-once
+    /// route-gone. Completing a bind against a finalized slot panics.
     pub fn force_drain(&self) -> Vec<(RouteHandle, Vec<tokio::task::AbortHandle>, TaskTracker)> {
         let mut inner = self.inner.lock().expect("registry lock");
         let mut drained = Vec::new();

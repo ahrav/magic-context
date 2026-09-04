@@ -21,7 +21,7 @@
       "version": "0.38.0"
     }
   ],
-  "production_inputs_lock_sha256": "3cbe0295b1d7deb3ab607b480f48e8bc0896c5d1d99fe2dd289a82614d71fce0",
+  "production_inputs_lock_sha256": "a6504cc8a11bc4879e8e12c0dc56a818279ef13dda2bef1cca5af2507920f90a",
   "production_qualified": false,
   "publication": {
     "order": [
@@ -37,6 +37,6 @@
     "id": "mc-host-release",
     "version": "0.38.0"
   },
-  "release_contract_sha256": "ab3b41c0f4f99f917dc4ac03515a2a36f50d5cb0dde603b4518cf47480e975e2",
+  "release_contract_sha256": "971702c0440c1e61df259c067e62a82022b11a7bae4e594a936eb9bbd35c6f60",
   "schema": "magic-context.mc-host-payload-index/v1"
 }

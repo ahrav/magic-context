@@ -1,3 +1,8 @@
+//! Pins scanner limits, rule gating, deterministic ordering, UTF-8 byte spans,
+//! checksum validation, placeholder suppression, and overflow reporting.
+//! Reported spans index original UTF-8 input in bytes and must end on character
+//! boundaries.
+
 use mc_secret_scanner::{LimitExhausted, RuleSource, ScanError, ScanLimits, ScanProfile, Scanner};
 use proptest::prelude::*;
 use std::sync::OnceLock;

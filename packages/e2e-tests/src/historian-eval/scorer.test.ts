@@ -822,6 +822,52 @@ describe("scoreRunRecord", () => {
             fixture.cleanup();
         }
     });
+    test("a record whose chunk budget the report contract cannot carry is ERROR, not a tuple the parser refuses", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            const score = scoreRunRecord({ ...record, system: { ...record.system, chunkTokenBudget: 0 } }, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-malformed");
+            expect(score.errorDetail).toContain("system");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a blank record scenario id is a shape error carrying the unknown id", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            // `parseScenarioScore` admits only a non-blank id, so the score must not carry the blank through.
+            const score = scoreRunRecord({ ...record, scenarioId: "   " }, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-malformed");
+            expect(score.scenarioId).toBe("<unknown>");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an aborted record without a string detail is a shape error, not an ERROR carrying it", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            const score = scoreRunRecord(
+                { ...record, error: { reason: "harness-crash", detail: undefined } as unknown as HistorianEvalRunRecord["error"] },
+                scenario,
+            );
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-malformed");
+            expect(score.errorDetail).toContain("[error]");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("a record paired with a different scenario is ERROR, never a misattributed verdict", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
@@ -2343,7 +2389,8 @@ describe("buildLaneReport", () => {
             visibleClaimsTotal: 2,
             falseAuthoritativeMatches: [],
             structuralFindings: [],
-            probeVerdicts: [],
+            // A lint-admitted scenario declares at least one probe, and a run answers each.
+            probeVerdicts: [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: "yes" }],
             // Lane scores come from runs, so the report accepts only scores with both a system and source.
             system: LANE_SYSTEM,
             source: "run-record",
@@ -2388,6 +2435,13 @@ describe("buildLaneReport", () => {
         expect(first.runFatal).toBe(false);
         expect(first.scenarios.map((score) => score.scenarioId)).toEqual(["hse-a", "hse-b"]);
         expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+    });
+
+    test("scenarios sort by code unit, so a report parses on a reader with another locale", () => {
+        // `localeCompare` places `hse-a` before `hse-B`; code-unit order does not.
+        const report = buildLaneReport([passScore("hse-a"), passScore("hse-B")]);
+        expect(report.scenarios.map((score) => score.scenarioId)).toEqual(["hse-B", "hse-a"]);
+        expect(parseLaneReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
     });
 
     test("a report cannot span two systems, and cannot be labelled with a system the scores contradict", () => {
@@ -2472,11 +2526,24 @@ describe("buildLaneReport", () => {
         const fa: ScenarioScore = {
             ...passScore("hse-b"),
             verdict: "FAIL",
-            failReasons: ["false-authoritative"],
+            // A failing probe is its own reason, so `assembleScore` would list both.
+            failReasons: ["false-authoritative", "probe"],
             falseAuthoritativeMatches: ["abs-x"],
-            probeVerdicts: [{ probeId: "probe-1", outcome: "fail", expected: "yes", actual: "" }],
+            probeVerdicts: [{ probeId: "probe-1", outcome: "fail", expected: "yes", actual: "no" }],
         };
-        const errored: ScenarioScore = { ...passScore("hse-c"), verdict: "ERROR", errorReason: "script-drift", precision: null, recall: null };
+        // `errorScore` zeroes every count alongside the null ratios, so a partial override is not a real shape.
+        const errored: ScenarioScore = {
+            ...passScore("hse-c"),
+            verdict: "ERROR",
+            errorReason: "script-drift",
+            precision: null,
+            recall: null,
+            expectedClaimsMatched: 0,
+            expectedClaimsTotal: 0,
+            visibleClaimsMatched: 0,
+            visibleClaimsTotal: 0,
+            probeVerdicts: [],
+        };
         const report = buildLaneReport([passScore("hse-a"), fa, errored], { releaseVersion: "v2.0.0" });
         expect(parseLaneReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
         expect(() => parseLaneReport({ ...report, schema: "historian-eval-report/v2" })).toThrow(/report\.schema: version-invalid/);
@@ -2489,7 +2556,277 @@ describe("buildLaneReport", () => {
         expect(() => parseLaneReport(badReason)).toThrow(/report\.scenarios\[1\]\.failReasons\[0\]: enum-invalid/);
         const badVerdict = structuredClone(report) as unknown as { scenarios: { verdict: string }[] };
         badVerdict.scenarios[0]!.verdict = "GREEN";
+        // Error metadata belongs to ERROR alone, and every ERROR names its reason.
+        const passWithReason = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        passWithReason.scenarios[0]!.errorReason = "stray";
+        expect(() => parseLaneReport(passWithReason)).toThrow(/report\.scenarios\[0\]\.errorReason: derived-mismatch/);
+        const reasonlessError = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        reasonlessError.scenarios[2]!.errorReason = null;
+        expect(() => parseLaneReport(reasonlessError)).toThrow(/report\.scenarios\[2\]\.errorReason: derived-mismatch/);
+        // `errorScore` carries no evidence, and the rebuild sets ERROR scores aside before it aggregates.
+        const evidencedError = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(evidencedError.scenarios[2]!, {
+            precision: 1, recall: 1, expectedClaimsMatched: 10, expectedClaimsTotal: 10, visibleClaimsMatched: 10, visibleClaimsTotal: 10,
+        });
+        expect(() => parseLaneReport(evidencedError)).toThrow(/report\.scenarios\[2\]: error-shape-invalid/);
+        // An aborted record whose claims matched an expected-absent predicate keeps the abort's reason on its
+        // FAIL, over the empty facts `errorScore` writes.
+        const abortedFa = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(abortedFa.scenarios[1]!, {
+            failReasons: ["false-authoritative"], probeVerdicts: [], errorReason: "harness-crash", errorDetail: "boom",
+        });
+        expect(() => parseLaneReport(abortedFa)).toThrow(/report\.scenarios\[1\]: error-shape-invalid/);
+        // Clearing the abort's reason does not make the counts admissible: without the reason the score is an
+        // ordinary FAIL, which must carry its probe evidence.
+        Object.assign(abortedFa.scenarios[1]!, { errorReason: null, errorDetail: null });
+        expect(() => parseLaneReport(abortedFa)).toThrow(/report\.scenarios\[1\]\.probeVerdicts: probes-required/);
+        // Over the empty facts the shape is admitted, and it stays probe-free: the abort branch returns before
+        // probe scoring, so a probe verdict on it is fabricated evidence.
+        const abortedScore: ScenarioScore = {
+            ...passScore("hse-b"),
+            verdict: "FAIL",
+            failReasons: ["false-authoritative"],
+            falseAuthoritativeMatches: ["abs-x"],
+            errorReason: "harness-crash",
+            errorDetail: "boom",
+            precision: null,
+            recall: null,
+            expectedClaimsMatched: 0,
+            expectedClaimsTotal: 0,
+            visibleClaimsMatched: 0,
+            visibleClaimsTotal: 0,
+            structuralFindings: [],
+            probeVerdicts: [],
+        };
+        const abortedReport = buildLaneReport([passScore("hse-a"), abortedScore]);
+        expect(() => parseLaneReport(abortedReport)).not.toThrow();
+        const abortedWithProbe = structuredClone(abortedReport);
+        abortedWithProbe.scenarios[1]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: "yes" }];
+        expect(() => parseLaneReport(abortedWithProbe)).toThrow(/report\.scenarios\[1\]: error-shape-invalid/);
+        Object.assign(abortedFa.scenarios[1]!, {
+            errorReason: "harness-crash", errorDetail: "boom",
+            precision: null, recall: null, expectedClaimsMatched: 0, expectedClaimsTotal: 0, visibleClaimsMatched: 0, visibleClaimsTotal: 0,
+        });
+        expect(() => parseLaneReport(abortedFa)).toThrow(/^report: derived-mismatch/);
+        // A false-authoritative match names an expected-absent id, never a blank.
+        const blankMatch = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(blankMatch.scenarios[1]!, { falseAuthoritativeMatches: [""] });
+        expect(() => parseLaneReport(blankMatch)).toThrow(/report\.scenarios\[1\]\.falseAuthoritativeMatches\[0\]: string-invalid/);
+        const doubledProbe = structuredClone(report) as unknown as { scenarios: Record<string, unknown[]>[] };
+        doubledProbe.scenarios[1]!.probeVerdicts!.push(structuredClone(doubledProbe.scenarios[1]!.probeVerdicts![0]!));
+        expect(() => parseLaneReport(doubledProbe)).toThrow(/report\.scenarios\[1\]\.probeVerdicts: duplicate/);
         expect(() => parseLaneReport(badVerdict)).toThrow(/report\.scenarios\[0\]\.verdict: enum-invalid/);
+    });
+
+    test("parseLaneReport rejects derived fields that disagree with the scenarios and re-applies admission rules", () => {
+        const fa: ScenarioScore = {
+            ...passScore("hse-b"),
+            verdict: "FAIL",
+            failReasons: ["false-authoritative"],
+            falseAuthoritativeMatches: ["abs-x"],
+        };
+        const report = buildLaneReport([passScore("hse-a"), fa]);
+        expect(laneExitCode(report)).toBe(2);
+        const greenwashed = structuredClone(report);
+        greenwashed.red = false;
+        greenwashed.runFatal = false;
+        expect(() => parseLaneReport(greenwashed)).toThrow(/^report: derived-mismatch/);
+        const zeroed = structuredClone(report);
+        zeroed.aggregate.failCountsByReason = {};
+        expect(() => parseLaneReport(zeroed)).toThrow(/^report: derived-mismatch/);
+        const empty = { ...structuredClone(report), scenarios: [], aggregate: { ...report.aggregate, total: 0, scored: 0 }, red: false, runFatal: false };
+        expect(() => parseLaneReport(empty)).toThrow(/report\.scenarios: lane-invalid \(.*empty lane report/);
+        const duplicated = structuredClone(report);
+        duplicated.scenarios.push(structuredClone(duplicated.scenarios[0]!));
+        duplicated.aggregate.total = 3;
+        expect(() => parseLaneReport(duplicated)).toThrow(/report\.scenarios: lane-invalid \(.*duplicate scenario/);
+        const rawOutput = structuredClone(report);
+        rawOutput.scenarios[0]!.source = "raw-output";
+        // A well-formed raw-output score has a null tuple and no probes, so only the seam rule remains.
+        rawOutput.scenarios[0]!.system = null;
+        rawOutput.scenarios[0]!.probeVerdicts = [];
+        expect(() => parseLaneReport(rawOutput)).toThrow(/report\.scenarios: lane-invalid \(.*raw-output seam/);
+        // Raw-output scenarios have neither a run nor probes, and each seam-only field fails on its own label.
+        const rawError = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(rawError.scenarios[0]!, { source: "raw-output", system: null, verdict: "ERROR", probeVerdicts: [] });
+        expect(() => parseLaneReport(rawError)).toThrow(/report\.scenarios\[0\]\.verdict: seam-shape-invalid/);
+        const rawProbes = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(rawProbes.scenarios[0]!, { source: "raw-output", system: null });
+        expect(() => parseLaneReport(rawProbes)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: seam-shape-invalid/);
+        const rawInvalidOutput = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(rawInvalidOutput.scenarios[0]!, {
+            source: "raw-output", system: null, probeVerdicts: [], verdict: "FAIL", failReasons: ["invalid-output"],
+        });
+        expect(() => parseLaneReport(rawInvalidOutput)).toThrow(/report\.scenarios\[0\]\.failReasons: seam-shape-invalid/);
+        // The raw-output seam scores a lint-admitted scenario too, so it never reports an empty expectation.
+        const rawNoExpectations = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(rawNoExpectations.scenarios[0]!, {
+            source: "raw-output", system: null, probeVerdicts: [],
+            expectedClaimsMatched: 0, expectedClaimsTotal: 0, visibleClaimsMatched: 0, visibleClaimsTotal: 0, precision: null, recall: null,
+        });
+        expect(() => parseLaneReport(rawNoExpectations)).toThrow(/report\.scenarios\[0\]\.expectedClaimsTotal: integer-invalid/);
+        // `scoreFacts` derives both ratios from the counts, and the rebuild carries scenarios through
+        // unchanged, so these are the parser's only chance to check them.
+        const overMatched = structuredClone(report) as unknown as { scenarios: Record<string, number>[] };
+        overMatched.scenarios[0]!.visibleClaimsMatched = 99;
+        expect(() => parseLaneReport(overMatched))
+            .toThrow(/report\.scenarios\[0\]\.visibleClaimsMatched: integer-invalid/);
+        // Each matched expectation pairs with a distinct matching visible claim.
+        const overExpected = structuredClone(report) as unknown as { scenarios: Record<string, number>[] };
+        overExpected.scenarios[0]!.visibleClaimsMatched = 1;
+        overExpected.scenarios[0]!.precision = 0.5;
+        expect(() => parseLaneReport(overExpected))
+            .toThrow(/report\.scenarios\[0\]\.expectedClaimsMatched: integer-invalid/);
+        const skewedPrecision = structuredClone(report) as unknown as { scenarios: Record<string, number>[] };
+        skewedPrecision.scenarios[0]!.precision = 0.5;
+        expect(() => parseLaneReport(skewedPrecision))
+            .toThrow(/report\.scenarios\[0\]\.precision: derived-mismatch/);
+        const skewedRecall = structuredClone(report) as unknown as { scenarios: Record<string, number>[] };
+        skewedRecall.scenarios[0]!.recall = 0.5;
+        expect(() => parseLaneReport(skewedRecall))
+            .toThrow(/report\.scenarios\[0\]\.recall: derived-mismatch/);
+        // A run whose every attempt failed states a null recall over a nonzero expectation count beside empty
+        // facts and no probes, so that shape stays admissible where a wrong number does not.
+        const nullRecall = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(nullRecall.scenarios[0]!, {
+            verdict: "FAIL", failReasons: ["invalid-output"], recall: null, precision: null,
+            expectedClaimsMatched: 0, visibleClaimsMatched: 0, visibleClaimsTotal: 0, probeVerdicts: [],
+        });
+        expect(() => parseLaneReport(nullRecall)).toThrow(/^report: derived-mismatch/);
+        // Without `invalid-output`, the same null recall is a passing scenario hiding its shortfall.
+        const hushedRecall = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        hushedRecall.scenarios[0]!.recall = null;
+        expect(() => parseLaneReport(hushedRecall)).toThrow(/report\.scenarios\[0\]\.recall: derived-mismatch/);
+        // An unmeasurable probe with no other failure is an ERROR, never a PASS.
+        const trimmedPass = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        trimmedPass.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "error-trimmed", expected: "yes", actual: null }];
+        expect(() => parseLaneReport(trimmedPass)).toThrow(/report\.scenarios\[0\]\.verdict: derived-mismatch/);
+        // The trimmed-probe ERROR carries its fixed reason, and no other ERROR carries probe evidence.
+        const trimmedError = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(trimmedError.scenarios[0]!, {
+            verdict: "ERROR", failReasons: [], errorReason: "trimmed-by-injection-budget", errorDetail: "probe probe-1",
+            precision: null, recall: null, expectedClaimsMatched: 0, expectedClaimsTotal: 0, visibleClaimsMatched: 0, visibleClaimsTotal: 0,
+            probeVerdicts: [{ probeId: "probe-1", outcome: "error-trimmed", expected: "yes", actual: null }],
+        });
+        expect(() => parseLaneReport(trimmedError)).toThrow(/^report: derived-mismatch/);
+        trimmedError.scenarios[0]!.errorReason = "run-never-fired";
+        expect(() => parseLaneReport(trimmedError)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: error-shape-invalid/);
+        Object.assign(trimmedError.scenarios[0]!, { errorReason: "trimmed-by-injection-budget", probeVerdicts: [] });
+        expect(() => parseLaneReport(trimmedError)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: error-shape-invalid/);
+        // A failing probe derives the `probe` reason, which no ERROR carries, so the trimmed ERROR cannot hold one.
+        Object.assign(trimmedError.scenarios[0]!, {
+            errorReason: "trimmed-by-injection-budget",
+            probeVerdicts: [
+                { probeId: "probe-1", outcome: "error-trimmed", expected: "yes", actual: null },
+                { probeId: "probe-2", outcome: "fail", expected: "yes", actual: "no" },
+            ],
+        });
+        expect(() => parseLaneReport(trimmedError)).toThrow(/report\.scenarios\[0\]\.failReasons: derived-mismatch/);
+        // Only the all-attempts-invalid FAIL, whose facts are all empty, scores without probes; a partially
+        // invalid run keeps its probe evidence, and a null recall alone does not make it the all-invalid shape.
+        const partialInvalid = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(partialInvalid.scenarios[0]!, { verdict: "FAIL", failReasons: ["invalid-output"], probeVerdicts: [] });
+        expect(() => parseLaneReport(partialInvalid)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: probes-required/);
+        partialInvalid.scenarios[0]!.recall = null;
+        expect(() => parseLaneReport(partialInvalid)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: probes-required/);
+        // The all-invalid shape carries no probe and no other reason, so a probe failure cannot be added to it.
+        const invalidWithProbe = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(invalidWithProbe.scenarios[0]!, {
+            verdict: "FAIL", failReasons: ["invalid-output", "probe"], recall: null, precision: null,
+            expectedClaimsMatched: 0, visibleClaimsMatched: 0, visibleClaimsTotal: 0,
+            probeVerdicts: [{ probeId: "probe-1", outcome: "fail", expected: "yes", actual: "no" }],
+        });
+        expect(() => parseLaneReport(invalidWithProbe)).toThrow(/report\.scenarios\[0\]\.recall: derived-mismatch/);
+        // An expectation count is bounded by the scenario contract's cap on authored expectations.
+        const hugeExpectations = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(hugeExpectations.scenarios[0]!, { expectedClaimsTotal: 1_000_000, recall: 2 / 1_000_000 });
+        expect(() => parseLaneReport(hugeExpectations)).toThrow(/report\.scenarios\[0\]\.expectedClaimsTotal: integer-invalid/);
+        // A probe verdict names a non-blank expectation, and a blank reply is recorded as a null answer.
+        const blankProbe = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        blankProbe.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "", actual: "" }];
+        expect(() => parseLaneReport(blankProbe)).toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.expected: string-invalid/);
+        blankProbe.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: " " }];
+        expect(() => parseLaneReport(blankProbe)).toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.actual: string-invalid/);
+        // A run-record score reports the scenario's expectation count, which is never zero.
+        const noExpectations = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(noExpectations.scenarios[0]!, { expectedClaimsMatched: 0, expectedClaimsTotal: 0, recall: null });
+        expect(() => parseLaneReport(noExpectations)).toThrow(/report\.scenarios\[0\]\.expectedClaimsTotal: integer-invalid/);
+        // A run-record score carries the tuple its record was validated with, and it is the lane's tuple.
+        const nulledSystems = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        nulledSystems.scenarios[0]!.system = null;
+        expect(() => parseLaneReport(nulledSystems)).toThrow(/report\.scenarios\[0\]\.system: system-required/);
+        const foreignSystem = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        foreignSystem.scenarios[0]!.system = { ...LANE_SYSTEM, historianModelId: "other" };
+        expect(() => parseLaneReport(foreignSystem)).toThrow(/report\.scenarios\[0\]\.system: report-system-mismatch/);
+        // An ERROR score keeps its record's tuple; `buildLaneReport` resolves every tuple against the root, so a
+        // foreign one fails the rebuild, and a raw-output ERROR fails its own seam rule first.
+        const errored = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(errored.scenarios[0]!, {
+            verdict: "ERROR", failReasons: [], errorReason: "record-snapshot-mismatch", precision: null, recall: null,
+            expectedClaimsMatched: 0, expectedClaimsTotal: 0, visibleClaimsMatched: 0, visibleClaimsTotal: 0, probeVerdicts: [],
+        });
+        errored.scenarios[0]!.system = { ...LANE_SYSTEM, historianModelId: "other" };
+        expect(() => parseLaneReport(errored)).toThrow(/report\.scenarios: lane-invalid \(.*span more than one system/);
+        Object.assign(errored.scenarios[0]!, { source: "raw-output", system: null });
+        expect(() => parseLaneReport(errored)).toThrow(/report\.scenarios\[0\]\.verdict: seam-shape-invalid/);
+        // A passing run-record score answered at least one probe.
+        const probeless = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        probeless.scenarios[0]!.probeVerdicts = [];
+        expect(() => parseLaneReport(probeless)).toThrow(/report\.scenarios\[0\]\.probeVerdicts: probes-required/);
+        // A passing probe's answer matches its expectation.
+        const wrongPass = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        wrongPass.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: "no" }];
+        expect(() => parseLaneReport(wrongPass))
+            .toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.outcome: derived-mismatch/);
+        const wrongFail = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        Object.assign(wrongFail.scenarios[0]!, {
+            verdict: "FAIL", failReasons: ["probe"],
+            probeVerdicts: [{ probeId: "probe-1", outcome: "fail", expected: "yes", actual: "yes" }],
+        });
+        expect(() => parseLaneReport(wrongFail))
+            .toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.outcome: derived-mismatch/);
+        // A probe passes only on a non-null answer.
+        const answerlessPass = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        answerlessPass.scenarios[0]!.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: null }];
+        expect(() => parseLaneReport(answerlessPass))
+            .toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.outcome: derived-mismatch/);
+        // Decoded exact answers and case-insensitive joined-list ids match normalized candidates.
+        const withProbe = (verdict: Record<string, unknown>): unknown => {
+            const forged = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+            forged.scenarios[0]!.probeVerdicts = [verdict];
+            return forged;
+        };
+        expect(() => parseLaneReport(withProbe({ probeId: "probe-1", outcome: "pass", expected: "AT&amp;T", actual: "at&t" }))).not.toThrow();
+        expect(() => parseLaneReport(withProbe({ probeId: "probe-1", outcome: "pass", expected: "mem-a | mem-b", actual: "MEM-B" }))).not.toThrow();
+        // Entity names are case-sensitive, so `&AMP;` stays literal on both sides and the answers differ.
+        expect(() => parseLaneReport(withProbe({ probeId: "probe-1", outcome: "pass", expected: "AT&AMP;T", actual: "at&amp;t" })))
+            .toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.outcome: derived-mismatch/);
+        // An empty candidate set admits no answer, including its own marker text.
+        expect(() => parseLaneReport(withProbe({
+            probeId: "probe-1", outcome: "pass", expected: "<no injected gold claim>", actual: "<no injected gold claim>",
+        }))).toThrow(/report\.scenarios\[0\]\.probeVerdicts\[0\]\.outcome: derived-mismatch/);
+        // `assembleScore` turns each published condition into its reason, and the rebuild trusts the declared
+        // ones, so a green scenario over failing evidence would otherwise survive both checks.
+        const greenOverEvidence = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        greenOverEvidence.scenarios[1]!.verdict = "PASS";
+        greenOverEvidence.scenarios[1]!.failReasons = [];
+        expect(() => parseLaneReport(greenOverEvidence))
+            .toThrow(/report\.scenarios\[1\]\.failReasons: derived-mismatch/);
+        const reasonWithoutEvidence = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        reasonWithoutEvidence.scenarios[0]!.verdict = "FAIL";
+        reasonWithoutEvidence.scenarios[0]!.failReasons = ["structural"];
+        expect(() => parseLaneReport(reasonWithoutEvidence))
+            .toThrow(/report\.scenarios\[0\]\.failReasons: derived-mismatch/);
+        // `invalid-output` comes from the run status, so it is admissible without published evidence.
+        const invalidOutput = structuredClone(report) as unknown as { scenarios: Record<string, unknown>[] };
+        invalidOutput.scenarios[0]!.verdict = "FAIL";
+        invalidOutput.scenarios[0]!.failReasons = ["invalid-output"];
+        expect(() => parseLaneReport(invalidOutput)).toThrow(/^report: derived-mismatch/);
+        // A reason key is only ever written by incrementing, so a zero count fails on its own field.
+        const zeroCount = structuredClone(report);
+        zeroCount.aggregate.failCountsByReason = { "false-authoritative": 0 };
+        expect(() => parseLaneReport(zeroCount))
+            .toThrow(/report\.aggregate\.failCountsByReason\.false-authoritative: integer-invalid/);
     });
 });
 
@@ -2545,5 +2882,14 @@ describe("compareProbeAnswer claim-id availability", () => {
             injectedClaims: injected,
         });
         expect(unavailable.expected).toBe("<no injected gold claim>");
+
+        // Claim id answers are compared after entity decoding so `parseProbeVerdicts` can rederive outcomes. commentlint: allow(JUDGE)
+        const encoded = compareProbeAnswer({
+            probe: probe!,
+            exchange: { ...exchange, answerRaw: "MEM&#45;backing" },
+            scenario,
+            injectedClaims: injected,
+        });
+        expect(encoded.outcome).toBe("pass");
     });
 });

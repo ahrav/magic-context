@@ -57,6 +57,7 @@ pub enum Role {
 }
 
 impl Role {
+    /// Maps recognized provider roles to fixed variants and preserves unknown roles verbatim.
     pub fn from_provider(value: &str) -> Self {
         match value {
             "user" => Role::User,
@@ -66,6 +67,7 @@ impl Role {
         }
     }
 
+    /// Returns the provider spelling, including the borrowed value of [`Role::Other`].
     pub fn as_str(&self) -> &str {
         match self {
             Role::User => "user",
@@ -301,6 +303,10 @@ pub struct TriggerProgress {
     pub protected_start_ordinal: u64,
 }
 
+/// Derives a token budget from usable context and clamps it to 5,000 through 50,000 tokens.
+///
+/// Non-finite or non-positive context limits return the 5,000-token minimum. Negative
+/// threshold percentages contribute zero usable context before the clamp.
 pub fn derive_trigger_budget(context_limit: f64, execute_threshold_percentage: f64) -> f64 {
     if !context_limit.is_finite() || context_limit <= 0.0 {
         return TRIGGER_BUDGET_MIN;
@@ -613,6 +619,11 @@ pub fn resolve_wrapup_boundary(
     }
 }
 
+/// Formats messages in ordinal order and estimates tokens up to `budget_stop`.
+///
+/// The half-open eligible range starts at `start_ordinal` and ends before
+/// `eligible_end_ordinal` when supplied. A partial scan sets `has_more` and reports at least
+/// `budget_stop` tokens when any block was measured.
 pub fn chunked_message_estimate(
     messages: &[BoundaryMsg],
     start_ordinal: u64,
@@ -659,7 +670,10 @@ fn chunked_message_estimate_with_estimator(
     builder.finish(total_message_count, eligible_end_ordinal)
 }
 
+/// Resolves the protected tail and decides whether its eligible head should be compacted.
 ///
+/// An in-progress compartment never fires. Fired decisions consume only the half-open
+/// eligible head and retain the exact [`BoundaryResolution`] used for the decision.
 pub fn check_compartment_trigger(
     messages: &[BoundaryMsg],
     ctx: &TriggerContext,

@@ -1,4 +1,8 @@
-//! R37).
+//! Proves ordering and failure isolation for post-publication activation.
+//!
+//! Transport publication precedes component activation. Artifact failures in
+//! these tests remain lane-local. Activation invariant failures reach the
+//! host-fatal channel.
 
 mod support;
 
@@ -17,7 +21,6 @@ use support::synapse::EchoPrimary;
 
 const BUDGET: Duration = Duration::from_secs(10);
 
-/// invariant failure.
 struct GatedState {
     id: &'static str,
     release: tokio::sync::Semaphore,

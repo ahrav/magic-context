@@ -278,6 +278,7 @@ describe("macroAggregate", () => {
                 recallAt50: value,
                 reciprocalRank: value,
                 ndcgAt10: value,
+                duplicateRateAt50: value,
             },
         };
     }
@@ -293,6 +294,7 @@ describe("macroAggregate", () => {
         // Macro aggregation gives each base intent equal weight: `(0.5 + 1) / 2`.
         expect(aggregates[0].recallAt10).toBe(0.75);
         expect(aggregates[0].mrr).toBe(0.75);
+        expect(aggregates[0].duplicateRateAt50).toBe(0.75);
         expect(aggregates[0].queryCount).toBe(3);
         expect(aggregates[0].groupCount).toBe(2);
     });
@@ -323,7 +325,7 @@ describe("macroAggregate", () => {
             paraphraseGroup: "pg-n",
             partition: "holdout",
             mode: "explicit",
-            values: { recallAt10: null, recallAt50: null, reciprocalRank: 0, ndcgAt10: null },
+            values: { recallAt10: null, recallAt50: null, reciprocalRank: 0, ndcgAt10: null, duplicateRateAt50: null },
         };
         const aggregates = macroAggregate([
             withNull,
@@ -332,11 +334,12 @@ describe("macroAggregate", () => {
                 paraphraseGroup: "pg-v",
                 partition: "holdout",
                 mode: "explicit",
-                values: { recallAt10: 1, recallAt50: 1, reciprocalRank: 1, ndcgAt10: 1 },
+                values: { recallAt10: 1, recallAt50: 1, reciprocalRank: 1, ndcgAt10: 1, duplicateRateAt50: 0.5 },
             },
         ]);
         expect(aggregates[0].recallAt10).toBe(1);
         expect(aggregates[0].ndcgAt10).toBe(1);
+        expect(aggregates[0].duplicateRateAt50).toBe(0.5);
         expect(aggregates[0].mrr).toBe(0.5);
     });
 
@@ -351,6 +354,7 @@ describe("macroAggregate", () => {
             recallAt50: 1,
             reciprocalRank: 1,
             ndcgAt10: 1,
+            duplicateRateAt50: 0,
         });
     });
 });

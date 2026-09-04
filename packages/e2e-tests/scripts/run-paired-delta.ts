@@ -27,7 +27,10 @@ import {
 import { parsePolicyOwnerDocument } from "../src/prospective-holdout/contract";
 import { pairedFactsFingerprint } from "../src/prospective-holdout/report";
 import {
+    MAX_BOOTSTRAP_WORK,
     MIN_BOOTSTRAP_RESAMPLES,
+    PRIMARY_ENDPOINTS,
+    REGRET_ENDPOINTS,
     estimateFamilyDeltas,
     type FamilyDeltaAnalysis,
     type FamilyDeltaObservation,
@@ -93,7 +96,7 @@ interface CliArgs {
     deadlineMinutes: number;
 }
 
-/** A caller keyed off the exit code has to be able to tell a budget stop from a state that forbids the obvious retry: `harness-unreclaimed` means a live harness may still be running, and `invalid-stored-records` means the records file needs inspection before any `--resume` can be trusted. commentlint: allow(JUDGE) */
+/** A caller keyed off the exit code has to be able to tell a budget stop from a state that forbids the obvious retry: `harness-unreclaimed` means a live harness may still be running, and `invalid-stored-records` means the records file needs inspection before any `--resume` can be trusted. */
 const SMOKE_EXPECTED_ROLLOUTS = 11;
 
 const EXIT_CODES: Record<PairedDeltaRunResult["status"], number> = {
@@ -102,20 +105,20 @@ const EXIT_CODES: Record<PairedDeltaRunResult["status"], number> = {
     "deadline-reached": 1,
     "invalid-stored-records": 2,
     "harness-unreclaimed": 3,
-    /** Distinct from the budget stops because a resume that simply continues would admit arms against a `spentUsd` the failed record understates; the operator has to see the estimate stood in for a measurement. Distinct from `INSUFFICIENT_EVIDENCE_EXIT` because the workflow keys its checkpoint save on this code alone. commentlint: allow(JUDGE) */
+    /** Distinct from the budget stops because a resume that simply continues would admit arms against a `spentUsd` the failed record understates; the operator has to see the estimate stood in for a measurement. Distinct from `INSUFFICIENT_EVIDENCE_EXIT` because the workflow keys its checkpoint save on this code alone. */
     "usage-unmeasured": 6,
 };
 
-/** A malformed records file reached the top level as an unhandled rejection and exited 1 — the same code a cost or deadline stop uses — so automation could read a file that needs inspection as a resumable budget stop and retry it forever. Returning null asks the caller to stop after the dedicated code is set. commentlint: allow(JUDGE) */
+/** A malformed records file reached the top level as an unhandled rejection and exited 1 — the same code a cost or deadline stop uses — so automation could read a file that needs inspection as a resumable budget stop and retry it forever. Returning null asks the caller to stop after the dedicated code is set. */
 async function runOrReportInvalidRecords(
     run: () => Promise<PairedDeltaRunResult>,
-    /** Called for a publication that lost its lock: unlike a malformed file, that error follows a paid rollout whose record is not in the file, so the caller records the refusal to resume before the shared exit code is set. commentlint: allow(JUDGE) */
+    /** Called for a publication that lost its lock: unlike a malformed file, that error follows a paid rollout whose record is not in the file, so the caller records the refusal to resume before the shared exit code is set. */
     onPublishConflict: () => void = () => {},
 ): Promise<PairedDeltaRunResult | null> {
     try {
         return await run();
     } catch (error) {
-        /** A publication that lost its lock is classified with a malformed file, not with a budget stop: both mean the records path has to be inspected before any resume, and the generic code is the one automation is entitled to retry. commentlint: allow(JUDGE) */
+        /** A publication that lost its lock is classified with a malformed file, not with a budget stop: both mean the records path has to be inspected before any resume, and the generic code is the one automation is entitled to retry. */
         const inspectable = error instanceof RolloutRecordsInvalidError ||
             error instanceof RolloutStorePublishConflictError;
         if (!inspectable) throw error;
@@ -126,7 +129,7 @@ async function runOrReportInvalidRecords(
     }
 }
 
-/** Names the filesystem type so two different non-regular entries at one path do not hash alike. commentlint: allow(JUDGE) */
+/** Names the filesystem type so two different non-regular entries at one path do not hash alike. */
 function entryKind(entry: Stats): string {
     if (entry.isDirectory()) return "directory";
     if (entry.isFIFO()) return "fifo";
@@ -207,16 +210,16 @@ function parseArgs(argv: string[]): CliArgs {
     };
 }
 
-/** Returns the worktree-relative POSIX path, or null when the target sits outside the worktree and cannot appear in its status. `isWithin` owns the boundary test, which several e2e modules already share. commentlint: allow(JUDGE) */
+/** Returns the worktree-relative POSIX path, or null when the target sits outside the worktree and cannot appear in its status. `isWithin` owns the boundary test, which several e2e modules already share. */
 function relativeTo(root: string, target: string): string | null {
     const rooted = resolve(root);
     const path = resolve(target);
     if (path === rooted || !isWithin(rooted, path)) return null;
-    /** `relative` returns the platform separator, while a git pathspec always takes `/`. commentlint: allow(JUDGE) */
+    /** `relative` returns the platform separator, while a git pathspec always takes `/`. */
     return relative(rooted, path).split(sep).join("/");
 }
 
-/** A resume must not skip coordinates recorded by a different checkout: `bindingMatches` compares `repoCommit`, so a constant would let a post-change run report success without executing the changed code. commentlint: allow(JUDGE) */
+/** A resume must not skip coordinates recorded by a different checkout: `bindingMatches` compares `repoCommit`, so a constant would let a post-change run report success without executing the changed code. */
 /**
  * Digest the declared calibration scope from the worktree, so the binding changes when the running
  * system does and not when an unrelated commit lands.
@@ -358,7 +361,7 @@ function installedDependencyParts(): Uint8Array[] {
                 parts.push(fileDigestParts(file));
             }
         } catch (error) {
-            /** Thrown, not folded into the digest: a stable error string would leave both bindings unchanged while a linked package's bytes moved. A live run that cannot name what it loads cannot bind to it. commentlint: allow(JUDGE) */
+            /** Thrown, not folded into the digest: a stable error string would leave both bindings unchanged while a linked package's bytes moved. A live run that cannot name what it loads cannot bind to it. */
             throw new Error(
                 `paired-delta cannot digest the installed ${specifier}: ` +
                 `${error instanceof Error ? error.message : String(error)}`,
@@ -375,14 +378,14 @@ function installedDependencyParts(): Uint8Array[] {
  * Each is resolved from the directory that imports it at runtime. The SDK is imported by this
  * script. `@opencode-ai/plugin` is imported by the plugin bundle, which the build leaves `--external`,
  * so the bundle bytes do not change when that installed package does even though it supplies the
- * `tool` implementation that registers `ctx_search`. commentlint: allow(JUDGE)
+ * `tool` implementation that registers `ctx_search`.
  */
 const MEASUREMENT_RUNTIME_MODULES: readonly { specifier: string; importedFrom: () => string }[] = [
     { specifier: "@opencode-ai/sdk", importedFrom: () => import.meta.dir },
     { specifier: "@opencode-ai/plugin", importedFrom: () => dirname(pluginEntryPath()) },
 ];
 
-/** Walks up from the resolved entry to the nearest directory whose `package.json` names the specifier. `Bun.resolveSync` returns the real path, so a `bun link`-ed or `file:` package sits outside any `node_modules`; matching the manifest name rather than the path finds its root too, and the whole tree is then hashed like an ordinary install. commentlint: allow(JUDGE) */
+/** Walks up from the resolved entry to the nearest directory whose `package.json` names the specifier. `Bun.resolveSync` returns the real path, so a `bun link`-ed or `file:` package sits outside any `node_modules`; matching the manifest name rather than the path finds its root too, and the whole tree is then hashed like an ordinary install. */
 function installedPackageRoot(entry: string, specifier: string): string {
     for (let directory = dirname(entry); directory !== dirname(directory); directory = dirname(directory)) {
         const manifest = join(directory, "package.json");
@@ -405,7 +408,7 @@ function installedPackageRoot(entry: string, specifier: string): string {
  * --splitting`, so the entry imports sibling chunk files and OpenCode executes those too; hashing
  * the entry alone kept one digest across a stale or edited chunk. The whole output directory is
  * hashed, which also covers the agent and config files the plugin reads from beside its code. A
- * source entry is tracked and reaches both bindings through git, so only its own bytes are added. commentlint: allow(JUDGE)
+ * source entry is tracked and reaches both bindings through git, so only its own bytes are added.
  */
 function loadedBundleParts(root: string): Uint8Array[] {
     const entry = pluginEntryPath();
@@ -418,7 +421,7 @@ function loadedBundleParts(root: string): Uint8Array[] {
     return parts;
 }
 
-/** Every regular file and symlink under the directory in code-unit order, so the digest is independent of enumeration order. A symlink is hashed as its target text by `fileDigestParts`, matching the untracked-file walk: a `bun link`-ed package retargeted at identical bytes must still move the digest. commentlint: allow(JUDGE) */
+/** Every regular file and symlink under the directory in code-unit order, so the digest is independent of enumeration order. A symlink is hashed as its target text by `fileDigestParts`, matching the untracked-file walk: a `bun link`-ed package retargeted at identical bytes must still move the digest. */
 function bundleFiles(directory: string): string[] {
     return readdirSync(directory, { recursive: true, withFileTypes: true })
         .filter((entry) => entry.isFile() || entry.isSymbolicLink())
@@ -453,9 +456,9 @@ function gitAt(cwd: string): (args: string[]) => string {
     };
 }
 
-/** The harness drives the installed OpenCode binary, so the same checkout can produce different rollouts under a different release. `bindingMatches` compares this alongside `repoCommit`, which pins the repository but says nothing about the binary under it, so a resume across an OpenCode upgrade reuses coordinates the new release may no longer reproduce. commentlint: allow(JUDGE) */
+/** The harness drives the installed OpenCode binary, so the same checkout can produce different rollouts under a different release. `bindingMatches` compares this alongside `repoCommit`, which pins the repository but says nothing about the binary under it, so a resume across an OpenCode upgrade reuses coordinates the new release may no longer reproduce. */
 function openCodeVersion(): string {
-    /** `Bun.spawnSync` throws on an unresolvable executable rather than returning an `ENOENT` result, so a bare `opencode` on a runner that has not installed it yet escapes as a raw spawn failure and the exit-code branch below never runs. Resolving first turns that into this lane's own error. commentlint: allow(JUDGE) */
+    /** `Bun.spawnSync` throws on an unresolvable executable rather than returning an `ENOENT` result, so a bare `opencode` on a runner that has not installed it yet escapes as a raw spawn failure and the exit-code branch below never runs. Resolving first turns that into this lane's own error. */
     const entry = Bun.which("opencode");
     if (entry === null) {
         throw new Error("cannot resolve OpenCode version: opencode is not on PATH");
@@ -465,7 +468,7 @@ function openCodeVersion(): string {
         stderr: "pipe",
     });
     if (result.exitCode !== 0) {
-        /** The binary resolved but would not report a version, and the reason is only in the captured stderr: without it the operator sees a bare refusal and cannot tell a broken install from a permission error. commentlint: allow(JUDGE) */
+        /** The binary resolved but would not report a version, and the reason is only in the captured stderr: without it the operator sees a bare refusal and cannot tell a broken install from a permission error. */
         throw new Error(
             `cannot resolve OpenCode version: ${entry} --version exited ${result.exitCode}` +
             `${stderrDetail(result.stderr)}`,
@@ -480,21 +483,21 @@ function stderrDetail(stderr: Uint8Array | null): string {
 }
 
 function recordsRepoCommit(ownedPaths: readonly string[]): string {
-    /** Run from the worktree root: `git ls-files --others` and the paths `git status` prints are both relative to the working directory, so a package-local cwd would miss a change made anywhere else in the repository. commentlint: allow(JUDGE) */
+    /** Run from the worktree root: `git ls-files --others` and the paths `git status` prints are both relative to the working directory, so a package-local cwd would miss a change made anywhere else in the repository. */
     const root = worktreeRoot();
     const git = gitAt(root);
     const commit = git(["rev-parse", "HEAD"]).trim();
-    /** The runner writes its own records file, so hashing it would change the binding on every run and reject every completed coordinate the resume exists to reuse. commentlint: allow(JUDGE) */
-    /** The store's lock file sits beside the records file and a killed run leaves it behind, so it is runner-owned output too: hashing it would reject every completed record on the resume that is about to reclaim it. commentlint: allow(JUDGE) */
-    /** `publishJsonAtomically` writes through `${path}.tmp-<hex>` before renaming, so a run killed mid-write leaves one behind; the lock is a directory the next run reclaims. Both are runner-owned output, and hashing either would reject every stored coordinate. commentlint: allow(JUDGE) */
-    /** A reclaimer renames a judged lock to `<lock>.reclaimed-<nonce>` and deliberately leaves it when neither restoration succeeds, so it is runner-owned residue like the lock itself; hashing it would derive a different binding than the run that wrote the records and reject every coordinate the resume exists to reuse. commentlint: allow(JUDGE) */
+    /** The runner writes its own records file, so hashing it would change the binding on every run and reject every completed coordinate the resume exists to reuse. */
+    /** The store's lock file sits beside the records file and a killed run leaves it behind, so it is runner-owned output too: hashing it would reject every completed record on the resume that is about to reclaim it. */
+    /** `publishJsonAtomically` writes through `${path}.tmp-<hex>` before renaming, so a run killed mid-write leaves one behind; the lock is a directory the next run reclaims. Both are runner-owned output, and hashing either would reject every stored coordinate. */
+    /** A reclaimer renames a judged lock to `<lock>.reclaimed-<nonce>` and deliberately leaves it when neither restoration succeeds, so it is runner-owned residue like the lock itself; hashing it would derive a different binding than the run that wrote the records and reject every coordinate the resume exists to reuse. */
     const relative = (path: string): string | null => relativeTo(root, path);
-    /** The exact paths are excluded as literals because they come from `--records`: a value carrying pathspec metacharacters — `artifacts/run[1].json` — would otherwise exclude unrelated matching paths, dropping their changes from the status, the diff, and the untracked hash, so a resume could reuse records produced against different working code. commentlint: allow(JUDGE) */
+    /** The exact paths are excluded as literals because they come from `--records`: a value carrying pathspec metacharacters — `artifacts/run[1].json` — would otherwise exclude unrelated matching paths, dropping their changes from the status, the diff, and the untracked hash, so a resume could reuse records produced against different working code. */
     const exact = ownedPaths.flatMap((path) => [path, `${path}.lock`, unmeasuredMarkerPath(path)])
         .map(relative)
         .filter((path): path is string => path !== null)
         .map((path) => `:(exclude,literal)${path}`);
-    /** The suffix families need pattern meaning, so they cannot be literal; the caller-supplied prefix is escaped instead, leaving only the trailing `*` as a wildcard. commentlint: allow(JUDGE) */
+    /** The suffix families need pattern meaning, so they cannot be literal; the caller-supplied prefix is escaped instead, leaving only the trailing `*` as a wildcard. */
     const escapeGlob = (path: string): string => path.replace(/[\\[\]*?]/g, "\\$&");
     const globbed = ownedPaths
         .flatMap((path) => [".lock.reclaimed-", ".tmp-"].map((suffix) => `${path}${suffix}`))
@@ -516,33 +519,33 @@ function recordsRepoCommit(ownedPaths: readonly string[]): string {
     if (status === "") {
         return `${commit}-runtime-${Bun.hash(Buffer.concat(bundle)).toString(16)}`;
     }
-    /** An uncommitted worktree shares its parent's commit, so the digest covers the working content itself: paths and status codes alone stay identical when a file's bytes change, and a resume would reuse records written before the edit. commentlint: allow(JUDGE) */
+    /** An uncommitted worktree shares its parent's commit, so the digest covers the working content itself: paths and status codes alone stay identical when a file's bytes change, and a resume would reuse records written before the edit. */
     const untracked = git(["ls-files", "--others", "--exclude-standard", "-z", "--", ...scope])
         .split("\0")
         .filter(Boolean);
-    /** Untracked contents are hashed as raw bytes: decoding to UTF-8 first maps distinct binary payloads onto the same replacement character, and `git status` cannot tell them apart either while `git diff HEAD` omits untracked files entirely. commentlint: allow(JUDGE) */
+    /** Untracked contents are hashed as raw bytes: decoding to UTF-8 first maps distinct binary payloads onto the same replacement character, and `git status` cannot tell them apart either while `git diff HEAD` omits untracked files entirely. */
     const parts: Uint8Array[] = [
         ...bundle,
         Buffer.from(status, "utf8"),
-        /** `--binary` because a plain diff reduces a modified binary file to a stable `Binary files … differ` line, so its bytes could change while the digest did not. commentlint: allow(JUDGE) */
+        /** `--binary` because a plain diff reduces a modified binary file to a stable `Binary files … differ` line, so its bytes could change while the digest did not. */
         Buffer.from(git(["diff", "--binary", "HEAD", "--", ...scope]), "utf8"),
     ];
     for (const path of untracked) {
         parts.push(Buffer.from(`${path}\n`, "utf8"));
         try {
             const absolute = resolve(root, path);
-            /** A symlink's worktree identity is the text it points at, not the bytes it resolves to: following it left the digest unchanged when the same path was retargeted at another module with identical contents, so a resume could reuse records produced against different working code. `lstat` because `readFileSync` and `statSync` both dereference. commentlint: allow(JUDGE) */
+            /** A symlink's worktree identity is the text it points at, not the bytes it resolves to: following it left the digest unchanged when the same path was retargeted at another module with identical contents, so a resume could reuse records produced against different working code. `lstat` because `readFileSync` and `statSync` both dereference. */
             const entry = lstatSync(absolute);
             if (entry.isSymbolicLink()) {
                 parts.push(Buffer.from(`<symlink>${readlinkSync(absolute)}`, "utf8"));
             } else if (!entry.isFile()) {
-                /** Only a regular file has contents to hash. Opening anything else can block indefinitely — a named pipe waits for a writer — and this runs before the experiment starts, so its deadline cannot interrupt it. The type is recorded so the entry still changes the digest. commentlint: allow(JUDGE) */
+                /** Only a regular file has contents to hash. Opening anything else can block indefinitely — a named pipe waits for a writer — and this runs before the experiment starts, so its deadline cannot interrupt it. The type is recorded so the entry still changes the digest. */
                 parts.push(Buffer.from(`<non-file>${entryKind(entry)}`, "utf8"));
             } else {
                 parts.push(readFileSync(absolute));
             }
         } catch {
-            /** An unreadable path still changes the digest through its own name. commentlint: allow(JUDGE) */
+            /** An unreadable path still changes the digest through its own name. */
             parts.push(Buffer.from("<unreadable>", "utf8"));
         }
     }
@@ -553,7 +556,7 @@ function fixtureScenario(
     scenarioId: string,
     title: string,
 ): ScenarioDeclaration {
-    /** The declaration goes through `parseScenarioDeclaration` so the smoke exercises a scenario the paired-delta contract accepts: the evidence turn precedes the R1 insertion point, no turn from that point on repeats the answer, and one R2 claim carries it. commentlint: allow(JUDGE) */
+    /** The declaration goes through `parseScenarioDeclaration` so the smoke exercises a scenario the paired-delta contract accepts: the evidence turn precedes the R1 insertion point, no turn from that point on repeats the answer, and one R2 claim carries it. */
     return parseScenarioDeclaration({
         scenarioId,
         familyId: "fam-smoke",
@@ -636,7 +639,7 @@ function smokeExpectationDrift(
     args: CliArgs,
 ): string[] {
     const drift: string[] = [];
-    /** Keys are sorted before comparing: `exclusionCounts` and `providerCalls` are built in iteration order, so a change in arm scheduling or route resolution would otherwise report drift for identical content. `stableStringify` is the shared implementation of that ordering, so a fix to its edge cases reaches this comparison too. commentlint: allow(JUDGE) */
+    /** Keys are sorted before comparing: `exclusionCounts` and `providerCalls` are built in iteration order, so a change in arm scheduling or route resolution would otherwise report drift for identical content. `stableStringify` is the shared implementation of that ordering, so a fix to its edge cases reaches this comparison too. */
     const canonical = stableStringify;
     const expect = (label: string, actual: unknown, expected: unknown): void => {
         const shown = canonical(actual);
@@ -645,7 +648,7 @@ function smokeExpectationDrift(
     };
     expect("rolloutCount", summary.rolloutCount, SMOKE_EXPECTED_ROLLOUTS);
     expect("invalidStoredCoordinates", summary.invalidStoredCoordinates.length, 0);
-    /** `smokeObservation` fails mc-on's critical check in both scenarios, so both fire the ladder. `var-smoke-provider-error` loses only mc-off, leaving r1/r2/r3 to complete one full ladder; `var-smoke-failing-verifier` loses r2, so its ladder carries retrieval and stops. commentlint: allow(JUDGE) */
+    /** `smokeObservation` fails mc-on's critical check in both scenarios, so both fire the ladder. `var-smoke-provider-error` loses only mc-off, leaving r1/r2/r3 to complete one full ladder; `var-smoke-failing-verifier` loses r2, so its ladder carries retrieval and stops. */
     expect("completeRegretLadders", summary.completeRegretLadders, 1);
     expect("partialRegretLadders", summary.partialRegretLadders, 1);
     expect("exclusionCounts", summary.exclusionCounts, {
@@ -653,7 +656,7 @@ function smokeExpectationDrift(
         r2: { "provider-unavailable": 1 },
     });
     if (!args.resume) {
-        /** Both routes must resolve independently, so each is prompted exactly once. commentlint: allow(JUDGE) */
+        /** Both routes must resolve independently, so each is prompted exactly once. */
         expect("providerCalls", summary.providerCalls, { "mock-anthropic": 1, "mock-live": 1 });
     }
     return drift;
@@ -679,7 +682,7 @@ async function runSmoke(args: CliArgs): Promise<void> {
             scenarios: SCENARIOS,
             poolManifestFingerprint: "smoke-pool-v1",
             repoCommit: recordsRepoCommit([args.recordsPath, args.reportPath, args.calibrationRecordPath]),
-            /** The smoke lane answers prompts from an in-process mock and never launches the installed binary, so it pins a literal beside its other mock identities rather than binding to whatever release happens to be on PATH. commentlint: allow(JUDGE) */
+            /** The smoke lane answers prompts from an in-process mock and never launches the installed binary, so it pins a literal beside its other mock identities rather than binding to whatever release happens to be on PATH. */
             openCodeVersion: "mock-opencode",
             pinnedProviderId: "mock-live",
             pinnedSnapshotId: "mock-snapshot-2026-08-31",
@@ -751,7 +754,7 @@ async function runSmoke(args: CliArgs): Promise<void> {
     console.log(JSON.stringify(summary, null, 2));
     const drift = smokeExpectationDrift(summary, args);
     for (const line of drift) console.error(`smoke expectation: ${line}`);
-    /** A non-completed status outranks drift, because `harness-unreclaimed` means a live harness may still be running and a caller keyed on that code must not lose it: drift gets its own code only when the status itself reports success. commentlint: allow(JUDGE) */
+    /** A non-completed status outranks drift, because `harness-unreclaimed` means a live harness may still be running and a caller keyed on that code must not lose it: drift gets its own code only when the status itself reports success. */
     if (result.status !== "completed") {
         process.exitCode = EXIT_CODES[result.status];
         return;
@@ -934,7 +937,7 @@ const SCRIPTED_ORACLE_MOCK_ENTRIES = 2;
  * closing assistant message's `parentID`. Requiring every fixture row to carry that parent, and
  * exactly the scheduled number of them, ties the rows to the turn: a count alone lets a missing
  * scripted row and a stray live child that routed to the fixture cancel out. An arm without a
- * scripted turn must have no fixture rows at all. commentlint: allow(JUDGE)
+ * scripted turn must have no fixture rows at all.
  */
 function scriptedRowsMatch(
     mockRows: SessionUsage["mockRows"],
@@ -978,7 +981,7 @@ function addUsage(
         cacheCreation: left.cacheCreation + right.cacheCreation,
         cacheRead: left.cacheRead + right.cacheRead,
     };
-    /** Each row is a safe integer; their sum need not be. An unsafe aggregate would be nulled downstream and priced from the estimate with the cell still completed, so it is a ledger the rollout cannot be priced from. commentlint: allow(JUDGE) */
+    /** Each row is a safe integer; their sum need not be. An unsafe aggregate would be nulled downstream and priced from the estimate with the cell still completed, so it is a ledger the rollout cannot be priced from. */
     if (!Object.values(sum).every((count) => Number.isSafeInteger(count))) {
         throw new Error("live paired-delta session ledger totals exceed the safe integer range");
     }
@@ -1067,7 +1070,7 @@ function historianState(
     const lines = readFileSync(logPath, "utf8")
         .split("\n")
         .filter((line) => line.includes(`[${sessionId}]`));
-    /** The plugin logs every transform pass for a session it processed, so a session with no lines at all is diagnostics that were never written — silenced by `NODE_ENV=test`, or a swallowed append error — not a session with nothing to report. The marker cannot be trusted absent from a log that was never written. commentlint: allow(JUDGE) */
+    /** The plugin logs every transform pass for a session it processed, so a session with no lines at all is diagnostics that were never written — silenced by `NODE_ENV=test`, or a swallowed append error — not a session with nothing to report. The marker cannot be trusted absent from a log that was never written. */
     if (lines.length === 0) return "unobservable";
     return lines.some((line) => line.includes(COMPARTMENT_AWAIT_TIMED_OUT_MARKER))
         ? "abandoned"
@@ -1081,7 +1084,7 @@ function historianState(
  * permission failure can discard exactly the flush carrying the timeout marker while every earlier
  * line for the session survives. The dropped count is exposed over the plugin's local RPC, so a
  * clean-looking log is trusted only when the plugin confirms it dropped nothing. Unreachable RPC
- * reads as dropped: the check exists to fail closed. commentlint: allow(JUDGE)
+ * reads as dropped: the check exists to fail closed.
  */
 async function pluginDroppedLogWrites(harness: TestHarness, sessionId: string): Promise<boolean> {
     try {
@@ -1110,7 +1113,7 @@ async function pluginDroppedLogWrites(harness: TestHarness, sessionId: string): 
  * quiescence is observed rather than queried.
  *
  * Scored rollouts reject an incomplete ledger because in-flight calls can change billed usage.
- * Failed rollouts charge it: each row is a call the provider already billed, the runner takes the larger of this and its worst-case bound, and rejecting would fall back to a bound the historian's retry tree exceeds. commentlint: allow(JUDGE)
+ * Failed rollouts charge it: each row is a call the provider already billed, the runner takes the larger of this and its worst-case bound, and rejecting would fall back to a bound the historian's retry tree exceeds.
  */
 async function settledSessionUsage(
     harness: TestHarness,
@@ -1140,9 +1143,9 @@ async function settledSessionUsage(
         }
         const reading = await sessionUsage(harness, sessionId, pinned, expectedMockEntries);
         const signature = JSON.stringify(reading);
-        /** Two agreeing reads settle only a ledger whose historian is known clear: a running historian can append rows after them, and an unobservable log cannot say one is not running. Charged incomplete ledgers wait for all attempts. commentlint: allow(JUDGE) */
+        /** Two agreeing reads settle only a ledger whose historian is known clear: a running historian can append rows after them, and an unobservable log cannot say one is not running. Charged incomplete ledgers wait for all attempts. */
         if (signature === previous && state === "clear") {
-            /** A clean log is only evidence when nothing was dropped from it; a swallowed flush could be the marker. Checked once, at the point of trusting the log, rather than every pass. commentlint: allow(JUDGE) */
+            /** A clean log is only evidence when nothing was dropped from it; a swallowed flush could be the marker. Checked once, at the point of trusting the log, rather than every pass. */
             if (pluginBacked && await pluginDroppedLogWrites(harness, sessionId)) {
                 state = "unobservable";
                 previous = signature;
@@ -1156,7 +1159,7 @@ async function settledSessionUsage(
         last = reading;
         await Bun.sleep(LEDGER_SETTLE_INTERVAL_MS);
     }
-    /** What landed is charged, and the caller is told it is not the whole bill: an abandoned or unobservable historian may still be running, and a clear ledger that never repeated itself was still moving. commentlint: allow(JUDGE) */
+    /** What landed is charged, and the caller is told it is not the whole bill: an abandoned or unobservable historian may still be running, and a clear ledger that never repeated itself was still moving. */
     if (settle.incomplete === "charge" && last !== null) return { ...last, settled: false };
     if (state === "unobservable") {
         throw new Error(
@@ -1206,7 +1209,7 @@ async function sessionUsage(
             };
             const tokens = info.tokens;
             /** An assistant entry names a route, so absent counters are an incomplete ledger rather than a message with nothing to price. */
-            /** Safe non-negative integers, not merely numbers: a `NaN`, negative, or fractional counter would price to a value `completedRecord` nulls and replaces with the estimate while the status stays `completed`, admitting later arms against it. commentlint: allow(JUDGE) */
+            /** Safe non-negative integers, not merely numbers: a `NaN`, negative, or fractional counter would price to a value `completedRecord` nulls and replaces with the estimate while the status stays `completed`, admitting later arms against it. */
             if (
                 ![tokens?.input, tokens?.output, tokens?.cache?.write, tokens?.cache?.read]
                     .every((count) => Number.isSafeInteger(count) && (count as number) >= 0)
@@ -1362,7 +1365,7 @@ function configMatchesArm(
  * A live handle must account for what it billed. `usageOnFailure` is optional on the runner's
  * interface because the scripted and mock handles bill nothing, so for them the estimate is exact;
  * a live handle without it would price every failure from a bound the historian's retry tree can
- * exceed, and the runner cannot tell the two apart at runtime. commentlint: allow(JUDGE)
+ * exceed, and the runner cannot tell the two apart at runtime.
  */
 type LiveRolloutHandle = RolloutHandle & Required<Pick<RolloutHandle, "usageOnFailure">>;
 
@@ -1414,7 +1417,7 @@ export function createLiveDependencies(input: {
                 try {
                     return await promise;
                 } catch (error) {
-                    /** The harness's own timer loses the race but does not stop the request; the SDK call it abandoned is what the provider is still billing, so that is what stays in flight. commentlint: allow(JUDGE) */
+                    /** The harness's own timer loses the race but does not stop the request; the SDK call it abandoned is what the provider is still billing, so that is what stays in flight. */
                     if (error instanceof PromptTimeoutError) inFlight = error.pending;
                     throw error;
                 } finally {
@@ -1644,9 +1647,9 @@ export function createLiveDependencies(input: {
                  */
                 async usageOnFailure() {
                     abortRequested = true;
-                    /** No session means no prompt was sent: `prepare` and `createSession` run before the first provider call, so a failure there billed nothing, and reading the ledger for an empty id would report that nothing as unmeasured. commentlint: allow(JUDGE) */
+                    /** No session means no prompt was sent: `prepare` and `createSession` run before the first provider call, so a failure there billed nothing, and reading the ledger for an empty id would report that nothing as unmeasured. */
                     if (activeSessionId === undefined) return { usage: ZERO_USAGE, settled: true };
-                    /** A prompt the deadline interrupted is still being billed. Its row lands when the provider answers, so the read waits for it inside the grace; one that outlasts the wait leaves the ledger unsettled by construction. commentlint: allow(JUDGE) */
+                    /** A prompt the deadline interrupted is still being billed. Its row lands when the provider answers, so the read waits for it inside the grace; one that outlasts the wait leaves the ledger unsettled by construction. */
                     const startedAt = Date.now();
                     const landed = inFlight === null || await Promise.race([
                         inFlight.then(() => true, () => true),
@@ -1897,7 +1900,7 @@ function deskCostCeilingUsd(
  * measurement, so a later invocation that finds the file and resumes would admit arms against a
  * `spentUsd` the run refused to continue from. The marker travels with the records — the workflow
  * caches both under one key — so any checkpoint chain that can restore the records also restores
- * the refusal. commentlint: allow(JUDGE)
+ * the refusal.
  */
 function unmeasuredMarkerPath(recordsPath: string): string {
     return `${recordsPath}.unmeasured`;
@@ -1920,7 +1923,7 @@ async function runLive(args: CliArgs): Promise<void> {
      * would lose the marker and the record together. Proving the directory writable here does not
      * prevent that, but it does refuse the far more common case — a path that was never writable —
      * before any provider call, so the refusal path is exercised where it can still be cheap. A
-     * mid-run loss of the directory is reported on stderr by the marker write itself. commentlint: allow(JUDGE)
+     * mid-run loss of the directory is reported on stderr by the marker write itself.
      */
     mkdirSync(dirname(args.recordsPath), { recursive: true });
     const probe = `${marker}.probe-${process.pid}`;
@@ -2162,6 +2165,14 @@ async function runLive(args: CliArgs): Promise<void> {
             `requires ${policy.minimumAnalyzableFamilyCount}`,
         );
     }
+    /** The estimator bounds observations times resamples; at most one observation per coordinate per endpoint, checked here before any rollout is paid for. */
+    const worstCaseObservations = scenarios.length * policy.replicateCount * (PRIMARY_ENDPOINTS.length + REGRET_ENDPOINTS.length);
+    if (worstCaseObservations * policy.bootstrapResamples > MAX_BOOTSTRAP_WORK) {
+        throw new Error(
+            `paired-delta ${mode} could produce ${worstCaseObservations} observations at ` +
+            `${policy.bootstrapResamples} resamples, above the estimator's bound of ${MAX_BOOTSTRAP_WORK}`,
+        );
+    }
     // The fingerprinted policy documents the executed configuration, so the
     // context limit it pins must match what the scenarios actually request.
     for (const scenario of scenarios) {
@@ -2187,7 +2198,7 @@ async function runLive(args: CliArgs): Promise<void> {
      * conflict, anything the runner does not classify — leaves the records file without the paid
      * coordinate while the always-on cache save keeps the older file, so a rerun would resume and
      * repeat or admit calls against spend the checkpoint never restored. The marker makes that path
-     * refuse the same way an unmeasured record does. commentlint: allow(JUDGE)
+     * refuse the same way an unmeasured record does.
      */
     const writeUnmeasuredMarker = (status: string, spentUsd: number | null): void => {
         const body = `${JSON.stringify({
@@ -2199,7 +2210,7 @@ async function runLive(args: CliArgs): Promise<void> {
         try {
             writeFileSync(marker, body);
         } catch (error) {
-            /** The refusal could not be persisted beside the records, so it is left where the run's own output goes; a checkpoint saved from this attempt is not safe to resume, and the operator has to see that in the log. commentlint: allow(JUDGE) */
+            /** The refusal could not be persisted beside the records, so it is left where the run's own output goes; a checkpoint saved from this attempt is not safe to resume, and the operator has to see that in the log. */
             console.error(
                 `paired-delta could not write ${marker} (${error instanceof Error ? error.message : String(error)}); ` +
                 `do not resume ${args.recordsPath}: ${body.trim()}`,
@@ -2207,7 +2218,7 @@ async function runLive(args: CliArgs): Promise<void> {
         }
     };
     let result: PairedDeltaRunResult | null = null;
-    /** Set once `runOrReportInvalidRecords` has classified and reported an error itself; those are pre-rollout validation failures that already refuse resume with their own code and must not also be marked unmeasured, which would hide the actual record problem on the next attempt. commentlint: allow(JUDGE) */
+    /** Set once `runOrReportInvalidRecords` has classified and reported an error itself; those are pre-rollout validation failures that already refuse resume with their own code and must not also be marked unmeasured, which would hide the actual record problem on the next attempt. */
     let handled = false;
     try {
         result = await runOrReportInvalidRecords(() => runPairedDelta(
@@ -2241,11 +2252,11 @@ async function runLive(args: CliArgs): Promise<void> {
         ), () => writeUnmeasuredMarker("publish-conflict", null));
         handled = result === null;
     } finally {
-        /** A returned result, even a failed one, has published every record it paid for, and a handled validation failure ran no rollout; only an escape has spent without recording. commentlint: allow(JUDGE) */
+        /** A returned result, even a failed one, has published every record it paid for, and a handled validation failure ran no rollout; only an escape has spent without recording. */
         if (result === null && !handled) writeUnmeasuredMarker("run-escaped", null);
     }
     if (result === null) return;
-    /** Written before any report or calibration work, which can throw — an unwritable `--report` destination, a malformed record — and would otherwise leave the records file unmarked for the always-on cache save. commentlint: allow(JUDGE) */
+    /** Written before any report or calibration work, which can throw — an unwritable `--report` destination, a malformed record — and would otherwise leave the records file unmarked for the always-on cache save. */
     if (result.usageUnmeasured) writeUnmeasuredMarker(result.status, result.spentUsd);
     const scenarioFamilies = new Map(
         scenarios.map(({ scenarioId, familyId }) => [scenarioId, familyId]),

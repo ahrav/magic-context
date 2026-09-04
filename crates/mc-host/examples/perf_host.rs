@@ -1,6 +1,11 @@
-//! The separate host process lets strace and perf attribute costs only to the host.
-//! The harness contract defines the request-body mode layout that the load generator encodes.
-//! generator encodes.
+//! Performance host isolated from the load generator so `strace` and `perf`
+//! attribute host costs only to this process.
+//!
+//! Request bodies use the load-generator contract: mode byte `1` followed by
+//! a little-endian `u32` delay in milliseconds. Other bodies are echoed
+//! without an artificial delay. Allocation counters are process-wide
+//! telemetry; relaxed ordering is sufficient because no synchronization
+//! decision depends on their values.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,13 +24,19 @@ static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
 struct CountingAlloc;
 
+// SAFETY: Every allocation and deallocation delegates unchanged layouts and
+// pointers to `System`; counter updates do not affect allocator behavior.
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
         ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: Caller supplies a valid `GlobalAlloc::alloc` layout, which is
+        // forwarded unchanged to the system allocator.
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: Caller supplies the pointer and layout from a compatible
+        // allocation, and both are forwarded unchanged.
         unsafe { System.dealloc(ptr, layout) }
     }
 }

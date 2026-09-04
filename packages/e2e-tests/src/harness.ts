@@ -243,7 +243,7 @@ export class TestHarness {
             if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
         });
         if (result === null) {
-            /** The SDK request is still running when the race is lost, and the provider still bills it. The promise rides on the error so a caller that accounts for spend can wait for or observe the request instead of losing it with the wrapper. Its own rejection is observed here so an abandoned request cannot surface as an unhandled rejection. commentlint: allow(JUDGE) */
+            /** The SDK request is still running when the race is lost, and the provider still bills it. The promise rides on the error so a caller that accounts for spend can wait for or observe the request instead of losing it with the wrapper. Its own rejection is observed here so an abandoned request cannot surface as an unhandled rejection. */
             promptPromise.catch(() => {});
             throw new PromptTimeoutError(
                 `sendPrompt did not complete within ${timeoutMs}ms. stderr:\n${this.opencode.stderr().slice(-2000)}`,

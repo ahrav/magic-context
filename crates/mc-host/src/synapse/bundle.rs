@@ -1,4 +1,7 @@
-//! Bundle loading enforces a strict manifest schema.
+//! Verifies Synapse bundle manifests and artifacts before inference.
+//!
+//! Verification uses opened regular-file descriptors, enforces byte and
+//! serving limits, checks artifact digests, and rejects unlisted files.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -32,18 +35,10 @@ const OUTPUT_NAME_ALLOWLIST: &[&str] = &[
 ];
 const MAX_OUTPUT_INDEX: u64 = 7;
 
-/// Bundle errors omit artifact bytes.
-/// their manifest.
-#[derive(Debug, Clone)]
+/// Bundle validation failure that omits artifact contents from diagnostics.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("invalid synapse bundle: {0}")]
 pub struct BundleError(pub String);
-
-impl std::fmt::Display for BundleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid synapse bundle: {}", self.0)
-    }
-}
-
-impl std::error::Error for BundleError {}
 
 fn err(reason: impl Into<String>) -> BundleError {
     BundleError(reason.into())
@@ -122,7 +117,10 @@ pub enum SelectedOutput {
 }
 
 impl BundleManifest {
-    /// FastEmbed vocabulary.
+    /// Resolves the manifest's exclusive output selector.
+    ///
+    /// Returns an error unless exactly one selector form is present. Named
+    /// outputs must be allowlisted, and ordered indices must be at most seven.
     pub fn selected_output(&self) -> Result<SelectedOutput, BundleError> {
         match (&self.output.name, self.output.index, self.output.only_one) {
             (Some(name), None, None) => OUTPUT_NAME_ALLOWLIST
@@ -168,7 +166,6 @@ pub struct VerifiedBundle {
     pub corpus: Corpus,
 }
 
-///
 /// `expected_manifest_sha256` binds the parsed `manifest.json` to the outer trust root.
 /// The outer manifest digest extends trust over every artifact named by `manifest.json`.
 /// `None` permits callers that have no outer digest.
@@ -672,9 +669,7 @@ fn open_artifact(dir: &Path, name: &str) -> Result<OpenRegularFile, BundleError>
     })
 }
 
-/// The reader limits reads to the checked length to bound allocation.
-/// The reader limits reads to the checked length to bound allocation.
-/// The reader limits reads to the checked length to bound allocation.
+/// Reads at most the byte length recorded on the validated descriptor.
 fn read_open_artifact(open: OpenRegularFile, name: &str) -> Result<Vec<u8>, BundleError> {
     open.read()
         .map_err(|_| err(format!("artifact read failed: {name}")))
@@ -943,7 +938,7 @@ mod tests {
         assert!(error.0.contains("maximum batch result"));
     }
 
-    /// startup.
+    /// Rejects result-page bounds that cannot fit startup scratch reservation.
     #[test]
     fn a_page_bound_above_the_scratch_pool_is_rejected() {
         let manifest = manifest();

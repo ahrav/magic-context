@@ -1,3 +1,5 @@
+import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { compareCodeUnits } from "../code-unit-order";
 import { describe, expect, test } from "bun:test";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,7 +27,7 @@ import {
     type LiveObservation,
     type LiveRole,
 } from "./live";
-import { buildMetamorphicReport, metamorphicExitCode, parseMetamorphicReport, type MetamorphicReport } from "./report";
+import { MetamorphicReportError, buildMetamorphicReport, metamorphicExitCode, parseMetamorphicReport, type MetamorphicReport, type MetamorphicReportEntry } from "./report";
 import { buildScriptedOutput, runDeterministicMetamorphicEval, DETERMINISTIC_SEEDS } from "./runner";
 import { TRANSFORMS, type Transform } from "./transforms";
 import {
@@ -119,6 +121,34 @@ function importancesOf(output: string): number[] {
     return [...output.matchAll(/ importance="(\d+)"/g)].map((match) => Number(match[1]));
 }
 
+/** Relabels a deterministic report's scored pairs as run-record scores, the shape the live runner emits. */
+function relabelScoredAsRunRecord(report: MetamorphicReport, system: SystemVersionTuple | null = null): void {
+    for (const entry of report.entries) {
+        if (entry.kind !== "scored") continue;
+        entry.baselineScore.source = "run-record";
+        entry.derivativeScore.source = "run-record";
+        if (system !== null) {
+            entry.baselineScore.system = system;
+            entry.derivativeScore.system = system;
+        }
+        const probe = { probeId: "probe-1", outcome: "pass" as const, expected: "yes", actual: "yes" };
+        entry.baselineScore.probeVerdicts = [probe];
+        entry.derivativeScore.probeVerdicts = [probe];
+        entry.invariants = entry.invariants.filter(({ invariant }) =>
+            invariant !== "expected-absent-empty" && invariant !== "verdict-monotonicity");
+    }
+}
+
+/** A scored control entry over a product pair's scores, at the fixed control coordinate. */
+function controlEntryFrom(entry: Extract<MetamorphicReportEntry, { kind: "scored" }>): MetamorphicReportEntry {
+    const control = structuredClone(entry);
+    control.transformId = "baseline-control";
+    control.transformVersion = 1;
+    control.seed = 0;
+    control.derivativeScore.scenarioId = control.scenarioId;
+    return control;
+}
+
 describe("deterministic metamorphic runner", () => {
     test("rejects an empty scenario input", () => {
         expect(() => runDeterministicMetamorphicEval([])).toThrow(
@@ -143,6 +173,8 @@ describe("deterministic metamorphic runner", () => {
         expect(parseMetamorphicReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
         const invalid = buildMetamorphicReport({
             entries: [
+                // The live runner records a control disagreement beside an error entry at the control coordinate.
+                { scenarioId: "hse-a", transformId: "baseline-control", transformVersion: 1, seed: 0, kind: "error", error: "tier-invalid: baseline control pair disagreed; product pairs skipped" },
                 { scenarioId: "hse-a", transformId: "reorder-independent-turns", transformVersion: 1, seed: 0, kind: "error", error: "boom" },
                 {
                     scenarioId: "hse-a", transformId: "reorder-independent-turns", transformVersion: 1, seed: 1,
@@ -152,7 +184,7 @@ describe("deterministic metamorphic runner", () => {
             ],
             coverage: [{ scenarioId: "hse-a", applied: 1, inapplicable: [{ scenarioId: "hse-a", transformId: "t", transformVersion: 1, seed: 3, reason: "n/a" }], violations: [] }],
             injectionCanaryHits: [{ scenarioId: "hse-a", role: "control-a", transformId: null, transformVersion: null, seed: null }],
-            tierInvalidReason: { kind: "control-disagreement", systemMismatch: true, failedInvariants: ["expected-absent-empty"] },
+            tierInvalidReason: { kind: "control-disagreement", systemMismatch: true, failedInvariants: ["scenario-verdict-equality"] },
             system: systemTuple(),
         });
         expect(parseMetamorphicReport(JSON.parse(JSON.stringify(invalid)))).toEqual(invalid);
@@ -162,12 +194,362 @@ describe("deterministic metamorphic runner", () => {
         const unknownKind = structuredClone(invalid) as unknown as { entries: Record<string, unknown>[] };
         unknownKind.entries[0]!.kind = "skipped";
         expect(() => parseMetamorphicReport(unknownKind)).toThrow(/report\.entries\[0\]\.kind: enum-invalid/);
+        // A malformed score inside a metamorphic report is this report's contract failure, not the historian lane's.
+        const badScoreIndex = report.entries.findIndex((entry) => entry.kind === "scored");
+        expect(badScoreIndex).toBeGreaterThanOrEqual(0);
+        const badScore = structuredClone(report) as unknown as { entries: Record<string, Record<string, unknown>>[] };
+        badScore.entries[badScoreIndex]!.baselineScore!.verdict = "MAYBE";
+        expect(() => parseMetamorphicReport(badScore)).toThrow(MetamorphicReportError);
+        expect(() => parseMetamorphicReport(badScore)).toThrow(new RegExp(`report\\.entries\\[${badScoreIndex}\\]\\.baselineScore\\.verdict: enum-invalid`));
+        // On a completed run, every applied pair left an entry behind.
+        const inflatedApplied = structuredClone(report);
+        inflatedApplied.coverage[0]!.applied += 1;
+        expect(metamorphicExitCode(inflatedApplied)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(inflatedApplied)).toThrow(/report\.coverage\[0\]\.applied: derived-mismatch/);
+        // A transform that throws during admission leaves an error entry without counting as applied, so an
+        // applied count one below the entry count is a shape the producer can emit once one entry is an error.
+        const deflatedApplied = structuredClone(report);
+        const deflatedRow = deflatedApplied.coverage[0]!;
+        const executedIndex = deflatedApplied.entries.findIndex((entry) =>
+            entry.scenarioId === deflatedRow.scenarioId && (entry.kind === "scored" || entry.kind === "stage-not-scored"));
+        expect(executedIndex).toBeGreaterThanOrEqual(0);
+        const executedKey = deflatedApplied.entries[executedIndex]!;
+        deflatedApplied.entries[executedIndex] = {
+            scenarioId: executedKey.scenarioId,
+            transformId: executedKey.transformId,
+            transformVersion: executedKey.transformVersion,
+            seed: executedKey.seed,
+            kind: "error",
+            error: "admission threw",
+        };
+        deflatedRow.applied -= 1;
+        if (deflatedRow.applied === 0) deflatedRow.violations = ["no transforms applied"];
+        expect(() => parseMetamorphicReport(deflatedApplied)).not.toThrow();
+        // Only an applied pair executes, so the applied count never drops below the executed entries.
+        const underApplied = structuredClone(report);
+        underApplied.coverage[0]!.applied -= 1;
+        if (underApplied.coverage[0]!.applied === 0) underApplied.coverage[0]!.violations = ["no transforms applied"];
+        expect(() => parseMetamorphicReport(underApplied)).toThrow(/report\.coverage\[0\]\.applied: executed-shortfall/);
+        // A scenario nothing applied to records that as a violation.
+        const silentZero = structuredClone(report);
+        const zeroRow = silentZero.coverage[0]!;
+        silentZero.entries = silentZero.entries.filter((entry) => entry.scenarioId !== zeroRow.scenarioId || entry.kind === "lint-red");
+        zeroRow.applied = 0;
+        zeroRow.violations = [];
+        expect(() => parseMetamorphicReport(silentZero)).toThrow(/report\.coverage\[0\]\.violations: derived-mismatch/);
+        // One admission disposition per coordinate, so an inapplicable pair is listed once.
+        const doubledInapplicable = structuredClone(invalid);
+        doubledInapplicable.coverage[0]!.inapplicable.push(structuredClone(doubledInapplicable.coverage[0]!.inapplicable[0]!));
+        expect(() => parseMetamorphicReport(doubledInapplicable)).toThrow(/report\.coverage\[0\]\.inapplicable: duplicate/);
+        // A control error is recorded beside the control entry that produced it.
+        const orphanControlError = structuredClone(report);
+        orphanControlError.tierInvalidReason = { kind: "control-error", controlAErrorReason: "boom", controlBErrorReason: null };
+        expect(() => parseMetamorphicReport(orphanControlError)).toThrow(/report\.tierInvalidReason: control-error-entry-required/);
+        // So is a control disagreement.
+        const orphanDisagreement = structuredClone(report);
+        orphanDisagreement.tierInvalidReason = { kind: "control-disagreement", systemMismatch: true, failedInvariants: [] };
+        expect(() => parseMetamorphicReport(orphanDisagreement)).toThrow(/report\.tierInvalidReason: control-disagreement-entry-required/);
+        // The control id sorts before every product transform id, so the entry belongs at the front. Two control
+        // observations without a tuple are themselves the mismatch, so the root may be null.
+        orphanDisagreement.entries.unshift({
+            scenarioId: orphanDisagreement.entries[0]!.scenarioId, transformId: "baseline-control", transformVersion: 1, seed: 0,
+            kind: "error", error: "tier-invalid: baseline control pair disagreed; product pairs skipped",
+        });
+        expect(orphanDisagreement.system).toBeNull();
+        expect(() => parseMetamorphicReport(orphanDisagreement)).not.toThrow();
+        // Both runners write a coverage row per scenario, so an empty coverage array is not a shape they emit.
+        const uncoveredAll = structuredClone(report);
+        uncoveredAll.entries = [];
+        uncoveredAll.coverage = [];
+        expect(() => parseMetamorphicReport(uncoveredAll)).toThrow(/report\.coverage: coverage-required/);
+        // A deadline report ends before the named role, so a finished green report cannot carry one.
+        const forgedDeadline = structuredClone(report);
+        forgedDeadline.tierInvalidReason = { kind: "deadline-exhausted", nextRole: "derivative" };
+        expect(() => parseMetamorphicReport(forgedDeadline)).toThrow(/report\.tierInvalidReason: deadline-prefix-invalid/);
+        forgedDeadline.tierInvalidReason = { kind: "deadline-exhausted", nextRole: "control-a" };
+        expect(() => parseMetamorphicReport(forgedDeadline)).toThrow(/report\.tierInvalidReason: deadline-prefix-invalid/);
+        // The control coordinate is fixed for every entry kind, not only a scored pair.
+        const strayControlSeed = structuredClone(invalid) as unknown as { entries: Record<string, unknown>[] };
+        expect(strayControlSeed.entries[0]!.transformId).toBe("baseline-control");
+        strayControlSeed.entries[0]!.seed = 5;
+        expect(() => parseMetamorphicReport(strayControlSeed)).toThrow(/report\.entries\[0\]: control-pair-coordinates-invalid/);
+        // selection-empty means nothing was admitted or scored.
+        const falseEmpty = structuredClone(report);
+        falseEmpty.tierInvalidReason = { kind: "selection-empty", reason: "n/a" };
+        expect(() => parseMetamorphicReport(falseEmpty)).toThrow(/report\.tierInvalidReason: selection-empty-with-entries/);
+        // A coordinate is inapplicable, rejected, or admitted, never two of those.
+        const doubleBooked = structuredClone(report);
+        const bookedEntry = doubleBooked.entries.find((entry) => entry.kind === "scored")!;
+        doubleBooked.coverage.find(({ scenarioId }) => scenarioId === bookedEntry.scenarioId)!.inapplicable.push({
+            scenarioId: bookedEntry.scenarioId, transformId: bookedEntry.transformId,
+            transformVersion: bookedEntry.transformVersion, seed: bookedEntry.seed, reason: "n/a",
+        });
+        expect(() => parseMetamorphicReport(doubleBooked)).toThrow(/report\.coverage\[\d+\]\.inapplicable\[\d+\]: entry-conflict/);
+        const duplicateCoverage = structuredClone(invalid);
+        duplicateCoverage.coverage.push(structuredClone(duplicateCoverage.coverage[0]!));
+        expect(() => parseMetamorphicReport(duplicateCoverage)).toThrow(/report\.coverage: duplicate/);
+        const strayInapplicable = structuredClone(invalid);
+        strayInapplicable.coverage[0]!.inapplicable[0]!.scenarioId = "hse-elsewhere";
+        expect(() => parseMetamorphicReport(strayInapplicable))
+            .toThrow(/report\.coverage\[0\]\.inapplicable\[0\]\.scenarioId: coverage-scenario-mismatch/);
+        // The builder sorts each array, so a reordered archive is not a shape it can emit.
+        const reordered = structuredClone(report);
+        expect(reordered.entries.length).toBeGreaterThan(1);
+        reordered.entries.reverse();
+        expect(() => parseMetamorphicReport(reordered)).toThrow(/report\.entries: order-invalid/);
+        const bothNull = structuredClone(invalid) as unknown as { tierInvalidReason: Record<string, unknown> };
+        bothNull.tierInvalidReason = { kind: "control-error", controlAErrorReason: null, controlBErrorReason: null };
+        expect(() => parseMetamorphicReport(bothNull))
+            .toThrow(/report\.tierInvalidReason: control-error-reason-required/);
+        // A control disagreement is recorded only with a cause, and only over the live comparator's invariants.
+        const causeless = structuredClone(invalid) as unknown as { tierInvalidReason: Record<string, unknown> };
+        causeless.tierInvalidReason.systemMismatch = false;
+        causeless.tierInvalidReason.failedInvariants = [];
+        expect(() => parseMetamorphicReport(causeless))
+            .toThrow(/report\.tierInvalidReason: control-disagreement-cause-required/);
+        const foreignInvariant = structuredClone(invalid) as unknown as { tierInvalidReason: Record<string, unknown> };
+        foreignInvariant.tierInvalidReason.failedInvariants = ["verdict-monotonicity"];
+        expect(() => parseMetamorphicReport(foreignInvariant))
+            .toThrow(/report\.tierInvalidReason\.failedInvariants\[0\]: enum-invalid/);
+        // Only the derivative ran a transform, so only it names one.
+        const canaryCoords = structuredClone(invalid) as unknown as { injectionCanaryHits: Record<string, unknown>[] };
+        canaryCoords.injectionCanaryHits[0]!.transformId = "reorder-independent-turns";
+        expect(() => parseMetamorphicReport(canaryCoords))
+            .toThrow(/report\.injectionCanaryHits\[0\]: canary-coordinates-unexpected/);
+        const canarySeed = structuredClone(invalid) as unknown as { injectionCanaryHits: Record<string, unknown>[] };
+        canarySeed.injectionCanaryHits[0]!.role = "derivative";
+        expect(() => parseMetamorphicReport(canarySeed))
+            .toThrow(/report\.injectionCanaryHits\[0\]: canary-coordinates-required/);
         const extraNested = structuredClone(report) as unknown as { entries: Record<string, unknown>[] };
         extraNested.entries[0]!.note = "x";
         expect(() => parseMetamorphicReport(extraNested)).toThrow(/report\.entries\[0\]: fields-invalid/);
         const badReason = structuredClone(invalid) as unknown as { tierInvalidReason: Record<string, unknown> };
         badReason.tierInvalidReason.kind = "tired";
         expect(() => parseMetamorphicReport(badReason)).toThrow(/report\.tierInvalidReason\.kind: enum-invalid/);
+
+        // `holds` is derivable from each invariant's evidence, so a recorded value that disagrees is rejected rather than trusted.
+        const scoredIndex = report.entries.findIndex((entry) => entry.kind === "scored");
+        expect(scoredIndex).toBeGreaterThanOrEqual(0);
+        const flipped = structuredClone(report);
+        const scored = flipped.entries[scoredIndex]!;
+        if (scored.kind !== "scored") throw new Error("unreachable");
+        const verdictEquality = scored.invariants.findIndex((entry) => entry.invariant === "scenario-verdict-equality");
+        const target = scored.invariants[verdictEquality]!;
+        if (target.invariant !== "scenario-verdict-equality") throw new Error("unreachable");
+        target.derivativeVerdict = target.baselineVerdict === "PASS" ? "FAIL" : "PASS";
+        // The flipped evidence leaves `holds` untouched, so the exit code alone cannot see the contradiction.
+        expect(metamorphicExitCode(flipped)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(flipped))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.invariants\\[${verdictEquality}\\]\\.holds: derived-mismatch`));
+
+        // A scored pair whose roles ran different systems cannot isolate the transform, so parsing rejects it.
+        // Only a run-record pair carries tuples, so the raw-output report is relabelled as a live one first.
+        const crossSystem = structuredClone(report);
+        crossSystem.system = systemTuple();
+        relabelScoredAsRunRecord(crossSystem, systemTuple());
+        const crossEntry = crossSystem.entries[scoredIndex]!;
+        if (crossEntry.kind !== "scored") throw new Error("unreachable");
+        crossEntry.derivativeScore.system = {
+            repoCommitSha: "f".repeat(40),
+            bunVersion: "9.9.9",
+            opencodeVersion: "9.9.9",
+            historianModelId: "other-model",
+            probeModelId: "other-probe",
+            parserImpl: "ts",
+            chunkTokenBudget: null,
+        };
+        // Both roles still say PASS and every archived invariant still holds, so the exit code stays green.
+        expect(metamorphicExitCode(crossSystem)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(crossSystem))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: pair-system-mismatch`));
+
+        // The raw-output scorer stamps a null tuple, so a matching pair of forged tuples is still not its output.
+        const forgedTuples = structuredClone(report);
+        const forgedTupleEntry = forgedTuples.entries[scoredIndex]!;
+        if (forgedTupleEntry.kind !== "scored") throw new Error("unreachable");
+        forgedTupleEntry.baselineScore.system = systemTuple();
+        forgedTupleEntry.derivativeScore.system = systemTuple();
+        expect(() => parseMetamorphicReport(forgedTuples))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.baselineScore\\.system: seam-shape-invalid`));
+        // Equal tuples parse, including the null pair this runner produces.
+        expect(report.entries[scoredIndex]).toMatchObject({ baselineScore: { system: null }, derivativeScore: { system: null } });
+        expect(() => parseMetamorphicReport(report)).not.toThrow();
+
+        // A baseline score lifted from another scenario would let one passing bundle stand in for every pair.
+        const unbound = structuredClone(report);
+        const unboundEntry = unbound.entries[scoredIndex]!;
+        if (unboundEntry.kind !== "scored") throw new Error("unreachable");
+        unboundEntry.baselineScore.scenarioId = `${unboundEntry.scenarioId}-other`;
+        expect(metamorphicExitCode(unbound)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(unbound))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.baselineScore\\.scenarioId: pair-scenario-mismatch`));
+
+        // The derivative id is derivable from the pair key, so a score from another pair cannot stand in.
+        const swapped = structuredClone(report);
+        const swappedEntry = swapped.entries[scoredIndex]!;
+        if (swappedEntry.kind !== "scored") throw new Error("unreachable");
+        expect(swappedEntry.derivativeScore.scenarioId).toBe(
+            `${swappedEntry.scenarioId}-d-${swappedEntry.transformId}-v${swappedEntry.transformVersion}-s${swappedEntry.seed}`,
+        );
+        swappedEntry.derivativeScore.scenarioId = `${swappedEntry.derivativeScore.scenarioId}-x`;
+        expect(metamorphicExitCode(swapped)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(swapped))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.derivativeScore\\.scenarioId: pair-scenario-mismatch`));
+
+        // `normalizedSeed` rejects a seed past 32 bits, so the runner records such a coordinate as an error.
+        const wideSeed = structuredClone(report);
+        wideSeed.entries[scoredIndex]!.seed = 0x1_0000_0000;
+        expect(() => parseMetamorphicReport(wideSeed))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.seed: integer-invalid`));
+
+        // Changing both verdicts preserves `holds`; score evidence must still match.
+        const bothSides = structuredClone(report);
+        const bothSidesEntry = bothSides.entries[scoredIndex]!;
+        if (bothSidesEntry.kind !== "scored") throw new Error("unreachable");
+        const equality = bothSidesEntry.invariants.findIndex((entry) => entry.invariant === "scenario-verdict-equality");
+        const both = bothSidesEntry.invariants[equality]!;
+        if (both.invariant !== "scenario-verdict-equality") throw new Error("unreachable");
+        both.baselineVerdict = "ERROR";
+        both.derivativeVerdict = "ERROR";
+        expect(both.holds).toBe(true);
+        expect(metamorphicExitCode(bothSides)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(bothSides))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.invariants\\[${equality}\\]\\.baselineVerdict: score-evidence-mismatch`));
+
+        const duplicated = structuredClone(report);
+        duplicated.entries.push(structuredClone(duplicated.entries[scoredIndex]!));
+        expect(() => parseMetamorphicReport(duplicated)).toThrow(/report\.entries: duplicate/);
+
+        // The control exemption is claimable only at the reserved coordinate.
+        const forgedControl = structuredClone(report);
+        const forgedEntry = forgedControl.entries[scoredIndex]!;
+        forgedEntry.transformId = "baseline-control";
+        forgedEntry.transformVersion = 7;
+        if (forgedEntry.kind !== "scored") throw new Error("unreachable");
+        forgedEntry.derivativeScore.scenarioId = forgedEntry.scenarioId;
+        expect(() => parseMetamorphicReport(forgedControl))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: control-pair-coordinates-invalid`));
+        // Only the live runner emits the control pair, so a raw-output pair cannot claim the exemption.
+        const relabelled = structuredClone(report);
+        const relabelledEntry = relabelled.entries[scoredIndex]!;
+        relabelledEntry.transformId = "baseline-control";
+        relabelledEntry.transformVersion = 1;
+        relabelledEntry.seed = 0;
+        if (relabelledEntry.kind !== "scored") throw new Error("unreachable");
+        relabelledEntry.derivativeScore.scenarioId = relabelledEntry.scenarioId;
+        expect(relabelledEntry.baselineScore.source).toBe("raw-output");
+        expect(() => parseMetamorphicReport(relabelled))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: control-pair-source-invalid`));
+
+        // The pair checks only prove the roles agree with each other, not that they ran the named system.
+        const rootMismatch = structuredClone(report);
+        rootMismatch.system = systemTuple();
+        // A raw-output report publishes no root tuple at all.
+        expect(() => parseMetamorphicReport(rootMismatch)).toThrow(/report\.system: report-system-mismatch/);
+        // Relabelled as a live report, the roles must still name the root's system.
+        relabelScoredAsRunRecord(rootMismatch);
+        // A live report carries its stability control before any product pair.
+        expect(() => parseMetamorphicReport(rootMismatch)).toThrow(/report\.entries: control-pair-required/);
+        const rootEntry = rootMismatch.entries[scoredIndex]!;
+        if (rootEntry.kind !== "scored") throw new Error("unreachable");
+        const otherSystem = { ...systemTuple(), historianModelId: "another-model" };
+        rootEntry.baselineScore.system = otherSystem;
+        rootEntry.derivativeScore.system = otherSystem;
+        rootMismatch.entries.push(controlEntryFrom(rootEntry));
+        rootMismatch.entries.sort((left, right) =>
+            `${left.scenarioId}\u0000${left.transformId}`.localeCompare(`${right.scenarioId}\u0000${right.transformId}`));
+        expect(() => parseMetamorphicReport(rootMismatch)).toThrow(/report\.entries\[\d+\]: report-system-mismatch/);
+        // A run-record score carries the tuple its record was validated with.
+        const nullPairSystem = structuredClone(rootMismatch);
+        for (const entry of nullPairSystem.entries) {
+            if (entry.kind !== "scored") continue;
+            entry.baselineScore.system = null;
+            entry.derivativeScore.system = null;
+        }
+        expect(() => parseMetamorphicReport(nullPairSystem)).toThrow(/report\.entries\[\d+\]: system-required/);
+        // A live report always names the system it ran.
+        const identityless = structuredClone(rootMismatch);
+        identityless.system = null;
+        for (const entry of identityless.entries) {
+            if (entry.kind !== "scored") continue;
+            entry.baselineScore.system = systemTuple();
+            entry.derivativeScore.system = systemTuple();
+        }
+        expect(() => parseMetamorphicReport(identityless)).toThrow(/report\.system: report-system-mismatch/);
+        // A control-role hit names no coverage row, and a null-tuple control observation can carry one, so the
+        // root's system says nothing about it.
+        const controlHit = structuredClone(report);
+        controlHit.injectionCanaryHits.push({ scenarioId: "hse-control", role: "control-a", transformId: null, transformVersion: null, seed: null });
+        expect(() => parseMetamorphicReport(controlHit)).not.toThrow();
+        // Both producers publish violations sorted and deduplicated, and lint diagnostics sorted.
+        const shuffledViolations = structuredClone(report);
+        const violationRow = shuffledViolations.coverage[0]!;
+        violationRow.violations = ["z violation", "a violation"];
+        expect(() => parseMetamorphicReport(shuffledViolations)).toThrow(/report\.coverage\[0\]\.violations: order-invalid/);
+        violationRow.violations = ["a violation", "a violation"];
+        expect(() => parseMetamorphicReport(shuffledViolations)).toThrow(/report\.coverage\[0\]\.violations: duplicate/);
+        const shuffledDiagnostics = structuredClone(invalid);
+        const lintRed = shuffledDiagnostics.entries.find((entry) => entry.kind === "lint-red");
+        if (lintRed?.kind !== "lint-red") throw new Error("unreachable");
+        lintRed.diagnostics = ["d2", "d1"];
+        expect(() => parseMetamorphicReport(shuffledDiagnostics)).toThrow(/report\.entries\[\d+\]\.diagnostics: order-invalid/);
+        // One hit per role per pair, so a repeated hit is a duplicated observation.
+        const doubledHit = structuredClone(report);
+        const hit = { scenarioId: doubledHit.coverage[0]!.scenarioId, role: "baseline" as const, transformId: null, transformVersion: null, seed: 1 };
+        doubledHit.injectionCanaryHits.push(hit, { ...hit });
+        expect(() => parseMetamorphicReport(doubledHit)).toThrow(/report\.injectionCanaryHits: duplicate/);
+        // A canary hit names a covered scenario.
+        const strayHit = structuredClone(report);
+        strayHit.injectionCanaryHits.push({ scenarioId: "hse-nowhere", role: "baseline", transformId: null, transformVersion: null, seed: 1 });
+        expect(() => parseMetamorphicReport(strayHit)).toThrow(/report\.injectionCanaryHits\[0\]: coverage-row-required/);
+        // Every scenario with entries has its coverage row, or its violations could vanish with it.
+        const uncovered = structuredClone(report);
+        const dropped = uncovered.coverage.shift()!;
+        expect(uncovered.entries.some((entry) => entry.scenarioId === dropped.scenarioId)).toBe(true);
+        expect(() => parseMetamorphicReport(uncovered)).toThrow(/report\.entries\[\d+\]: coverage-row-required/);
+        // Each producer emits a fixed invariant set, so dropping a row hides a failure.
+        const missingInvariant = structuredClone(report);
+        const missingEntry = missingInvariant.entries[scoredIndex]!;
+        if (missingEntry.kind !== "scored") throw new Error("unreachable");
+        missingEntry.invariants = missingEntry.invariants.filter(({ invariant }) => invariant !== "injection-set-equality");
+        expect(metamorphicExitCode(missingInvariant)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(missingInvariant))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]\\.invariants: invariant-set-mismatch`));
+
+        // Each producer scores both roles through one path, so a mixed-source pair is unreachable.
+        const mixedSource = structuredClone(report);
+        const mixedEntry = mixedSource.entries[scoredIndex]!;
+        if (mixedEntry.kind !== "scored") throw new Error("unreachable");
+        expect(mixedEntry.baselineScore.source).toBe("raw-output");
+        mixedEntry.derivativeScore.source = "run-record";
+        mixedEntry.derivativeScore.probeVerdicts = [{ probeId: "probe-1", outcome: "pass", expected: "yes", actual: "yes" }];
+        expect(metamorphicExitCode(mixedSource)).toBe(metamorphicExitCode(report));
+        expect(() => parseMetamorphicReport(mixedSource))
+            .toThrow(new RegExp(`report\\.entries\\[${scoredIndex}\\]: pair-source-mismatch`));
+    });
+
+    test("refuses a seed the transforms would reject before building any entry", () => {
+        expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { seeds: [0x1_0000_0000] }))
+            .toThrow(/seed 4294967296 is outside the unsigned 32-bit range/);
+        expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { seeds: [7, 7] })).toThrow(/seed 7 is listed twice/);
+        expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { transforms: [reorder(), reorder()] })).toThrow(/is listed twice/);
+        expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { transforms: [{ ...reorder(), version: 1.5 }] }))
+            .toThrow(/not a non-negative safe integer/);
+        expect(() => runDeterministicMetamorphicEval([corpus()[0]!, corpus()[0]!])).toThrow(/scenario ".*" is listed twice/);
+        expect(() => runDeterministicMetamorphicEval([{ ...corpus()[0]!, id: " " }])).toThrow(/scenario id is blank/);
+        // Two pairs deriving one scenario id would share an entry binding and an artifact directory.
+        expect(() => runDeterministicMetamorphicEval(
+            [{ ...corpus()[0]!, id: "hse-a" }, { ...corpus()[0]!, id: "hse-a-d-b" }],
+            { transforms: [{ ...reorder(), id: "b-d-c" }, { ...reorder(), id: "c" }] },
+        )).toThrow(/derive the same scenario id "hse-a-d-b-d-c-v1-s\d+"/);
+        // A derivative id equal to a selected base id would let that base's score stand in for the derivative.
+        const seed = DETERMINISTIC_SEEDS[0]!;
+        expect(() => runDeterministicMetamorphicEval(
+            [{ ...corpus()[0]!, id: "hse-a" }, { ...corpus()[0]!, id: `hse-a-d-t-v1-s${seed}` }],
+            { transforms: [{ ...reorder(), id: "t", version: 1 }], seeds: [seed] },
+        )).toThrow(/derives the selected scenario id/);
+        expect(() => runDeterministicMetamorphicEval([corpus()[0]!], { transforms: [{ ...reorder(), id: "baseline-control" }] }))
+            .toThrow(/reserved for the control pair/);
     });
 
     test("runs the full corpus deterministically with all invariants green", () => {
@@ -1038,6 +1420,45 @@ describe("live metamorphic control tier", () => {
         expect(report.tierInvalidReason).toEqual({ kind: "deadline-exhausted", nextRole: "control-b" });
         expect(progress.at(-1)?.tierInvalidReason).toEqual(report.tierInvalidReason);
         expect(metamorphicExitCode(report)).toBe(1);
+        expect(parseMetamorphicReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
+    });
+
+    test("a deadline before a product role leaves a scored control and an unfinished coordinate", () => {
+        const live = runDeterministicMetamorphicEval(corpus(), { transforms: [reorder()], seeds: [DETERMINISTIC_SEEDS[0]!] });
+        live.system = systemTuple();
+        relabelScoredAsRunRecord(live, systemTuple());
+        const scoredIndex = live.entries.findIndex((entry) => entry.kind === "scored");
+        const scored = live.entries[scoredIndex]!;
+        if (scored.kind !== "scored") throw new Error("unreachable");
+        live.entries.unshift(controlEntryFrom(scored));
+        live.tierInvalidReason = { kind: "deadline-exhausted", nextRole: "derivative" };
+        // Every applied coordinate has its entry, so nothing was left unfinished.
+        expect(() => parseMetamorphicReport(live)).toThrow(/report\.tierInvalidReason: deadline-prefix-invalid/);
+        // The pair whose derivative the deadline pre-empted has no entry yet.
+        live.entries.splice(scoredIndex + 1, 1);
+        expect(parseMetamorphicReport(JSON.parse(JSON.stringify(live)))).toEqual(live);
+        // A transform that threw during admission leaves an error entry `applied` does not count, so that entry
+        // must not read as the pre-empted pair having finished.
+        const admissionError = structuredClone(live);
+        const preempted = admissionError.coverage.find((row) => row.applied > 0)!;
+        admissionError.entries.push({
+            scenarioId: preempted.scenarioId, transformId: "zzz-throwing-transform", transformVersion: 1, seed: 0,
+            kind: "error", error: "admission threw",
+        });
+        const entryKey = (entry: MetamorphicReportEntry): string =>
+            canonicalJson([entry.scenarioId, entry.transformId, entry.transformVersion, entry.seed]);
+        admissionError.entries.sort((left, right) => compareCodeUnits(entryKey(left), entryKey(right)));
+        expect(() => parseMetamorphicReport(JSON.parse(JSON.stringify(admissionError)))).not.toThrow();
+        // A tier-valid live report ran its controls only because a product pair was admitted, so the control
+        // alone, with every product entry deleted, is not a shape the runner emits.
+        const controlOnly = structuredClone(live);
+        controlOnly.tierInvalidReason = null;
+        controlOnly.entries = controlOnly.entries.filter((entry) => entry.transformId === "baseline-control");
+        for (const row of controlOnly.coverage) {
+            row.applied = 0;
+            row.violations = ["no transforms applied"];
+        }
+        expect(() => parseMetamorphicReport(controlOnly)).toThrow(/report\.entries: product-entry-required/);
     });
 
     test("rejects report destinations that reserve another run's auxiliary names", () => {
@@ -1200,6 +1621,7 @@ describe("live metamorphic control tier", () => {
 
         expect(roles).toEqual([]);
         expect(report.tierInvalidReason).toEqual({ kind: "deadline-exhausted", nextRole: "control-a" });
+        expect(parseMetamorphicReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
     });
 
     test("budgets every declared historian run in a role", () => {

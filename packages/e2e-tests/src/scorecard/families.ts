@@ -1,5 +1,5 @@
-import { aggregateReportQuality, type BenchmarkReport } from "../../../plugin/scripts/retrieval-benchmark/report";
-import { gateAggregates } from "../../../plugin/scripts/retrieval-benchmark/metrics";
+import { aggregateReportQuality } from "../../../plugin/scripts/retrieval-benchmark/report";
+import { gateAggregates, type MacroAggregate } from "../../../plugin/scripts/retrieval-benchmark/metrics";
 import { compareCodeUnits } from "../code-unit-order";
 import type { DreamerEvalRunReport } from "../dreamer-eval/contract";
 import type { LaneReport as HistorianReport } from "../historian-eval/scorer";
@@ -13,13 +13,11 @@ import {
     reasonCode,
     type LaneId,
     type MetricSlotId,
+    type MetricUnit,
     type ScoreFamilyId,
     type SecondaryMetricKey,
 } from "./policy";
-import type { FamilyEstimateRow, MetricSlot, MetricUnit, ScoreFamilySection, UtilitySection } from "./report-contract";
-
-/** The incident-pool family whose cases compare the same scenario across harnesses. */
-export const PARITY_FAMILY_ID = "fam-parity-harness-gaps";
+import { estimateId, interruptedOnThisTarget, type FamilyEstimateRow, type MetricSlot, type ScoreFamilySection, type UtilitySection } from "./report-contract";
 
 const SECONDARY_UNITS: Readonly<Record<SecondaryMetricKey, MetricUnit>> = {
     invalidSuccessRateByArm: "ratio",
@@ -40,16 +38,15 @@ function count(value: number): Reading {
     return { value, unit: "count" };
 }
 
-function mean(values: readonly number[]): number | null {
-    return values.length === 0 ? null : values.reduce((sum, value) => sum + value, 0) / values.length;
-}
-
 type Reader<L extends LaneId> = (report: LaneReports[L], id: MetricSlotId) => Reading;
 
-/** A lane that did not finish contributes only to reliability, so `allowIncomplete` is set by that family alone. */
+/**
+ * A lane that did not finish contributes only to reliability, so `allowIncomplete` is set by that family alone,
+ * and only for a run interrupted on this target: counts from a report that names another build stay unmeasured.
+ */
 function laneSlot<L extends LaneId>(bundle: ScorecardEvidenceBundle, lane: L, allowIncomplete: boolean, read: Reader<L>, id: MetricSlotId): MetricSlot {
     const evidence = laneEvidence(bundle, lane);
-    const usable = evidence.status === "present" || (allowIncomplete && evidence.status === "incomplete");
+    const usable = evidence.status === "present" || (allowIncomplete && interruptedOnThisTarget(evidence));
     if (!usable || evidence.report === null || evidence.reportFingerprint === null) {
         return { id, status: "not-measured", reason: evidence.status === "incomplete" ? "lane-incomplete" : "lane-missing" };
     }
@@ -78,7 +75,7 @@ export function familyEstimateRows(report: PairedDeltaReport): FamilyEstimateRow
     return report.body.analysis.endpoints
         .flatMap((estimate) => estimate.families.map((family): FamilyEstimateRow => ({
             endpoint: estimate.endpoint as FamilyEstimateRow["endpoint"],
-            familyId: family.familyId,
+            familyId: estimateId(family.familyId, "paired-delta.familyId"),
             pointEstimate: family.pointEstimate,
             interval: family.interval,
             noiseLabel: family.noise.label,
@@ -94,12 +91,8 @@ function formationReading(report: HistorianReport, id: MetricSlotId): Reading {
             return ratio(report.aggregate.recall, "no-expected-claims");
         case "false-authoritative-scenario-rate":
             return ratio(report.aggregate.falseAuthoritativeRate, "no-scored-scenarios");
-        case "false-authoritative-memory-rate": {
-            const scored = report.scenarios.filter((scenario) => scenario.verdict !== "ERROR");
-            const visible = scored.reduce((sum, scenario) => sum + scenario.visibleClaimsTotal, 0);
-            const matches = scored.reduce((sum, scenario) => sum + scenario.falseAuthoritativeMatches.length, 0);
-            return visible === 0 ? { reason: "no-visible-claims" } : { value: matches / visible, unit: "ratio" };
-        }
+        // `falseAuthoritativeMatches` lists matched expected-absent predicate ids, and one visible claim can
+        // match several, so the lane report carries no count of offending claims for a per-memory rate.
         default:
             return PENDING;
     }
@@ -107,38 +100,41 @@ function formationReading(report: HistorianReport, id: MetricSlotId): Reading {
 
 const RETRIEVAL_SLOT_RE = /^(recall-at-10|recall-at-50|reciprocal-rank|ndcg-at-10|duplicate-rate-at-50)-(explicit|automatic)$/;
 
-function retrievalReading(report: BenchmarkReport, id: MetricSlotId): Reading {
-    const match = RETRIEVAL_SLOT_RE.exec(id);
-    if (match === null) return PENDING;
-    const metric = match[1]!;
-    const mode = match[2]! as "explicit" | "automatic";
-    if (metric === "duplicate-rate-at-50") {
-        const rates = report.evidence.scenarios
-            .filter((scenario) => scenario.partition === "holdout" && scenario.mode === mode)
-            .map((scenario) => scenario.metrics.duplicateRateAt50)
-            .filter((rate): rate is number => rate !== null);
-        return ratio(mean(rates), "no-holdout-queries");
-    }
-    const aggregate = gateAggregates(aggregateReportQuality(report)).find((entry) => entry.mode === mode);
-    if (aggregate === undefined) return { reason: "no-holdout-queries" };
-    const value = metric === "recall-at-10"
-        ? aggregate.recallAt10
-        : metric === "recall-at-50"
-            ? aggregate.recallAt50
-            : metric === "reciprocal-rank"
-                ? aggregate.mrr
-                : aggregate.ndcgAt10;
-    return ratio(value, "no-holdout-queries");
+const RETRIEVAL_AGGREGATE_FIELDS: Readonly<Record<string, keyof Pick<MacroAggregate, "recallAt10" | "recallAt50" | "mrr" | "ndcgAt10" | "duplicateRateAt50">>> = {
+    "recall-at-10": "recallAt10",
+    "recall-at-50": "recallAt50",
+    "reciprocal-rank": "mrr",
+    "ndcg-at-10": "ndcgAt10",
+    "duplicate-rate-at-50": "duplicateRateAt50",
+};
+
+function retrievalReader(): Reader<"retrieval"> {
+    let aggregates: MacroAggregate[] | undefined;
+    return (report, id) => {
+        const match = RETRIEVAL_SLOT_RE.exec(id);
+        if (match === null) return PENDING;
+        const field = RETRIEVAL_AGGREGATE_FIELDS[match[1]!]!;
+        const mode = match[2]! as "explicit" | "automatic";
+        aggregates ??= gateAggregates(aggregateReportQuality(report));
+        const aggregate = aggregates.find((entry) => entry.mode === mode);
+        if (aggregate === undefined) return { reason: "no-holdout-queries" };
+        // A `null` field on an existing aggregate means the mode's holdout queries define no value for this metric.
+        return ratio(aggregate[field], "metric-undefined");
+    };
 }
 
+// Each reliability reader names every slot it serves; a slot routed to a reader without a case reads
+// `producer-pending` rather than a neighbouring slot's count.
 function pairedDeltaReliability(report: PairedDeltaReport, id: MetricSlotId): Reading {
     switch (id) {
         case "paired-delta-planned-coordinates":
             return count(report.body.runSummary.plannedCoordinates);
         case "paired-delta-healthy-coordinates":
             return count(report.body.runSummary.healthyCoordinates);
-        default:
+        case "paired-delta-excluded-cells":
             return count(report.body.exclusions.reduce((sum, exclusion) => sum + exclusion.count, 0));
+        default:
+            return PENDING;
     }
 }
 
@@ -151,17 +147,20 @@ function incidentReliability(report: IncidentPoolReport, id: MetricSlotId): Read
         case "incident-baseline-mismatches":
             return count(report.results.filter((result) =>
                 result.baseline_comparison === "regression" || result.baseline_comparison === "unexpected_failure").length);
-        default: {
-            const parity = report.results.filter((result) => result.family_id === PARITY_FAMILY_ID);
-            return ratio(mean(parity.map((result) => (result.behavioral_verdict === "pass" ? 1 : 0))), "no-parity-cases");
-        }
+        default:
+            return PENDING;
     }
 }
 
 function dreamerReliability(runs: DreamerEvalRunReport[], id: MetricSlotId): Reading {
-    return id === "dreamer-runs-total"
-        ? count(runs.length)
-        : count(runs.filter((run) => run.status !== "PASS").length);
+    switch (id) {
+        case "dreamer-runs-total":
+            return count(runs.length);
+        case "dreamer-runs-not-passed":
+            return count(runs.filter((run) => run.status !== "PASS").length);
+        default:
+            return PENDING;
+    }
 }
 
 function reliabilitySlot(bundle: ScorecardEvidenceBundle, id: MetricSlotId): MetricSlot {
@@ -173,11 +172,12 @@ function reliabilitySlot(bundle: ScorecardEvidenceBundle, id: MetricSlotId): Met
         case "incident-results-total":
         case "incident-results-unhealthy":
         case "incident-baseline-mismatches":
-        case "cross-harness-parity-pass-rate":
             return laneSlot(bundle, "incident", true, incidentReliability, id);
         case "dreamer-runs-total":
         case "dreamer-runs-not-passed":
             return laneSlot(bundle, "dreamer", true, dreamerReliability, id);
+        // `cross-harness-parity-pass-rate` has no producer: the catalog's parity family holds only
+        // adjudication-only variants, which the incident runner never schedules.
         default:
             return { id, status: "not-measured", reason: "producer-pending" };
     }
@@ -193,6 +193,7 @@ export interface ScoreFamilies {
 
 export function buildScoreFamilies(bundle: ScorecardEvidenceBundle): ScoreFamilies {
     const pairedDelta = laneEvidence(bundle, "paired-delta");
+    const readRetrieval = retrievalReader();
     return {
         utility: {
             ...section("utility", (id) => laneSlot(bundle, "paired-delta", false, utilityReading, id)),
@@ -200,7 +201,7 @@ export function buildScoreFamilies(bundle: ScorecardEvidenceBundle): ScoreFamili
             familyEstimates: pairedDelta.status === "present" && pairedDelta.report !== null ? familyEstimateRows(pairedDelta.report) : [],
         },
         formation: section("formation", (id) => laneSlot(bundle, "historian", false, formationReading, id)),
-        retrieval: section("retrieval", (id) => laneSlot(bundle, "retrieval", false, retrievalReading, id)),
+        retrieval: section("retrieval", (id) => laneSlot(bundle, "retrieval", false, readRetrieval, id)),
         context: section("context", (id) => ({ id, status: "not-measured", reason: "producer-pending" })),
         reliability: section("reliability", (id) => reliabilitySlot(bundle, id)),
     };

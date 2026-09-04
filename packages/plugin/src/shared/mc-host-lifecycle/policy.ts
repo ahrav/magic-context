@@ -779,12 +779,20 @@ export class McHostLifecyclePolicy {
                 compatible.checks.map((check) => [check.id, check] as const),
             );
             const addCheck = (
-                id: "readiness.transport" | "readiness.storage" | "readiness.synapse",
+                id:
+                    | "readiness.transport"
+                    | "readiness.storage"
+                    | "readiness.synapse"
+                    | "readiness.kernel",
                 record: NonNullable<DaemonReadiness[keyof DaemonReadiness]>,
             ): void => {
+                // A `ready` component with a non-healthy reason is degraded but
+                // still serving, so it warns rather than fails.
                 const status =
                     record.state === "ready"
-                        ? "pass"
+                        ? record.reason === "healthy"
+                            ? "pass"
+                            : "warn"
                         : record.state === "unsupported"
                           ? "skip"
                           : "fail";
@@ -803,6 +811,9 @@ export class McHostLifecyclePolicy {
             }
             if (observed.readiness.synapse) {
                 addCheck("readiness.synapse", observed.readiness.synapse);
+            }
+            if (observed.readiness.kernel) {
+                addCheck("readiness.kernel", observed.readiness.kernel);
             }
             const checks = [...checksById.values()].sort((left, right) =>
                 left.id.localeCompare(right.id),
