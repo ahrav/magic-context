@@ -75,6 +75,10 @@ pub const FINISH_WORKING_BYTES_MAX: u64 = 2 * MAX_STAGED_BYTES;
 /// neither the staging budget nor any upload, so concurrent page requests
 /// are bounded here. Enough for one page per pending upload at once.
 pub const PAGE_DECODE_BYTES_MAX: u64 = PAGE_BYTES_MAX * MAX_PENDING_UPLOADS as u64;
+/// Page jobs in flight across every route. A tiny page charges almost no
+/// bytes but still holds a blocking-pool worker and its frame, so the count is
+/// bounded on its own: four concurrent pages per pending upload.
+pub const PAGE_DECODE_JOBS_MAX: usize = 4 * MAX_PENDING_UPLOADS;
 /// Uploads are evicted after this idle interval.
 pub const UPLOAD_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 const MAX_UPLOAD_ID_BYTES: usize = 128;
@@ -261,6 +265,9 @@ pub(crate) struct UploadCoordinator {
     /// Decoded page bytes currently in flight, bounded by `decode_max`.
     decoding_bytes: u64,
     decode_max: u64,
+    /// Page jobs currently in flight, bounded by `decode_jobs_max`.
+    decoding_jobs: usize,
+    decode_jobs_max: usize,
 }
 
 impl Default for UploadCoordinator {
@@ -273,6 +280,8 @@ impl Default for UploadCoordinator {
             next_generation: 1,
             decoding_bytes: 0,
             decode_max: PAGE_DECODE_BYTES_MAX,
+            decoding_jobs: 0,
+            decode_jobs_max: PAGE_DECODE_JOBS_MAX,
         }
     }
 }
@@ -379,12 +388,16 @@ impl UploadCoordinator {
         self.budget.release(bytes);
     }
 
-    /// Admits `bytes` of page decoding when the in-flight total stays under
-    /// the cap.
+    /// Admits one page job of `bytes` when both the in-flight byte total and
+    /// the job count stay under their caps.
     fn reserve_decode(&mut self, bytes: u64) -> bool {
+        if self.decoding_jobs >= self.decode_jobs_max {
+            return false;
+        }
         match self.decoding_bytes.checked_add(bytes) {
             Some(total) if total <= self.decode_max => {
                 self.decoding_bytes = total;
+                self.decoding_jobs += 1;
                 true
             }
             _ => false,
@@ -393,6 +406,7 @@ impl UploadCoordinator {
 
     fn release_decode(&mut self, bytes: u64) {
         self.decoding_bytes = self.decoding_bytes.saturating_sub(bytes);
+        self.decoding_jobs = self.decoding_jobs.saturating_sub(1);
     }
 
     /// An upload already handed out by `take_complete` is no longer in the
@@ -1297,9 +1311,10 @@ mod tests {
     }
 
     #[test]
-    fn page_decoding_is_bounded_and_released_exactly() {
+    fn page_decoding_is_bounded_by_bytes_and_by_jobs_and_released_exactly() {
         let mut uploads = UploadCoordinator {
             decode_max: 10,
+            decode_jobs_max: 3,
             ..UploadCoordinator::default()
         };
         assert!(uploads.reserve_decode(6));
@@ -1311,6 +1326,12 @@ mod tests {
         assert!(!uploads.reserve_decode(1));
         uploads.release_decode(10);
         assert!(uploads.reserve_decode(10));
+        // Two jobs are in flight; the third fits and a fourth is refused even
+        // at zero bytes.
+        assert!(uploads.reserve_decode(0));
+        assert!(!uploads.reserve_decode(0));
+        uploads.release_decode(0);
+        assert!(uploads.reserve_decode(0));
     }
 
     #[test]

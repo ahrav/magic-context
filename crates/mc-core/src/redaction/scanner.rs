@@ -207,6 +207,7 @@ fn render_sorted(
             .map(|replacement| replacement.replacement.len())
             .sum::<usize>();
     let mut text = String::with_capacity(bound);
+    let reserved = text.capacity();
     let mut detections = Vec::with_capacity(replacements.len());
     let mut cursor = 0;
     let mut index = 0;
@@ -240,7 +241,7 @@ fn render_sorted(
         index = next;
     }
     text.push_str(input.get(cursor..).ok_or_else(invalid_span)?);
-    debug_assert!(text.capacity() == bound, "rendering must not reallocate");
+    debug_assert!(text.capacity() == reserved, "rendering must not reallocate");
     Ok(Redaction { text, detections })
 }
 
@@ -268,10 +269,11 @@ mod tests {
                 replacement: "<REDACTED:secret>".to_owned(),
             })
             .collect();
-        let bound = input.len() + 64 * "<REDACTED:secret>".len();
+        // The debug assertion inside `render_sorted` is what proves the buffer
+        // never reallocated; the output length shows the bound was needed.
         let redaction = render(&input, replacements).unwrap();
         assert_eq!(redaction.text.len(), 64 * "<REDACTED:secret>".len());
-        assert_eq!(redaction.text.capacity(), bound);
+        assert!(redaction.text.len() > input.len());
         assert_eq!(redaction.detections.len(), 64);
     }
 
