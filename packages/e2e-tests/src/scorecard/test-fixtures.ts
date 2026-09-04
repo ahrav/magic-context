@@ -255,10 +255,21 @@ export function metamorphicReportFixture(options: {
     coveredScenarioIds?: readonly string[];
     injectionCanaryHits?: MetamorphicReport["injectionCanaryHits"];
     tierInvalidReason?: MetamorphicReport["tierInvalidReason"];
+    /** The raw-output scoring seam publishes no system tuple, runs no control pair, and reports two extra invariants. */
+    source?: ScenarioScore["source"];
 } = {}): MetamorphicReport {
     const covered = options.coveredScenarioIds ?? CANARY_SCENARIO_IDS;
+    const source = options.source ?? "run-record";
+    const score = (scenarioId: string): ScenarioScore =>
+        source === "run-record" ? scenarioScoreFixture(scenarioId) : scenarioScoreFixture(scenarioId, { system: null, source, probeVerdicts: [] });
     const invariants = () => [
         { invariant: "injection-set-equality" as const, holds: true, changes: [] },
+        ...(source === "raw-output"
+            ? [
+                { invariant: "expected-absent-empty" as const, holds: true, baselineMatches: [], derivativeMatches: [] },
+                { invariant: "verdict-monotonicity" as const, holds: true, baselineVerdict: "PASS" as const, derivativeVerdict: "PASS" as const, introducedFailReasons: [] },
+            ]
+            : []),
         { invariant: "expectation-predicate-equality" as const, holds: true, changedExpectationIds: [] },
         { invariant: "false-authoritative-set-equality" as const, holds: true, baselineMatches: [], derivativeMatches: [] },
         { invariant: "scenario-verdict-equality" as const, holds: true, baselineVerdict: "PASS" as const, derivativeVerdict: "PASS" as const },
@@ -269,11 +280,11 @@ export function metamorphicReportFixture(options: {
             const product = {
                 ...pair,
                 kind: "scored" as const,
-                baselineScore: scenarioScoreFixture(scenarioId),
-                derivativeScore: scenarioScoreFixture(derivativeScenarioId(pair)),
+                baselineScore: score(scenarioId),
+                derivativeScore: score(derivativeScenarioId(pair)),
                 invariants: invariants(),
             };
-            return index === 0
+            return index === 0 && source === "run-record"
                 ? [{
                     scenarioId,
                     transformId: "baseline-control" as const,
@@ -289,7 +300,7 @@ export function metamorphicReportFixture(options: {
         coverage: covered.map((scenarioId) => ({ scenarioId, applied: 1, inapplicable: [], violations: [] })),
         injectionCanaryHits: options.injectionCanaryHits ?? [],
         tierInvalidReason: options.tierInvalidReason ?? null,
-        system: HISTORIAN_SYSTEM,
+        system: source === "run-record" ? HISTORIAN_SYSTEM : null,
     });
 }
 

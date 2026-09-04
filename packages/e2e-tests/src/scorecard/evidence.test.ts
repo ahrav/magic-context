@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import type { BenchmarkReport } from "../../../plugin/scripts/retrieval-benchmark/report";
+import { parseMetamorphicReport } from "../metamorphic-eval/report";
 import type { PolicyOwnerDocument } from "../prospective-holdout/contract";
 import { laneEvidence, loadEvidenceBundle, type EvidenceSources } from "./evidence";
 import { LANE_IDS, ScorecardContractError } from "./policy";
@@ -110,6 +111,15 @@ describe("loadEvidenceBundle", () => {
         const bundle = loadEvidenceBundle(tree({ lanes: { "paired-delta": pairedDeltaReportFixture({ runSummary: { evidenceComplete: false } }) } }));
         expect(laneEvidence(bundle, "paired-delta")).toMatchObject({ diagnostics: ["run-incomplete"] });
         expect(laneEvidence(bundle, "paired-delta").report).not.toBeNull();
+    });
+
+    it("rejects a metamorphic report from the raw-output scoring seam", () => {
+        // The raw-output seam scores without a system tuple; the live producer always publishes one.
+        const rawMetamorphic = metamorphicReportFixture({ source: "raw-output" });
+        expect(rawMetamorphic.system).toBeNull();
+        expect(() => parseMetamorphicReport(rawMetamorphic)).not.toThrow();
+        const bundle = loadEvidenceBundle(tree({ lanes: { metamorphic: rawMetamorphic } }));
+        expect(laneEvidence(bundle, "metamorphic")).toMatchObject({ status: "schema-mismatch", diagnostics: ["producer-mismatch"], report: null });
     });
 
     it("lowers paired-delta to incomplete when the estimator found too few analyzable families", () => {

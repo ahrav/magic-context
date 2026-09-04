@@ -155,6 +155,15 @@ function contradictionReasons(parsed: ParsedLane): string[] {
     return computeRetrievalReportStatus({ expectedQueryIds: [], scenarios, attempts }) === "invalid" ? ["report-parse-failed"] : [];
 }
 
+/**
+ * The metamorphic lane is the live run. Its producer resolves a system tuple before it scores, while the raw-output
+ * scoring seam publishes none, so a report without a system did not come from the lane. The historian parser
+ * already refuses raw-output scores itself.
+ */
+function producerReasons(parsed: ParsedLane): string[] {
+    return parsed.lane === "metamorphic" && parsed.report.system === null ? ["producer-mismatch"] : [];
+}
+
 /** The report's binding fields must name the paired-delta policy the scorecard policy pinned, and that policy's pool. */
 function pairedDeltaBindingReasons(report: PairedDeltaReport, policy: ScorecardPolicy, pairedDeltaPolicy: PairedDeltaPolicyView): string[] {
     const bound = report.body.policyFingerprint === policy.pairedDeltaPolicyFingerprint
@@ -268,6 +277,7 @@ function loadLane(required: RequiredLane, policy: ScorecardPolicy, pairedDeltaPo
     const identity = observedIdentity(parsed);
     const rejectedReasons = [
         ...contradictionReasons(parsed),
+        ...producerReasons(parsed),
         ...(parsed.lane === "paired-delta" ? pairedDeltaBindingReasons(parsed.report, policy, pairedDeltaPolicy) : []),
     ];
     if (rejectedReasons.length > 0) return rejected("schema-mismatch", rejectedReasons, reportFingerprint, identity);
