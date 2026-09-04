@@ -344,7 +344,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                             <box marginTop={1}>
                                 <text fg={t().text}><b>Memory</b></text>
                             </box>
-                            <R t={t()} l="Active" v={String(s().memoryCount)} fg={t().accent} />
+                            <R t={t()} l="Active" v={s().memoryState && s().memoryState !== "available" ? String(s().memoryState) : String(s().memoryCount)} fg={s().memoryState && s().memoryState !== "available" ? t().warning : t().accent} />
                             <R t={t()} l="Injected" v={String(s().memoryBlockCount)} fg={t().textMuted} />
                         </box>
                         <box flexDirection="column" flexGrow={1} flexBasis={0}>

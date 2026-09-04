@@ -259,14 +259,22 @@ export interface ExecuteCtxMemoryArgs {
 async function readMemoryRows(
     client: KernelClient,
     signal?: AbortSignal,
-): Promise<{ ok: true; rows: ReadRow[]; knownAsOf: number } | { ok: false; state: MemoryState }> {
+): Promise<
+    | { ok: true; rows: ReadRow[]; knownAsOf: number; truncated: boolean }
+    | { ok: false; state: MemoryState }
+> {
     const read = await client.read({
         surface: "explicit_search",
         gated: false,
         ...(signal ? { signal } : {}),
     });
     if (!isAvailable(read)) return { ok: false, state: read.state };
-    return { ok: true, rows: read.rows.filter(isMemoryDecisionRow), knownAsOf: read.known_as_of };
+    return {
+        ok: true,
+        rows: read.rows.filter(isMemoryDecisionRow),
+        knownAsOf: read.known_as_of,
+        truncated: read.truncated,
+    };
 }
 
 /** An anti-memory predecessor's summary is parsed back into an `antiMemory` payload — never inherited as `content` — because `assertCtxMemoryWriteShape` requires the payload arm for the anti-memory category. commentlint: allow(JUDGE) */
@@ -315,6 +323,51 @@ function withAntiMemoryExpiry(args: CtxMemoryArgs): CtxMemoryArgs {
     return { ...args, antiMemory: { ...args.antiMemory, expiresAt } };
 }
 
+/** Replay recovery answers "already applied" only when the request's content matches the row this identity already wrote: a caller-supplied summary must equal the stored one byte for byte, and an anti-memory must re-render to the stored payload under the stored expiry, so changed content still surfaces the daemon's `operation_key_reused` rejection. commentlint: allow(JUDGE) */
+function replayMatchesRow(args: CtxMemoryArgs, row: ReadRow): boolean {
+    const decision = row.decision;
+    if (!decision) return false;
+    if (args.antiMemory) {
+        try {
+            const stored = parseAntiMemoryContent(decision.payload.summary);
+            const rendered = renderAntiMemoryContent({
+                ...args.antiMemory,
+                expiresAt: stored.expiresAt ?? null,
+            });
+            return rendered === decision.payload.summary;
+        } catch {
+            return false;
+        }
+    }
+    if (args.content !== undefined) return decision.payload.summary === args.content.trim();
+    return true;
+}
+
+/** The row a redelivered revise or merge already wrote: the successor id derives from the write identity, so its presence while a named target is gone proves this exact tool call committed. `null` keeps the ordinary visibility error. commentlint: allow(JUDGE) */
+function redeliveredSuccessor(
+    args: CtxMemoryArgs,
+    identity: CtxMemoryWriteIdentity,
+    rows: readonly ReadRow[],
+    targets: readonly string[],
+): ReadRow | null {
+    const present = new Set(rows.map((row) => row.object.object_id));
+    if (targets.every((id) => present.has(id))) return null;
+    const successor = rows.find((row) => row.object.object_id === derivedId("mem", identity, 0));
+    if (!successor || !replayMatchesRow(args, successor)) return null;
+    return successor;
+}
+
+function renderReplayedOutcome(action: CtxMemoryAction, row: ReadRow, knownAsOf: number): string {
+    return JSON.stringify({
+        action,
+        outcome: "already applied",
+        commitSeq: row.object.created_commit_seq,
+        knownAsOf,
+        objectId: row.object.object_id,
+        objects: [row.object.object_id],
+    });
+}
+
 export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<string> {
     const { client, action, identity, actor, sourceKind, signal } = input;
     const args = withAntiMemoryExpiry(input.args);
@@ -346,6 +399,7 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
                 knownAsOf: read.knownAsOf,
                 memories: found.map(memoryView),
                 missingObjectIds: wanted.filter((id) => !foundIds.has(id)),
+                ...(read.truncated ? { truncated: true } : {}),
             });
         }
         const category = args.category?.trim();
@@ -359,6 +413,7 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
             action,
             knownAsOf: read.knownAsOf,
             memories: listed.map(memoryView),
+            ...(read.truncated ? { truncated: true } : {}),
         });
     }
 
@@ -383,15 +438,8 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
             const existing = read.ok
                 ? read.rows.find((row) => row.object.object_id === spec.object_id)
                 : undefined;
-            if (read.ok && existing) {
-                return JSON.stringify({
-                    action,
-                    outcome: "already applied",
-                    commitSeq: existing.object.created_commit_seq,
-                    knownAsOf: read.knownAsOf,
-                    objectId: spec.object_id,
-                    objects: [spec.object_id],
-                });
+            if (read.ok && existing && replayMatchesRow(args, existing)) {
+                return renderReplayedOutcome(action, existing, read.knownAsOf);
             }
         }
         return renderCommit(action, result, [], spec.object_id);
@@ -418,6 +466,8 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         const target = requireTarget(args);
         const read = await readMemoryRows(client, signal);
         if (!read.ok) return renderCtxMemoryStateText(read.state, [target]);
+        const replayed = redeliveredSuccessor(args, identity, read.rows, [target]);
+        if (replayed) return renderReplayedOutcome(action, replayed, read.knownAsOf);
         const predecessors = requireVisible(read.rows, [target]);
         const merged = revisionArgs(args, predecessors);
         assertCtxMemoryWriteShape({ ...merged, action: "revise" });
@@ -447,6 +497,8 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
     }
     const read = await readMemoryRows(client, signal);
     if (!read.ok) return renderCtxMemoryStateText(read.state, targets);
+    const replayed = redeliveredSuccessor(args, identity, read.rows, targets);
+    if (replayed) return renderReplayedOutcome(action, replayed, read.knownAsOf);
     const predecessors = requireVisible(read.rows, targets);
     const predecessorCategory = requireMergeableCategory(predecessors);
     const merged = revisionArgs(args, predecessors);

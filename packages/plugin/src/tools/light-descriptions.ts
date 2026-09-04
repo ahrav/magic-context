@@ -6,4 +6,4 @@ export const CTX_NOTE_LIGHT_DESCRIPTION = `For ctx_note users, write saves, read
 
 export const CTX_MEMORY_LIGHT_DESCRIPTION = `For ctx_memory users, create one durable project claim with category and content; revise, archive, or merge claims by opaque object id, or get up to twenty object ids. No token is passed; revise and merge return the survivor's id. list remains dreamer-only, so primary agents must NEVER assume bulk-list access.`;
 
-export const CTX_SEARCH_LIGHT_DESCRIPTION = `For ctx_search users, retrieve compacted messages, commits, and notes. Broad project-memory retrieval is disabled until the claim retrieval projection is active; exact public claim or revision locators resolve directly. Message hits continue through ctx_expand.`;
+export const CTX_SEARCH_LIGHT_DESCRIPTION = `For ctx_search users, retrieve compacted messages, commits, notes, and project memories, including rejected-approach warnings. A query that is entirely memory object ids (\`mem_<32hex>\`) resolves those memories directly; other queries rank by text. Message hits continue through ctx_expand.`;

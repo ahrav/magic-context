@@ -95,7 +95,10 @@ export function memoryResultFromRow(
     }
     return {
         source: "memory",
-        content: decision?.payload.summary ?? "",
+        // `rowText` ranks the rationale, so the rationale renders too; a hit matched only in the rationale would otherwise display none of the matched terms and read as unrelated. commentlint: allow(JUDGE)
+        content: decision?.payload.rationale
+            ? `${decision.payload.summary}\n${decision.payload.rationale}`
+            : (decision?.payload.summary ?? ""),
         score,
         publicClaimId: row.object.object_id,
         revisionLocator,

@@ -17,7 +17,7 @@ import {
 } from "../../features/magic-context/search-bounds";
 import { getVisibleRevisionLocators } from "../../hooks/magic-context/inject-compartments";
 import { recordKernelMemoryRetrievals } from "../../hooks/magic-context/kernel-claim-usage";
-import { isAvailable, renderToolStateText } from "../../shared/kernel-client";
+import { disabled, isAvailable, renderToolStateText } from "../../shared/kernel-client";
 import { parseObjectIdQuery, searchKernelMemoryRows } from "./kernel-memory-search";
 import { normalizeCtxSearchArgs, prepareQueryFromNormalizedArgs } from "./query-input";
 import { type ExplicitDeliveryReason, packSearchResults } from "./render";
@@ -150,6 +150,12 @@ export async function executeCtxSearch(
     );
     let memoryNote: string | undefined;
     let memoryResults: UnifiedSearchResult[] = [];
+    if (!memoryEnabled && memoryOnly) {
+        return {
+            status: "invalid",
+            text: `Error: ${renderToolStateText(disabled())}`,
+        };
+    }
     if (memoryEnabled && memorySourceAllowed) {
         const client = deps.kernelClient({
             sessionId: toolContext.sessionID,

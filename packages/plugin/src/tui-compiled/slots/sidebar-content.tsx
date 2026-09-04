@@ -863,12 +863,12 @@ const SidebarContent = props => {
             _$setProp(_el$60, "justifyContent", "space-between");
             _$insertNode(_el$61, _$createTextNode(`Memories`));
             _$insert(_el$63, (() => {
-              var _c$11 = _$memo(() => (s()?.memoryBlockCount ?? 0) > 0);
-              return () => _c$11() ? `${s().memoryBlockCount}/${s()?.memoryCount ?? 0}` : String(s()?.memoryCount ?? 0);
+              var _c$11 = _$memo(() => !!(s()?.memoryState && s()?.memoryState !== "available"));
+              return () => _c$11() ? String(s().memoryState) : _$memo(() => (s()?.memoryBlockCount ?? 0) > 0)() ? `${s().memoryBlockCount}/${s()?.memoryCount ?? 0}` : String(s()?.memoryCount ?? 0);
             })());
             _$effect(_p$ => {
               var _v$15 = props.theme.textMuted,
-                _v$16 = props.theme.textMuted;
+                _v$16 = s()?.memoryState && s()?.memoryState !== "available" ? props.theme.warning : props.theme.textMuted;
               _v$15 !== _p$.e && (_p$.e = _$setProp(_el$61, "fg", _v$15, _p$.e));
               _v$16 !== _p$.t && (_p$.t = _$setProp(_el$63, "fg", _v$16, _p$.t));
               return _p$;
@@ -995,7 +995,7 @@ const SidebarContent = props => {
         },
         label: "Memories",
         get value() {
-          return String(s()?.memoryCount ?? 0);
+          return _$memo(() => !!(s()?.memoryState && s()?.memoryState !== "available"))() ? String(s().memoryState) : String(s()?.memoryCount ?? 0);
         },
         accent: true
       }), _$memo(() => _$memo(() => (s()?.memoryBlockCount ?? 0) > 0)() && _$createComponent(StatRow, {

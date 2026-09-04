@@ -196,7 +196,9 @@ export async function executeAutoSearchDelivery(args: {
         return emptyDelivery(emptyReason(timed.memory), results);
     }
     if (results[0].score < args.scoreThreshold) {
-        return emptyDelivery("below-threshold", results);
+        // A withheld memory lane overrides `below-threshold`: the memory reasons stay retryable after the daemon recovers, while `below-threshold` persists a completed no-hint decision. commentlint: allow(JUDGE)
+        const reason = emptyReason(timed.memory);
+        return emptyDelivery(reason === "empty" ? "below-threshold" : reason, results);
     }
     const packed = packAutoSearchHint(results, {
         warningScoreThreshold: args.scoreThreshold,

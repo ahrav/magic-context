@@ -679,10 +679,10 @@ const StatusDialog = props => {
           },
           l: "Active",
           get v() {
-            return String(s().memoryCount);
+            return _$memo(() => !!(s().memoryState && s().memoryState !== "available"))() ? String(s().memoryState) : String(s().memoryCount);
           },
           get fg() {
-            return t().accent;
+            return _$memo(() => !!(s().memoryState && s().memoryState !== "available"))() ? t().warning : t().accent;
           }
         }), null);
         _$insert(_el$47, _$createComponent(R, {
