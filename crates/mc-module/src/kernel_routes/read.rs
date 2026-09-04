@@ -79,11 +79,18 @@ pub(crate) fn read_visible(
         .filter(|row| row.object.object_kind == "decision")
         .map(|row| row.object.object_id.clone())
         .collect();
-    let decisions = store
+    let decisions: HashMap<String, DecisionRow> = store
         .decisions_for_objects_as_of(&decision_ids, visible.known_as_of)?
         .into_iter()
         .map(|decision| (decision.object_id.clone(), decision))
         .collect();
+    // A visible decision-kind row without its typed decision row at the same snapshot is a
+    // canonical-integrity break. Serving it with `decision: null` would be indistinguishable
+    // from a non-decision row and silently drop it from memory surfaces, so the read fails
+    // closed instead.
+    if decision_ids.iter().any(|id| !decisions.contains_key(id)) {
+        return Err(KernelError::CorruptCanonicalRow);
+    }
     Ok(ReadResponse {
         known_as_of: visible.known_as_of,
         tip: visible.tip,

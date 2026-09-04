@@ -73,7 +73,7 @@ impl KernelStore {
     ///
     /// Object IDs are queried in chunks of [`DECISION_LOOKUP_CHUNK`] to stay within SQLite's bound-variable limit.
     /// Every chunk runs in the same deferred transaction, so all rows share one database view.
-    /// Rows are ordered by `decision_id` within a chunk only.
+    /// Result order is unspecified; callers key rows by `object_id`.
     /// An empty id list returns an empty vector without opening a transaction.
     ///
     /// Returns [`KernelError::InvalidInput`] for a negative sequence,
@@ -102,9 +102,9 @@ impl KernelStore {
     }
 }
 
-/// Upper bound on `object_id` placeholders per `IN (...)` query; SQLite's compiled-in limit on
-/// bound variables is 999 on older builds and 32766 on current ones, and one slot is taken by
-/// the sequence parameter.
+/// Upper bound on `object_id` placeholders per `IN (...)` query. The bundled SQLite build
+/// permits 32766 bound variables, one of which carries the sequence parameter; 500 is a
+/// deliberate margin under that limit, not a hard constraint.
 const DECISION_LOOKUP_CHUNK: usize = 500;
 
 /// Loads one snapshot from the caller's transaction so tip and rows share a database view.
@@ -181,8 +181,7 @@ fn load_decisions_for_objects(
          FROM decisions
          WHERE created_commit_seq<=?1
            AND (invalidated_commit_seq IS NULL OR ?1<invalidated_commit_seq)
-           AND object_id IN ({placeholders})
-         ORDER BY decision_id"
+           AND object_id IN ({placeholders})"
     );
     let mut statement = tx.prepare(&sql).map_err(|_| KernelError::Io)?;
     let params = std::iter::once(rusqlite::types::Value::Integer(requested)).chain(
