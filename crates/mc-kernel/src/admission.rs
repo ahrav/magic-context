@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "ea6a55eb504fd2f30dcb0ed14623ba64b4c19f9ee6e55eea726c02bc5c250abd";
+    "e12c7a76b5ac76f2ca20cae5ce2c3c1b62905157073068879354ec7ec0e0b17b";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -2036,43 +2036,53 @@ fn validate_trigger(
 }
 
 // policy-digest:serving-start
-/// Column names for one decision's group in the serving read, so `decided_row`
-/// does not rebuild them per row.
+/// Column positions of one decision's group in the serving read's SELECT, so
+/// `decided_row` indexes the row instead of matching column names.
 struct DecidedColumns {
-    maturity: &'static str,
-    effective_maturity: &'static str,
-    disposition: &'static str,
-    visibility: &'static str,
-    taint_class: &'static str,
-    source_class: &'static str,
-    sensitivity_class: &'static str,
-    policy_revision: &'static str,
-    approval_object_id: &'static str,
+    maturity: usize,
+    effective_maturity: usize,
+    disposition: usize,
+    visibility: usize,
+    taint_class: usize,
+    source_class: usize,
+    policy_revision: usize,
+    sensitivity_class: usize,
+    approval_object_id: usize,
 }
 
-const OWN_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
-    maturity: "d_maturity",
-    effective_maturity: "d_effective_maturity",
-    disposition: "d_disposition",
-    visibility: "d_visibility",
-    taint_class: "d_taint_class",
-    source_class: "d_source_class",
-    sensitivity_class: "d_sensitivity_class",
-    policy_revision: "d_policy_revision",
-    approval_object_id: "d_approval_object_id",
-};
+impl DecidedColumns {
+    const fn starting_at(first: usize) -> Self {
+        Self {
+            maturity: first,
+            effective_maturity: first + 1,
+            disposition: first + 2,
+            visibility: first + 3,
+            taint_class: first + 4,
+            source_class: first + 5,
+            policy_revision: first + 6,
+            sensitivity_class: first + 7,
+            approval_object_id: first + 8,
+        }
+    }
+}
 
-const LINEAGE_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
-    maturity: "s_maturity",
-    effective_maturity: "s_effective_maturity",
-    disposition: "s_disposition",
-    visibility: "s_visibility",
-    taint_class: "s_taint_class",
-    source_class: "s_source_class",
-    sensitivity_class: "s_sensitivity_class",
-    policy_revision: "s_policy_revision",
-    approval_object_id: "s_approval_object_id",
-};
+const OWN_DECISION_COLUMNS: DecidedColumns = DecidedColumns::starting_at(10);
+const LINEAGE_DECISION_COLUMNS: DecidedColumns = DecidedColumns::starting_at(19);
+const ACCEPTED_DECISION_COLUMN: usize = 28;
+const HISTORY_SENSITIVITY_COLUMN: usize = 29;
+const OWN_HISTORY_INCONSISTENT_COLUMN: usize = 30;
+const SCOPE_ID_COLUMN: usize = 31;
+
+/// A text column borrowed from the row, `None` for SQL NULL.
+fn text_column<'r>(row: &'r rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<&'r str>> {
+    row.get_ref(index)?.as_str_or_null().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
 
 /// The strongest surface a single stored decision can justify, its sensitivity
 /// ceiling, and whether the row could be interpreted at all. `None` when the
@@ -2081,20 +2091,16 @@ fn decided_row(
     row: &rusqlite::Row<'_>,
     columns: &DecidedColumns,
 ) -> rusqlite::Result<Option<(VisibilityRow, Sensitivity, bool)>> {
-    let accepted_decision = row.get::<_, bool>("accepted_decision")?;
+    let accepted_decision = row.get::<_, bool>(ACCEPTED_DECISION_COLUMN)?;
     let Some(revision) = row.get::<_, Option<i64>>(columns.policy_revision)? else {
         return Ok(None);
     };
-    let taint = row
-        .get::<_, Option<String>>(columns.taint_class)?
-        .and_then(|value| TaintClass::try_from(value.as_str()).ok());
-    let source = row
-        .get::<_, Option<String>>(columns.source_class)?
-        .and_then(|value| SourceClass::try_from(value.as_str()).ok());
-    let sensitivity = Sensitivity::from_stored(
-        &row.get::<_, Option<String>>(columns.sensitivity_class)?
-            .unwrap_or_default(),
-    );
+    let taint =
+        text_column(row, columns.taint_class)?.and_then(|value| TaintClass::try_from(value).ok());
+    let source =
+        text_column(row, columns.source_class)?.and_then(|value| SourceClass::try_from(value).ok());
+    let sensitivity =
+        Sensitivity::from_stored(text_column(row, columns.sensitivity_class)?.unwrap_or_default());
     // A newer revision may attach meanings this binary cannot see, and a pairing
     // the evaluator forbids can only be corruption or an out-of-band write.
     let interpretable = revision <= POLICY_REVISION
@@ -2106,18 +2112,14 @@ fn decided_row(
         return Ok(Some((VisibilityRow::AuditOnly, Sensitivity::Secret, false)));
     }
     let floor = taint.map_or(Sensitivity::Secret, sensitivity_floor);
-    let stored = row
-        .get::<_, Option<String>>(columns.visibility)?
-        .and_then(|value| VisibilityRow::try_from(value.as_str()).ok());
-    let historical = row
-        .get::<_, Option<String>>(columns.maturity)?
-        .and_then(|value| Maturity::try_from(value.as_str()).ok());
-    let approval = row.get::<_, Option<String>>(columns.approval_object_id)?;
+    let stored =
+        text_column(row, columns.visibility)?.and_then(|value| VisibilityRow::try_from(value).ok());
+    let historical =
+        text_column(row, columns.maturity)?.and_then(|value| Maturity::try_from(value).ok());
+    let approval = text_column(row, columns.approval_object_id)?;
     let expected = match (
-        row.get::<_, Option<String>>(columns.effective_maturity)?
-            .map(|value| Maturity::try_from(value.as_str())),
-        row.get::<_, Option<String>>(columns.disposition)?
-            .map(|value| Disposition::try_from(value.as_str())),
+        text_column(row, columns.effective_maturity)?.map(Maturity::try_from),
+        text_column(row, columns.disposition)?.map(Disposition::try_from),
     ) {
         // Support can only clamp what history earned, so effective above
         // historical is a state the evaluator cannot produce. Support above the
@@ -2411,6 +2413,7 @@ fn served_rows(
              ORDER BY o.object_id"
         ))
         .map_err(map_sqlite)?;
+    assert_served_columns(&statement);
     let rows = statement
         .query_map(
             rusqlite::named_params! {
@@ -2426,7 +2429,7 @@ fn served_rows(
                     &OWN_DECISION_COLUMNS,
                 )?
                 .unwrap_or((VisibilityRow::AuditOnly, Sensitivity::Secret, false));
-                if !interpretable || row.get::<_, bool>("own_history_inconsistent")? {
+                if !interpretable || row.get::<_, bool>(OWN_HISTORY_INCONSISTENT_COLUMN)? {
                     visibility_row_value = VisibilityRow::AuditOnly;
                     sensitivity = Sensitivity::Secret;
                 }
@@ -2441,13 +2444,12 @@ fn served_rows(
                     sensitivity = sensitivity.restrictive(lineage_sensitivity);
                 }
                 sensitivity = sensitivity.restrictive(Sensitivity::from_stored(
-                    &row.get::<_, Option<String>>("history_sensitivity_class")?
-                        .unwrap_or_default(),
+                    text_column(row, HISTORY_SENSITIVITY_COLUMN)?.unwrap_or_default(),
                 ));
                 object.sensitivity = object.sensitivity.restrictive(sensitivity);
                 let visibility =
                     surface_visibility(visibility_row_value, surface, object.sensitivity);
-                let scope_id = row.get::<_, Option<String>>("scope_id")?;
+                let scope_id = row.get::<_, Option<String>>(SCOPE_ID_COLUMN)?;
                 Ok((object, visibility, scope_id))
             },
         )
@@ -2455,6 +2457,75 @@ fn served_rows(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(map_sqlite)?;
     Ok(rows)
+}
+
+/// Fail-stop guard for the positional reads in `decided_row`: every offset
+/// constant must name the alias it was written against. Runs in release
+/// builds too — the columns adjacent to each offset are all TEXT, so a
+/// desynced constant reads a type-compatible wrong value and misgates
+/// visibility instead of erroring. A few string compares per call is
+/// negligible next to the multi-join query this guards.
+fn assert_served_columns(statement: &rusqlite::Statement<'_>) {
+    // Per-field checks catch swapped interior aliases that count and
+    // block-anchor checks miss.
+    let expected = [
+        (OWN_DECISION_COLUMNS.maturity, "d_maturity"),
+        (
+            OWN_DECISION_COLUMNS.effective_maturity,
+            "d_effective_maturity",
+        ),
+        (OWN_DECISION_COLUMNS.disposition, "d_disposition"),
+        (OWN_DECISION_COLUMNS.visibility, "d_visibility"),
+        (OWN_DECISION_COLUMNS.taint_class, "d_taint_class"),
+        (OWN_DECISION_COLUMNS.source_class, "d_source_class"),
+        (OWN_DECISION_COLUMNS.policy_revision, "d_policy_revision"),
+        (
+            OWN_DECISION_COLUMNS.sensitivity_class,
+            "d_sensitivity_class",
+        ),
+        (
+            OWN_DECISION_COLUMNS.approval_object_id,
+            "d_approval_object_id",
+        ),
+        (LINEAGE_DECISION_COLUMNS.maturity, "s_maturity"),
+        (
+            LINEAGE_DECISION_COLUMNS.effective_maturity,
+            "s_effective_maturity",
+        ),
+        (LINEAGE_DECISION_COLUMNS.disposition, "s_disposition"),
+        (LINEAGE_DECISION_COLUMNS.visibility, "s_visibility"),
+        (LINEAGE_DECISION_COLUMNS.taint_class, "s_taint_class"),
+        (LINEAGE_DECISION_COLUMNS.source_class, "s_source_class"),
+        (
+            LINEAGE_DECISION_COLUMNS.policy_revision,
+            "s_policy_revision",
+        ),
+        (
+            LINEAGE_DECISION_COLUMNS.sensitivity_class,
+            "s_sensitivity_class",
+        ),
+        (
+            LINEAGE_DECISION_COLUMNS.approval_object_id,
+            "s_approval_object_id",
+        ),
+        (ACCEPTED_DECISION_COLUMN, "accepted_decision"),
+        (HISTORY_SENSITIVITY_COLUMN, "history_sensitivity_class"),
+        (OWN_HISTORY_INCONSISTENT_COLUMN, "own_history_inconsistent"),
+        (SCOPE_ID_COLUMN, "scope_id"),
+    ];
+    assert_eq!(
+        statement.column_count(),
+        SCOPE_ID_COLUMN + 1,
+        "served_rows must select exactly {} columns",
+        SCOPE_ID_COLUMN + 1
+    );
+    for (index, alias) in expected {
+        assert_eq!(
+            statement.column_name(index).ok(),
+            Some(alias),
+            "served_rows column {index} must be {alias}"
+        );
+    }
 }
 
 impl SourceClass {
