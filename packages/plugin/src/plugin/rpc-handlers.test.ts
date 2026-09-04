@@ -16,6 +16,7 @@ import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models
 import type { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
 import {
+    BoundedTtlCache,
     buildSidebarSnapshot,
     buildSidebarSnapshotRpcResponse,
     buildStatusDetail,
@@ -632,5 +633,45 @@ describe("buildStatusDetail — cacheNeverExpires with 'never' TTL", () => {
         } finally {
             closeQuietly(db);
         }
+    });
+});
+
+describe("BoundedTtlCache", () => {
+    test("serves a fresh entry and drops an expired one on read", () => {
+        const cache = new BoundedTtlCache<string>(2_000, 32);
+        cache.set("a", "alpha", 1_000);
+        expect(cache.get("a", 2_500)).toBe("alpha");
+        expect(cache.get("a", 3_000)).toBeUndefined();
+        expect(cache.size).toBe(0);
+    });
+
+    test("set sweeps every expired entry, not only the written key", () => {
+        const cache = new BoundedTtlCache<string>(2_000, 32);
+        cache.set("a", "alpha", 1_000);
+        cache.set("b", "beta", 1_000);
+        cache.set("c", "gamma", 5_000);
+        expect(cache.size).toBe(1);
+        expect(cache.get("c", 5_000)).toBe("gamma");
+    });
+
+    test("a full cache evicts its oldest entry before inserting", () => {
+        const cache = new BoundedTtlCache<string>(60_000, 2);
+        cache.set("a", "alpha", 1_000);
+        cache.set("b", "beta", 2_000);
+        cache.set("c", "gamma", 3_000);
+        expect(cache.size).toBe(2);
+        expect(cache.get("a", 3_000)).toBeUndefined();
+        expect(cache.get("b", 3_000)).toBe("beta");
+        expect(cache.get("c", 3_000)).toBe("gamma");
+    });
+
+    test("rewriting a live key refreshes it without evicting another entry", () => {
+        const cache = new BoundedTtlCache<string>(60_000, 2);
+        cache.set("a", "alpha", 1_000);
+        cache.set("b", "beta", 2_000);
+        cache.set("a", "alpha-2", 3_000);
+        expect(cache.size).toBe(2);
+        expect(cache.get("a", 3_000)).toBe("alpha-2");
+        expect(cache.get("b", 3_000)).toBe("beta");
     });
 });

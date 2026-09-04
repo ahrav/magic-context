@@ -52,6 +52,8 @@ export class FakeKernel {
     nextCommitState: MemoryState | null = null;
     /** Every read reply carries this `truncated` flag, standing in for a daemon that dropped rows to fit its per-read bounds. commentlint: allow(JUDGE) */
     readTruncated = false;
+    /** Rows served per read when set, standing in for the daemon's newest-rows cap: the `object_ids` filter applies before the cap, so a filtered read reaches a row a capped unfiltered read drops. commentlint: allow(JUDGE) */
+    readRowCap: number | null = null;
     /** Runs after the client's read and before the commit's token check, standing in for a concurrent writer. */
     beforeCommit: (() => void) | null = null;
 
@@ -140,14 +142,27 @@ export class FakeKernel {
         if (forced && forced.kind !== "available") return { state: forced };
         const asOf = typeof body.as_of === "number" ? body.as_of : this.tip;
         if (asOf > this.tip) return { state: { kind: "unavailable", reason: "snapshot_diverged" } };
-        const rows = [...this.objects.values()]
-            .filter(
-                (object) =>
-                    object.created_commit_seq <= asOf &&
-                    (object.invalidated_commit_seq === null ||
-                        asOf < object.invalidated_commit_seq) &&
-                    FakeKernel.servesOn(object, surface),
-            )
+        const objectIds = Array.isArray(body.object_ids)
+            ? new Set(body.object_ids.filter((id): id is string => typeof id === "string"))
+            : null;
+        let visible = [...this.objects.values()].filter(
+            (object) =>
+                object.created_commit_seq <= asOf &&
+                (object.invalidated_commit_seq === null || asOf < object.invalidated_commit_seq) &&
+                FakeKernel.servesOn(object, surface),
+        );
+        if (objectIds !== null) {
+            visible = visible.filter((object) => objectIds.has(object.object_id));
+        }
+        // The daemon scopes rows to the id filter before its newest-rows cap, so the cap applies after the filter here too. commentlint: allow(JUDGE)
+        let truncated = this.readTruncated;
+        if (this.readRowCap !== null && visible.length > this.readRowCap) {
+            visible = [...visible]
+                .sort((left, right) => right.created_commit_seq - left.created_commit_seq)
+                .slice(0, this.readRowCap);
+            truncated = true;
+        }
+        const rows = visible
             .sort((left, right) => (left.object_id < right.object_id ? -1 : 1))
             .map((object) => {
                 const { labeled, decision, ...row } = object;
@@ -165,7 +180,7 @@ export class FakeKernel {
             known_as_of: asOf,
             tip: this.tip,
             gated: body.gated === true,
-            truncated: this.readTruncated,
+            truncated,
             rows,
         };
     }

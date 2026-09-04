@@ -12,6 +12,7 @@ import { cancelled, conflict, disabled, invalid, type MemoryState, unavailable }
 import { TokenCache } from "./token";
 import {
     type CommitPayload,
+    MAX_READ_OBJECT_IDS,
     type MutationToken,
     type Parsed,
     parseCommitResponse,
@@ -70,6 +71,8 @@ export interface ReadArgs extends CallOptions {
     surface: Surface;
     asOf?: number | null;
     gated?: boolean;
+    /** Scopes the read to the named objects before the daemon applies its row cap, so a targeted lookup reaches a live row a capped unfiltered snapshot drops. At most `MAX_READ_OBJECT_IDS` ids; a longer list answers `invalid_input` without a daemon round trip. commentlint: allow(JUDGE) */
+    objectIds?: readonly string[];
 }
 
 export interface IntentArgs {
@@ -352,6 +355,7 @@ export class KernelClient {
                 surface: args.surface,
                 as_of: asOf,
                 gated: args.gated ?? false,
+                ...(args.objectIds === undefined ? {} : { object_ids: [...args.objectIds] }),
             }),
             // Reads have no side effects, so an ambiguous transport outcome reissues once instead of answering daemon_absent for a transient drop. commentlint: allow(JUDGE)
             { signal: args.signal, deadline, reissuable: true },
@@ -368,6 +372,9 @@ export class KernelClient {
      * tokens and reads the tip once; a second divergence surfaces as-is.
      */
     async read(args: ReadArgs): Promise<ReadResult> {
+        if (args.objectIds !== undefined && args.objectIds.length > MAX_READ_OBJECT_IDS) {
+            return { state: nonAvailable(invalid("invalid_input")) };
+        }
         const deadline = this.deadline(args);
         const first = await this.readAt(args, args.asOf ?? null, deadline);
         if (!isSnapshotDiverged(first.state)) return first;
@@ -436,8 +443,14 @@ export class KernelClient {
     private async commitOnce(args: CommitArgs, deadline: Deadline): Promise<CommitResult> {
         let { tokens, missing } = this.collectTokens(args);
         if (missing.length > 0) {
+            // The refresh only needs tokens for the missing targets, and a filtered read reaches a target beyond the daemon's row cap; a target list over the filter bound falls back to the unfiltered snapshot. commentlint: allow(JUDGE)
             const refreshed = await this.readAt(
-                { surface: "explicit_search", gated: false, signal: args.signal },
+                {
+                    surface: "explicit_search",
+                    gated: false,
+                    signal: args.signal,
+                    ...(missing.length <= MAX_READ_OBJECT_IDS ? { objectIds: missing } : {}),
+                },
                 null,
                 deadline,
             );

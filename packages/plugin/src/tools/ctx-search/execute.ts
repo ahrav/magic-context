@@ -17,7 +17,12 @@ import {
 } from "../../features/magic-context/search-bounds";
 import { getVisibleRevisionLocators } from "../../hooks/magic-context/inject-compartments";
 import { recordKernelMemoryRetrievals } from "../../hooks/magic-context/kernel-claim-usage";
-import { disabled, isAvailable, renderToolStateText } from "../../shared/kernel-client";
+import {
+    disabled,
+    isAvailable,
+    MAX_READ_OBJECT_IDS,
+    renderToolStateText,
+} from "../../shared/kernel-client";
 import { parseObjectIdQuery, searchKernelMemoryRows } from "./kernel-memory-search";
 import { normalizeCtxSearchArgs, prepareQueryFromNormalizedArgs } from "./query-input";
 import { type ExplicitDeliveryReason, packSearchResults } from "./render";
@@ -177,8 +182,9 @@ export async function executeCtxSearch(
             ...(toolContext.abort ? { signal: toolContext.abort } : {}),
         });
     // An object-id query is daemon-first with local search as fallback only, and a memory-only request has no local sources, so neither starts the local search eagerly. commentlint: allow(JUDGE)
+    const idQuery = parseObjectIdQuery(query);
     let localResultsPromise: ReturnType<typeof startLocalSearch> | null = null;
-    if (!parseObjectIdQuery(query) && !memoryOnly) {
+    if (!idQuery && !memoryOnly) {
         localResultsPromise = startLocalSearch();
         // The no-op handler prevents an unawaited local-search rejection from becoming unhandled on an early return; awaiting the promise later still propagates it. commentlint: allow(JUDGE)
         localResultsPromise.catch(() => {});
@@ -188,9 +194,11 @@ export async function executeCtxSearch(
             sessionId: toolContext.sessionID,
             projectRoot,
         });
+        // An id query filters the read so a named object beyond the daemon's row cap still resolves; a pasted list over the filter bound falls back to the unfiltered snapshot instead of failing the search. commentlint: allow(JUDGE)
         const read = await client.read({
             surface: "explicit_search",
             gated: true,
+            ...(idQuery && idQuery.length <= MAX_READ_OBJECT_IDS ? { objectIds: idQuery } : {}),
             ...(toolContext.abort ? { signal: toolContext.abort } : {}),
         });
         if (isAvailable(read)) {
@@ -202,7 +210,7 @@ export async function executeCtxSearch(
             });
             if (hits) {
                 // An object-id query is answered by the daemon alone.
-                if (parseObjectIdQuery(query)) return completeFrom(hits);
+                if (idQuery) return completeFrom(hits);
                 memoryResults = hits;
             }
         } else {

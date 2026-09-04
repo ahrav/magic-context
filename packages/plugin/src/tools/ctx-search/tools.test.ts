@@ -454,6 +454,41 @@ describe("createCtxSearchTools", () => {
         }
     });
 
+    it("resolves an object-id query for a row beyond the daemon's row cap through the id filter", async () => {
+        const harness = kernelHarness();
+        harness.kernel.seedDecision({
+            object_id: OBJECT_A,
+            decision_kind: "ARCHITECTURE",
+            summary: "Oldest row, beyond the cap.",
+        });
+        harness.kernel.seedDecision({
+            object_id: OBJECT_B,
+            decision_kind: "ARCHITECTURE",
+            summary: "Newest row.",
+        });
+        harness.kernel.readRowCap = 1;
+        const searchSpy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => {
+            throw new Error("unifiedSearch must not run for object-id queries");
+        });
+        try {
+            const tools = createCtxSearchTools({
+                db,
+                kernelClient: harness.kernelClient,
+                resolveProjectPath: () => "git:repo-project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+            const result = await tools.ctx_search.execute({ query: OBJECT_A }, toolContext());
+            expect(result).toContain(`id=${OBJECT_A}`);
+            expect(result).toContain("Oldest row, beyond the cap.");
+            const read = harness.transport.calls[0]?.body as { object_ids?: string[] };
+            expect(read.object_ids).toEqual([OBJECT_A]);
+        } finally {
+            searchSpy.mockRestore();
+        }
+    });
+
     it("resolves a pasted revision locator from the daemon without calling unifiedSearch", async () => {
         const harness = kernelHarness();
         const seeded = harness.kernel.seedDecision({

@@ -79,6 +79,51 @@ import { applyStickySnapshotCache } from "./sidebar-snapshot-cache";
 // A restart discards the in-memory carry; the next poll cold-starts from persisted session metadata.
 const workMetricsCarryBySession = new Map<string, WorkMetricsCarry>();
 const RUST_STATUS_CACHE_TTL_MS = 2_000;
+/** Live entries per poll cache. Each open sidebar pane polls one `(session, directory)` pair, so the cap covers concurrent panes while bounding growth across sessions and projects. commentlint: allow(JUDGE) */
+const POLL_CACHE_MAX_ENTRIES = 32;
+
+/** Every `get` and `set` sweeps expired entries, and a full cache evicts its oldest entry before inserting, so a long-lived RPC server polling many sessions never accumulates dead snapshots. commentlint: allow(JUDGE) */
+export class BoundedTtlCache<V> {
+    private readonly entries = new Map<string, { value: V; cachedAt: number }>();
+
+    constructor(
+        private readonly ttlMs: number,
+        private readonly maxEntries: number,
+    ) {}
+
+    private sweep(nowMs: number): void {
+        for (const [key, entry] of this.entries) {
+            if (nowMs - entry.cachedAt >= this.ttlMs) this.entries.delete(key);
+        }
+    }
+
+    get(key: string, nowMs = Date.now()): V | undefined {
+        this.sweep(nowMs);
+        return this.entries.get(key)?.value;
+    }
+
+    set(key: string, value: V, nowMs = Date.now()): void {
+        this.sweep(nowMs);
+        this.entries.delete(key);
+        if (this.entries.size >= this.maxEntries) {
+            let oldestKey: string | undefined;
+            let oldestAt = Number.POSITIVE_INFINITY;
+            for (const [candidate, entry] of this.entries) {
+                if (entry.cachedAt < oldestAt) {
+                    oldestAt = entry.cachedAt;
+                    oldestKey = candidate;
+                }
+            }
+            if (oldestKey !== undefined) this.entries.delete(oldestKey);
+        }
+        this.entries.set(key, { value, cachedAt: nowMs });
+    }
+
+    get size(): number {
+        return this.entries.size;
+    }
+}
+
 export interface RustSessionStatus {
     usage?: { current_total_input_tokens?: number; context_limit_tokens?: number };
     tail_hygiene?: WireTailHygieneBaseline | null;
@@ -93,7 +138,10 @@ export interface RustSessionStatus {
     wrapup_active?: boolean;
     wrapup_rounds?: number | null;
 }
-const rustStatusCache = new Map<string, { status: RustSessionStatus; cachedAt: number }>();
+const rustStatusCache = new BoundedTtlCache<RustSessionStatus>(
+    RUST_STATUS_CACHE_TTL_MS,
+    POLL_CACHE_MAX_ENTRIES,
+);
 
 /**
  * When OpenCode's DB is unavailable or unreadable, the sidebar returns the persisted fallback.
@@ -140,8 +188,8 @@ async function loadRustSessionStatus(
 ): Promise<RustSessionStatus | undefined> {
     if (!client) return undefined;
     const cached = rustStatusCache.get(sessionId);
-    if (cached && Date.now() - cached.cachedAt < RUST_STATUS_CACHE_TTL_MS) {
-        return cached.status;
+    if (cached !== undefined) {
+        return cached;
     }
     try {
         const response = await client.call({
@@ -158,7 +206,7 @@ async function loadRustSessionStatus(
                 : raw;
         if (value.error || value.ok === false) return undefined;
         const status = value as RustSessionStatus;
-        rustStatusCache.set(sessionId, { status, cachedAt: Date.now() });
+        rustStatusCache.set(sessionId, status);
         return status;
     } catch (error) {
         log(`[rpc] Rust session.status unavailable for ${sessionId}:`, error);
@@ -820,24 +868,24 @@ export function registerRpcHandlers(
     // so the sidebar shows `stale` when the projector is behind.
     const kernelClient = kernelClientResolver(config);
     // The cache reuses snapshots for `RUST_STATUS_CACHE_TTL_MS` to avoid a daemon read on each sidebar poll. commentlint: allow(JUDGE)
-    const memorySnapshotCache = new Map<
-        string,
-        { snapshot: KernelMemorySnapshot; cachedAt: number }
-    >();
+    const memorySnapshotCache = new BoundedTtlCache<KernelMemorySnapshot>(
+        RUST_STATUS_CACHE_TTL_MS,
+        POLL_CACHE_MAX_ENTRIES,
+    );
     const readMemory = async (sessionId: string, dir: string): Promise<KernelMemorySnapshot> => {
         if (config.memory?.enabled === false) {
             return { state: disabled(), rows: [], knownAsOf: null };
         }
         const cacheKey = `${sessionId}\u001f${dir}`;
         const cached = memorySnapshotCache.get(cacheKey);
-        if (cached && Date.now() - cached.cachedAt < RUST_STATUS_CACHE_TTL_MS) {
-            return cached.snapshot;
+        if (cached !== undefined) {
+            return cached;
         }
         const client = kernelClient({ sessionId, projectRoot: resolveProjectRootDirectory(dir) });
         const snapshot = kernelMemorySnapshotFrom(
             await client.read({ surface: "explicit_search", gated: true }),
         );
-        memorySnapshotCache.set(cacheKey, { snapshot, cachedAt: Date.now() });
+        memorySnapshotCache.set(cacheKey, snapshot);
         return snapshot;
     };
 

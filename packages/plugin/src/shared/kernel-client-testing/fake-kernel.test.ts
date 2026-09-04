@@ -73,3 +73,51 @@ describe("FakeKernel commit prevalidation", () => {
         expect(kernel.objects.get("mem_survivor")?.invalidated_commit_seq).toBeNull();
     });
 });
+
+function readCall(body: Record<string, unknown>): KernelTransportCall {
+    return {
+        sessionId: "session",
+        projectRoot: "/repo",
+        method: "kernel.read",
+        body: { surface: "explicit_search", gated: false, ...body },
+    };
+}
+
+interface ReadReply {
+    truncated: boolean;
+    rows: { object: { object_id: string } }[];
+}
+
+function seedThree(kernel: FakeKernel): void {
+    kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "oldest" });
+    kernel.seedDecision({ object_id: "mem_b", decision_kind: "ARCHITECTURE", summary: "middle" });
+    kernel.seedDecision({ object_id: "mem_c", decision_kind: "ARCHITECTURE", summary: "newest" });
+}
+
+describe("FakeKernel read filtering and row cap", () => {
+    it("scopes rows to the object_ids filter", () => {
+        const kernel = new FakeKernel();
+        seedThree(kernel);
+        const reply = kernel.reply(readCall({ object_ids: ["mem_b"] })) as ReadReply;
+        expect(reply.rows.map((row) => row.object.object_id)).toEqual(["mem_b"]);
+        expect(reply.truncated).toBe(false);
+    });
+
+    it("caps unfiltered reads to the newest rows and flags truncation", () => {
+        const kernel = new FakeKernel();
+        seedThree(kernel);
+        kernel.readRowCap = 2;
+        const reply = kernel.reply(readCall({})) as ReadReply;
+        expect(reply.rows.map((row) => row.object.object_id)).toEqual(["mem_b", "mem_c"]);
+        expect(reply.truncated).toBe(true);
+    });
+
+    it("applies the id filter before the row cap, so a filtered read reaches a dropped row", () => {
+        const kernel = new FakeKernel();
+        seedThree(kernel);
+        kernel.readRowCap = 2;
+        const reply = kernel.reply(readCall({ object_ids: ["mem_a"] })) as ReadReply;
+        expect(reply.rows.map((row) => row.object.object_id)).toEqual(["mem_a"]);
+        expect(reply.truncated).toBe(false);
+    });
+});

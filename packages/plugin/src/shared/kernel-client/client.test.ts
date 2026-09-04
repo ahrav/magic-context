@@ -333,6 +333,30 @@ describe("KernelClient reads", () => {
         expect(c.tokens.get(PROJECT, "o1")).toBeUndefined();
         expect(c.tokens.knownAsOfFor(PROJECT)).toBeUndefined();
     });
+
+    test("a filtered read carries object_ids on the wire", async () => {
+        const transport = new FakeTransport().queue(readReply(5, "o1"));
+        const result = await client(transport).read({
+            surface: "explicit_search",
+            objectIds: ["o1", "o2"],
+        });
+        expect(isAvailable(result)).toBe(true);
+        expect(transport.bodies("kernel.read")[0]?.object_ids).toEqual(["o1", "o2"]);
+    });
+
+    test("an unfiltered read omits object_ids from the wire", async () => {
+        const transport = new FakeTransport().queue(readReply(5, "o1"));
+        await client(transport).read({ surface: "explicit_search" });
+        expect("object_ids" in (transport.bodies("kernel.read")[0] ?? {})).toBe(false);
+    });
+
+    test("an over-limit objectIds filter is invalid_input with no transport call", async () => {
+        const transport = new FakeTransport();
+        const objectIds = Array.from({ length: 65 }, (_, index) => `o${index}`);
+        const result = await client(transport).read({ surface: "explicit_search", objectIds });
+        expect(result.state).toEqual({ kind: "invalid", reason: "invalid_input" });
+        expect(transport.calls).toHaveLength(0);
+    });
 });
 
 describe("KernelClient mutations", () => {
@@ -444,6 +468,7 @@ describe("KernelClient mutations", () => {
         expect(read?.surface).toBe("explicit_search");
         expect(read?.gated).toBe(false);
         expect(read?.as_of).toBeNull();
+        expect(read?.object_ids).toEqual(["old-object"]);
         expect(transport.bodies("kernel.commit")[0]?.tokens).toEqual([
             { object_id: "old-object", known_as_of: 6 },
         ]);

@@ -61,6 +61,7 @@ export {
     type CommitPayload,
     type DecisionPayload,
     isMemoryDecisionRow,
+    MAX_READ_OBJECT_IDS,
     MEMORY_DOMAIN_ID,
     type MutationToken,
     type ObjectRow,

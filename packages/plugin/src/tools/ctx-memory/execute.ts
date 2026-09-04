@@ -263,9 +263,11 @@ export interface ExecuteCtxMemoryArgs {
     signal?: AbortSignal;
 }
 
+/** `objectIds` scopes the read to the named objects, so a preflight or replay probe reaches a target beyond the daemon's row cap; the listing paths read unfiltered because they need the whole snapshot. commentlint: allow(JUDGE) */
 async function readMemoryRows(
     client: KernelClient,
     signal?: AbortSignal,
+    objectIds?: readonly string[],
 ): Promise<
     | { ok: true; rows: ReadRow[]; knownAsOf: number; truncated: boolean }
     | { ok: false; state: MemoryState }
@@ -274,6 +276,7 @@ async function readMemoryRows(
         surface: "explicit_search",
         gated: false,
         ...(signal ? { signal } : {}),
+        ...(objectIds === undefined ? {} : { objectIds }),
     });
     if (!isAvailable(read)) return { ok: false, state: read.state };
     return {
@@ -392,32 +395,35 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         ...(signal ? { signal } : {}),
     };
 
-    if (action === "get" || action === "list") {
+    if (action === "get") {
+        const wanted = uniqueIds(args.objectIds);
+        if (wanted.length === 0) {
+            return "Error: 'objectIds' is required when action is 'get'.";
+        }
+        if (wanted.length > GET_MAX_CLAIMS) {
+            throw new ClaimOperationInputError(
+                `get accepts at most ${GET_MAX_CLAIMS} objectIds; ${wanted.length} were given. Split the request.`,
+            );
+        }
+        const read = await readMemoryRows(client, signal, wanted);
+        if (!read.ok) return renderCtxMemoryStateText(read.state, []);
+        const found = read.rows.filter((row) => wanted.includes(row.object.object_id));
+        const foundIds = new Set(found.map((row) => row.object.object_id));
+        const notFound = wanted.filter((id) => !foundIds.has(id));
+        // A truncated read cannot prove absent ids are missing — they can live beyond the daemon's row cap — so those ids report as unresolved rather than missing. commentlint: allow(JUDGE)
+        return JSON.stringify({
+            action,
+            knownAsOf: read.knownAsOf,
+            memories: found.map(memoryView),
+            ...(read.truncated
+                ? { truncated: true, missingObjectIds: [], unresolvedObjectIds: notFound }
+                : { missingObjectIds: notFound }),
+        });
+    }
+
+    if (action === "list") {
         const read = await readMemoryRows(client, signal);
         if (!read.ok) return renderCtxMemoryStateText(read.state, []);
-        if (action === "get") {
-            const wanted = uniqueIds(args.objectIds);
-            if (wanted.length === 0) {
-                return "Error: 'objectIds' is required when action is 'get'.";
-            }
-            if (wanted.length > GET_MAX_CLAIMS) {
-                throw new ClaimOperationInputError(
-                    `get accepts at most ${GET_MAX_CLAIMS} objectIds; ${wanted.length} were given. Split the request.`,
-                );
-            }
-            const found = read.rows.filter((row) => wanted.includes(row.object.object_id));
-            const foundIds = new Set(found.map((row) => row.object.object_id));
-            const notFound = wanted.filter((id) => !foundIds.has(id));
-            // A truncated read cannot prove absent ids are missing — they can live beyond the daemon's row cap — so those ids report as unresolved rather than missing. commentlint: allow(JUDGE)
-            return JSON.stringify({
-                action,
-                knownAsOf: read.knownAsOf,
-                memories: found.map(memoryView),
-                ...(read.truncated
-                    ? { truncated: true, missingObjectIds: [], unresolvedObjectIds: notFound }
-                    : { missingObjectIds: notFound }),
-            });
-        }
         const category = args.category?.trim();
         const nowMs = Date.now();
         const listed = read.rows
@@ -450,7 +456,7 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
             result.state.kind === "invalid" &&
             result.state.reason === "operation_key_reused"
         ) {
-            const read = await readMemoryRows(client, signal);
+            const read = await readMemoryRows(client, signal, [spec.object_id]);
             const existing = read.ok
                 ? read.rows.find((row) => row.object.object_id === spec.object_id)
                 : undefined;
@@ -463,7 +469,7 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
 
     if (action === "archive") {
         const target = requireTarget(args);
-        const read = await readMemoryRows(client, signal);
+        const read = await readMemoryRows(client, signal, [target]);
         if (!read.ok) return renderCtxMemoryStateText(read.state, [target]);
         requireVisible(read.rows, [target]);
         return renderCommit(
@@ -480,7 +486,10 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
 
     if (action === "revise") {
         const target = requireTarget(args);
-        const read = await readMemoryRows(client, signal);
+        // The successor id rides in the filter so redelivery recovery sees the row this identity already wrote. commentlint: allow(JUDGE)
+        const read = await readMemoryRows(client, signal, [
+            ...new Set([target, derivedId("mem", identity, 0)]),
+        ]);
         if (!read.ok) return renderCtxMemoryStateText(read.state, [target]);
         // A truncated read cannot prove the target retired, so recovery only runs on a complete snapshot. commentlint: allow(JUDGE)
         const replayed = read.truncated
@@ -535,7 +544,10 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
     if (targets.length < 2) {
         throw new ClaimOperationInputError("merge requires at least two objectIds");
     }
-    const read = await readMemoryRows(client, signal);
+    // The successor id rides in the filter so redelivery recovery sees the row this identity already wrote. commentlint: allow(JUDGE)
+    const read = await readMemoryRows(client, signal, [
+        ...new Set([...targets, derivedId("mem", identity, 0)]),
+    ]);
     if (!read.ok) return renderCtxMemoryStateText(read.state, targets);
     const replayed = read.truncated
         ? null

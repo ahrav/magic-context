@@ -334,6 +334,40 @@ describe("ctx_memory reads", () => {
     });
 });
 
+describe("ctx_memory reads beyond the daemon row cap", () => {
+    test("get and revise resolve a row the capped unfiltered snapshot drops", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        kernel.seedDecision({ object_id: "mem_b", decision_kind: "ARCHITECTURE", summary: "B." });
+        kernel.seedDecision({ object_id: "mem_c", decision_kind: "ARCHITECTURE", summary: "C." });
+        kernel.readRowCap = 2;
+        const tool = harness(kernel);
+        const listed = parseJson<ReadJson>(
+            await tool.execute({ action: "list" }, "call-list-capped", DREAMER_AGENT),
+        );
+        expect(listed.truncated).toBe(true);
+        expect(listed.memories.map((memory) => memory.objectId)).toEqual(["mem_b", "mem_c"]);
+        const got = parseJson<ReadJson>(
+            await tool.execute({ action: "get", objectIds: ["mem_a"] }, "call-get-capped"),
+        );
+        expect(got.truncated).toBeUndefined();
+        expect(got.memories.map((memory) => memory.objectId)).toEqual(["mem_a"]);
+        const readBodies = tool.transport.calls
+            .filter((call) => call.method === "kernel.read")
+            .map((call) => call.body as Record<string, unknown>);
+        expect("object_ids" in (readBodies[0] ?? {})).toBe(false);
+        expect(readBodies[1]?.object_ids).toEqual(["mem_a"]);
+        const revised = parseJson<CommitJson>(
+            await tool.execute(
+                { action: "revise", objectId: "mem_a", content: "A, revised." },
+                "call-revise-capped",
+            ),
+        );
+        expect(revised.outcome).toBe("applied");
+        expect(kernel.objects.get("mem_a")?.superseded_by).toBe(revised.objectId ?? "");
+    });
+});
+
 describe("ctx_memory lifecycle and merge", () => {
     test("archive retires and merge folds two into one", async () => {
         const kernel = new FakeKernel();
