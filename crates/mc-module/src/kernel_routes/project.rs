@@ -34,7 +34,7 @@ pub struct ProjectBinding {
 impl ProjectBinding {
     pub(crate) fn new(root: &Path) -> Self {
         let root = canonical_root(root);
-        let digest = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
+        let digest = format!("{:x}", Sha256::digest(identity_bytes(&root)));
         Self { root, digest }
     }
 
@@ -83,6 +83,28 @@ impl ProjectBinding {
     fn match_context(&self) -> ScopeMatchContext {
         ScopeMatchContext::new().with_value(Dimension::Project, self.digest.clone())
     }
+}
+
+/// The bytes a root is hashed over. The digest is persisted in scope ids, so
+/// it is taken over the platform's own path representation, which is stable
+/// across Rust releases, rather than `OsStr::as_encoded_bytes`, whose
+/// encoding the standard library leaves unspecified.
+#[cfg(unix)]
+fn identity_bytes(root: &Path) -> std::borrow::Cow<'_, [u8]> {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::borrow::Cow::Borrowed(root.as_os_str().as_bytes())
+}
+
+/// UTF-16 code units in little-endian byte order.
+#[cfg(windows)]
+fn identity_bytes(root: &Path) -> std::borrow::Cow<'_, [u8]> {
+    use std::os::windows::ffi::OsStrExt as _;
+    std::borrow::Cow::Owned(
+        root.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect(),
+    )
 }
 
 /// A commit intent as the wire carries it; `kernel.commit` and artifact
