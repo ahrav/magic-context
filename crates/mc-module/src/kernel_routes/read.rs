@@ -59,7 +59,9 @@ pub(crate) fn read_visible(
         Some(as_of) => as_of,
         None => store.tip()?,
     };
-    let visible = store.visible_as_of(surface, requested)?;
+    // The kernel keeps rows whose scope names another project out of the
+    // snapshot, so the read costs the project's rows and not the store's.
+    let visible = store.visible_as_of_in_scope(surface, requested, Some(project.scope_term()))?;
     let mut filter = ScopeFilter::new(project);
     let mut terms = stored_terms(store);
     let mut rows = Vec::with_capacity(visible.rows.len());

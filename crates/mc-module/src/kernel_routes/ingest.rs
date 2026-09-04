@@ -676,21 +676,28 @@ impl McHandler {
             }
             generation
         };
-        let _decoding = DecodeReservation {
+        let decoding = DecodeReservation {
             kernel: Arc::clone(&self.kernel),
             bytes: decode_bytes,
         };
         // Decoding and hashing a page is CPU work proportional to the frame,
         // so it runs off the async workers and before the coordinator lock.
+        // The reservation rides in each job's result: a dropped
+        // `spawn_blocking` handle does not stop its worker, so a cancelled
+        // handler must not release the charge while the worker still holds
+        // the bytes.
         let decoded = blocking(move || {
-            base64::engine::general_purpose::STANDARD
+            let decoded = base64::engine::general_purpose::STANDARD
                 .decode(parsed.bytes_base64.as_bytes())
-                .map(|bytes| (parsed.upload_id, parsed.index, parsed.page_digest, bytes))
+                .map(|bytes| (parsed.upload_id, parsed.index, parsed.page_digest, bytes));
+            (decoded, decoding)
         })
         .await;
-        let (upload_id, index, declared_digest, bytes) = match decoded {
-            Ok(Ok(decoded)) => decoded,
-            Ok(Err(_)) => {
+        let (upload_id, index, declared_digest, bytes, decoding) = match decoded {
+            Ok((Ok((upload_id, index, digest, bytes)), decoding)) => {
+                (upload_id, index, digest, bytes, decoding)
+            }
+            Ok((Err(_), _)) => {
                 return crate::invalid_params_error(format!(
                     "{PAGE} bytes_base64 is not standard base64"
                 ))
@@ -700,8 +707,11 @@ impl McHandler {
         if bytes.len() as u64 > PAGE_BYTES_MAX {
             return state_only(KernelOutcome::invalid(InvalidReason::PageTooLarge));
         }
-        let page = match blocking(move || (sha256_hex(&bytes), bytes)).await {
-            Ok((digest, bytes)) if digest == declared_digest => Page { digest, bytes },
+        let hashed = blocking(move || (sha256_hex(&bytes), bytes, decoding)).await;
+        let (page, _decoding) = match hashed {
+            Ok((digest, bytes, decoding)) if digest == declared_digest => {
+                (Page { digest, bytes }, decoding)
+            }
             Ok(_) => return state_only(KernelOutcome::invalid(InvalidReason::PageDigest)),
             Err(outcome) => return state_only(outcome),
         };

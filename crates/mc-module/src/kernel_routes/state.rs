@@ -181,6 +181,9 @@ impl From<ArtifactErrorKind> for KernelOutcome {
                 Self::unavailable(UnavailableReason::StoreUnavailable)
             }
             ArtifactErrorKind::PayloadTooLarge => Self::invalid(InvalidReason::PayloadTooLarge),
+            ArtifactErrorKind::OperationKeyReused => {
+                Self::invalid(InvalidReason::OperationKeyReused)
+            }
             ArtifactErrorKind::InvalidInput
             | ArtifactErrorKind::TextFieldTooLong
             | ArtifactErrorKind::DetectionLimit => Self::invalid(InvalidReason::InvalidInput),
@@ -241,6 +244,7 @@ mod tests {
         ArtifactErrorKind::DetectionLimit,
         ArtifactErrorKind::TextFieldTooLong,
         ArtifactErrorKind::InvalidInput,
+        ArtifactErrorKind::OperationKeyReused,
         ArtifactErrorKind::PurgeIntent,
         ArtifactErrorKind::PurgeUnlinkPending,
     ];

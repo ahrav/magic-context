@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use mc_kernel::{
     scope_matches, CanonicalScope, CommitIntent, Dimension, KernelError, KernelStore, MatchOutcome,
-    ScopeMatchContext, ScopeSpec, ScopeTermSpec, Sensitivity, UnknownGraph,
+    ScopeMatchContext, ScopeSpec, ScopeTermFilter, ScopeTermSpec, Sensitivity, UnknownGraph,
 };
 use mc_store::canonical_root;
 use serde::Deserialize;
@@ -82,6 +82,14 @@ impl ProjectBinding {
 
     fn match_context(&self) -> ScopeMatchContext {
         ScopeMatchContext::new().with_value(Dimension::Project, self.digest.clone())
+    }
+
+    /// The term a stored scope must carry to name this project.
+    pub(crate) fn scope_term(&self) -> ScopeTermFilter<'_> {
+        ScopeTermFilter {
+            dimension: Dimension::Project,
+            value: &self.digest,
+        }
     }
 }
 

@@ -2469,6 +2469,33 @@ async fn a_row_under_any_scope_naming_the_project_is_readable_and_mutable() {
                 None,
                 (SourceClass::ModelInference, TaintClass::AssistantInference),
             ))?;
+            // A set term that lists this project's digest among others names
+            // it just as well.
+            envelope.insert_scope(ScopeSpec {
+                scope_id: "scope-set".to_string(),
+                object_id: "scope-set".to_string(),
+                domain_id: DOMAIN.to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "scope-set".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+                terms: vec![ScopeTermSpec {
+                    dimension: "project".to_string(),
+                    operator: "set".to_string(),
+                    set_values: Some(vec![
+                        digest("another-project"),
+                        digest(&root.to_string_lossy()),
+                    ]),
+                    ..ScopeTermSpec::default()
+                }],
+            })?;
+            envelope.insert_decision(store_decision(2, "scope-set", "set-lineage"))?;
+            envelope.record_admission(admission(
+                "store-decision-object-2",
+                EventKind::Other,
+                None,
+                (SourceClass::ModelInference, TaintClass::AssistantInference),
+            ))?;
             Ok(String::new())
         })
         .unwrap();
@@ -2476,7 +2503,11 @@ async fn a_row_under_any_scope_naming_the_project_is_readable_and_mutable() {
     let read = daemon.read("explicit_search", None).await;
     assert_eq!(
         object_ids(&read),
-        ["decision-object-1", "store-decision-object-1"]
+        [
+            "decision-object-1",
+            "store-decision-object-1",
+            "store-decision-object-2"
+        ]
     );
     let known_as_of = read["known_as_of"].as_i64().unwrap();
     // The write path honours the token the read handed out.
@@ -2831,6 +2862,23 @@ async fn ingest_route_accepts_a_payload_at_the_artifact_cap() {
             .map(|entries| entries.count() > 0)
             .unwrap_or(false)
     );
+    daemon.handler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_ingestion_key_reused_with_another_payload_is_a_permanent_refusal() {
+    let daemon = Daemon::start().await;
+    seed_domain(&daemon.store());
+    let finished = daemon
+        .ingest_paged(daemon.route, "reused", b"first payload", 8)
+        .await;
+    assert_state(&finished, "available", None);
+    // The same intent key now carries a different request digest.
+    let reused = daemon
+        .ingest_paged(daemon.route, "reused", b"second payload", 8)
+        .await;
+    assert_state(&reused, "invalid", Some("operation_key_reused"));
+    assert_eq!(daemon.handler.staging_budget_for_test(), (0, 0));
     daemon.handler.shutdown().await.unwrap();
 }
 

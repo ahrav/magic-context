@@ -195,6 +195,9 @@ pub enum ArtifactErrorKind {
     DetectionLimit,
     TextFieldTooLong,
     InvalidInput,
+    /// The intent's `operation_key` already carries a receipt for a different
+    /// `request_digest`; no retry with this key can succeed.
+    OperationKeyReused,
     PurgeIntent,
     PurgeUnlinkPending,
 }
@@ -354,6 +357,9 @@ impl fmt::Display for ArtifactErrorMessage<'_> {
             }
             ArtifactErrorKind::PurgeUnlinkPending => {
                 formatter.write_str("artifact purge committed with durable unlink pending")
+            }
+            ArtifactErrorKind::OperationKeyReused => {
+                formatter.write_str("operation key already used with a different request digest")
             }
         }
     }

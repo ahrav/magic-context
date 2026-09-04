@@ -8,6 +8,7 @@ use super::envelope::{
 };
 use super::object_write;
 use super::redaction::{identity, record, redact};
+use super::scope::Dimension;
 use super::slice::{DecisionSpec, DecisionWriteOutcome};
 use super::{map_sqlite, KernelError, KernelStore, Sensitivity};
 use crate::current_time_ms;
@@ -2148,8 +2149,23 @@ impl KernelStore {
         surface: Surface,
         requested: i64,
     ) -> Result<VisibleAsOf, KernelError> {
+        self.visible_as_of_in_scope(surface, requested, None)
+    }
+
+    /// [`Self::visible_as_of`] restricted to rows whose scope carries a term
+    /// on `scope.dimension` that can match `scope.value`, so a caller serving
+    /// one value of that dimension never materializes rows that name another.
+    /// The restriction is a superset of the scope algebra's verdict: a term
+    /// on the dimension whose operator the query cannot evaluate is kept for
+    /// the caller to judge.
+    pub fn visible_as_of_in_scope(
+        &self,
+        surface: Surface,
+        requested: i64,
+        scope: Option<ScopeTermFilter<'_>>,
+    ) -> Result<VisibleAsOf, KernelError> {
         let (tip, rows) = self.read_snapshot(requested, |tx| {
-            let rows = served_rows(tx, surface, requested, None)?
+            let rows = served_rows(tx, surface, requested, None, scope)?
                 .into_iter()
                 .filter_map(|(object, visibility, scope_id)| match visibility {
                     SurfaceVisibility::Hidden => None,
@@ -2193,7 +2209,7 @@ impl KernelStore {
                 .map_err(map_sqlite)?;
             // Hidden at `ExplicitSearch`, the widest surface, means hidden everywhere.
             let served: HashMap<String, ServedClass> =
-                served_rows(tx, Surface::ExplicitSearch, tip, Some(&ids))?
+                served_rows(tx, Surface::ExplicitSearch, tip, Some(&ids), None)?
                     .into_iter()
                     .map(|(object, visibility, _)| {
                         (
@@ -2279,15 +2295,23 @@ pub struct ServedClass {
     pub visibility: SurfaceVisibility,
 }
 
+/// One value on one scope dimension that a served-rows read is restricted to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopeTermFilter<'a> {
+    pub dimension: Dimension,
+    pub value: &'a str,
+}
+
 /// Every object admitted at `requested` with its served sensitivity and the
 /// visibility `surface` gives it, restricted to `ids` (a JSON string array)
-/// when given. Hidden rows are included so a caller can see the class of an
-/// object no surface serves.
+/// when given and to scopes that can match `scope` when given. Hidden rows
+/// are included so a caller can see the class of an object no surface serves.
 fn served_rows(
     tx: &Transaction<'_>,
     surface: Surface,
     requested: i64,
     ids: Option<&str>,
+    scope: Option<ScopeTermFilter<'_>>,
 ) -> Result<Vec<(ObjectRow, SurfaceVisibility, Option<String>)>, KernelError> {
     let own = latest_own_decision_sql("a", "AND a.commit_seq<=:governing_as_of");
     let lineage = latest_lineage_decision_sql("a", "AND a.commit_seq<=:governing_as_of");
@@ -2336,12 +2360,25 @@ fn served_rows(
                     OR :governing_as_of<o.invalidated_commit_seq)
                AND (:ids IS NULL
                     OR o.object_id IN (SELECT value FROM json_each(:ids)))
+               AND (:scope_dimension IS NULL
+                    OR COALESCE(dec.scope_id,obs.scope_id) IN (
+                        SELECT t.scope_id FROM scope_term t
+                        WHERE t.dimension=:scope_dimension
+                          AND (t.operator NOT IN ('exact','set')
+                               OR t.exact_value=:scope_value
+                               OR EXISTS(SELECT 1 FROM json_each(t.set_values)
+                                         WHERE value=:scope_value))))
              ORDER BY o.object_id"
         ))
         .map_err(map_sqlite)?;
     let rows = statement
         .query_map(
-            rusqlite::named_params! { ":governing_as_of": requested, ":ids": ids },
+            rusqlite::named_params! {
+                ":governing_as_of": requested,
+                ":ids": ids,
+                ":scope_dimension": scope.map(|scope| scope.dimension.as_str()),
+                ":scope_value": scope.map(|scope| scope.value),
+            },
             |row| {
                 let mut object = object_row_from(row)?;
                 let (mut visibility_row_value, mut sensitivity, interpretable) = decided_row(

@@ -495,11 +495,17 @@ impl KernelStore {
             return Err(ArtifactError::new(ArtifactErrorKind::IngestionFailClosed));
         }
 
+        // The receipt lookup runs before the operation, so a `Conflict` raised
+        // without entering it is a reused `operation_key`, not a constraint.
+        let mut entered = false;
         let commit_result = commit_with_writer(
             &mut writer,
             self.lease_epoch(),
             prepared.request.intent.clone(),
-            |envelope| insert_reference(envelope, &prepared, &reservation_id),
+            |envelope| {
+                entered = true;
+                insert_reference(envelope, &prepared, &reservation_id)
+            },
             || {
                 if faults.after_events {
                     Err(KernelError::Fault)
@@ -563,6 +569,7 @@ impl KernelStore {
                 );
                 Err(ArtifactError::new(match error {
                     KernelError::InvalidInput => ArtifactErrorKind::InvalidInput,
+                    KernelError::Conflict if !entered => ArtifactErrorKind::OperationKeyReused,
                     _ => ArtifactErrorKind::ReferenceCommit,
                 }))
             }
