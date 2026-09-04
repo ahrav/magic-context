@@ -212,7 +212,8 @@ export class FakeKernel {
         const operations = body.operations as Operation[];
         const touched = new Set<string>();
         const sourceKind = typeof body.source_kind === "string" ? body.source_kind : "assistant";
-        // Every inserted object id must be new to the store, matching the daemon's duplicate-id answer; retired ids stay in `objects`, so a re-insert of an archived id answers `already_exists` too. One envelope may name the same survivor from several supersessions. commentlint: allow(JUDGE)
+        // Every inserted object id must be new to the store, matching the daemon's duplicate-id answer; retired ids stay in `objects`, so a re-insert of an archived id answers `already_exists` too. Two inserts of the same id within one envelope also collide (the daemon's object_registry primary key rejects the whole envelope), so prospective insert ids are tracked across the loop; only supersede operations may name the same survivor id repeatedly, because a merge emits one supersession per predecessor sharing a single survivor. commentlint: allow(JUDGE)
+        const prospectiveInsertIds = new Set<string>();
         for (const operation of operations) {
             if (operation.op !== "insert_decision" && operation.op !== "supersede_decision") {
                 continue;
@@ -220,6 +221,12 @@ export class FakeKernel {
             const objectId = (operation.spec as Record<string, unknown>).object_id as string;
             if (this.objects.has(objectId)) {
                 return { state: { kind: "invalid", reason: "already_exists" } };
+            }
+            if (operation.op === "insert_decision") {
+                if (prospectiveInsertIds.has(objectId)) {
+                    return { state: { kind: "invalid", reason: "already_exists" } };
+                }
+                prospectiveInsertIds.add(objectId);
             }
         }
         // The daemon applies one envelope atomically: every operation is validated against pre-envelope state before any mutation, and `invalidating` rejects a second supersede or retire of a target an earlier operation in the envelope already invalidates. The commit sequence is allocated only after validation so a rejected envelope does not advance the snapshot. commentlint: allow(JUDGE)

@@ -511,21 +511,29 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
     }
 
     const targets = uniqueIds(args.objectIds);
-    // A duplicate id in the merge list is a caller-side bug; the duplicate check precedes arity validation so duplicate input cannot pass as a smaller merge after deduplication, and the error names the offending ids so the caller can fix its list. commentlint: allow(JUDGE)
+    // The raw list is bounded before any per-element work so an oversized input (the schema-fallback path passes raw arguments through) is rejected without scanning. A duplicate id in the merge list is a caller-side bug; the duplicate check precedes arity validation so duplicate input cannot pass as a smaller merge after deduplication, and the error names the offending ids so the caller can fix its list. commentlint: allow(JUDGE)
     const supplied = (args.objectIds ?? []).map((id) => id.trim()).filter((id) => id.length > 0);
-    const duplicates = [...new Set(supplied.filter((id, index) => supplied.indexOf(id) !== index))];
-    if (duplicates.length > 0) {
+    if (supplied.length > MERGE_MAX_TARGETS) {
         throw new ClaimOperationInputError(
-            `merge requires distinct objectIds; duplicated: ${duplicates.join(", ")}`,
+            `merge accepts at most ${MERGE_MAX_TARGETS} objectIds; ${supplied.length} were given. Merge in smaller batches.`,
+        );
+    }
+    const seen = new Set<string>();
+    const duplicates = new Set<string>();
+    for (const id of supplied) {
+        if (seen.has(id)) {
+            duplicates.add(id);
+        } else {
+            seen.add(id);
+        }
+    }
+    if (duplicates.size > 0) {
+        throw new ClaimOperationInputError(
+            `merge requires distinct objectIds; duplicated: ${[...duplicates].join(", ")}`,
         );
     }
     if (targets.length < 2) {
         throw new ClaimOperationInputError("merge requires at least two objectIds");
-    }
-    if (targets.length > MERGE_MAX_TARGETS) {
-        throw new ClaimOperationInputError(
-            `merge accepts at most ${MERGE_MAX_TARGETS} objectIds; ${targets.length} were given. Merge in smaller batches.`,
-        );
     }
     const read = await readMemoryRows(client, signal);
     if (!read.ok) return renderCtxMemoryStateText(read.state, targets);

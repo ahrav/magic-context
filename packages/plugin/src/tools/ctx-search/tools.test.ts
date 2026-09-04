@@ -480,6 +480,7 @@ describe("createCtxSearchTools", () => {
             expect(result).toContain("[1] [memory]");
             expect(result).toContain(`id=${OBJECT_A}`);
             expect(result).toContain("Locator round trip.");
+            expect(searchSpy).not.toHaveBeenCalled();
         } finally {
             searchSpy.mockRestore();
         }
