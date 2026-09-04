@@ -131,9 +131,24 @@ async fn a_second_daemon_on_the_same_root_starts_until_the_first_releases_its_le
         .await
         .unwrap();
     PrimaryComponent::activate(&second).await.unwrap();
-    // The open runs in a spawned task that has not reached its blocking worker
-    // yet, and the cache store lease is held, so the kernel behind it cannot
-    // have opened.
+    // The coordinator starts in `Starting`, so the assertion only proves the
+    // kernel waited if the cache-store lease wait is already observable.
+    let started = Instant::now();
+    loop {
+        let health = second.health().await;
+        let waiting = health
+            .metrics
+            .as_ref()
+            .is_some_and(|metrics| metrics["storage_lease_wait_elapsed_ms"].is_number());
+        if waiting {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "second daemon never entered the storage lease wait: {health:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(second.kernel_state(), KernelState::Starting);
     assert!(second.kernel_store_for_test().is_none());
 
@@ -223,22 +238,6 @@ fn insert_domains(store: &mc_kernel::KernelStore, first: i64, count: i64) -> i64
         .commit_seq
 }
 
-/// Registers `projector` as a required consumer and acknowledges its own
-/// registration row, so only later domain rows count as lag.
-fn register_projector(store: &mc_kernel::KernelStore) -> i64 {
-    let registered = store
-        .commit(intent("register"), |envelope| {
-            envelope.register_outbox_consumer("projector", 1)?;
-            Ok(String::new())
-        })
-        .unwrap()
-        .commit_seq;
-    store
-        .acknowledge_outbox("projector", registered, 1)
-        .unwrap();
-    registered
-}
-
 fn sanitized_kernel_block(health: &mc_host::HealthReport) -> serde_json::Value {
     let composite = mc_host::HealthReport {
         status: health.status,
@@ -326,7 +325,7 @@ async fn sanitized_kernel_blocks_match_the_shared_readiness_fixture() {
     );
 
     let store = daemon.handler.kernel_store_for_test().unwrap();
-    register_projector(&store);
+    daemon.register_caught_up_consumer("projector");
     let acked = insert_domains(&store, 1, 1);
     store.mark_outbox_published_through(2, 1).unwrap();
     store.acknowledge_outbox("projector", acked, 1).unwrap();
@@ -358,6 +357,53 @@ async fn sanitized_kernel_blocks_match_the_shared_readiness_fixture() {
         &fixture["kernel_unavailable"],
         "kernel_unavailable",
     );
+
+    // Construct `KernelHealthBlock` directly because the test daemon cannot
+    // reach the fixed 1 GiB warning limits.
+    for (name, core_file_warn, artifact_warn) in [
+        ("kernel_capacity_warn_core_file", true, false),
+        ("kernel_capacity_warn_artifact", false, true),
+    ] {
+        assert_matches_fixture(
+            &sanitized_kernel_block(&capacity_warn_health(core_file_warn, artifact_warn)),
+            &fixture[name],
+            name,
+        );
+    }
+}
+
+fn capacity_warn_health(core_file_warn: bool, artifact_warn: bool) -> mc_host::HealthReport {
+    use mc_module::kernel_routes::health::{KernelFactsBlock, KernelHealthBlock};
+    let cap = 1u64 << 30;
+    let block = KernelHealthBlock {
+        kernel_state: KernelState::Ready,
+        unavailable_reason: None,
+        sampled_at_ms: Some(now_ms()),
+        facts: Some(KernelFactsBlock {
+            core_file_bytes: if core_file_warn {
+                mc_kernel::MAIN_FILE_WARN_BYTES
+            } else {
+                65_536
+            },
+            core_file_warn,
+            artifact_usage_bytes: if artifact_warn { cap - cap / 5 } else { 0 },
+            artifact_cap_bytes: cap,
+            artifact_warn,
+            outbox_position_lag: Some(0),
+            oldest_unconsumed_age_ms: None,
+            retained_outbox_rows: 1,
+            required_consumer_count: 1,
+            lag_threshold_tripped: false,
+        }),
+    };
+    mc_host::HealthReport {
+        status: mc_host::HealthStatus::Ok,
+        detail: None,
+        metrics: Some(serde_json::json!({
+            "storage_state": "ready",
+            "kernel": block.to_json(),
+        })),
+    }
 }
 
 #[tokio::test]
@@ -453,7 +499,7 @@ async fn an_empty_required_consumer_set_raises_a_daemon_health_warning() {
 async fn crossing_the_lag_threshold_raises_a_daemon_health_warning() {
     let daemon = Daemon::start().await;
     let store = daemon.handler.kernel_store_for_test().unwrap();
-    let registered = register_projector(&store);
+    let registered = daemon.register_caught_up_consumer("projector");
     let mut next = 1;
     while next <= 9_999 {
         let count = (9_999 - next + 1).min(2_500);
@@ -1857,6 +1903,16 @@ impl Daemon {
             .commit_seq
     }
 
+    /// Registers `consumer` and acknowledges its own registration row, so
+    /// only later domain rows count as lag.
+    fn register_caught_up_consumer(&self, consumer: &str) -> i64 {
+        let registered = self.register_consumer(consumer);
+        self.store()
+            .acknowledge_outbox(consumer, registered, 1)
+            .unwrap();
+        registered
+    }
+
     fn deregister_consumer(&self, consumer: &str) {
         self.store()
             .commit(intent(&format!("deregister-{consumer}")), |envelope| {
@@ -1910,10 +1966,7 @@ async fn search_returns_stale_marker_and_injection_abstains_past_threshold() {
     );
 
     // A consumer caught up to its registration, then 9,999 published rows.
-    let registered = daemon.register_consumer("projector");
-    store
-        .acknowledge_outbox("projector", registered, 1)
-        .unwrap();
+    let registered = daemon.register_caught_up_consumer("projector");
     daemon.publish_domains(1, 9_999);
     let created_at = oldest_unconsumed_created_at(&daemon, registered);
     let below = daemon

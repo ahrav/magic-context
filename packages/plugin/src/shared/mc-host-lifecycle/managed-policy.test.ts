@@ -412,12 +412,15 @@ describe("kernel readiness from host.status metrics", () => {
     });
 
     test("blocks a live daemon emits classify as the shared fixture names them", () => {
-        // The same fixture is asserted against mc-host's sanitized output in
-        // `crates/mc-module/tests/kernel_routes.rs`, so a field renamed on
-        // either side of the wire fails here or there.
         const blocks: Record<string, unknown> = kernelHealthBlocks;
-        for (const reason of ["healthy", "kernel_lagging", "no_required_consumer"]) {
-            expect(kernelReadiness(metricsWith(blocks[reason]))).toEqual({
+        for (const [block, reason] of [
+            ["healthy", "healthy"],
+            ["kernel_lagging", "kernel_lagging"],
+            ["no_required_consumer", "no_required_consumer"],
+            ["kernel_capacity_warn_core_file", "kernel_capacity_warn"],
+            ["kernel_capacity_warn_artifact", "kernel_capacity_warn"],
+        ]) {
+            expect(kernelReadiness(metricsWith(blocks[block]))).toEqual({
                 state: "ready",
                 reason,
             });

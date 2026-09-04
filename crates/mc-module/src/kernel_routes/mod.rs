@@ -521,6 +521,8 @@ mod tests {
 
     #[test]
     fn open_failure_kind_names_exactly_the_unsupported_errors() {
+        // Only these errors map to Unsupported; every other KernelError variant
+        // maps to Store, so a new variant is checked without being listed.
         let unsupported = [
             KernelError::EngineUnsupported,
             KernelError::Foreign,
@@ -528,38 +530,16 @@ mod tests {
             KernelError::IdentityMismatch,
             KernelError::CorruptCanonicalRow,
         ];
-        let store = [
-            KernelError::Held,
-            KernelError::Io,
-            KernelError::Busy,
-            KernelError::FenceLost,
-            KernelError::Conflict,
-            KernelError::InvalidInput,
-            KernelError::AdmissionPolicy,
-            KernelError::FutureSnapshot,
-            KernelError::NotFound,
-            KernelError::InvalidCheckpoint,
-            KernelError::NoRequiredConsumers,
-            KernelError::ConsumerPending,
-            KernelError::Fault,
-            KernelError::Deadline,
-            KernelError::UnsafeDestination,
-            KernelError::InvalidBackup,
-            KernelError::InvalidRestore,
-        ];
-        for error in unsupported {
-            assert_eq!(
-                open_failure_kind(error),
-                UnavailableKind::Unsupported,
-                "{error:?}"
-            );
+        for error in KernelError::ALL {
+            let expected = if unsupported.contains(error) {
+                UnavailableKind::Unsupported
+            } else {
+                UnavailableKind::Store
+            };
+            assert_eq!(open_failure_kind(*error), expected, "{error:?}");
         }
-        for error in store {
-            assert_eq!(
-                open_failure_kind(error),
-                UnavailableKind::Store,
-                "{error:?}"
-            );
+        for error in unsupported {
+            assert!(KernelError::ALL.contains(&error), "{error:?} not in ALL");
         }
     }
 }

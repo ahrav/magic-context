@@ -1,5 +1,5 @@
 {
-  "_comment": "Sanitized `kernel` health blocks as mc-host emits them in host.status. `crates/mc-module/tests/kernel_routes.rs` asserts a live daemon produces these key sets and stable values; `managed-policy.test.ts` asserts kernelReadiness classifies each block as its key names. Volatile counters (bytes, sample time, ages) carry representative values only.",
+  "_comment": "Sanitized `kernel` health blocks as mc-host emits them in host.status. `crates/mc-module/tests/kernel_routes.rs` asserts these key sets and stable values against a live daemon (or, for the two capacity-warn blocks, against the sampler's own block types); `managed-policy.test.ts` asserts kernelReadiness classifies each block as its key names, with both capacity-warn blocks reading as kernel_capacity_warn. Volatile counters (bytes, sample time, ages) carry representative values only.",
   "healthy": {
     "kernel_state": "ready",
     "sampled_at_ms": 1700000000000,
@@ -40,6 +40,34 @@
     "oldest_unconsumed_age_ms": null,
     "retained_outbox_rows": 0,
     "required_consumer_count": 0,
+    "lag_threshold_tripped": false
+  },
+  "kernel_capacity_warn_core_file": {
+    "kernel_state": "ready",
+    "sampled_at_ms": 1700000000000,
+    "core_file_bytes": 1073741824,
+    "core_file_warn": true,
+    "artifact_usage_bytes": 0,
+    "artifact_cap_bytes": 1073741824,
+    "artifact_warn": false,
+    "outbox_position_lag": 0,
+    "oldest_unconsumed_age_ms": null,
+    "retained_outbox_rows": 1,
+    "required_consumer_count": 1,
+    "lag_threshold_tripped": false
+  },
+  "kernel_capacity_warn_artifact": {
+    "kernel_state": "ready",
+    "sampled_at_ms": 1700000000000,
+    "core_file_bytes": 65536,
+    "core_file_warn": false,
+    "artifact_usage_bytes": 858993460,
+    "artifact_cap_bytes": 1073741824,
+    "artifact_warn": true,
+    "outbox_position_lag": 0,
+    "oldest_unconsumed_age_ms": null,
+    "retained_outbox_rows": 1,
+    "required_consumer_count": 1,
     "lag_threshold_tripped": false
   },
   "kernel_unavailable": {

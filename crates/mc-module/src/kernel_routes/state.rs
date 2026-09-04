@@ -203,31 +203,6 @@ impl From<ArtifactErrorKind> for KernelOutcome {
 mod tests {
     use super::*;
 
-    const KERNEL_ERRORS: &[KernelError] = &[
-        KernelError::Held,
-        KernelError::EngineUnsupported,
-        KernelError::Foreign,
-        KernelError::Inconclusive,
-        KernelError::Io,
-        KernelError::Busy,
-        KernelError::IdentityMismatch,
-        KernelError::FenceLost,
-        KernelError::Conflict,
-        KernelError::CorruptCanonicalRow,
-        KernelError::InvalidInput,
-        KernelError::AdmissionPolicy,
-        KernelError::FutureSnapshot,
-        KernelError::NotFound,
-        KernelError::InvalidCheckpoint,
-        KernelError::NoRequiredConsumers,
-        KernelError::ConsumerPending,
-        KernelError::Fault,
-        KernelError::Deadline,
-        KernelError::UnsafeDestination,
-        KernelError::InvalidBackup,
-        KernelError::InvalidRestore,
-    ];
-
     const ARTIFACT_ERRORS: &[ArtifactErrorKind] = &[
         ArtifactErrorKind::PayloadTooLarge,
         ArtifactErrorKind::Capacity,
@@ -253,7 +228,7 @@ mod tests {
 
     #[test]
     fn every_kernel_error_serializes_to_a_tagged_non_available_state() {
-        for error in KERNEL_ERRORS {
+        for error in KernelError::ALL {
             let outcome = KernelOutcome::from(*error);
             assert!(!outcome.is_available(), "{error:?}");
             let value = serde_json::to_value(&outcome).unwrap();
