@@ -552,8 +552,8 @@ export function scorecardReportFixture(policy: ScorecardPolicy = policyFixture()
         evidence: {
             lanes: LANE_IDS.map((lane) => ({ lane, status: "missing", reportFingerprint: null, identity: null, diagnostics: ["artifact-missing"] })),
             baseline: policy.baselineScorecardReportFingerprint === null
-                ? { status: "absent", reportFingerprint: null }
-                : { status: "present", reportFingerprint: policy.baselineScorecardReportFingerprint },
+                ? { status: "absent", reportFingerprint: null, estimatesStatus: null }
+                : { status: "present", reportFingerprint: policy.baselineScorecardReportFingerprint, estimatesStatus: "present" },
         },
         ...overrides,
     };
@@ -562,7 +562,7 @@ export function scorecardReportFixture(policy: ScorecardPolicy = policyFixture()
         outcome: overrides.outcome ?? deriveOutcome({
             gates: rows.safetyGates,
             lanes: rows.evidence.lanes,
-            baseline: rows.evidence.baseline.status,
+            baseline: rows.evidence.baseline,
             families: SCORE_FAMILY_IDS.map((family) => rows[family]),
             adverseDeltas: rows.adverseDeltas,
             requiredMetricSlots: rows.target.requiredMetricSlots,

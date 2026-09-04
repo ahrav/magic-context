@@ -42,7 +42,7 @@ function allGatesPassed(bundle: ScorecardEvidenceBundle): ScorecardReport {
     body.outcome = deriveOutcome({
         gates: body.safetyGates,
         lanes: body.evidence.lanes,
-        baseline: body.evidence.baseline.status,
+        baseline: body.evidence.baseline,
         families: SCORE_FAMILY_IDS.map((family) => body[family]),
         requiredMetricSlots: bundle.policy.requiredMetricSlots,
         adverseDeltas: body.adverseDeltas,
@@ -170,6 +170,30 @@ describe("buildScorecardReport", () => {
         forged.outcome.mandatoryEvidenceComplete = true;
         expect(() => parseScorecardReport({ schema: built.schema, body: forged, reportFingerprint: canonicalFingerprint(forged) }))
             .toThrow(/outcome: cross-field-invalid/);
+    });
+
+    it("denies promotion when the pinned baseline loaded but its own paired-delta lane did not finish", () => {
+        const hollow = baselineReport({ statuses: { "paired-delta": "missing" } });
+        expect(hollow.body.utility.familyEstimates).toEqual([]);
+        const policy = policyFixture({ baselineScorecardReportFingerprint: hollow.reportFingerprint });
+        const report = allGatesPassed(bundleFixture({ policy, baseline: hollow }));
+        expect(report.body.evidence.baseline).toMatchObject({ status: "present", estimatesStatus: "missing" });
+        expect(report.body.adverseDeltas).toEqual([]);
+        expect(report.body.outcome).toMatchObject({ promotionAllowed: false, mandatoryEvidenceComplete: false, blockingRegressionCount: 0 });
+        expect(report.body.limitations).toContain("baseline-estimates-unavailable");
+        expect(scorecardExitCode(report)).toBe(1);
+        const bundle = bundleFixture({ policy, baseline: hollow });
+        const built = buildScorecardReport(bundle);
+        const forgedOutcome = structuredClone(built.body);
+        forgedOutcome.outcome.mandatoryEvidenceComplete = true;
+        expect(() => parseScorecardReport({ schema: built.schema, body: forgedOutcome, reportFingerprint: canonicalFingerprint(forgedOutcome) }))
+            .toThrow(/outcome: cross-field-invalid/);
+        // The recorded estimate status is a loader fact the report cannot recompute; the bundle-side admission catches it.
+        const forgedRow = structuredClone(built.body);
+        forgedRow.evidence.baseline.estimatesStatus = "present";
+        forgedRow.outcome.mandatoryEvidenceComplete = true;
+        expect(() => publishScorecardReport({ bundle, report: { schema: built.schema, body: forgedRow, reportFingerprint: canonicalFingerprint(forgedRow) } }, "/dev/null"))
+            .toThrow(/scorecard: report-bundle-mismatch/);
     });
 
     it("refuses a bundle whose policy terms do not match the fingerprint it names", () => {

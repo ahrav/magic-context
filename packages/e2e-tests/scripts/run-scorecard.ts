@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
-import { rmSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { existsSync, realpathSync, rmSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { HEX64_RE } from "../src/contract-primitives";
 import { loadEvidenceBundle, type EvidenceSources } from "../src/scorecard/evidence";
 import { ScorecardContractError } from "../src/scorecard/policy";
@@ -40,10 +40,28 @@ function inputPaths(values: ReadonlyMap<string, readonly string[]>, root: string
     return INPUT_FLAGS.flatMap((flag) => values.get(flag) ?? (defaults[flag] === undefined ? [] : [defaults[flag]])).map((path) => resolve(path));
 }
 
+/**
+ * The real path with symlinks resolved, for a path that may not exist yet: the nearest existing
+ * ancestor is resolved and the remainder rejoined. A lexical comparison would miss an output written
+ * through a symlinked directory into an input.
+ */
+function canonical(path: string): string {
+    let existing = path;
+    const trailing: string[] = [];
+    while (!existsSync(existing)) {
+        const parent = dirname(existing);
+        if (parent === existing) return path;
+        trailing.unshift(existing.slice(parent.length + 1));
+        existing = parent;
+    }
+    return join(realpathSync(existing), ...trailing);
+}
+
 /** Whether `out` names an input or lies inside an input directory; the run deletes `out` before reading. */
 function overlapsInput(out: string, inputs: readonly string[]): boolean {
+    const target = canonical(out);
     return inputs.some((input) => {
-        const step = relative(input, out);
+        const step = relative(canonical(input), target);
         return step === "" || (!step.startsWith("..") && !isAbsolute(step));
     });
 }

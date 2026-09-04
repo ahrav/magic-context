@@ -41,10 +41,12 @@ export function buildScorecardReport(bundle: ScorecardEvidenceBundle): Scorecard
     verifyBundleFingerprints(bundle);
     const safetyGates = evaluateGates(bundle);
     const families = buildScoreFamilies(bundle);
+    const baseline = baselineEstimates(bundle.baseline);
     const comparison = compareWithBaseline(
         { status: laneEvidence(bundle, "paired-delta").status, familyEstimates: families.utility.familyEstimates },
-        baselineEstimates(bundle.baseline),
+        baseline,
     );
+    const baselineRow = { status: bundle.baseline.status, reportFingerprint: bundle.baseline.reportFingerprint, estimatesStatus: baseline.estimatesStatus };
     const lanes: EvidenceRow[] = bundle.lanes.map((lane) => ({
         lane: lane.lane,
         status: lane.status,
@@ -73,7 +75,7 @@ export function buildScorecardReport(bundle: ScorecardEvidenceBundle): Scorecard
     const outcome = deriveOutcome({
         gates: safetyGates,
         lanes,
-        baseline: bundle.baseline.status,
+        baseline: baselineRow,
         families: SCORE_FAMILY_IDS.map((family) => families[family]),
         requiredMetricSlots: bundle.policy.requiredMetricSlots,
         adverseDeltas: comparison.adverseDeltas,
@@ -90,7 +92,7 @@ export function buildScorecardReport(bundle: ScorecardEvidenceBundle): Scorecard
     const body: ScorecardReportBody = {
         ...partial,
         limitations,
-        evidence: { lanes, baseline: { status: bundle.baseline.status, reportFingerprint: bundle.baseline.reportFingerprint } },
+        evidence: { lanes, baseline: baselineRow },
         outcome,
     };
     return parseScorecardReport({ schema: SCORECARD_REPORT_SCHEMA, body, reportFingerprint: canonicalFingerprint(body) });

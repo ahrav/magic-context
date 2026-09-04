@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readCanonicalJsonFile } from "../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -104,9 +104,14 @@ describe("removeNamedOutput", () => {
         const inside = join(artifacts, "scorecard-report.json");
         writeFileSync(baseline, "{}\n");
         writeFileSync(inside, "{}\n");
+        const link = join(root, "link");
+        symlinkSync(artifacts, link);
         const hex = "a".repeat(64);
         const common = ["--freeze", join(root, "freeze"), "--freeze-fingerprint", hex, "--artifacts", artifacts];
         for (const argv of [
+            [...common, "--out", join(link, "scorecard-report.json")],
+            [...common, "--out", join(link, "nested", "later", "scorecard-report.json")],
+            ["--freeze", join(root, "freeze"), "--freeze-fingerprint", hex, "--artifacts", link, "--out", inside],
             [...common, "--baseline", baseline, "--out", baseline],
             [...common, "--out", inside],
             [...common, "--out", artifacts],

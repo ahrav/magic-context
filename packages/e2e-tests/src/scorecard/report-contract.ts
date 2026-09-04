@@ -165,7 +165,8 @@ export interface ScorecardReportBody {
     limitations: string[];
     evidence: {
         lanes: EvidenceRow[];
-        baseline: { status: BaselineStatus; reportFingerprint: string | null };
+        /** `estimatesStatus` is the loaded baseline's own paired-delta lane status: a baseline that estimated nothing cannot be compared against. */
+        baseline: { status: BaselineStatus; reportFingerprint: string | null; estimatesStatus: LaneStatus | null };
     };
     outcome: {
         promotionAllowed: boolean;
@@ -393,7 +394,7 @@ export function hardGateFailures(rows: readonly GateRow[]): GateId[] {
 export function deriveOutcome(input: {
     gates: readonly GateRow[];
     lanes: readonly EvidenceRow[];
-    baseline: BaselineStatus;
+    baseline: Pick<ScorecardReportBody["evidence"]["baseline"], "status" | "estimatesStatus">;
     families: readonly ScoreFamilySection[];
     requiredMetricSlots: readonly MetricSlotId[];
     adverseDeltas: readonly AdverseRow[];
@@ -402,9 +403,11 @@ export function deriveOutcome(input: {
     const failures = hardGateFailures(input.gates);
     const measured = new Set(input.families.flatMap((family) => family.slots)
         .filter((slot) => slot.status === "measured").map((slot) => slot.id));
-    // A pinned baseline that did not load leaves the release-over-release comparison unmade.
+    // A pinned baseline that did not load, or loaded without its own estimates, leaves the release-over-release comparison unmade.
+    const baselineComparable = input.baseline.status === "absent"
+        || (input.baseline.status === "present" && input.baseline.estimatesStatus === "present");
     const mandatoryEvidenceComplete = input.lanes.every((row) => row.status === "present")
-        && input.baseline !== "schema-mismatch"
+        && baselineComparable
         && input.requiredMetricSlots.every((slot) => measured.has(slot));
     const blockingRegressionCount = input.adverseDeltas.filter((row) => row.blocking).length;
     return {
@@ -504,7 +507,7 @@ export function parseScorecardReport(raw: unknown): ScorecardReport {
     const evidence = record(value.evidence, "report.body.evidence");
     exact(evidence, ["lanes", "baseline"], "report.body.evidence");
     const baseline = record(evidence.baseline, "report.body.evidence.baseline");
-    exact(baseline, ["status", "reportFingerprint"], "report.body.evidence.baseline");
+    exact(baseline, ["status", "reportFingerprint", "estimatesStatus"], "report.body.evidence.baseline");
     const outcome = record(value.outcome, "report.body.outcome");
     exact(outcome, ["promotionAllowed", "mandatoryEvidenceComplete", "hardGateFailures", "blockingRegressionCount"], "report.body.outcome");
     const gates = array(value.safetyGates, "report.body.safetyGates");
@@ -539,6 +542,8 @@ export function parseScorecardReport(raw: unknown): ScorecardReport {
                 status: enumeration(baseline.status, BASELINE_STATUSES, "report.body.evidence.baseline.status"),
                 reportFingerprint: nullable(baseline.reportFingerprint, (fingerprint) =>
                     hex64(fingerprint, "report.body.evidence.baseline.reportFingerprint")),
+                estimatesStatus: nullable(baseline.estimatesStatus, (status) =>
+                    enumeration(status, LANE_STATUSES, "report.body.evidence.baseline.estimatesStatus")),
             },
         },
         outcome: {
@@ -553,14 +558,14 @@ export function parseScorecardReport(raw: unknown): ScorecardReport {
     const pinned = body.target.baselineScorecardReportFingerprint;
     const loaded = body.evidence.baseline;
     if ((loaded.status === "absent") !== (pinned === null)) fail("report.body.evidence.baseline.status: cross-field-invalid");
-    if ((loaded.status === "present") !== (loaded.reportFingerprint !== null)) fail("report.body.evidence.baseline: shape-invalid");
+    if ((loaded.status === "present") !== (loaded.reportFingerprint !== null && loaded.estimatesStatus !== null)) fail("report.body.evidence.baseline: shape-invalid");
     if (loaded.status === "present" && loaded.reportFingerprint !== pinned) fail("report.body.evidence.baseline.reportFingerprint: cross-field-invalid");
     verifyEvidenceBindings(body);
     verifyComparison(body);
     const derived = deriveOutcome({
         gates: body.safetyGates,
         lanes: body.evidence.lanes,
-        baseline: loaded.status,
+        baseline: loaded,
         families: familySections(body),
         requiredMetricSlots: body.target.requiredMetricSlots,
         adverseDeltas: body.adverseDeltas,
