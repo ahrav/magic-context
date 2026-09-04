@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "6aa0938dcc5e4c81f37fbdd9652bf50600d46a48c64b70dda47e99a1d8ef1374";
+    "ad521020d5ceac2fcc76ed2e8db10318598290e5f9f67a135b437f26531a8871";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -487,7 +487,29 @@ fn taint_floor_class_sql(alias: &str) -> String {
 /// Returns the strictest sensitivity from decisions visible at the snapshot.
 /// Each row contributes the greater of its stored class and its taint floor.
 /// An unrecognized class sorts strictest, so it fails closed.
+///
+/// A single `OR` over the own-object and lineage predicates makes the planner
+/// walk the whole lineage per object, quadratic in lineage size.
 fn strictest_sensitivity_sql(commit_bound: &str) -> String {
+    let own = strictest_sensitivity_branch_sql(
+        "h.subject_object_id=o.object_id AND h.commit_seq>=o.created_commit_seq",
+        commit_bound,
+    );
+    let lineage = strictest_sensitivity_branch_sql("h.subject_object_id IS NULL", commit_bound);
+    let own_rank = sensitivity_rank_sql("own");
+    let lineage_rank = sensitivity_rank_sql("lineage");
+    format!(
+        "(
+    SELECT CASE WHEN own IS NULL THEN lineage
+                WHEN lineage IS NULL THEN own
+                WHEN {lineage_rank}>{own_rank} THEN lineage
+                ELSE own END
+    FROM (SELECT {own} AS own, {lineage} AS lineage)
+)"
+    )
+}
+
+fn strictest_sensitivity_branch_sql(subject: &str, commit_bound: &str) -> String {
     let lineage = same_lineage_as_object("h");
     let floor_class = taint_floor_class_sql("h");
     let stored_rank = sensitivity_rank_sql("h.sensitivity_class");
@@ -497,10 +519,7 @@ fn strictest_sensitivity_sql(commit_bound: &str) -> String {
     SELECT CASE WHEN {floor_rank}>{stored_rank} THEN {floor_class}
                 ELSE h.sensitivity_class END
     FROM admission_decisions h
-    WHERE (
-            (h.subject_object_id=o.object_id AND h.commit_seq>=o.created_commit_seq)
-            OR h.subject_object_id IS NULL
-          )
+    WHERE {subject}
       AND {lineage}
       AND h.commit_seq IS NOT NULL
       {commit_bound}
