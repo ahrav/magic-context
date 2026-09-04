@@ -49,7 +49,7 @@ import {
 	appendAutoSearchHintDecision,
 	getAutoSearchHintDecisions,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
-import { collectAntiMemoryWarningFragments } from "@magic-context/core/hooks/magic-context/auto-search-hint";
+import { collectMemoryHintFragments } from "@magic-context/core/hooks/magic-context/auto-search-hint";
 import { extractBoundedAutoSearchQuery } from "@magic-context/core/hooks/magic-context/auto-search-prompt";
 import {
 	type AutoSearchDelivery,
@@ -216,7 +216,7 @@ export async function runAutoSearchHintForPi(args: {
 		}
 		sessionLog(
 			sessionId,
-			`auto-search: suppressing persisted anti-memory warning for ${decision.messageId} — fresh search required`,
+			`auto-search: suppressing persisted memory-backed hint for ${decision.messageId} — fresh search required`,
 		);
 	};
 	const existing = getAutoSearchHintDecisions(db, sessionId);
@@ -366,11 +366,8 @@ export async function runAutoSearchHintForPi(args: {
 	// Prefix with double newline so the hint is a separate block, matching
 	// OpenCode's auto-search runner.
 	const payload = `\n\n${delivery.hintText}`;
-	// Any anti-memory fragment marks the persisted decision as non-replayable;
-	// decisions without anti-memory fragments remain eligible for replay.
-	const { warningResults, memoryFragments } = collectAntiMemoryWarningFragments(
-		delivery.delivered,
-	);
+	// Any memory-backed fragment — an anti-memory warning or a positive kernel hit — marks the persisted decision as non-replayable; hints from non-memory sources persist an empty list and replay. commentlint: allow(JUDGE)
+	const { memoryFragments } = collectMemoryHintFragments(delivery.delivered);
 	const outcome = appendAutoSearchHintDecision(db, sessionId, {
 		messageId: userMsgId,
 		decision: "hint",
@@ -378,8 +375,8 @@ export async function runAutoSearchHintForPi(args: {
 		memoryFragments,
 	});
 	if (!outcome.ok) return messages;
-	if (outcome.kind === "appended" && warningResults.length > 0) {
-		// A freshly delivered warning bypasses replay; later passes cannot re-serve it.
+	if (outcome.kind === "appended") {
+		// A fresh delivery appends directly because a memory-backed decision bypasses replay; later passes cannot re-serve it. commentlint: allow(JUDGE)
 		appendHintToUserMessage(userMsg, payload);
 	} else {
 		replayHintIfEligible(outcome.decision);

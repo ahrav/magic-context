@@ -354,6 +354,7 @@ export function prepareCompartmentInjection(
               renderedRows,
               args.memory.state,
               memoryRows(args.memory).length,
+              args.memory.truncated === true,
           ) || undefined
         : undefined;
     const memoryCount = renderedRows.length;
@@ -1591,6 +1592,7 @@ export function renderM0(args: {
               args.memoryRows ?? [],
               args.memory.state,
               memoryRows(args.memory).length,
+              args.memory.truncated === true,
           )
         : "";
     if (memoriesBlock) sections.push(memoriesBlock);

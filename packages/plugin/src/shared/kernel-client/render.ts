@@ -24,21 +24,29 @@ export const EMPTY_PROJECT_MARKER = "memory: no memories recorded for this proje
 export const BUDGET_OMITTED_MARKER =
     "memory: memories exist for this project but were omitted to fit the injection budget";
 
+/** An `available` read truncated before any memory row survived; absence is not evidence of an empty project. commentlint: allow(JUDGE) */
+export const READ_TRUNCATED_MARKER =
+    "memory: the memory read was truncated; recorded memories may be missing from this block";
+
 /**
  * One line for an injected block. An `available` state with rows renders the
  * empty string: the rows are the marker, and a header line would spend budget
  * on every turn. Row rendering and budget trimming belong to the injector.
  * A trim that empties a non-empty snapshot renders `BUDGET_OMITTED_MARKER`
- * so the model does not treat a trimmed block as an empty project.
+ * so the model does not treat a trimmed block as an empty project; the
+ * incomplete-read markers keep a capped snapshot from reading as
+ * authoritative emptiness. commentlint: allow(JUDGE)
  */
 export function renderMemoryStateMarker(
     state: MemoryState,
     rowCount: number,
     totalRowCount: number = rowCount,
+    truncated = false,
 ): string {
     if (state.kind === "available") {
         if (rowCount > 0) return "";
-        return totalRowCount > 0 ? BUDGET_OMITTED_MARKER : EMPTY_PROJECT_MARKER;
+        if (totalRowCount > 0) return BUDGET_OMITTED_MARKER;
+        return truncated ? READ_TRUNCATED_MARKER : EMPTY_PROJECT_MARKER;
     }
     if (state.kind === "stale" || state.kind === "abstained") {
         return `${guidanceFor(state).marker} (${state.lag_positions} behind, oldest ${state.oldest_unconsumed_age_ms} ms)`;

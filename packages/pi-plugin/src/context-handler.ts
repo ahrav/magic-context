@@ -4966,7 +4966,7 @@ function applyNoteNudges(args: {
 		);
 	}
 	for (const decision of getAutoSearchHintDecisions(db, sessionId)) {
-		// Anti-memory warnings require a fresh search; they never replay stored hint text.
+		// Memory-backed hints require a fresh search; they never replay stored hint text. commentlint: allow(JUDGE)
 		if (decision.decision === "hint" && autoSearchHintReplayable(decision)) {
 			appendReminderToUserMessageByIdPi(
 				messages,

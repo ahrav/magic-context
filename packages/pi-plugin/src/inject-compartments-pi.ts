@@ -990,6 +990,7 @@ export function renderM0Pi(
 				rowsOverride ?? renderedMemoryRows(state),
 				state.memory.state,
 				memoryRows(state.memory).length,
+				state.memory.truncated === true,
 			)
 		: "";
 	// Facts render through <project-memory>, not through decayed compartments.

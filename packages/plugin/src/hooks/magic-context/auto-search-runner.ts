@@ -34,7 +34,7 @@ import {
 import { log, sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { searchKernelMemoryRows } from "../../tools/ctx-search/kernel-memory-search";
-import { collectAntiMemoryWarningFragments, packAutoSearchHint } from "./auto-search-hint";
+import { collectMemoryHintFragments, packAutoSearchHint } from "./auto-search-hint";
 import {
     AUTO_SEARCH_RESULT_LIMIT,
     AUTO_SEARCH_SOURCES,
@@ -246,8 +246,9 @@ export interface AutoSearchRunnerOptions {
 }
 
 /**
- * Persisted anti-memory warnings never replay; each warning requires a fresh
- * search. Ordinary hints carry an empty fragment list and replay on every pass.
+ * A persisted hint replays only when it carries no memory-backed fragments.
+ * Anti-memory warnings and kernel memory hits persist fragments because the rows they were read from can be archived or revised between passes, and a stored rendering would replay stale memory as authoritative context. commentlint: allow(JUDGE)
+ * Hints built from non-memory sources persist an empty fragment list and stay replayable. commentlint: allow(JUDGE)
  */
 export function autoSearchHintReplayable(
     decision: Extract<AutoSearchHintDecision, { decision: "hint" }>,
@@ -312,7 +313,7 @@ export async function runAutoSearchHint(args: {
         }
         sessionLog(
             sessionId,
-            `auto-search: suppressing persisted anti-memory warning for ${decision.messageId} — fresh search required`,
+            `auto-search: suppressing persisted memory-backed hint for ${decision.messageId} — fresh search required`,
         );
     };
 
@@ -451,11 +452,8 @@ export async function runAutoSearchHint(args: {
     const hintText = delivery.hintText;
 
     const payload = `\n\n${hintText}`;
-    // Any anti-memory fragment marks the persisted decision as non-replayable;
-    // ordinary kernel hits persist an empty fragment list and replay.
-    const { warningResults, memoryFragments } = collectAntiMemoryWarningFragments(
-        delivery.delivered,
-    );
+    // Any memory-backed fragment — an anti-memory warning or a positive kernel hit — marks the persisted decision as non-replayable; hints from non-memory sources persist an empty list and replay. commentlint: allow(JUDGE)
+    const { memoryFragments } = collectMemoryHintFragments(delivery.delivered);
     const outcome = appendAutoSearchHintDecision(db, sessionId, {
         messageId: userMsgId,
         decision: "hint",
@@ -466,8 +464,8 @@ export async function runAutoSearchHint(args: {
         sessionLog(sessionId, `auto-search: CAS exhausted for ${userMsgId}; skipping wire append`);
         return { ok: false, kind: "cas-exhaustion" };
     }
-    if (outcome.kind === "appended" && warningResults.length > 0) {
-        // A freshly delivered warning bypasses replay; later passes cannot re-serve it.
+    if (outcome.kind === "appended") {
+        // A fresh delivery appends directly because a memory-backed decision bypasses replay; later passes cannot re-serve it. commentlint: allow(JUDGE)
         appendReminderToUserMessageById(messages, userMsgId, payload);
     } else {
         replayHintIfEligible(outcome.decision);

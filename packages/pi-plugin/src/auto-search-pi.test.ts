@@ -154,7 +154,7 @@ describe("runAutoSearchHintForPi", () => {
 			});
 			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]).toMatchObject({
 				decision: "hint",
-				memoryFragments: [],
+				memoryFragments: [{ id: -1, hash: `mem_${"a".repeat(32)}@1` }],
 			});
 		} finally {
 			spy.mockRestore();
@@ -368,7 +368,7 @@ describe("runAutoSearchHintForPi", () => {
 			expect(textOf(messages[0])).toContain("<ctx-search-hint>");
 			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]).toMatchObject({
 				decision: "hint",
-				memoryFragments: [],
+				memoryFragments: [{ id: -1, hash: `mcm_1/r1/${"0".repeat(64)}` }],
 			});
 		} finally {
 			spy.mockRestore();

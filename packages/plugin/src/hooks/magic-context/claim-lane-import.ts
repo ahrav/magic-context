@@ -16,6 +16,12 @@ import {
 } from "../../features/magic-context/memory/storage-claim-current-state";
 import { CLAIM_POLICY_VERSION } from "../../features/magic-context/storage-claim-policy-schema";
 import {
+    computeWorkspaceEpochFingerprint,
+    expandWorkspaceIdentitySetWithAliases,
+    resolveWorkspaceIdentitySet,
+    resolveWorkspaceShareCategories,
+} from "../../features/magic-context/workspaces";
+import {
     type DecisionSpecInput,
     deriveObjectId,
     isAvailable,
@@ -138,20 +144,39 @@ export function listClaimLaneMemories(
     projectPath: string,
 ): ProjectMemoryClaimSnapshot[] | null {
     if (!hasClaimMemoryFragment(db)) return [];
-    const projectIds = resolveProjectIdsForIdentities(db, [projectPath]);
+    // The lane served workspace members' shareable rows under `share_categories`, so the bridge reads with the same workspace authorization; importing only the project's own rows would drop foreign shared memories the retired lane paths served. commentlint: allow(JUDGE)
+    const resolved = resolveWorkspaceIdentitySet(db, projectPath);
+    const isWorkspaced = resolved.identities.length > 1;
+    const expanded = expandWorkspaceIdentitySetWithAliases(db, resolved.identities);
+    const identities = isWorkspaced ? expanded.expandedIdentities : resolved.identities;
+    const ownIdentities = isWorkspaced
+        ? identities.filter(
+              (identity) => expanded.canonicalIdentityByStoredPath.get(identity) === projectPath,
+          )
+        : identities;
+    const projectIds = resolveProjectIdsForIdentities(db, identities);
     if (projectIds.length === 0) return [];
+    const ownProjectIds = resolveProjectIdsForIdentities(db, ownIdentities);
+    const sharedCategories = isWorkspaced
+        ? (resolveWorkspaceShareCategories(db, projectPath) ?? [])
+        : [];
     const result = readProjectMemoryCurrentState(db, {
         projectIds,
-        workspaceAuthorization: { ownProjectIds: projectIds, sharedCategories: [] },
+        workspaceAuthorization: { ownProjectIds, sharedCategories },
+        // `workspaceIdentities` lets the reader detect membership or share-policy revocation between hydration and publication. commentlint: allow(JUDGE)
+        ...(isWorkspaced
+            ? {
+                  workspaceEpoch: computeWorkspaceEpochFingerprint(db, resolved.identities),
+                  workspaceIdentities: resolved.identities,
+              }
+            : {}),
         surface: "explicit_search",
         lifecycleStates: ["active"],
     });
     if (result.status !== "ok") return null;
-    const own = new Set(projectIds);
     return result.items
         .filter(
             (item) =>
-                own.has(item.projectId) &&
                 item.lifecycleState === "active" &&
                 IMPORTED_CATEGORIES.includes(item.category) &&
                 item.content.trim().length > 0,

@@ -302,6 +302,86 @@ describe("ctx_memory create and revise through the cached token", () => {
             setSystemTime();
         }
     });
+
+    test("a retry that drops the original's explicit expiry keeps its digest conflict", async () => {
+        const digestError = "Error: The operation key was reused with a different request digest.";
+        const antiMemory = {
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            rejectionReason: "it creates split ownership",
+        };
+        try {
+            setSystemTime(new Date("2026-01-01T12:00:00Z"));
+            // The stored expiry is not day-aligned, so it cannot have been generated; the probe must not substitute it. commentlint: allow(JUDGE)
+            const misaligned = harness();
+            const first = parseJson<CommitJson>(
+                await misaligned.execute(
+                    {
+                        action: "create",
+                        category: "REJECTED_APPROACH",
+                        antiMemory: {
+                            ...antiMemory,
+                            expiresAt: Date.parse("2026-02-15T07:30:00Z"),
+                        },
+                    },
+                    "call-anti-explicit",
+                ),
+            );
+            expect(first.outcome).toBe("applied");
+            expect(
+                await misaligned.execute(
+                    { action: "create", category: "REJECTED_APPROACH", antiMemory },
+                    "call-anti-explicit",
+                ),
+            ).toBe(digestError);
+            // A day-aligned explicit expiry beyond the retry's own generated horizon fails the substitution bound. commentlint: allow(JUDGE)
+            const farFuture = harness();
+            const second = parseJson<CommitJson>(
+                await farFuture.execute(
+                    {
+                        action: "create",
+                        category: "REJECTED_APPROACH",
+                        antiMemory: {
+                            ...antiMemory,
+                            expiresAt: Date.parse("2027-06-01T00:00:00Z"),
+                        },
+                    },
+                    "call-anti-explicit-far",
+                ),
+            );
+            expect(second.outcome).toBe("applied");
+            expect(
+                await farFuture.execute(
+                    { action: "create", category: "REJECTED_APPROACH", antiMemory },
+                    "call-anti-explicit-far",
+                ),
+            ).toBe(digestError);
+        } finally {
+            setSystemTime();
+        }
+    });
+
+    test("a revise retry reusing its identity against an absent target errors instead of replaying", async () => {
+        const kernel = new FakeKernel();
+        kernel.seedDecision({ object_id: "mem_a", decision_kind: "ARCHITECTURE", summary: "A." });
+        const tool = harness(kernel);
+        const args = {
+            action: "revise",
+            category: "ARCHITECTURE",
+            content: "A, revised.",
+            reason: "clarified",
+        };
+        const first = parseJson<CommitJson>(
+            await tool.execute({ ...args, objectId: "mem_a" }, "call-revise-retarget"),
+        );
+        expect(first.outcome).toBe("applied");
+        // The retry names a target that never existed: absence from the read cannot prove it was the committed predecessor, and the probe's digest names the new target, so the daemon rejects the reuse and the ordinary visibility error surfaces. commentlint: allow(JUDGE)
+        expect(await tool.execute({ ...args, objectId: "mem_gone" }, "call-revise-retarget")).toBe(
+            "Error: memory not found or not visible from this project: mem_gone",
+        );
+        expect(kernel.liveRows()).toHaveLength(1);
+        expect(kernel.liveRows()[0]?.object_id).toBe(first.objectId as string);
+    });
 });
 
 describe("ctx_memory reads", () => {
@@ -587,9 +667,6 @@ describe("ctx_memory lifecycle and merge", () => {
         const tool = harness(kernel);
         const refused = "Error: memory not found or not visible from this project: mem_secret";
         expect(
-            await tool.execute({ action: "archive", objectId: "mem_secret" }, "call-archive-x"),
-        ).toBe(refused);
-        expect(
             await tool.execute(
                 { action: "revise", objectId: "mem_secret", content: "S2." },
                 "call-revise-x",
@@ -602,6 +679,14 @@ describe("ctx_memory lifecycle and merge", () => {
             ),
         ).toBe(refused);
         expect(tool.transport.methods()).not.toContain("kernel.commit");
+        // Archive's replay probe reaches the daemon, but its snapshot-0 token trips the token conflict before the envelope can mutate the hidden row. commentlint: allow(JUDGE)
+        expect(
+            await tool.execute({ action: "archive", objectId: "mem_secret" }, "call-archive-x"),
+        ).toBe(refused);
+        const probe = tool.transport.calls.find((call) => call.method === "kernel.commit");
+        expect(probe?.body).toMatchObject({
+            tokens: [{ object_id: "mem_secret", known_as_of: 0 }],
+        });
         expect(kernel.objects.get("mem_secret")?.invalidated_commit_seq).toBeNull();
     });
 });
@@ -754,7 +839,11 @@ describe("ctx_memory domain fence and lineage", () => {
         expect(
             await tool.execute({ action: "archive", objectId: "mem_notes" }, "call-archive-domain"),
         ).toBe("Error: memory not found or not visible from this project: mem_notes");
-        expect(tool.transport.methods()).not.toContain("kernel.commit");
+        // Archive's replay probe reaches the daemon, but its snapshot-0 token trips the token conflict before the envelope can mutate the out-of-domain row. commentlint: allow(JUDGE)
+        const probe = tool.transport.calls.find((call) => call.method === "kernel.commit");
+        expect(probe?.body).toMatchObject({
+            tokens: [{ object_id: "mem_notes", known_as_of: 0 }],
+        });
         expect(kernel.objects.get("mem_notes")?.invalidated_commit_seq).toBeNull();
     });
 

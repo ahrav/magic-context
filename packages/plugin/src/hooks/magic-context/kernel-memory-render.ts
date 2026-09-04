@@ -110,10 +110,11 @@ export async function readHistorianMemoryBlock(args: {
         return "";
     }
     const snapshot = withoutSensitiveRows(kernelMemorySnapshotFrom(read));
-    return renderKernelMemoryBlock(memoryRows(snapshot), read.state);
+    const rows = memoryRows(snapshot);
+    return renderKernelMemoryBlock(rows, read.state, rows.length, snapshot.truncated === true);
 }
 
-/** Excludes the store-wide `known_as_of`, which every commit to any project advances; a changed key rematerializes m[0] and the prompt prefix. commentlint: allow(JUDGE) */
+/** Excludes the store-wide `known_as_of`, which every commit to any project advances; a changed key rematerializes m[0] and the prompt prefix. The truncation flag keys because it changes the zero-row marker. commentlint: allow(JUDGE) */
 export function memorySnapshotKey(snapshot: KernelMemorySnapshot): string {
     const rows = memoryRows(snapshot)
         .map(
@@ -121,7 +122,7 @@ export function memorySnapshotKey(snapshot: KernelMemorySnapshot): string {
                 `${row.object.object_id}\u001f${row.labeled ? 1 : 0}\u001f${memoryRowCategory(row)}\u001f${row.decision?.payload.summary ?? ""}`,
         )
         .sort();
-    return `${stateKey(snapshot.state)}#${rows.length}@${sha256Hex(rows.join("\u001e")).slice(0, 16)}`;
+    return `${stateKey(snapshot.state)}${snapshot.truncated ? "!" : ""}#${rows.length}@${sha256Hex(rows.join("\u001e")).slice(0, 16)}`;
 }
 
 /** Rows the automatic surfaces (m[0] injection, historian baseline) render. Anti-memories are excluded because rewriting can drop the negation and recreate a rejected strategy as guidance; they stay visible to search and the explicit ctx_memory actions, which read the snapshot rows directly. commentlint: allow(JUDGE) */
@@ -219,16 +220,16 @@ export function trimKernelRowsToBudget(rows: readonly ReadRow[], budgetTokens: n
  * clean `available` with rows, the state marker line. An `available` snapshot
  * with zero rows renders the empty-project marker so the model learns the
  * project has no memories rather than inferring the block was cut.
- * `totalRowCount` records the row count before budget trimming so the marker
- * can report when trimming removes every row.
+ * `totalRowCount` distinguishes a budget-trimmed block from an empty project; `truncated` identifies a truncated read. commentlint: allow(JUDGE)
  */
 export function renderKernelMemoryBlock(
     rows: readonly ReadRow[],
     state: MemoryState,
     totalRowCount: number = rows.length,
+    truncated = false,
     wrapper = PROJECT_MEMORY_WRAPPER,
 ): string {
-    const marker = renderMemoryStateMarker(state, rows.length, totalRowCount);
+    const marker = renderMemoryStateMarker(state, rows.length, totalRowCount, truncated);
     if (rows.length === 0 && marker.length === 0) return "";
     const lines = [`<${wrapper}>`];
     if (marker.length > 0) lines.push(escapeXmlContent(marker));

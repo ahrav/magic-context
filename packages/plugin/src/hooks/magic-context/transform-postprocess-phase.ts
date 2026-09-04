@@ -386,7 +386,7 @@ export function runRustModePostprocess(args: {
         appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
     }
     for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
-        // Anti-memory warnings require a fresh search; they never replay stored hint text.
+        // Memory-backed hints require a fresh search; they never replay stored hint text. commentlint: allow(JUDGE)
         if (decision.decision === "hint" && autoSearchHintReplayable(decision)) {
             appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
         }

@@ -29,6 +29,13 @@ export function requireTaxonomyCategory(category: string | undefined): string | 
 }
 
 export function assertCtxMemoryWriteShape(args: CtxMemoryWriteShape): void {
+    // The wrappers fall back to unvalidated raw arguments when schema parsing fails, so each optional string field is type-checked before any `.trim()` call can throw a TypeError outside the input-error path. `null` stays admitted: the optional-chained reads downstream treat it as absent. commentlint: allow(JUDGE)
+    for (const field of ["content", "category", "reason", "objectId"] as const) {
+        const value = (args as Record<string, unknown>)[field];
+        if (value !== undefined && value !== null && typeof value !== "string") {
+            throw new ClaimOperationInputError(`'${field}' must be a string`);
+        }
+    }
     if (args.action !== "create" && args.action !== "revise") return;
     const category = requireTaxonomyCategory(args.category?.trim());
     const antiArm = category === ANTI_MEMORY_CATEGORY || args.antiMemory !== undefined;

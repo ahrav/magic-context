@@ -61,6 +61,7 @@ function seedClaim(
     key: string,
     content: string,
     category = "ARCHITECTURE",
+    sharing?: "private" | "shareable",
 ): string {
     const projectId = ensureProject(db, project);
     const result = createProjectMemoryClaim(
@@ -70,6 +71,7 @@ function seedClaim(
             projectId,
             content,
             category,
+            ...(sharing === undefined ? {} : { sharing }),
             provenance: {
                 sourceLocator: "transcript://seed",
                 sourceContent: content,
@@ -157,6 +159,35 @@ describe("claim-lane import", () => {
         seedClaim(db, OTHER_PROJECT, "b", "Foreign claim B.");
         const listed = listClaimLaneMemories(db, PROJECT);
         expect(listed?.map((claim) => claim.content)).toEqual(["Own claim A."]);
+    });
+
+    test("a workspace member's shareable claim in a shared category is listed for the bridge", () => {
+        const { db } = harness();
+        db.exec(
+            `INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+             VALUES (1, 'shared', 0, 0, '["CONSTRAINTS"]');
+             INSERT INTO workspace_members
+                 (workspace_id, project_path, display_name, display_path, added_at)
+             VALUES
+                 (1, '${PROJECT}', 'own', '${PROJECT}', 0),
+                 (1, '${OTHER_PROJECT}', 'foreign', '${OTHER_PROJECT}', 0);`,
+        );
+        seedClaim(db, PROJECT, "a", "Own claim A.");
+        seedClaim(db, OTHER_PROJECT, "b", "Shared constraint.", "CONSTRAINTS", "shareable");
+        seedClaim(db, OTHER_PROJECT, "c", "Private foreign constraint.", "CONSTRAINTS");
+        seedClaim(
+            db,
+            OTHER_PROJECT,
+            "d",
+            "Unshared-category foreign.",
+            "ARCHITECTURE",
+            "shareable",
+        );
+        const listed = listClaimLaneMemories(db, PROJECT);
+        expect(listed?.map((claim) => claim.content).sort()).toEqual([
+            "Own claim A.",
+            "Shared constraint.",
+        ]);
     });
 
     test("a claim the lane withholds from automatic surfaces imports as sensitive", async () => {

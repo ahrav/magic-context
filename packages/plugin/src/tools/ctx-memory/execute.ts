@@ -29,6 +29,7 @@ import {
     type MemoryState,
     type MutationArgs,
     OPERATION_KEY_SEPARATOR,
+    type ReadDecision,
     type ReadRow,
     renderToolStateText,
     SENSITIVITIES,
@@ -243,15 +244,15 @@ function requireMergeableCategory(predecessors: readonly ReadRow[]): string {
     return categories[0] as string;
 }
 
-/** An anti-memory records a rejected strategy; a survivor on the other arm would flip the negation, so the survivor's anti-memory arm must match the predecessors'. commentlint: allow(JUDGE) */
-function requireMatchingAntiArm(survivorCategory: string, predecessorCategory: string): void {
-    const survivorAnti = survivorCategory === ANTI_MEMORY_CATEGORY;
-    if (survivorAnti !== (predecessorCategory === ANTI_MEMORY_CATEGORY)) {
-        throw new ClaimOperationInputError(
-            survivorAnti
-                ? "merge cannot fold positive memories into an anti-memory survivor"
-                : `merge cannot fold ${ANTI_MEMORY_CATEGORY} memories into a positive survivor; the negation would be lost`,
-        );
+/** An anti-memory records a rejected strategy; a successor on the other arm would flip the negation, so the successor's anti-memory arm must match the predecessors'. The caller supplies the action-specific error for each direction. commentlint: allow(JUDGE) */
+function requireMatchingAntiArm(
+    successorCategory: string,
+    predecessorCategory: string,
+    errors: { toAnti: string; toPositive: string },
+): void {
+    const successorAnti = successorCategory === ANTI_MEMORY_CATEGORY;
+    if (successorAnti !== (predecessorCategory === ANTI_MEMORY_CATEGORY)) {
+        throw new ClaimOperationInputError(successorAnti ? errors.toAnti : errors.toPositive);
     }
 }
 
@@ -415,9 +416,23 @@ function operationIdOf(identity: CtxMemoryWriteIdentity): string {
 /** A caller-supplied anti-memory without an explicit expiry gets the default horizon: kernel writes have no lifecycle expiry, so the horizon rides in the rendered payload and the read sites filter on it. The expiry is day-aligned because the rendered payload feeds the commit's request digest: a redelivered tool call must produce byte-identical operations to replay instead of hitting `operation_key_reused`. commentlint: allow(JUDGE) */
 function withAntiMemoryExpiry(args: CtxMemoryArgs): CtxMemoryArgs {
     if (!args.antiMemory || args.antiMemory.expiresAt != null) return args;
-    const day = 24 * 60 * 60 * 1_000;
-    const expiresAt = Math.ceil((Date.now() + ANTI_MEMORY_DEFAULT_TTL_MS) / day) * day;
+    const expiresAt = Math.ceil((Date.now() + ANTI_MEMORY_DEFAULT_TTL_MS) / DAY_MS) * DAY_MS;
     return { ...args, antiMemory: { ...args.antiMemory, expiresAt } };
+}
+
+const DAY_MS = 24 * 60 * 60 * 1_000;
+
+/** A stored row cannot reveal whether its expiry was generated or explicit, so the replay probes substitute it only when it could have been generated: every generated expiry is UTC-day-aligned, and time moves forward, so an earlier delivery's generated expiry never exceeds the retry's regenerated one. An explicit expiry outside that envelope keeps its digest conflict instead of being erased by the substitution. commentlint: allow(JUDGE) */
+function plausiblyGeneratedExpiry(
+    stored: number | null | undefined,
+    retryGenerated: number | null | undefined,
+): boolean {
+    return (
+        typeof stored === "number" &&
+        typeof retryGenerated === "number" &&
+        stored % DAY_MS === 0 &&
+        stored <= retryGenerated
+    );
 }
 
 /** The create replay probe answers "already applied" only when the stored row equals the spec this request derives on its own: the derived category and rationale (empty when omitted) must equal the stored decision kind and rationale, a caller-supplied summary must equal the stored one byte for byte, and an anti-memory must re-render to the stored payload under the stored expiry — the one field a generated expiry legitimately drifts on — so any other changed content surfaces the daemon's `operation_key_reused` rejection. commentlint: allow(JUDGE) */
@@ -429,6 +444,9 @@ function replayMatchesRow(args: CtxMemoryArgs, row: ReadRow): boolean {
     if (args.antiMemory) {
         try {
             const stored = parseAntiMemoryContent(decision.payload.summary);
+            if (!plausiblyGeneratedExpiry(stored.expiresAt, args.antiMemory.expiresAt)) {
+                return false;
+            }
             const rendered = renderAntiMemoryContent({
                 ...args.antiMemory,
                 expiresAt: stored.expiresAt ?? null,
@@ -442,7 +460,7 @@ function replayMatchesRow(args: CtxMemoryArgs, row: ReadRow): boolean {
     return decision.payload.summary === args.content.trim();
 }
 
-/** The revise and merge replay probe requires every payload field explicitly: an omitted category, content, or reason inherits from the retired predecessors, which no read serves, so the reconstructed spec is unverifiable — the probe answers no match and the ordinary path surfaces the mismatch instead of a false "already applied". A generated anti-memory expiry is the one field a redelivery legitimately drifts on — it is day-aligned at delivery time — so the comparison re-renders under the stored expiry, mirroring the create probe. commentlint: allow(JUDGE) */
+/** The revise and merge replay probe requires every payload field explicitly: an omitted category, content, or reason inherits from the retired predecessors, which no read serves, so the reconstructed spec is unverifiable — the probe answers no match and the ordinary path surfaces the mismatch instead of a false "already applied". A generated anti-memory expiry is the one field a redelivery legitimately drifts on — it is day-aligned at delivery time — so the comparison re-renders under the stored expiry when the stored value could have been generated, mirroring the create probe. commentlint: allow(JUDGE) */
 function replayMatchesSuccessor(
     args: CtxMemoryArgs,
     row: ReadRow,
@@ -461,6 +479,9 @@ function replayMatchesSuccessor(
         }
         try {
             const stored = parseAntiMemoryContent(decision.payload.summary);
+            if (!plausiblyGeneratedExpiry(stored.expiresAt, args.antiMemory.expiresAt)) {
+                return false;
+            }
             const rendered = renderAntiMemoryContent({
                 ...args.antiMemory,
                 expiresAt: stored.expiresAt ?? null,
@@ -487,6 +508,24 @@ function redeliveredSuccessor(
     const successor = rows.find((row) => row.object.object_id === derivedId("mem", identity, 0));
     if (!successor || !replayMatchesSuccessor(args, successor, generatedExpiry)) return null;
     return successor;
+}
+
+/** Rebuilds the committed successor spec byte-for-byte from the row that commit wrote: the daemon stores every spec field verbatim, and the request digest canonicalizes key order, so a probe carrying this spec hashes identically to the original envelope. Target absence alone proves only that the named objects are not currently visible — the digest comparison is what proves they were the committed request's predecessors. commentlint: allow(JUDGE) */
+function successorSpec(identity: CtxMemoryWriteIdentity, successor: ReadRow): DecisionSpecInput {
+    const decision = successor.decision as ReadDecision;
+    return {
+        decision_id: derivedId("dec", identity, 0),
+        object_id: successor.object.object_id,
+        domain_id: CTX_MEMORY_DOMAIN_ID,
+        decision_kind: decision.decision_kind,
+        payload: {
+            summary: decision.payload.summary,
+            rationale: decision.payload.rationale,
+        },
+        source_id: successor.object.source_id,
+        source_revision: successor.object.source_revision,
+        sensitivity: successor.object.sensitivity,
+    };
 }
 
 function renderReplayedOutcome(action: CtxMemoryAction, row: ReadRow, knownAsOf: number): string {
@@ -602,17 +641,27 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         const target = requireTarget(args);
         const read = await readMemoryRows(client, signal, [target]);
         if (!read.ok) return renderCtxMemoryStateText(read.state, [target]);
-        requireVisible(read.rows, [target]);
-        return renderCommit(
-            action,
-            await client.archive(target, {
-                actor,
-                operationId,
-                cause: archiveCause(identity, args.reason),
-                ...(signal ? { signal } : {}),
-            }),
-            [target],
-        );
+        const archiveMutation = {
+            actor,
+            operationId,
+            cause: archiveCause(identity, args.reason),
+            ...(signal ? { signal } : {}),
+        };
+        if (!read.rows.some((row) => row.object.object_id === target)) {
+            // A committed archive retired its target, so a redelivery's targeted read serves nothing and the visibility check alone would misreport the replay as "memory not found". The daemon answers a matching `(operation_key, request_digest)` from its receipt ledger before token validation, so resubmitting the identical retire operation replays the original commit; the operation bytes match `client.archive`'s, keeping the digest identical. The probe's token pins `known_as_of` to snapshot 0, which predates every commit, so a first-delivery envelope trips the token conflict before mutating anything and falls through to the visibility error. commentlint: allow(JUDGE)
+            const probe = await client.commit({
+                ...archiveMutation,
+                tokens: [{ object_id: target, known_as_of: 0 }],
+                operations: [{ op: "retire_decision", object_id: target }],
+            });
+            if (isAvailable(probe) && probe.receipt.replayed) {
+                return renderCommit(action, probe, [target]);
+            }
+            throw new ClaimOperationInputError(
+                `memory not found or not visible from this project: ${target}`,
+            );
+        }
+        return renderCommit(action, await client.archive(target, archiveMutation), [target]);
     }
 
     if (action === "revise") {
@@ -628,7 +677,23 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         const replayed = read.truncated
             ? null
             : redeliveredSuccessor(args, identity, read.rows, [target], generatedExpiry);
-        if (replayed) return renderReplayedOutcome(action, replayed, read.knownAsOf);
+        if (replayed) {
+            // Absence plus a matching successor only suggests a redelivery; the daemon's receipt ledger proves it. The probe resubmits the committed operation bytes rebuilt from the successor row: a digest match replays before token validation, while an identity reused with a different target hashes differently, answers `operation_key_reused`, and falls through to the ordinary visibility error. commentlint: allow(JUDGE)
+            const probe = await client.commit({
+                ...mutation,
+                tokens: [{ object_id: target, known_as_of: 0 }],
+                operations: [
+                    {
+                        op: "supersede_decision",
+                        replaced_object_id: target,
+                        spec: successorSpec(identity, replayed),
+                    },
+                ],
+            });
+            if (isAvailable(probe) && probe.receipt.replayed) {
+                return renderReplayedOutcome(action, replayed, read.knownAsOf);
+            }
+        }
         const predecessors = requireVisible(read.rows, [target]);
         const merged = revisionArgs(args, predecessors);
         assertCtxMemoryWriteShape({ ...merged, action: "revise" });
@@ -636,6 +701,10 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         if (!category) {
             throw new ClaimOperationInputError(`revise requires a category for ${target}`);
         }
+        requireMatchingAntiArm(category, rowCategory(predecessors[0] as ReadRow), {
+            toAnti: `revise cannot convert a positive memory into a ${ANTI_MEMORY_CATEGORY} memory; archive it and create the anti-memory instead`,
+            toPositive: `revise cannot convert a ${ANTI_MEMORY_CATEGORY} memory into a positive memory; the negation would be lost. Archive it and create the memory instead`,
+        });
         const lineage = successorLineage(predecessors);
         const spec: DecisionSpecInput = {
             ...decisionSpec(merged, category, identity, {
@@ -687,14 +756,32 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
     const replayed = read.truncated
         ? null
         : redeliveredSuccessor(args, identity, read.rows, targets, generatedExpiry);
-    if (replayed) return renderReplayedOutcome(action, replayed, read.knownAsOf);
+    if (replayed) {
+        // The same digest proof as revise, with one supersede operation per target in list order: a reordered or substituted target list hashes differently and keeps the ordinary visibility error. commentlint: allow(JUDGE)
+        const spec = successorSpec(identity, replayed);
+        const probe = await client.commit({
+            ...mutation,
+            tokens: targets.map((id) => ({ object_id: id, known_as_of: 0 })),
+            operations: targets.map((id) => ({
+                op: "supersede_decision" as const,
+                replaced_object_id: id,
+                spec,
+            })),
+        });
+        if (isAvailable(probe) && probe.receipt.replayed) {
+            return renderReplayedOutcome(action, replayed, read.knownAsOf);
+        }
+    }
     const predecessors = requireVisible(read.rows, targets);
     const predecessorCategory = requireMergeableCategory(predecessors);
     const merged = revisionArgs(args, predecessors);
     assertCtxMemoryWriteShape({ ...merged, action: "revise" });
     const category = merged.category?.trim();
     if (!category) throw new ClaimOperationInputError("merge requires a category");
-    requireMatchingAntiArm(category, predecessorCategory);
+    requireMatchingAntiArm(category, predecessorCategory, {
+        toAnti: "merge cannot fold positive memories into an anti-memory survivor",
+        toPositive: `merge cannot fold ${ANTI_MEMORY_CATEGORY} memories into a positive survivor; the negation would be lost`,
+    });
     const lineage = successorLineage(predecessors);
     const spec: DecisionSpecInput = {
         ...decisionSpec(merged, category, identity, {

@@ -177,25 +177,38 @@ export function buildAutoSearchHint(
     return packAutoSearchHint(results, options).text;
 }
 
-export interface AntiMemoryWarningDelivery {
+export interface MemoryHintFragmentDelivery {
     /** `warningResults` preserves delivery order. */
     warningResults: Extract<UnifiedSearchResult, { source: "anti_memory" }>[];
-    /** Each entry binds a delivered warning's claim id to its content hash. */
+    /** Each entry binds a delivered memory-backed fragment to the content it was read from: a warning's claim id and content hash, or the sentinel id `-1` with a kernel row's revision locator. A non-empty list marks the persisted decision as non-replayable. commentlint: allow(JUDGE) */
     memoryFragments: Array<{ id: number; hash: string }>;
 }
 
-export function collectAntiMemoryWarningFragments(
+/** Kernel rows carry no claim-lane rowid; the sentinel marks a fragment whose hash is a revision locator. */
+const KERNEL_FRAGMENT_ID = -1;
+
+export function collectMemoryHintFragments(
     delivered: readonly UnifiedSearchResult[],
-): AntiMemoryWarningDelivery {
+): MemoryHintFragmentDelivery {
     const warningResults = delivered.filter(
         (result): result is Extract<UnifiedSearchResult, { source: "anti_memory" }> =>
             result.source === "anti_memory",
     );
+    // Positive kernel memory hits persist their revision locators so a replayed decision is recognizably bound to rows that archive or revise out from under it. commentlint: allow(JUDGE)
+    const kernelMemoryFragments = delivered
+        .filter(
+            (result): result is Extract<UnifiedSearchResult, { source: "memory" }> =>
+                result.source === "memory",
+        )
+        .map((result) => ({ id: KERNEL_FRAGMENT_ID, hash: result.revisionLocator }));
     return {
         warningResults,
-        memoryFragments: warningResults.map((result) => ({
-            id: result.claimId,
-            hash: result.normalizedHash,
-        })),
+        memoryFragments: [
+            ...warningResults.map((result) => ({
+                id: result.claimId,
+                hash: result.normalizedHash,
+            })),
+            ...kernelMemoryFragments,
+        ],
     };
 }
