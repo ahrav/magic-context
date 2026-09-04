@@ -157,7 +157,8 @@ export function memoryCategoryCloseTag(category: string): string {
 export function renderKernelMemoryLine(row: ReadRow): string {
     const summary = row.decision?.payload.summary ?? "";
     const label = row.labeled ? " [labeled]" : "";
-    return `${row.object.object_id}${label}: ${escapeXmlContent(summary)}`;
+    // The kernel accepts any non-empty object id from other producers, so the id is escaped like the summary to keep markup or newlines in a foreign id from closing the enclosing element or injecting prompt lines.
+    return `${escapeXmlContent(row.object.object_id)}${label}: ${escapeXmlContent(summary)}`;
 }
 
 /** Unlabeled rows first, then newer rows, then object id, so a budget cut drops the least trusted and oldest rows. */

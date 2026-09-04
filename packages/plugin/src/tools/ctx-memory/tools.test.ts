@@ -725,6 +725,33 @@ describe("ctx_memory anti-memory", () => {
         expect(tool.kernel.liveRows()).toHaveLength(1);
     });
 
+    test("an explicit null expiry gets the default horizon like an omitted one", async () => {
+        const tool = harness();
+        const created = parseJson<CommitJson>(
+            await tool.execute(
+                {
+                    action: "create",
+                    category: "REJECTED_APPROACH",
+                    antiMemory: {
+                        trigger: "Choosing a cache backend",
+                        rejectedStrategy: "Use Redis",
+                        rejectionReason: "The project must work offline",
+                        expiresAt: null,
+                    },
+                },
+                "call-anti-null-ttl",
+            ),
+        );
+        const objectId = created.objects[0] as string;
+        const summary = tool.kernel.objects.get(objectId)?.decision?.payload.summary ?? "";
+        const match = summary.match(/^Expires at: (\d+)$/m);
+        expect(match).not.toBeNull();
+        const ninetyDays = 90 * 24 * 60 * 60 * 1_000;
+        const day = 24 * 60 * 60 * 1_000;
+        expect(Number(match?.[1])).toBeGreaterThanOrEqual(Date.now() + ninetyDays - day);
+        expect(Number(match?.[1])).toBeLessThanOrEqual(Date.now() + ninetyDays + day);
+    });
+
     test("list omits an expired anti-memory while get by id still returns it", async () => {
         const tool = harness();
         const expired = {

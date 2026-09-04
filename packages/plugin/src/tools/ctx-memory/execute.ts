@@ -309,7 +309,7 @@ function operationIdOf(identity: CtxMemoryWriteIdentity): string {
 
 /** A caller-supplied anti-memory without an explicit expiry gets the default horizon: kernel writes have no lifecycle expiry, so the horizon rides in the rendered payload and the read sites filter on it. The expiry is day-aligned because the rendered payload feeds the commit's request digest: a redelivered tool call must produce byte-identical operations to replay instead of hitting `operation_key_reused`. commentlint: allow(JUDGE) */
 function withAntiMemoryExpiry(args: CtxMemoryArgs): CtxMemoryArgs {
-    if (!args.antiMemory || args.antiMemory.expiresAt !== undefined) return args;
+    if (!args.antiMemory || args.antiMemory.expiresAt != null) return args;
     const day = 24 * 60 * 60 * 1_000;
     const expiresAt = Math.ceil((Date.now() + ANTI_MEMORY_DEFAULT_TTL_MS) / day) * day;
     return { ...args, antiMemory: { ...args.antiMemory, expiresAt } };
@@ -372,7 +372,7 @@ export async function executeCtxMemory(input: ExecuteCtxMemoryArgs): Promise<str
         const result = await client.create(spec, createMutation);
         // A generated expiry drifts across UTC day boundaries, so a call redelivered later produces a different request digest under the same operation key and the daemon answers `operation_key_reused` instead of replaying. The object id derives from the same identity, so a visible object under it proves the first delivery committed; answer the replay the daemon would have given. commentlint: allow(JUDGE)
         const generatedExpiry =
-            args.antiMemory !== undefined && input.args.antiMemory?.expiresAt === undefined;
+            args.antiMemory !== undefined && input.args.antiMemory?.expiresAt == null;
         if (
             generatedExpiry &&
             !isAvailable(result) &&
